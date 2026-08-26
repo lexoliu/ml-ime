@@ -8,11 +8,13 @@ import Foundation
 /// `MLIME_PROBE_SAMPLE` is set, and even then only a short prefix, because the
 /// text being probed is whatever the user happens to be writing.
 struct ProbeRecord: Codable {
+    /// What caused this measurement.
+    let trigger: Trigger
     /// Seconds since the probe process started. Relative, so the log carries no
     /// wall-clock record of when someone was typing.
     let elapsed: Double
-    /// How many keystrokes this client has been probed with so far. Lets the
-    /// report tell a genuinely static value apart from one that never moves.
+    /// How many probes this client has received so far. Lets the report tell a
+    /// genuinely static value apart from one that never moves.
     let keystroke: Int
     let clientBundleIdentifier: String?
     let documentLength: Int?
@@ -20,6 +22,17 @@ struct ProbeRecord: Codable {
     let markedRange: RangeReport
     let contextBefore: SubstringReport?
     let contextAfter: SubstringReport?
+}
+
+/// What prompted a measurement.
+///
+/// Activation matters as much as typing: it is the moment an input method first
+/// gets a client, and the only moment reachable without permission to post
+/// synthetic key events.
+enum Trigger: String, Codable {
+    case activate
+    case keystroke
+    case command
 }
 
 /// An `NSRange` as the API actually returned it, including the not-found case
