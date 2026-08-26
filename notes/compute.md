@@ -17,3 +17,14 @@
   silently scheduled onto the CPU image — the downgrade is the symptom of an
   unverified account, not a metadata problem.
 - 30h/week GPU quota, internet on. Primary training venue; Colab is the burst lane.
+
+## Inference backends (user directive, 2026-08-26)
+
+Explore GPU/ANE — never CPU-only. Production model ships with a measured
+backend choice: benchmark CPU vs Metal/MPS vs CoreML/ANE (latency per
+keystroke at realistic sequence lengths + resident energy) as part of the
+milestone-3 acceptance. macOS IMK runs as one resident server process, so
+memory permits 300M–1B int8; the binding constraints are keystroke latency
+(~30ms perception budget) and battery. For local batch g2pW annotation, try
+ort's CoreML EP after CPU parity is established (CPU stays the parity
+reference because fp16 backends flip near-ties).
