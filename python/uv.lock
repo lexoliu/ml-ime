@@ -1050,6 +1050,7 @@ source = { editable = "." }
 dependencies = [
     { name = "datasets" },
     { name = "g2pw" },
+    { name = "httpx" },
     { name = "jinja2" },
     { name = "openai" },
     { name = "opencc" },
@@ -1073,7 +1074,6 @@ train = [
 
 [package.dev-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "mypy" },
     { name = "pytest" },
     { name = "ruff" },
@@ -1084,6 +1084,7 @@ dev = [
 requires-dist = [
     { name = "datasets", specifier = ">=5.0.1" },
     { name = "g2pw", specifier = ">=0.1.1" },
+    { name = "httpx", specifier = ">=0.28" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "openai", specifier = ">=3.3.1" },
     { name = "opencc", specifier = ">=1.4.2" },
@@ -1104,7 +1105,6 @@ provides-extras = ["train"]
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "httpx", specifier = ">=0.28.1" },
     { name = "mypy", specifier = ">=1.14" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "ruff", specifier = ">=0.8" },

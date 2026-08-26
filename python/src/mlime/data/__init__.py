@@ -31,3 +31,13 @@ class DataLayout:
     def annotations(self) -> Path:
         """Dual g2p annotations, plus the hard and refused subsets."""
         return self.root / "annotations"
+
+    @property
+    def lexicon(self) -> Path:
+        """Word-pinyin pairs from external dictionaries (Sogou scel, etc.)."""
+        return self.root / "lexicon"
+
+    @property
+    def scel_cache(self) -> Path:
+        """Downloaded .scel files, cached to avoid repeat downloads."""
+        return self.root / ".scel-cache"
