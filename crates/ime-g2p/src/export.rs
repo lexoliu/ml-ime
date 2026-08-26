@@ -56,11 +56,17 @@ struct HeldOutLine {
 }
 
 /// Rows both annotators agreed on whose target is Han characters only.
+///
+/// Agreement comes from [`crate::report::sentence_agrees`], not the stored
+/// `agree_all` flag, so shards written before a comparison-rule change (the
+/// yv/yu fold) yield every sentence the current rules accept.
 #[must_use]
 pub fn eligible(annotated: &[AnnotatedRow]) -> Vec<&AnnotatedRow> {
     annotated
         .iter()
-        .filter(|row| row.agree_all && row.text.chars().count() == row.characters.len())
+        .filter(|row| {
+            crate::report::sentence_agrees(row) && row.text.chars().count() == row.characters.len()
+        })
         .collect()
 }
 
@@ -498,14 +504,25 @@ mod tests {
 
     #[test]
     fn only_agreed_all_han_rows_are_eligible() {
+        let mut disputed = row("c", "wiki", "重要", &["chong2", "yao4"], false);
+        disputed.llm[0] = "zhong4".to_owned();
         let rows = vec![
             row("a", "wiki", "中国", &["zhong1", "guo2"], true),
             row("b", "wiki", "中，国", &["zhong1", "guo2"], true),
-            row("c", "wiki", "重要", &["chong2", "yao4"], false),
+            disputed,
         ];
         let kept = eligible(&rows);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].id, "a");
+    }
+
+    #[test]
+    fn a_stale_disagreement_flag_no_longer_blocks_an_eligible_row() {
+        // Written by a build whose comparison called yv3 vs yu3 a dispute; the
+        // current rules fold them, so the row is eligible despite its flags.
+        let mut stale = row("d", "wiki", "与会", &["yv3", "hui4"], false);
+        stale.llm[0] = "yu3".to_owned();
+        assert_eq!(eligible(std::slice::from_ref(&stale)).len(), 1);
     }
 
     #[test]

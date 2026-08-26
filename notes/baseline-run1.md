@@ -43,3 +43,11 @@ abbreviations are the visible weakness (`zgrm` → 中国人民 ranked 2nd by 0.
 - g2pw upstream falsy-zero bug (`num_workers=0` → 2) is real and fixed
   (20ffe67), but the 4,000-run completed WITH workers=2 — the fix removes
   fragility; it was not the cause of any observed failure.
+
+## Post-fix rescore (2026-08-26, comparison rules recomputed at read time)
+
+Report/export now recompute agreement from stored readings instead of trusting
+the flags frozen at write time. Under the yv/yu fold: sentence agreement
+83.60% raw (91.3% once 和 is arbitrated), char agreement 99.08%; eligible
+eval rows 1,562 → 1,571. Baseline on the enlarged set: top-1 54.81%,
+top-5 61.49%, char 88.84%, MRR@5 0.577 — unchanged within noise, as expected.

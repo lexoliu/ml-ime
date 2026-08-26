@@ -11,6 +11,7 @@
 use crate::annotate::{ANNOTATED, AnnotatedRow, REFUSED, RefusedRow, read_annotated};
 use crate::error::Result;
 use crate::shards::{read_frame, shard_paths};
+use crate::text::toneless;
 use askama::Template;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -45,11 +46,10 @@ pub fn positions(annotated: &[AnnotatedRow]) -> Vec<Position<'_>> {
     let mut all = Vec::new();
     for row in annotated {
         for index in 0..row.characters.len() {
-            let (Some(character), Some(g2pw), Some(llm), Some(agree)) = (
+            let (Some(character), Some(g2pw), Some(llm)) = (
                 row.characters.get(index),
                 row.g2pw.get(index),
                 row.llm.get(index),
-                row.agree.get(index),
             ) else {
                 continue;
             };
@@ -57,7 +57,10 @@ pub fn positions(annotated: &[AnnotatedRow]) -> Vec<Position<'_>> {
                 character,
                 g2pw,
                 llm,
-                agree: *agree,
+                // Recomputed rather than read from the stored flag: the flag froze
+                // the comparison rules of whichever build wrote the shard, and a
+                // report must reflect the current rules (e.g. the yv/yu fold).
+                agree: toneless(g2pw) == toneless(llm),
                 sentence: &row.text,
             });
         }
@@ -105,6 +108,20 @@ fn ratio(part: usize, whole: usize) -> f64 {
     part as f64 / whole as f64
 }
 
+/// Whether every position of a row agrees under the *current* comparison rules.
+///
+/// The stored `agree_all` flag is deliberately ignored for the same reason
+/// [`positions`] recomputes per-position agreement.
+#[must_use]
+pub fn sentence_agrees(row: &AnnotatedRow) -> bool {
+    row.g2pw.len() == row.llm.len()
+        && row
+            .g2pw
+            .iter()
+            .zip(&row.llm)
+            .all(|(a, b)| toneless(a) == toneless(b))
+}
+
 /// Count sentences and character positions, agreed and total.
 #[must_use]
 pub fn summarise(annotated: &[AnnotatedRow], refusals: usize) -> AgreementSummary {
@@ -112,7 +129,7 @@ pub fn summarise(annotated: &[AnnotatedRow], refusals: usize) -> AgreementSummar
     AgreementSummary {
         sentences: annotated.len(),
         characters: positions.len(),
-        sentences_agreed: annotated.iter().filter(|row| row.agree_all).count(),
+        sentences_agreed: annotated.iter().filter(|row| sentence_agrees(row)).count(),
         characters_agreed: positions.iter().filter(|entry| entry.agree).count(),
         refusals,
     }
