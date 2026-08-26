@@ -1,0 +1,66 @@
+client:
+  name: basic
+  file-system: device-agnostic
+tools: {}
+targets:
+  "ContextProbe-arm64-apple-macosx-release.exe": ["<ContextProbe-arm64-apple-macosx-release.exe>"]
+  "ContextProbe-arm64-apple-macosx-release.module": ["<ContextProbe-arm64-apple-macosx-release.module>"]
+  "PackageStructure": ["<PackageStructure>"]
+  "main": ["<ContextProbe-arm64-apple-macosx-release.exe>","<ContextProbe-arm64-apple-macosx-release.module>"]
+  "test": ["<ContextProbe-arm64-apple-macosx-release.exe>","<ContextProbe-arm64-apple-macosx-release.module>"]
+default: "main"
+nodes:
+  "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Sources/ContextProbe/":
+    is-directory-structure: true
+    content-exclusion-patterns: [".git",".build"]
+commands:
+  "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/sources":
+    tool: write-auxiliary-file
+    inputs: ["<sources-file-list>","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Sources/ContextProbe/ProbeController.swift","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Sources/ContextProbe/ProbeLog.swift","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Sources/ContextProbe/ProbeRecord.swift","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Sources/ContextProbe/main.swift"]
+    outputs: ["/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/sources"]
+    description: "Write auxiliary file /Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/sources"
+
+  "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.product/Objects.LinkFileList":
+    tool: write-auxiliary-file
+    inputs: ["<link-file-list>","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeController.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeLog.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeRecord.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/main.swift.o"]
+    outputs: ["/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.product/Objects.LinkFileList"]
+    description: "Write auxiliary file /Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.product/Objects.LinkFileList"
+
+  "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/swift-version--58304C5D6DBC2206.txt":
+    tool: write-auxiliary-file
+    inputs: ["<swift-get-version>","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"]
+    outputs: ["/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/swift-version--58304C5D6DBC2206.txt"]
+    always-out-of-date: "true"
+    description: "Write auxiliary file /Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/swift-version--58304C5D6DBC2206.txt"
+
+  "<ContextProbe-arm64-apple-macosx-release.exe>":
+    tool: phony
+    inputs: ["/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe"]
+    outputs: ["<ContextProbe-arm64-apple-macosx-release.exe>"]
+
+  "<ContextProbe-arm64-apple-macosx-release.module>":
+    tool: phony
+    inputs: ["/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeController.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeLog.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeRecord.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/main.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/Modules/ContextProbe.swiftmodule"]
+    outputs: ["<ContextProbe-arm64-apple-macosx-release.module>"]
+
+  "C.ContextProbe-arm64-apple-macosx-release.exe":
+    tool: shell
+    inputs: ["/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeController.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeLog.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeRecord.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/main.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.product/Objects.LinkFileList"]
+    outputs: ["/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe"]
+    description: "Linking ./.build/arm64-apple-macosx/release/ContextProbe"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-L","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release","-o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe","-module-name","ContextProbe","-Xlinker","-no_warn_duplicate_libraries","-emit-executable","-Xlinker","-dead_strip","-Xlinker","-alias","-Xlinker","_ContextProbe_main","-Xlinker","_main","-Xlinker","-rpath","-Xlinker","@loader_path","@/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.product/Objects.LinkFileList","-Xlinker","-rpath","-Xlinker","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-6.2/macosx","-target","arm64-apple-macosx14.0","-plugin-path","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g"]
+
+  "C.ContextProbe-arm64-apple-macosx-release.module":
+    tool: shell
+    inputs: ["/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Sources/ContextProbe/ProbeController.swift","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Sources/ContextProbe/ProbeLog.swift","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Sources/ContextProbe/ProbeRecord.swift","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Sources/ContextProbe/main.swift","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/swift-version--58304C5D6DBC2206.txt","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/sources"]
+    outputs: ["/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeController.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeLog.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeRecord.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/main.swift.o","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/Modules/ContextProbe.swiftmodule"]
+    description: "Compiling Swift Module 'ContextProbe' (4 sources)"
+    args: ["/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc","-module-name","ContextProbe","-emit-dependencies","-emit-module","-emit-module-path","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/Modules/ContextProbe.swiftmodule","-output-file-map","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/output-file-map.json","-whole-module-optimization","-num-threads","12","-c","@/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/sources","-I","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/Modules","-target","arm64-apple-macosx14.0","-whole-module-optimization","-num-threads","12","-serialize-diagnostics","-O","-j12","-DSWIFT_PACKAGE","-DSWIFT_MODULE_RESOURCE_BUNDLE_UNAVAILABLE","-module-cache-path","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ModuleCache","-parseable-output","-Xfrontend","-entry-point-function-name","-Xfrontend","ContextProbe_main","-swift-version","6","-plugin-path","/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/host/plugins/testing","-sdk","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk","-F","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-I","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-L","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/usr/lib","-g","-Xcc","-isysroot","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk","-Xcc","-F","-Xcc","/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/Library/Frameworks","-Xcc","-fPIC","-Xcc","-g","-package-name","contextprobe"]
+
+  "PackageStructure":
+    tool: package-structure-tool
+    inputs: ["/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Sources/ContextProbe/","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Package.swift","/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Package.resolved"]
+    outputs: ["<PackageStructure>"]
+    description: "Planning build"
+    allow-missing-inputs: true
+

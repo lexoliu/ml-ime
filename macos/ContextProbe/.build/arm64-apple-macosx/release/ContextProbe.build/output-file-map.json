@@ -1,0 +1,31 @@
+{
+  "": {
+    "dependencies": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ContextProbe.d",
+    "object": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ContextProbe.o",
+    "swift-dependencies": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/primary.swiftdeps"
+  },
+  "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Sources/ContextProbe/ProbeController.swift": {
+    "object": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeController.swift.o",
+    "swiftmodule": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeController~partial.swiftmodule",
+    "swift-dependencies": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeController.swiftdeps",
+    "diagnostics": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeController.dia"
+  },
+  "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Sources/ContextProbe/ProbeLog.swift": {
+    "object": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeLog.swift.o",
+    "swiftmodule": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeLog~partial.swiftmodule",
+    "swift-dependencies": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeLog.swiftdeps",
+    "diagnostics": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeLog.dia"
+  },
+  "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Sources/ContextProbe/ProbeRecord.swift": {
+    "object": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeRecord.swift.o",
+    "swiftmodule": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeRecord~partial.swiftmodule",
+    "swift-dependencies": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeRecord.swiftdeps",
+    "diagnostics": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/ProbeRecord.dia"
+  },
+  "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/Sources/ContextProbe/main.swift": {
+    "object": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/main.swift.o",
+    "swiftmodule": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/main~partial.swiftmodule",
+    "swift-dependencies": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/main.swiftdeps",
+    "diagnostics": "/Users/lexoliu/Coding/ml-ime/macos/ContextProbe/.build/arm64-apple-macosx/release/ContextProbe.build/main.dia"
+  }
+}

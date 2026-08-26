@@ -32,3 +32,17 @@ def gen_pinyin_tables(
 
 if __name__ == "__main__":
     app()
+
+
+@app.command("probe-report")
+def probe_report(
+    log: Path = typer.Option(  # noqa: B008
+        None, help="Probe log to read (defaults to the location the probe writes to)"
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Summarise which applications supply text around the caret."""
+    configure(verbose)
+    from mlime.data.probe_report import DEFAULT_LOG, render, summarise
+
+    render(summarise(log or DEFAULT_LOG))
