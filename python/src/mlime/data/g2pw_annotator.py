@@ -42,6 +42,14 @@ class G2pwAnnotator(Annotator):
             batch_size=batch_size,
             turnoff_tqdm=True,
         )
+        # `G2PWConverter.__init__` stores `num_workers if num_workers else
+        # self.config.num_workers`, so the 0 above is falsy and is silently
+        # replaced by the packaged config's 2. That spawns DataLoader worker
+        # processes, which is both pointless here -- `annotate` already runs the
+        # batch on a worker thread -- and fragile, because the spawned workers
+        # break on macOS. Setting the attribute after construction is the only
+        # way to mean zero without editing the upstream package.
+        self._converter.num_workers = 0
 
     @property
     def name(self) -> str:
