@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>ContextProbe</string>
 	<key>CFBundleIdentifier</key>
-	<string>cool.lexo.mlime.ContextProbe</string>
+	<string>cool.lexo.inputmethod.ContextProbe</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -38,10 +38,10 @@
 	<dict>
 		<key>tsInputModeListKey</key>
 		<dict>
-			<key>cool.lexo.mlime.ContextProbe.probe</key>
+			<key>cool.lexo.inputmethod.ContextProbe.probe</key>
 			<dict>
 				<key>TISInputSourceID</key>
-				<string>cool.lexo.mlime.ContextProbe.probe</string>
+				<string>cool.lexo.inputmethod.ContextProbe.probe</string>
 				<key>TISIntendedLanguage</key>
 				<string>zh-Hans</string>
 				<key>tsInputModeCharacterRepertoireKey</key>
@@ -72,7 +72,7 @@
 		</dict>
 		<key>tsVisibleInputModeOrderedArrayKey</key>
 		<array>
-			<string>cool.lexo.mlime.ContextProbe.probe</string>
+			<string>cool.lexo.inputmethod.ContextProbe.probe</string>
 		</array>
 	</dict>
 </dict>
