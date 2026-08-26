@@ -25,38 +25,33 @@ allowed to constrain a design decision.
   uses `Squirrel_Connection` -- the executable name plus `_Connection`, with the
   bundle identifier `im.rime.inputmethod.Squirrel` nowhere in it. The probe now
   follows Squirrel.
+- **Ad-hoc signing is enough.** No Developer ID is needed for Text Input Sources
+  to accept an input method.
+- **No logout is needed to install one.** See below.
 
-## Open: the probe is installed but not indexed
+## The one thing that actually blocks installation
 
-The bundle is installed at `~/Library/Input Methods/ContextProbe.app`, runs, is
-validly signed, and its `Info.plist` now carries every input-method key Squirrel's
-does: `NSPrincipalClass`, `CFBundleSignature`, `CFBundleIconFile`,
-`InputMethodServerControllerClass`, `InputMethodServerDelegateClass`,
-`ComponentInputModeDict` with `tsInputModeCharacterRepertoireKey` inside the mode
-dict, and all four icon keys pointing at a generated `probe.pdf`.
+A bundle dropped into `~/Library/Input Methods` is invisible to Text Input Sources
+until something calls **`TISRegisterInputSource(CFURLRef)`** on it. Until then the
+input method installs, launches, holds its Mach connection and passes
+`codesign --verify --deep --strict`, yet never appears in System Settings -- and
+**nothing anywhere in the system log says why**.
 
-It still does not appear in `TISCreateInputSourceList`, and nothing in the system
-log mentions it. Four things were tried and none changed it:
+None of the obvious things substitute for it. `lsregister -f`, killing
+`TextInputMenuAgent` and `TextInputSwitcher`, adding every `Info.plist` key
+Squirrel carries (`NSPrincipalClass`, `InputMethodServerDelegateClass`,
+`CFBundleSignature`, all four icon keys), and renaming the bundle identifier into
+the `.inputmethod.` convention each changed nothing. `TISRegisterInputSource`
+returned `noErr` and the installed-source count went from 318 to 320 immediately.
 
-1. `lsregister -f` on the installed bundle.
-2. Killing `TextInputMenuAgent` and `TextInputSwitcher` to force a refresh.
-3. Adding every input-method key Squirrel's `Info.plist` carries, including all
-   four icon keys and a generated `probe.pdf`.
-4. Renaming the bundle identifier to the `cool.lexo.inputmethod.ContextProbe`
-   convention, on the theory that TIS requires `.inputmethod.` in the identifier
-   the way every shipping input method has it. It does not appear to.
+`main.swift` therefore registers its own bundle on every launch, before starting
+`IMKServer`. The call is idempotent, so this costs nothing and removes the
+failure mode entirely.
 
-Two hypotheses remain, both needing a person:
-
-- The input-source database is rebuilt at login, so a newly installed input method
-  stays invisible until logout. Widely repeated in installation instructions,
-  unconfirmed here.
-- Ad-hoc signing is not enough for TIS on macOS 26, and a Developer ID signature
-  is required. This would be worse news, since it puts a certificate on the
-  critical path of every development cycle.
-
-System Settings' input source picker is worth checking before either: it may
-enumerate differently from `TISCreateInputSourceList`.
+Diagnostic worth keeping: `TISCreateInputSourceList(nil, true)` counts *installed*
+sources and `TISCreateInputSourceList(nil, false)` counts *enabled* ones -- 320
+against 8 here. A missing entry in the first list means unregistered, not merely
+switched off, and that distinction is what separated this bug from a red herring.
 
 ## Unverified (second-hand, milestone 5)
 
