@@ -24,9 +24,13 @@ app = typer.Typer(help="ml-ime data pipeline", no_args_is_help=True)
 corpus_app = typer.Typer(help="Acquire and filter training corpora", no_args_is_help=True)
 g2p_app = typer.Typer(help="Dual pinyin annotation and its agreement report", no_args_is_help=True)
 export_app = typer.Typer(help="Emit artefacts for the Rust side", no_args_is_help=True)
+lexicon_app = typer.Typer(
+    help="Manage external word-pinyin lexicons (Sogou scel, etc.)", no_args_is_help=True
+)
 app.add_typer(corpus_app, name="corpus")
 app.add_typer(g2p_app, name="g2p")
 app.add_typer(export_app, name="export")
+app.add_typer(lexicon_app, name="lexicon")
 
 #: A polyphone-dense sentence: 重 chong/zhong, 还 huan/hai, 得 de/dei, 绿 lv.
 PROBE_SENTENCE = "他还了钱还差一点，我得到了那件重要的绿色东西"
@@ -212,6 +216,41 @@ def export_ngram_corpus_command(
 
     layout = DataLayout(data_dir)
     export_ngram_corpus(layout.samples, out, read_exclusions(exclude or ()))
+
+
+@lexicon_app.command("fetch")
+def lexicon_fetch(
+    dict_slug: list[str] = typer.Option(
+        None, "--dict", help="Dict slug to fetch; repeatable, defaults to all"
+    ),
+    data_dir: Path = DATA_DIR,
+    verbose: bool = VERBOSE,
+) -> None:
+    """Download Sogou scel dictionaries and write word-pinyin lexicon shards."""
+    configure(verbose)
+    from mlime.data.scel import DICTS, fetch_lexicon
+
+    slugs = tuple(dict_slug) if dict_slug else tuple(DICTS)
+    unknown = set(slugs) - set(DICTS)
+    if unknown:
+        raise typer.BadParameter(f"unknown dict slug(s) {sorted(unknown)}; have {sorted(DICTS)}")
+
+    layout = DataLayout(data_dir)
+    counts = fetch_lexicon(slugs, layout.lexicon, layout.scel_cache)
+    for slug, count in counts.items():
+        typer.echo(f"{slug}: {count} entries")
+
+
+@lexicon_app.command("list")
+def lexicon_list() -> None:
+    """Show the available Sogou dictionaries and their quality metadata."""
+    from mlime.data.scel import DICTS
+
+    for slug, d in DICTS.items():
+        typer.echo(f"  {slug}  (id={d.id})  {d.name}")
+        typer.echo(f"    quality: {d.quality}")
+        typer.echo(f"    url: {d.detail_url}")
+        typer.echo()
 
 
 def _requested(source: list[str] | None) -> tuple[str, ...]:

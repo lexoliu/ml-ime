@@ -12,16 +12,38 @@ n-gram IMEs fail hardest, so this is the differentiation, not garnish.
    path below.
 2. **萌娘百科** — full WikiTeam dump on Internet Archive
    (archive.org/details/wiki-zhmoegirlorg), CC BY-NC-SA 3.0 CN (fine for a
-   research prototype). Wikitext → prose; its 梗-explanation pages are dense
-   with real usage examples.
+   research prototype). **The entire article text is training corpus** (user
+   directive 2026-08-26) — the prose itself is written in live internet
+   Chinese; wikitext → prose as a fourth corpus source. Entry titles
+   additionally seed the synthesis path below.
 3. **Bilibili comments/danmaku** — `Midsummra/bilibilicomment` (HF) and/or
    VideoIC (5M comments). Real informal typing, short and noisy.
 4. **梗百科 (gengbaike.cn)** — SKIPPED: serves 403 with an anti-bot session
    cookie even for robots.txt. Not worth fighting; coverage overlaps 1+2.
 
+## Sogou scel dictionaries (seed lexicon, added 2026-08-26)
+
+Downloaded via `mlime lexicon fetch`. These are **word-pinyin lexicons**, not
+running text — they skip the corpus/g2p pipeline and land in `data/lexicon/`
+as parquet shards with schema `{word, pinyin, dict_id, dict_name, rank}`.
+
+| slug | id | name | quality |
+|---|---|---|---|
+| `wangluo-liuxing-xinci` | 4 | 网络流行新词 | **premium** — manually scanned 2026-08-26, very high quality |
+| `bilibili-wanggeng` | 177287 | 哔哩网梗 | unreviewed, appears reasonable |
+
+Source: https://pinyin.sogou.com/dict/ — auto-updated weekly by Sogou.
+Download quirk: the server drops HTTP/2 connections; force HTTP/1.1.
+CLI: `mlime lexicon fetch` (all) or `mlime lexicon fetch --dict <slug>`.
+
+These lexicons are high-priority seed data for the Luna synthesis path and
+directly usable as n-gram vocabulary. The 网络流行新词 dict in particular was
+manually reviewed and found to be very high quality internet vocabulary — treat
+it as a premium data source in any downstream pipeline.
+
 ## Luna synthesis path (the cheap-LLM leverage)
 
-Seed lexicon (source 1, plus 梗 titles from 2) → gpt-5.6-luna generates N
+Seed lexicon (source 1, plus entry titles from 2) → gpt-5.6-luna generates N
 realistic usage sentences per term with a preceding-context turn, IME-register.
 Rules:
 - synthetic samples carry `source=synthetic-luna` and are **training-only**;
