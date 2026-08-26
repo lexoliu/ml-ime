@@ -8,6 +8,16 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+anyhow.workspace = true
+askama.workspace = true
+clap.workspace = true
+ime-decode.workspace = true
+ime-eval.workspace = true
+ime-ngram.workspace = true
+ime-pinyin.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
