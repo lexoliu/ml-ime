@@ -1,11 +1,13 @@
 //! Command line driver for the input method engine.
 
 mod engine;
+mod g2p;
 
 use anyhow::{Context as _, Result};
 use askama::Template;
 use clap::{Args, Parser, Subcommand};
 use engine::Baseline;
+use g2p::{ExportCommand, G2pCommand};
 use ime_decode::BeamOptions;
 use ime_eval::{EvalSet, evaluate};
 use ime_ngram::{Counter, NgramModel};
@@ -46,6 +48,16 @@ enum Command {
         pinyin: String,
         #[command(flatten)]
         search: SearchArgs,
+    },
+    /// Dual pinyin annotation and its agreement report.
+    G2p {
+        #[command(subcommand)]
+        command: G2pCommand,
+    },
+    /// Emit artefacts for the rest of the engine.
+    Export {
+        #[command(subcommand)]
+        command: ExportCommand,
     },
     /// Run a model over an evaluation set and print the report.
     Eval {
@@ -112,7 +124,8 @@ struct CandidateList {
     candidates: Vec<Candidate>,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -132,6 +145,8 @@ fn main() -> Result<()> {
             eval_set,
             search,
         } => run_eval(&model, &eval_set, &search),
+        Command::G2p { command } => g2p::run(command).await,
+        Command::Export { command } => g2p::run_export(command),
     }
 }
 
