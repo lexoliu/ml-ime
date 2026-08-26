@@ -491,8 +491,8 @@ mod tests {
             self.name
         }
 
-        async fn annotate(&self, texts: &[String]) -> Vec<Outcome> {
-            self.answers.iter().take(texts.len()).cloned().collect()
+        fn annotate(&self, texts: &[String]) -> impl Future<Output = Vec<Outcome>> {
+            std::future::ready(self.answers.iter().take(texts.len()).cloned().collect())
         }
     }
 
