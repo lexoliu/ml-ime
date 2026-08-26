@@ -1,0 +1,9 @@
+target/
+.venv/
+__pycache__/
+/data/
+/models/
+*.safetensors
+*.arpa
+.DS_Store
+.env
