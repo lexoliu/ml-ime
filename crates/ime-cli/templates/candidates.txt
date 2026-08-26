@@ -1,0 +1,2 @@
+{% for candidate in candidates %}{{ loop.index }}. {{ candidate.text }}  {{ candidate.score|fmt("{:.3}") }}
+{% endfor %}
