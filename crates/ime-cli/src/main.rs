@@ -1,11 +1,13 @@
 //! Command line driver for the input method engine.
 
+mod corpus;
 mod engine;
 mod g2p;
 
 use anyhow::{Context as _, Result};
 use askama::Template;
 use clap::{Args, Parser, Subcommand};
+use corpus::CorpusCommand;
 use engine::Baseline;
 use g2p::{ExportCommand, G2pCommand};
 use ime_decode::BeamOptions;
@@ -48,6 +50,11 @@ enum Command {
         pinyin: String,
         #[command(flatten)]
         search: SearchArgs,
+    },
+    /// Fetch and prepare the internet-authentic corpus sources.
+    Corpus {
+        #[command(subcommand)]
+        command: CorpusCommand,
     },
     /// Dual pinyin annotation and its agreement report.
     G2p {
@@ -145,6 +152,7 @@ async fn main() -> Result<()> {
             eval_set,
             search,
         } => run_eval(&model, &eval_set, &search),
+        Command::Corpus { command } => corpus::run(command).await,
         Command::G2p { command } => g2p::run(command).await,
         Command::Export { command } => g2p::run_export(command),
     }
