@@ -186,6 +186,16 @@ impl Lexicon {
         self.chars[id.index()]
     }
 
+    /// Every character, in lexicon order -- which is [`CharId`] order, so index
+    /// *i* is the character `CharId` *i* stands for.
+    ///
+    /// A model trained against a lexicon has to record which one, since a
+    /// `CharId` means nothing without it.
+    #[must_use]
+    pub fn characters(&self) -> &[char] {
+        &self.chars
+    }
+
     /// Look a character up by its glyph.
     #[must_use]
     pub fn id_of(&self, ch: char) -> Option<CharId> {
@@ -307,6 +317,16 @@ mod tests {
             full.iter().all(|id| abbrev.contains(id)),
             "`z` must subsume `zhong`"
         );
+    }
+
+    #[test]
+    fn the_character_slice_is_indexed_by_char_id() {
+        let (_, lexicon) = fixture();
+        assert_eq!(lexicon.characters().len(), lexicon.len());
+        for ch in ['中', '国', '人', '民'] {
+            let id = lexicon.id_of(ch).expect("common character");
+            assert_eq!(lexicon.characters()[id.index()], ch);
+        }
     }
 
     #[test]
