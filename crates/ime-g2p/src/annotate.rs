@@ -9,11 +9,11 @@
 
 use crate::error::{Error, Result};
 use crate::outcome::{Annotator, compare};
-use crate::shards::{ShardWriter, Shardable, read_shards};
-use polars::prelude::{
-    Column, DataFrame, IntoSeries as _, ListBooleanChunkedBuilder, ListBuilderTrait as _,
-    ListStringChunkedBuilder,
+use crate::shards::{
+    ShardWriter, Shardable, bool_lists, column_of_bool_lists, column_of_optional_strings,
+    column_of_string_lists, column_of_strings, read_shards, string_lists, strings,
 };
+use polars::prelude::{Column, DataFrame};
 use std::path::Path;
 use tracing::info;
 
@@ -259,86 +259,6 @@ pub fn read_annotated(directory: &Path, prefix: &str) -> Result<Vec<AnnotatedRow
 /// If the directory holds no shards, or one cannot be read.
 pub fn read_samples(directory: &Path) -> Result<Vec<Sample>> {
     read_shards(directory, "*")
-}
-
-fn strings(name: &str, values: impl Iterator<Item = String>) -> Column {
-    Column::new(name.into(), values.collect::<Vec<_>>())
-}
-
-fn string_lists<'a>(name: &str, rows: usize, values: impl Iterator<Item = &'a [String]>) -> Column {
-    let mut builder = ListStringChunkedBuilder::new(name.into(), rows, rows * 8);
-    for row in values {
-        builder.append_values_iter(row.iter().map(String::as_str));
-    }
-    Column::new(name.into(), builder.finish().into_series())
-}
-
-fn bool_lists<'a>(name: &str, rows: usize, values: impl Iterator<Item = &'a [bool]>) -> Column {
-    let mut builder = ListBooleanChunkedBuilder::new(name.into(), rows, rows * 8);
-    for row in values {
-        builder.append_iter(row.iter().map(|flag| Some(*flag)));
-    }
-    Column::new(name.into(), builder.finish().into_series())
-}
-
-fn column_of_strings(frame: &DataFrame, name: &str) -> Result<Vec<String>> {
-    Ok(frame
-        .column(name)?
-        .str()?
-        .iter()
-        .map(|value| value.unwrap_or_default().to_owned())
-        .collect())
-}
-
-fn column_of_optional_strings(frame: &DataFrame, name: &str) -> Result<Vec<Option<String>>> {
-    Ok(frame
-        .column(name)?
-        .str()?
-        .iter()
-        .map(|value| value.map(ToOwned::to_owned))
-        .collect())
-}
-
-fn column_of_string_lists(frame: &DataFrame, name: &str) -> Result<Vec<Vec<String>>> {
-    let column = frame.column(name)?;
-    let lists = column.list()?;
-    let mut rows = Vec::with_capacity(lists.len());
-    for index in 0..lists.len() {
-        let series = lists.get_as_series(index).ok_or_else(|| {
-            Error::Invariant(format!(
-                "a shard holds a null {name} list, which cannot happen"
-            ))
-        })?;
-        rows.push(
-            series
-                .str()?
-                .iter()
-                .map(|item| item.unwrap_or_default().to_owned())
-                .collect(),
-        );
-    }
-    Ok(rows)
-}
-
-fn column_of_bool_lists(frame: &DataFrame, name: &str) -> Result<Vec<Vec<bool>>> {
-    let column = frame.column(name)?;
-    let lists = column.list()?;
-    let mut rows = Vec::with_capacity(lists.len());
-    for index in 0..lists.len() {
-        let series = lists.get_as_series(index).ok_or_else(|| {
-            Error::Invariant(format!(
-                "a shard holds a null {name} list, which cannot happen"
-            ))
-        })?;
-        rows.push(
-            series
-                .bool()?
-                .iter()
-                .map(|item| item.unwrap_or(false))
-                .collect(),
-        );
-    }
-    Ok(rows)
 }
 
 impl Shardable for Sample {
