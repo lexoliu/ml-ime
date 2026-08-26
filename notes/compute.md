@@ -28,3 +28,14 @@ memory permits 300M–1B int8; the binding constraints are keystroke latency
 (~30ms perception budget) and battery. For local batch g2pW annotation, try
 ort's CoreML EP after CPU parity is established (CPU stays the parity
 reference because fp16 backends flip near-ties).
+
+## Azure student credit — verified dead end for GPU (2026-08-26)
+
+$100 "Azure for Students" credit cannot buy GPU: quota requests for both
+NCASv3_T4 and NCADS_A100_v4 return `ResourceNotAvailableForOffer` — the
+student offer type is excluded from modern GPU families entirely (checked
+eastus/westus2/southcentralus/westeurope, all 0/0; the legacy K80 NC family
+holds a 6-vCPU quota but its SKUs are retired). The credit remains usable for
+CPU/storage only. Escalation compute beyond Kaggle 30h/week therefore means
+Colab paid units or a non-student GPU cloud, decided if/when the kill gate
+passes and route B needs it.
