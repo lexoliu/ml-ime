@@ -1,0 +1,11 @@
+g2p dual annotation
+{% for row in headline %}  {{ row.measure }}  {{ row.value }}
+{% endfor %}
+Agreement by character frequency
+  {{ band_column }}  {{ distinct_column }}  {{ positions_column }}  {{ rate_column }}
+{% for row in bands %}  {{ row.band }}  {{ row.distinct }}  {{ row.positions }}  {{ row.rate }}
+{% endfor %}
+Top {{ worst_limit }} disagreeing characters
+  {{ char_column }}  {{ count_column }}  {{ g2pw_column }}  {{ llm_column }}  Example
+{% for row in worst %}  {{ row.character }}  {{ row.count }}  {{ row.g2pw }}  {{ row.llm }}  {{ row.sentence }}
+{% endfor %}
