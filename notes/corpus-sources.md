@@ -31,6 +31,20 @@ n-gram IMEs fail hardest, so this is the differentiation, not garnish.
 4. **梗百科 (gengbaike.cn)** — SKIPPED: serves 403 with an anti-bot session
    cookie even for robots.txt. Not worth fighting; coverage overlaps 1+2.
 
+## Douyin / Xiaohongshu (scouted 2026-08-26)
+
+- **Douyin — accepted**: HF `bendavidsteel/douyin` (2026-01), 1.13M real posts,
+  `desc` = user-written captions, authentic douyin register. CC BY-NC-4.0.
+  Cleaning: strip `#hashtags`, then the standard filters. Into run2.
+- **Xiaohongshu — no real corpus found on HF**: `pangjin001/xiaohongshu*` is
+  LLM-generated "XHS style" rewrite data (sampled: Confucius quotes rewritten
+  as 姐妹们快听！…绝了～) — synthetic, rejected on authenticity. CHASM
+  (RedNote covert-ad detection) has real posts but is small; low priority.
+  Self-crawling (MediaCrawler-class) is RULED OUT by the user (2026-08-26):
+  existing public datasets only. XHS register is approximated by douyin desc +
+  bilibili comments until a real public XHS corpus appears; re-scout HF
+  occasionally.
+
 ## Sogou scel dictionaries (seed lexicon, added 2026-08-26)
 
 Downloaded via `mlime lexicon fetch`. These are **word-pinyin lexicons**, not
@@ -59,6 +73,12 @@ Rules:
 - synthetic samples carry `source=synthetic-luna` and are **training-only**;
   the eval set must never contain LLM-generated text (contamination).
 - keep per-term provenance so a bad generation batch can be dropped wholesale.
+- **grounded generation only** (user caveat: Luna's Chinese world knowledge is
+  limited): every synthesis prompt embeds the term's explanation text from the
+  seed source; Luna must never be asked to use a term from its own memory.
+- same caveat for g2p: on proper nouns/梗词 both annotators can be wrong
+  *in agreement* — Sogou lexicon readings override both where covered, and the
+  g2p report buckets agreement by in-lexicon vs out-of-lexicon terms.
 
 ## Performance directive (user, binding — escalated 2026-08-26)
 
