@@ -7,3 +7,4 @@ __pycache__/
 *.arpa
 .DS_Store
 .env
+/python/data/
