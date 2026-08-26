@@ -10,12 +10,22 @@ n-gram IMEs fail hardest, so this is the differentiation, not garnish.
    term + 1-3 sentence explanation + origin, categorised (拼音缩写/谐音/缩句…).
    Fetch via the MediaWiki API (proper route, no scraping). Feeds the synthesis
    path below.
-2. **萌娘百科** — full WikiTeam dump on Internet Archive
-   (archive.org/details/wiki-zhmoegirlorg), CC BY-NC-SA 3.0 CN (fine for a
-   research prototype). **The entire article text is training corpus** (user
-   directive 2026-08-26) — the prose itself is written in live internet
-   Chinese; wikitext → prose as a fourth corpus source. Entry titles
-   additionally seed the synthesis path below.
+2. **萌娘百科** — **the entire article text is training corpus** (user
+   directive) — the prose itself is live internet Chinese. Source selection
+   (corrected 2026-08-26 after the user pointed out fresh dumps exist; the
+   2019 IA dump is superseded):
+   - **primary**: HF `YCWTG/MoeGirlPedia_zh_cleaned_latest` — cleaned JSONL
+     {title, text} from the 2025-10 full dump. Sampled: prose is clean;
+     residue = flattened infobox `key=value` lines, removed by a line-level
+     Rust filter (`^\S+=` pattern) plus the standard han-ratio filter.
+   - **freshness top-up**: HF `milashkaarshif/MoeGirlPedia_wikitext_raw_archive`
+     — monthly raw wikitext archives, still updated (through 2026-02); process
+     increments with our own wikitext stripper when we need post-2025-10 text.
+   - IA full dumps (2019, 2023, 2025 slices) exist but are superseded by the
+     above. Entry titles additionally seed the synthesis path below
+     (`outloudvi/mw2fcitx` and `suiginko/moetype` already build IME dicts from
+     moegirl titles — reuse before reinventing).
+
 3. **Bilibili comments/danmaku** — `Midsummra/bilibilicomment` (HF) and/or
    VideoIC (5M comments). Real informal typing, short and noisy.
 4. **梗百科 (gengbaike.cn)** — SKIPPED: serves 403 with an anti-bot session
@@ -50,10 +60,12 @@ Rules:
   the eval set must never contain LLM-generated text (contamination).
 - keep per-term provenance so a bad generation batch can be dropped wholesale.
 
-## Performance directive (user, binding)
+## Performance directive (user, binding — escalated 2026-08-26)
 
-Heavy corpus processing (normalisation, splitting, filtering, dedup at
-millions-of-sentences scale) runs in Rust — `rust-script` for one-offs
-(rayon + memchr-class crates; verified working locally, 12 threads), workspace
-crates for recurring stages. Python stays for orchestration, HF datasets I/O,
-and LLM calls.
+**Everything is Rust except the GPU training loop.** After the g2p hang
+(g2pw's torch DataLoader multiprocessing deadlock), the user ruled: "please
+always use rust". Data processing, g2p annotation (`ort` + `tokenizers`
+against the same g2pw.onnx), LLM annotation (`async-openai`), eval and
+inference all live in workspace crates; `rust-script` (rayon) for one-offs.
+Python remains ONLY as HF dataset download shims and torch training scripts
+on Kaggle/Colab.
