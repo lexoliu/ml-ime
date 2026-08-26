@@ -11,10 +11,9 @@
   `uv tool install google-colab-cli --with "jupyter-kernel-client<1" --force`.
   A fresh machine must repeat that pin until upstream pins it.
 
-## Kaggle — GPU gated
-- `kaggle kernels push` works (CLI 2.2.4, OAuth). Kernel executes, but GPU requests
-  are silently downgraded to CPU: server-side metadata confirms
-  `enable_gpu: true, machine_shape: NvidiaTeslaT4` was recorded, run still got the
-  CPU image. Known gate: account phone verification unlocks GPU. Not programmatically
-  checkable from here.
-- CPU kernels remain useful for data preprocessing jobs (30h/week quota, internet on).
+## Kaggle — WORKING (since 2026-08-26, after account phone verification)
+- `machine_shape: NvidiaTeslaT4` in kernel-metadata.json now yields **2x Tesla T4**,
+  torch 2.10.0+cu128, CUDA matmul ok. Before verification the same request was
+  silently scheduled onto the CPU image — the downgrade is the symptom of an
+  unverified account, not a metadata problem.
+- 30h/week GPU quota, internet on. Primary training venue; Colab is the burst lane.
