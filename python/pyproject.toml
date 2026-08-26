@@ -10,6 +10,7 @@ dependencies = [
     "tqdm>=4.67",
     "typer>=0.15",
     "structlog>=24.4",
+    "rich>=13.9",
 ]
 
 [project.scripts]
