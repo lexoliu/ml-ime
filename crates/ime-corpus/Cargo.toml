@@ -1,0 +1,30 @@
+[package]
+name = "ime-corpus"
+version = "0.1.0"
+description = "Fetch and prepare internet-authentic Chinese corpora into sample shards"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blake2.workspace = true
+const-hex.workspace = true
+csv.workspace = true
+ferrous-opencc.workspace = true
+futures.workspace = true
+ime-g2p.workspace = true
+ime-pinyin.workspace = true
+polars.workspace = true
+rayon.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "time"] }
+tracing.workspace = true
+unicode-normalization.workspace = true
+
+[lints]
+workspace = true
