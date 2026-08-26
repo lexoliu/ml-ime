@@ -54,6 +54,15 @@ pub enum LexiconError {
         /// Number of entries found.
         count: usize,
     },
+    /// The table is not strictly sorted by character, which `id_of`'s binary
+    /// search relies on.
+    #[error("character table is not strictly sorted: {first:?} precedes {second:?}")]
+    Unsorted {
+        /// The earlier character.
+        first: char,
+        /// The character that should have sorted after it.
+        second: char,
+    },
 }
 
 /// Characters, their readings, and the inverse map from reading to characters.
@@ -113,6 +122,12 @@ impl Lexicon {
 
         let char_count = u32::try_from(chars.len())
             .map_err(|_| LexiconError::TooLarge { count: chars.len() })?;
+        if let Some(pair) = chars.windows(2).find(|pair| pair[0] >= pair[1]) {
+            return Err(LexiconError::Unsorted {
+                first: pair[0],
+                second: pair[1],
+            });
+        }
 
         // Invert into `syllable -> characters`, counting first so the CSR arrays
         // are allocated exactly once.
