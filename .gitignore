@@ -8,3 +8,5 @@ __pycache__/
 .DS_Store
 .env
 /python/data/
+macos/ContextProbe/.build/
+macos/ContextProbe/build/
