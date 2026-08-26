@@ -34,6 +34,11 @@ PROBE_SENTENCE = "他还了钱还差一点，我得到了那件重要的绿色�
 DATA_DIR = typer.Option(Path("data"), "--data-dir", help="Root the pipeline reads and writes")
 VERBOSE = typer.Option(False, "--verbose", "-v")
 SOURCE = typer.Option(None, "--source", help="Source to use; repeatable, defaults to all")
+EXCLUDE = typer.Option(
+    None,
+    "--exclude",
+    help="JSON Lines file whose `text` fields are held out of the corpus; repeatable",
+)
 
 
 @app.callback()
@@ -192,6 +197,21 @@ def export_eval_set_command(
     from mlime.data.g2p import read_annotated
 
     export_eval_set(read_annotated(DataLayout(data_dir).annotations), out, size, seed)
+
+
+@export_app.command("ngram-corpus")
+def export_ngram_corpus_command(
+    data_dir: Path = DATA_DIR,
+    out: Path = typer.Option(Path("data/corpus.txt"), help="Plain text file to write"),
+    exclude: list[Path] = EXCLUDE,
+    verbose: bool = VERBOSE,
+) -> None:
+    """Dump prepared targets as one line each, minus the sentences held out for evaluation."""
+    configure(verbose)
+    from mlime.data.export import export_ngram_corpus, read_exclusions
+
+    layout = DataLayout(data_dir)
+    export_ngram_corpus(layout.samples, out, read_exclusions(exclude or ()))
 
 
 def _requested(source: list[str] | None) -> tuple[str, ...]:

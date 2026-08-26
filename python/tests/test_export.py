@@ -14,7 +14,17 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from mlime.data.export import EvalItem, allocate, eligible, export_eval_set, sample_rows, to_item
+from mlime.data.corpus import SAMPLE_SCHEMA
+from mlime.data.export import (
+    EvalItem,
+    allocate,
+    eligible,
+    export_eval_set,
+    export_ngram_corpus,
+    read_exclusions,
+    sample_rows,
+    to_item,
+)
 
 
 def _frame(rows: list[dict[str, object]]) -> pl.DataFrame:
@@ -162,3 +172,74 @@ def test_context_survives_the_export(tmp_path: Path) -> None:
     )
     export_eval_set(frame, out, size=1, seed=0)
     assert json.loads(out.read_text(encoding="utf-8"))["context"] == "上下文"
+
+
+def _shard(directory: Path, prefix: str, texts: list[str]) -> None:
+    """Write one samples shard of the shape ``corpus prepare`` leaves behind."""
+    directory.mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        [
+            {"id": f"{prefix}{index}", "source": prefix, "text": text, "context": None}
+            for index, text in enumerate(texts)
+        ],
+        schema=SAMPLE_SCHEMA,
+    ).write_parquet(directory / f"{prefix}-00000.parquet")
+
+
+def _jsonl(path: Path, records: list[dict[str, object]]) -> Path:
+    path.write_text(
+        "".join(f"{json.dumps(record, ensure_ascii=False)}\n" for record in records),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_the_held_out_sentences_are_absent_from_the_training_text(tmp_path: Path) -> None:
+    """A sentence scored at evaluation time must not have been trained on."""
+    samples = tmp_path / "samples"
+    _shard(samples, "wiki", ["重要好", "绿色东西"])
+    _shard(samples, "news", ["他还了钱"])
+    out = tmp_path / "corpus.txt"
+    held_out = read_exclusions([_jsonl(tmp_path / "eval.jsonl", [{"text": "绿色东西"}])])
+    assert export_ngram_corpus(samples, out, held_out) == 2
+    assert out.read_text(encoding="utf-8").splitlines() == ["他还了钱", "重要好"]
+
+
+def test_an_exclusion_that_matches_nothing_raises(tmp_path: Path) -> None:
+    """Silently holding nothing out would put the evaluation sentences back into training."""
+    samples = tmp_path / "samples"
+    _shard(samples, "wiki", ["重要好"])
+    held_out = read_exclusions([_jsonl(tmp_path / "eval.jsonl", [{"text": "从未出现过的句子"}])])
+    with pytest.raises(ValueError, match="not in"):
+        export_ngram_corpus(samples, tmp_path / "corpus.txt", held_out)
+
+
+def test_the_exported_evaluation_set_is_itself_a_usable_exclusion_file(tmp_path: Path) -> None:
+    """`export eval-set` writes `pinyin`/`text`/`context`; only `text` is read back."""
+    eval_path = tmp_path / "eval.jsonl"
+    export_eval_set(_population(), eval_path, size=3, seed=7)
+    assert read_exclusions([eval_path]) == frozenset({"重要好"})
+
+
+def test_every_source_shard_reaches_the_corpus(tmp_path: Path) -> None:
+    """The samples directory holds one shard series per source; dropping one would skew the mix."""
+    samples = tmp_path / "samples"
+    _shard(samples, "dialogue", ["你好啊"])
+    _shard(samples, "news", ["他还了钱"])
+    _shard(samples, "wiki", ["重要好"])
+    out = tmp_path / "corpus.txt"
+    assert export_ngram_corpus(samples, out, frozenset()) == 3
+    assert sorted(out.read_text(encoding="utf-8").splitlines()) == sorted(
+        ["你好啊", "他还了钱", "重要好"]
+    )
+
+
+def test_a_line_without_a_text_field_raises(tmp_path: Path) -> None:
+    path = _jsonl(tmp_path / "eval.jsonl", [{"pinyin": "zhongyaohao"}])
+    with pytest.raises(ValueError, match="no usable `text` field"):
+        read_exclusions([path])
+
+
+def test_a_samples_directory_with_no_shards_raises(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="no sample shards"):
+        export_ngram_corpus(tmp_path / "samples", tmp_path / "corpus.txt", frozenset())
