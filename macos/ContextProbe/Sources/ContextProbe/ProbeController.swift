@@ -29,20 +29,25 @@ final class ProbeController: IMKInputController {
     private let started = Date()
     private var keystrokes: [String: Int] = [:]
 
+    override func activateServer(_ sender: Any!) {
+        super.activateServer(sender)
+        probe(sender, trigger: .activate)
+    }
+
     override func inputText(_ string: String!, client sender: Any!) -> Bool {
-        probe(sender)
+        probe(sender, trigger: .keystroke)
         // Never consume. The probe must not get in the way of the typing it is
         // measuring, or nobody will leave it selected long enough to be useful.
         return false
     }
 
     override func didCommand(by selector: Selector!, client sender: Any!) -> Bool {
-        probe(sender)
+        probe(sender, trigger: .command)
         return false
     }
 
     /// Interrogate one client and append what it said.
-    private func probe(_ sender: Any?) {
+    private func probe(_ sender: Any?, trigger: Trigger) {
         guard let client = sender as? IMKTextInput else {
             Self.logger.error("client does not conform to IMKTextInput")
             return
@@ -55,6 +60,7 @@ final class ProbeController: IMKInputController {
         let documentLength = client.length()
         let selected = client.selectedRange()
         let record = ProbeRecord(
+            trigger: trigger,
             elapsed: Date().timeIntervalSince(started),
             keystroke: keystroke,
             clientBundleIdentifier: bundleIdentifier,
@@ -78,15 +84,20 @@ final class ProbeController: IMKInputController {
 
     /// Ask for up to `contextWindow` characters starting after the selection.
     ///
-    /// Clamped against the reported document length, because asking beyond the end
-    /// is the kind of thing that makes a host misbehave, and a probe that crashes
-    /// its host teaches nothing.
+    /// Deliberately *not* clamped against `length()`. Safari reports a document
+    /// length of 0 while simultaneously answering `attributedSubstring(from:)`
+    /// for a range ending at offset 63, so trusting `length()` to bound the
+    /// request means never asking for anything and concluding, wrongly, that no
+    /// client supplies trailing context. The request is clamped only when the
+    /// reported length is self-consistent -- larger than the caret offset -- and
+    /// otherwise asks for the full window and records whatever comes back.
     private static func substring(
         after selected: NSRange, from client: IMKTextInput, documentLength: Int
     ) -> SubstringReport? {
-        guard selected.location != NSNotFound, documentLength != NSNotFound else { return nil }
+        guard selected.location != NSNotFound else { return nil }
         let start = selected.location + selected.length
-        let length = min(contextWindow, max(0, documentLength - start))
+        let trustworthy = documentLength != NSNotFound && documentLength > start
+        let length = trustworthy ? min(contextWindow, documentLength - start) : contextWindow
         guard length > 0 else { return nil }
         return read(NSRange(location: start, length: length), from: client)
     }
