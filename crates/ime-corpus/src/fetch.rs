@@ -171,12 +171,24 @@ async fn fetch_moegirl(hub: &Hub, layout: &DataLayout, limit: Option<usize>) -> 
                 })?;
             sink.push(
                 Some(&article.title),
-                &format!("{}\n{}", article.title, article.text),
+                &moegirl_document(&article.title, &article.text),
             )?;
         }
         sink.finish()
     })
     .await
+}
+
+/// The article as one document, its title as the first line exactly once.
+///
+/// The cleaned dump already opens most bodies with the title line; prepending
+/// unconditionally gave contexts that started with the title tripled.
+fn moegirl_document(title: &str, text: &str) -> String {
+    if text.trim_start().starts_with(title.trim()) {
+        text.to_owned()
+    } else {
+        format!("{title}\n{text}")
+    }
 }
 
 /// Douyin: 111 parquet partitions of video metadata, one caption column each.
@@ -309,6 +321,18 @@ async fn blocking<T: Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_title_joins_a_moegirl_body_exactly_once() {
+        assert_eq!(
+            moegirl_document("初音未来", "初音未来\n她是虚拟歌手。"),
+            "初音未来\n她是虚拟歌手。"
+        );
+        assert_eq!(
+            moegirl_document("初音未来", "她是虚拟歌手。"),
+            "初音未来\n她是虚拟歌手。"
+        );
+    }
 
     #[test]
     fn a_moegirl_record_needs_both_of_its_fields() {
