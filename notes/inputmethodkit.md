@@ -36,13 +36,27 @@ does: `NSPrincipalClass`, `CFBundleSignature`, `CFBundleIconFile`,
 dict, and all four icon keys pointing at a generated `probe.pdf`.
 
 It still does not appear in `TISCreateInputSourceList`, and nothing in the system
-log mentions it. `lsregister -f` and killing `TextInputMenuAgent` /
-`TextInputSwitcher` did not change that.
+log mentions it. Four things were tried and none changed it:
 
-The untested hypothesis is that the input-source database is rebuilt at login, so
-a newly installed input method is invisible until the user logs out and back in.
-This is widely repeated in input-method projects' installation instructions but
-has not been confirmed here. Next step is to test it.
+1. `lsregister -f` on the installed bundle.
+2. Killing `TextInputMenuAgent` and `TextInputSwitcher` to force a refresh.
+3. Adding every input-method key Squirrel's `Info.plist` carries, including all
+   four icon keys and a generated `probe.pdf`.
+4. Renaming the bundle identifier to the `cool.lexo.inputmethod.ContextProbe`
+   convention, on the theory that TIS requires `.inputmethod.` in the identifier
+   the way every shipping input method has it. It does not appear to.
+
+Two hypotheses remain, both needing a person:
+
+- The input-source database is rebuilt at login, so a newly installed input method
+  stays invisible until logout. Widely repeated in installation instructions,
+  unconfirmed here.
+- Ad-hoc signing is not enough for TIS on macOS 26, and a Developer ID signature
+  is required. This would be worse news, since it puts a certificate on the
+  critical path of every development cycle.
+
+System Settings' input source picker is worth checking before either: it may
+enumerate differently from `TISCreateInputSourceList`.
 
 ## Unverified (second-hand, milestone 5)
 

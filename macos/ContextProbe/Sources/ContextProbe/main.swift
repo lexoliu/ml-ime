@@ -2,7 +2,7 @@ import Cocoa
 import InputMethodKit
 import os
 
-private let logger = Logger(subsystem: "cool.lexo.mlime.ContextProbe", category: "main")
+private let logger = Logger(subsystem: "cool.lexo.inputmethod.ContextProbe", category: "main")
 
 let bundle = Bundle.main
 guard let connectionName = bundle.infoDictionary?["InputMethodConnectionName"] as? String else {

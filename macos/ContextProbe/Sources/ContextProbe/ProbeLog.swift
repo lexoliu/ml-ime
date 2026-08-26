@@ -10,7 +10,7 @@ final class ProbeLog: @unchecked Sendable {
     private let handle: FileHandle
     private let encoder = JSONEncoder()
     private let queue = DispatchQueue(label: "cool.lexo.mlime.probe.log")
-    private static let logger = Logger(subsystem: "cool.lexo.mlime.ContextProbe", category: "log")
+    private static let logger = Logger(subsystem: "cool.lexo.inputmethod.ContextProbe", category: "log")
 
     /// Where the probe writes. Fixed rather than configurable so the report tool
     /// and the reader of these instructions cannot disagree about it.

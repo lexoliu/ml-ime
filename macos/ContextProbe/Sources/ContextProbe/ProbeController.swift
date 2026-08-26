@@ -21,7 +21,7 @@ final class ProbeController: IMKInputController {
     /// Longest prefix recorded when sampling is switched on.
     private static let sampleLimit = 16
     private static let logger = Logger(
-        subsystem: "cool.lexo.mlime.ContextProbe", category: "controller")
+        subsystem: "cool.lexo.inputmethod.ContextProbe", category: "controller")
     /// Set `MLIME_PROBE_SAMPLE` to record short text prefixes as well as counts.
     private static let samplingEnabled = ProcessInfo.processInfo.environment["MLIME_PROBE_SAMPLE"] != nil
 
