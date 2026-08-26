@@ -31,7 +31,6 @@ from pypinyin.contrib.tone_convert import to_normal
 
 from mlime.logging import log
 
-
 TYPEABLE = re.compile(r"\A[a-z]+\Z")
 
 
