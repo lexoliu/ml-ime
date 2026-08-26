@@ -1,4 +1,10 @@
-"""Export an evaluation set in the JSON Lines form the Rust harness reads.
+"""Export what the Rust side reads: an evaluation set, and the text to train on.
+
+The two exports are one module because they are two halves of one split. Every
+sentence drawn into the evaluation set must be absent from the training text, or
+the baseline is scored on sentences it memorised, so the exclusion list and the
+evaluation draw have to agree on what a sentence *is* -- the exact target string,
+after the corpus normaliser has already run.
 
 Three constraints shape what is eligible. The line's ``pinyin`` field is what a
 user *types*, so it is the toneless syllables run together with no separator --
@@ -11,6 +17,15 @@ training data, where the mismatch is harmless, and are simply not evaluated on.
 
 Sampling is stratified by source and seeded, so the number quoted in one report
 is the number another run reproduces.
+
+``ngram-corpus`` is the other half: every prepared target, one per line, minus
+the held-out sentences. It reads the same JSON Lines shape it writes, so the
+evaluation set -- or the wider pool the evaluation set was drawn from -- is
+handed straight back as the exclusion list. An exclusion that matches nothing is
+an error rather than a warning: the held-out sentences came out of these very
+shards, so a miss means the wrong directory or a normaliser that has moved under
+the file, and both of those silently put the evaluation sentences back into
+training.
 """
 
 from __future__ import annotations
@@ -20,10 +35,11 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import polars as pl
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from mlime.logging import log
 
+from .shards import shard_paths
 from .text import han_characters, toneless
 
 
@@ -33,6 +49,16 @@ class EvalItem(BaseModel):
     pinyin: str
     text: str
     context: str | None
+
+
+class HeldOutLine(BaseModel):
+    """The one field an exclusion file has to carry, whatever else it holds.
+
+    Both the evaluation set and the pool it was drawn from are JSON Lines with a
+    ``text`` field, so either can be handed to ``--exclude`` unchanged.
+    """
+
+    text: str
 
 
 def eligible(annotated: pl.DataFrame) -> pl.DataFrame:
@@ -121,3 +147,59 @@ def export_eval_set(annotated: pl.DataFrame, out_path: Path, size: int, seed: in
         by_source=dict(selected["source"].value_counts().iter_rows()),
     )
     return selected.height
+
+
+def read_exclusions(paths: Sequence[Path]) -> frozenset[str]:
+    """The target sentences held out of training, from the ``text`` field of each line."""
+    held_out: set[str] = set()
+    for path in paths:
+        lines = path.read_text(encoding="utf-8").splitlines()
+        if not lines:
+            raise ValueError(f"{path} holds no exclusions; drop the flag rather than passing it")
+        for number, line in enumerate(lines, start=1):
+            try:
+                held_out.add(HeldOutLine.model_validate_json(line).text)
+            except ValidationError as error:
+                raise ValueError(f"{path}:{number} has no usable `text` field: {line!r}") from error
+    log.info("exclusions loaded", files=len(paths), sentences=len(held_out))
+    return frozenset(held_out)
+
+
+def export_ngram_corpus(samples_dir: Path, out_path: Path, held_out: frozenset[str]) -> int:
+    """Write every prepared target except *held_out* to *out_path*, one per line.
+
+    Shards are read one at a time: the corpus this feeds is millions of lines and
+    the whole point of the parquet shards is that no stage has to hold them all.
+    """
+    paths = shard_paths(samples_dir, "*")
+    if not paths:
+        raise FileNotFoundError(f"no sample shards under {samples_dir}")
+    unmatched = set(held_out)
+    written = 0
+    excluded = 0
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as handle:
+        for path in paths:
+            for value in pl.read_parquet(path, columns=["text"])["text"].to_list():
+                if not isinstance(value, str):
+                    raise TypeError(f"{path} holds a non-string target: {value!r}")
+                if value in held_out:
+                    unmatched.discard(value)
+                    excluded += 1
+                    continue
+                handle.write(value)
+                handle.write("\n")
+                written += 1
+    if unmatched:
+        raise ValueError(
+            f"{len(unmatched)} of {len(held_out)} held-out sentences are not in {samples_dir}, "
+            f"so nothing was held out for them: {sorted(unmatched)[:3]}"
+        )
+    log.info(
+        "n-gram corpus written",
+        path=str(out_path),
+        lines=written,
+        excluded=excluded,
+        shards=len(paths),
+    )
+    return written
