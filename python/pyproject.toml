@@ -17,6 +17,7 @@ dependencies = [
     "pydantic-settings>=2.15.0",
     "g2pw>=0.1.1",
     "torch>=2.13.0",
+    "transformers>=5.16",
     "httpx>=0.28",
     "opencc>=1.4.2",
     "regex>=2026.7.19",
@@ -68,6 +69,16 @@ strict = true
 [[tool.mypy.overrides]]
 module = ["g2pw.*", "datasets.*", "opencc.*"]
 ignore_missing_imports = true
+
+# `transformers` and `onnxruntime` ship enough annotations to be followed and not
+# enough to be checked: their constructors are unannotated, so every model object
+# is an untyped call inside a strict module. `mlime.train.model` and
+# `mlime.train.labels` are the only modules allowed to touch them, and both
+# annotate what they get back, so the Any stops at those two boundaries.
+[[tool.mypy.overrides]]
+module = ["transformers.*", "onnxruntime.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
 
 [tool.ruff.lint.flake8-bugbear]
 # Typer's entire API is `def command(x: T = typer.Option(...))`. The mutable

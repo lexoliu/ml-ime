@@ -27,10 +27,12 @@ export_app = typer.Typer(help="Emit artefacts for the Rust side", no_args_is_hel
 lexicon_app = typer.Typer(
     help="Manage external word-pinyin lexicons (Sogou scel, etc.)", no_args_is_help=True
 )
+train_app = typer.Typer(help="Route A training and the labels it needs", no_args_is_help=True)
 app.add_typer(corpus_app, name="corpus")
 app.add_typer(g2p_app, name="g2p")
 app.add_typer(export_app, name="export")
 app.add_typer(lexicon_app, name="lexicon")
+app.add_typer(train_app, name="train")
 
 #: A polyphone-dense sentence: 重 chong/zhong, 还 huan/hai, 得 de/dei, 绿 lv.
 PROBE_SENTENCE = "他还了钱还差一点，我得到了那件重要的绿色东西"
@@ -251,6 +253,127 @@ def lexicon_list() -> None:
         typer.echo(f"    quality: {d.quality}")
         typer.echo(f"    url: {d.detail_url}")
         typer.echo()
+
+
+@train_app.command("gen-spans")
+def train_gen_spans(
+    out: Path = typer.Option(None, help="Where to write the table; defaults to the package's own"),
+    syllables: Path = typer.Option(
+        None, help="ime-pinyin's syllables.txt; found upwards when omitted"
+    ),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Regenerate the typed-span table the fill tower is indexed by."""
+    configure(verbose)
+    from mlime.train.spans import TYPED_SPANS_PATH, build
+
+    spans = build(out or TYPED_SPANS_PATH, syllables)
+    typer.echo(f"{len(spans)} typed spans")
+
+
+@train_app.command("labels")
+def train_labels(
+    data_dir: Path = DATA_DIR,
+    out: Path = typer.Option(None, help="Where the label shards go; defaults to <data-dir>/labels"),
+    shards: int = typer.Option(None, help="Stop after this many sample shards"),
+    batch_size: int = typer.Option(512, help="Sentences handed to g2pW at once"),
+    onnx_batch_size: int = typer.Option(256, help="Query positions per ONNX call"),
+    g2pw_model: Path = typer.Option(None, help="Directory holding the g2pW model"),
+    cuda: bool = typer.Option(False, help="Require the ONNX session to run on CUDA"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Label the prepared samples with g2pW, one label shard per sample shard."""
+    configure(verbose)
+    from mlime.data.g2pw_annotator import DEFAULT_MODEL_DIR, G2pwAnnotator
+    from mlime.train.labels import generate, load_cuda_annotator
+
+    layout = DataLayout(data_dir)
+    model_dir = g2pw_model or DEFAULT_MODEL_DIR
+    annotator = (
+        load_cuda_annotator(model_dir, onnx_batch_size)
+        if cuda
+        else G2pwAnnotator(model_dir, batch_size=onnx_batch_size)
+    )
+    labels = out or data_dir / "labels"
+    counts = asyncio.run(
+        generate(
+            layout.samples,
+            labels,
+            annotator,
+            sentences_per_batch=batch_size,
+            shards=shards,
+            metrics=labels / "throughput.jsonl",
+        )
+    )
+    typer.echo(
+        f"{counts.labelled} labelled, {counts.refused} refused, "
+        f"{counts.sentences_per_second:.1f} sentences/s"
+    )
+
+
+@train_app.command("route-a")
+def train_route_a(
+    data_dir: Path = DATA_DIR,
+    labels: Path = typer.Option(None, help="Label shards; defaults to <data-dir>/labels"),
+    out: Path = typer.Option(Path("runs/route-a"), help="Where checkpoints and metrics go"),
+    char_table: Path = typer.Option(None, help="ime-pinyin's char_pinyin.tsv"),
+    train_shard: list[str] = typer.Option(
+        None, "--train-shard", help="Shard to train on; repeatable"
+    ),
+    held_out_shard: list[str] = typer.Option(
+        None, "--held-out-shard", help="Shard to score but never train on; repeatable"
+    ),
+    max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
+    token_budget: int = typer.Option(8192, help="Padded fill-tower positions per step"),
+    base_lr: float = typer.Option(3e-5, help="Learning rate for the pretrained weights"),
+    new_lr: float = typer.Option(1e-4, help="Learning rate for the tables route A adds"),
+    seed: int = typer.Option(0, help="Augmentation and initialisation seed"),
+    fp16: bool = typer.Option(True, help="Train in fp16 with loss scaling"),
+    checkpoint_every: int = typer.Option(500, help="Steps between checkpoints"),
+    max_held_out: int = typer.Option(4096, help="Held-out examples to score"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Train route A on the given shards and score the held-out ones, context on and off."""
+    configure(verbose)
+    from mlime.data.corpus import default_char_table
+    from mlime.train.loop import TrainingConfig
+    from mlime.train.run import RunPaths, Slices, describe_device, route_a
+
+    table = char_table or default_char_table()
+    if table is None:
+        raise typer.BadParameter("no char_pinyin.tsv found above the working directory")
+    if not train_shard:
+        raise typer.BadParameter("pass at least one --train-shard")
+    layout = DataLayout(data_dir)
+    typer.echo(f"device: {describe_device()}")
+    result = route_a(
+        RunPaths(
+            samples=layout.samples,
+            labels=labels or data_dir / "labels",
+            char_table=table,
+            out=out,
+        ),
+        Slices(
+            train=tuple(train_shard),
+            held_out=tuple(held_out_shard or ()),
+            max_held_out_examples=max_held_out,
+        ),
+        TrainingConfig(
+            max_steps=max_steps,
+            base_lr=base_lr,
+            new_lr=new_lr,
+            token_budget=token_budget,
+            seed=seed,
+            fp16=fp16,
+            checkpoint_every=checkpoint_every,
+        ),
+    )
+    typer.echo(f"loss {result.first_loss:.4f} -> {result.last_loss:.4f} over {result.steps} steps")
+    typer.echo(
+        f"held-out character accuracy: context on {result.with_context.rate:.4f}, "
+        f"off {result.without_context.rate:.4f} "
+        f"({result.with_context.scored} characters)"
+    )
 
 
 def _requested(source: list[str] | None) -> tuple[str, ...]:
