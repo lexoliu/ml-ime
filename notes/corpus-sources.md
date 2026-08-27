@@ -76,6 +76,10 @@ Rules:
 - **grounded generation only** (user caveat: Luna's Chinese world knowledge is
   limited): every synthesis prompt embeds the term's explanation text from the
   seed source; Luna must never be asked to use a term from its own memory.
+- **content policy (user decision 2026-08-27): keep everything** — slurs and
+  political epithets in seeds and generated samples stay in training data;
+  authentic register is the point, and per-term provenance allows wholesale
+  removal later if the decision changes.
 - same caveat for g2p: on proper nouns/梗词 both annotators can be wrong
   *in agreement* — Sogou lexicon readings override both where covered, and the
   g2p report buckets agreement by in-lexicon vs out-of-lexicon terms.
