@@ -18,6 +18,7 @@ ime-eval = { path = "crates/ime-eval" }
 ime-cli = { path = "crates/ime-cli" }
 ime-g2p = { path = "crates/ime-g2p" }
 ime-corpus = { path = "crates/ime-corpus" }
+ime-synth = { path = "crates/ime-synth" }
 
 anyhow = "1.0.104"
 async-openai = { version = "0.41.3", features = ["chat-completion"] }
