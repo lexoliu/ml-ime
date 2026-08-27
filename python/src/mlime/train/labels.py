@@ -156,24 +156,42 @@ def write_shard(rows: list[dict[str, object]], path: Path) -> None:
     pl.DataFrame(rows, schema=LABEL_SCHEMA).write_parquet(path)
 
 
+def select_shards(
+    samples_dir: Path, names: Sequence[str] | None = None, limit: int | None = None
+) -> list[Path]:
+    """The sample shards a job should cover, named or counted.
+
+    Naming them is what a stratified slice needs: the shards sort by source, so
+    "the first five" is five shards of dialogue and says nothing about news.
+    """
+    available = shard_paths(samples_dir, "*")
+    if not available:
+        raise FileNotFoundError(f"no sample shards under {samples_dir}")
+    if names:
+        wanted = {name if name.endswith(".parquet") else f"{name}.parquet" for name in names}
+        chosen = [path for path in available if path.name in wanted]
+        missing = wanted - {path.name for path in chosen}
+        if missing:
+            raise FileNotFoundError(f"no such shards under {samples_dir}: {sorted(missing)}")
+        return chosen
+    return available[:limit] if limit is not None else available
+
+
 async def generate(
-    samples_dir: Path,
+    shards: Sequence[Path],
     out_dir: Path,
     annotator: Any,
     sentences_per_batch: int = 512,
-    shards: int | None = None,
     metrics: Path | None = None,
 ) -> LabelCounts:
-    """Label every sample shard under *samples_dir*, writing one shard each.
+    """Label each of *shards*, writing one label shard per sample shard.
 
     A shard whose output already exists is skipped, so a kernel that ran out of
     time resumes where it stopped instead of redoing the corpus.
     """
-    paths = shard_paths(samples_dir, "*")
+    paths = list(shards)
     if not paths:
-        raise FileNotFoundError(f"no sample shards under {samples_dir}")
-    if shards is not None:
-        paths = paths[:shards]
+        raise ValueError("no shards to label")
     counts = LabelCounts()
     for path in paths:
         target = out_dir / path.name
