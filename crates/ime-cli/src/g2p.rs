@@ -281,7 +281,14 @@ pub fn run_export(command: ExportCommand) -> Result<()> {
             } else {
                 read_exclusions(&exclude)?
             };
-            let written = export_ngram_corpus(&layout.samples(), &out, &held_out)?;
+            let (enforceable, unreachable) = split_reachable(held_out);
+            if let Some(example) = unreachable.first() {
+                info!(
+                    sentences = unreachable.len(),
+                    example, "held-out sentences that no prepared target can equal"
+                );
+            }
+            let written = export_ngram_corpus(&layout.samples(), &out, &enforceable)?;
             info!(lines = written, path = %out.display(), "n-gram corpus written");
             Ok(())
         }
@@ -299,6 +306,29 @@ pub fn run_export(command: ExportCommand) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Split held-out sentences into the ones a prepared target can equal and the rest.
+///
+/// A prepared target is one uninterrupted run of Han characters, so a held-out
+/// sentence carrying a comma is one the export can never find no matter how the
+/// corpus was built. Handing those to the exporter would fail the run over a
+/// sentence that is correctly absent, so they are reported and set aside; the
+/// rest keep the exporter's guarantee that every exclusion was actually applied.
+fn split_reachable(
+    held_out: std::collections::HashSet<String>,
+) -> (std::collections::HashSet<String>, Vec<String>) {
+    let mut enforceable = std::collections::HashSet::new();
+    let mut unreachable = Vec::new();
+    for text in held_out {
+        if ime_corpus::is_typable_target(&text) {
+            enforceable.insert(text);
+        } else {
+            unreachable.push(text);
+        }
+    }
+    unreachable.sort();
+    (enforceable, unreachable)
 }
 
 async fn probe(sentence: &str, model: &ModelArgs) -> Result<()> {
@@ -449,4 +479,30 @@ fn run_g2pw(input: &Path, out: &Path, limit: Option<usize>, model: &ModelArgs) -
     handle.flush().context("could not flush the output")?;
     info!(sentences = texts.len(), path = %out.display(), "wrote the readings");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_held_out_sentence_shaped_like_a_target_stays_enforceable() {
+        let held_out: std::collections::HashSet<String> = [
+            "今天天气不错",
+            "白天不睡的话，累了就困了",
+            "使用Python写程序",
+            "太短",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect();
+        let (enforceable, unreachable) = split_reachable(held_out);
+        assert_eq!(
+            enforceable.into_iter().collect::<Vec<String>>(),
+            vec!["今天天气不错".to_owned()]
+        );
+        assert_eq!(unreachable.len(), 3);
+        // Sorted, so the report's example is the same one on every run.
+        assert_eq!(unreachable[0], "使用Python写程序");
+    }
 }

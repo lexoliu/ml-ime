@@ -225,8 +225,9 @@ fn drop_empty_brackets(text: &str) -> String {
 
 /// The sentences of `text`, each keeping its own terminal delimiter.
 ///
-/// Newlines separate sentences and are dropped; the delimiters are kept so that a
-/// run of preceding sentences reassembles into readable context.
+/// Newlines separate sentences and are dropped; the delimiters are kept because a
+/// sentence is a unit of *context*, not a target -- a run of them reassembles into
+/// readable context, and [`crate::segment`] cuts the targets out of each one.
 #[must_use]
 pub fn split_sentences(text: &str) -> Vec<String> {
     let mut sentences = Vec::new();
@@ -248,20 +249,6 @@ fn push_sentence(sentences: &mut Vec<String>, candidate: &str) {
     let trimmed = candidate.trim();
     if !trimmed.is_empty() {
         sentences.push(trimmed.to_owned());
-    }
-}
-
-/// Drop a sentence's final `。`-like character.
-///
-/// A target sentence is what the input method must emit for a run of keystrokes,
-/// and the terminal punctuation is typed as its own key rather than decoded from
-/// pinyin, so carrying it into the target would leave a character with no
-/// syllable behind it.
-#[must_use]
-pub fn strip_terminal_delimiter(sentence: &str) -> &str {
-    match sentence.chars().next_back() {
-        Some(last) if is_sentence_delimiter(last) => &sentence[..sentence.len() - last.len_utf8()],
-        _ => sentence,
     }
 }
 
@@ -392,13 +379,6 @@ mod tests {
             split_sentences("好的!真的?是;的"),
             vec!["好的!", "真的?", "是;", "的"]
         );
-    }
-
-    #[test]
-    fn a_sentence_keeps_everything_but_its_terminal_delimiter() {
-        assert_eq!(strip_terminal_delimiter("今天天气不错。"), "今天天气不错");
-        assert_eq!(strip_terminal_delimiter("今天，天气不错"), "今天，天气不错");
-        assert_eq!(strip_terminal_delimiter(""), "");
     }
 
     #[test]
