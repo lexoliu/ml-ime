@@ -3,8 +3,11 @@
 //! The decision record asks for per-term provenance so that a bad generation
 //! batch can be dropped wholesale. That is only possible if the link survives
 //! outside this process, so every written sample gets a row here keyed on the
-//! same content hash: filter the sidecar on `seed_source` or `term`, and the
-//! `id`s that come back are exactly the sample rows to remove.
+//! same content hash: filter the sidecar on `seed_source`, `grounding` or
+//! `term`, and the `id`s that come back are exactly the sample rows to remove.
+//! The two source columns answer different questions -- which lexicon proposed
+//! the term, and which encyclopaedia's prose the prompt was grounded on -- and a
+//! bad batch can be either.
 //!
 //! It is a separate file rather than extra columns because the sample shards have
 //! to stay byte-compatible with the schema every other stage reads -- `ime-cli
@@ -36,18 +39,22 @@ pub struct Provenance {
     pub term: String,
     /// Which seed lexicon the term is attributed to.
     pub seed_source: String,
+    /// Which source wrote the explanation its prompt was grounded on.
+    pub grounding: String,
     /// The Sogou dictionary id, for the terms that came from one.
     pub dict_id: Option<i64>,
 }
 
 impl Provenance {
-    /// The provenance of a sample generated from `term` out of `source`.
+    /// The provenance of a sample generated from `term` out of `source`, on an
+    /// explanation written by `grounding`.
     #[must_use]
-    pub fn new(id: String, term: String, source: SeedSource) -> Self {
+    pub fn new(id: String, term: String, source: SeedSource, grounding: SeedSource) -> Self {
         Self {
             id,
             term,
             seed_source: source.name.to_owned(),
+            grounding: grounding.name.to_owned(),
             dict_id: source.dict_id,
         }
     }
@@ -64,6 +71,7 @@ impl Shardable for Provenance {
                     "seed_source",
                     rows.iter().map(|row| row.seed_source.clone()),
                 ),
+                strings("grounding", rows.iter().map(|row| row.grounding.clone())),
                 Column::new(
                     "dict_id".into(),
                     rows.iter().map(|row| row.dict_id).collect::<Vec<_>>(),
@@ -76,16 +84,19 @@ impl Shardable for Provenance {
         let ids = column_of_strings(frame, "id")?;
         let terms = column_of_strings(frame, "term")?;
         let sources = column_of_strings(frame, "seed_source")?;
+        let groundings = column_of_strings(frame, "grounding")?;
         let dict_ids: Vec<Option<i64>> = frame.column("dict_id")?.i64()?.iter().collect();
         Ok(ids
             .into_iter()
             .zip(terms)
             .zip(sources)
+            .zip(groundings)
             .zip(dict_ids)
-            .map(|(((id, term), seed_source), dict_id)| Self {
+            .map(|((((id, term), seed_source), grounding), dict_id)| Self {
                 id,
                 term,
                 seed_source,
+                grounding,
                 dict_id,
             })
             .collect())
@@ -104,22 +115,24 @@ pub fn read(root: &Path) -> Result<Vec<Provenance>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{SOGOU_PREMIUM, WIKI_SLANG};
+    use crate::source::{GENGBAIKE, SOGOU_PREMIUM, WIKI_SLANG};
 
     #[test]
     fn a_row_carries_its_sources_dictionary_id_and_a_wiki_row_carries_none() {
-        let sogou = Provenance::new("a".to_owned(), "东大".to_owned(), SOGOU_PREMIUM);
+        let sogou = Provenance::new("a".to_owned(), "东大".to_owned(), SOGOU_PREMIUM, GENGBAIKE);
         assert_eq!(sogou.seed_source, "sogou-premium");
+        assert_eq!(sogou.grounding, "gengbaike");
         assert_eq!(sogou.dict_id, Some(4));
-        let wiki = Provenance::new("b".to_owned(), "爷青结".to_owned(), WIKI_SLANG);
+        let wiki = Provenance::new("b".to_owned(), "爷青结".to_owned(), WIKI_SLANG, WIKI_SLANG);
+        assert_eq!(wiki.grounding, "wiki-slang");
         assert_eq!(wiki.dict_id, None);
     }
 
     #[test]
     fn the_sidecar_survives_a_round_trip_through_its_frame() {
         let rows = vec![
-            Provenance::new("a".to_owned(), "东大".to_owned(), SOGOU_PREMIUM),
-            Provenance::new("b".to_owned(), "爷青结".to_owned(), WIKI_SLANG),
+            Provenance::new("a".to_owned(), "东大".to_owned(), SOGOU_PREMIUM, GENGBAIKE),
+            Provenance::new("b".to_owned(), "爷青结".to_owned(), WIKI_SLANG, WIKI_SLANG),
         ];
         let frame = Provenance::frame(&rows).expect("the frame builds");
         let names: Vec<&str> = frame
@@ -127,7 +140,7 @@ mod tests {
             .into_iter()
             .map(polars::prelude::PlSmallStr::as_str)
             .collect();
-        assert_eq!(names, ["id", "term", "seed_source", "dict_id"]);
+        assert_eq!(names, ["id", "term", "seed_source", "grounding", "dict_id"]);
         assert_eq!(
             Provenance::from_frame(&frame).expect("the frame reads back"),
             rows

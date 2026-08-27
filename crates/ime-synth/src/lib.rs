@@ -8,14 +8,20 @@
 //! model cannot learn anything from a word it has never seen used. This crate
 //! closes that gap by asking a cheap local model for the missing sentences.
 //!
+//! What the model is told about a term comes from the two sources that explain
+//! rather than merely list: the 梗百科 crawl ([`gengbaike`]) and the wikipedia
+//! slang list ([`wiki`]). Between them they ground the Sogou dictionaries, and
+//! the titles they carry that no dictionary has are seeds in their own right.
+//!
 //! Three rules from the decision record hold the whole thing together, and each
 //! one is enforced somewhere in the code rather than in a comment:
 //!
 //! * **Grounded generation only.** The model's Chinese world knowledge is not
 //!   trusted, so no prompt ever names a term without also carrying that term's
 //!   explanation from the seed source. A term nothing explains is skipped, and
-//!   [`seed`] counts the skips. This is why the Sogou dictionaries contribute
-//!   almost nothing: 128k words, and an explanation for a few dozen of them.
+//!   [`seed`] counts the skips, and records on every seed which source explained
+//!   it, so a run can be dropped by the encyclopaedia as well as by the
+//!   dictionary.
 //! * **Training only.** Every sample carries `source = "synthetic-luna"`
 //!   ([`source::SYNTHETIC`]), which is what lets the evaluation draw exclude
 //!   them. Model-written text in an evaluation set measures the model that wrote
@@ -34,6 +40,7 @@
 
 pub mod error;
 pub mod generate;
+pub mod gengbaike;
 pub mod llm;
 pub mod provenance;
 pub mod report;
@@ -45,9 +52,10 @@ pub mod wiki;
 
 pub use error::{Error, Result};
 pub use generate::{MAX_DROP_RATE, Options, generate};
+pub use gengbaike::Entry as GengbaikeEntry;
 pub use provenance::Provenance;
 pub use seed::{Seed, SeedCounts, SeedLoad};
-pub use source::{SEED_SOURCES, SYNTHETIC, SeedSource};
+pub use source::{GROUNDING_SOURCES, SEED_SOURCES, SYNTHETIC, SeedSource};
 pub use summary::RunSummary;
 pub use validate::DropCounts;
 pub use wiki::WikiEntry;
