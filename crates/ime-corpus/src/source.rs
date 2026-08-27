@@ -1,4 +1,4 @@
-//! The three upstream corpora of the run-2 expansion, and what a fetched document is.
+//! The six upstream corpora, and what a fetched document is.
 //!
 //! The stage is split in two, and the line between them is the network. `fetch`
 //! writes the upstream text as it arrives, split only where upstream already
@@ -8,11 +8,15 @@
 //! be re-run offline, so tightening a filter costs a minute rather than another
 //! pass over the network.
 //!
-//! The three registers are deliberate, and none of them is encyclopaedic in the
-//! way `wiki` was. Moe Girl Pedia's prose is written *by* the internet about the
-//! internet; douyin captions are what a person types under a video; bilibili
-//! comments are what they type under someone else's. Between them they cover the
-//! slang, 梗 and abbreviations an n-gram model trained on news has never seen.
+//! Three of the six are edited prose -- Chinese Wikipedia, the Sina news archive
+//! and the LCCC conversation corpus -- and were fetched by the Python pipeline
+//! into the same document schema this one reads. The other three are what the
+//! run-2 expansion added, because none of the first three is the register an
+//! input method is actually used in: Moe Girl Pedia's prose is written *by* the
+//! internet about the internet; douyin captions are what a person types under a
+//! video; bilibili comments are what they type under someone else's. Between them
+//! they cover the slang, 梗 and abbreviations an n-gram model trained on news has
+//! never seen.
 
 use crate::clean::Cleaning;
 use ime_g2p::Result as ShardResult;
@@ -27,29 +31,60 @@ pub const DOCUMENTS_PER_SHARD: usize = 20_000;
 /// How many samples one prepared shard holds before the next one is started.
 pub const SAMPLES_PER_SHARD: usize = 100_000;
 
-/// How many preceding segments a prose sample carries as context.
-const PROSE_CONTEXT_SEGMENTS: usize = 3;
+/// How many preceding units a sample composed inside a document carries as context.
+const DOCUMENT_CONTEXT_UNITS: usize = 3;
 
 /// The longest context a sample carries, in characters, counted from its end.
 pub const MAX_CONTEXT_CHARACTERS: usize = 256;
 
+/// What one unit of a source's text is -- the thing a document is a run of.
+///
+/// Two variants and no behaviour beyond a joiner, so this is data about a source
+/// rather than a strategy worth a trait: a `SourceSpec` is a `const`, and a trait
+/// object in one would cost the constness for nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SegmentUnit {
+    /// A sentence, carrying the `。`-like character it ended on.
+    Sentence,
+    /// A whole turn, which is what one person composed before pressing send.
+    Turn,
+}
+
+impl SegmentUnit {
+    /// What runs consecutive units together when they become a sample's context.
+    ///
+    /// Sentences already carry their own terminal punctuation, so nothing goes
+    /// between them; turns carry none, and running them together would fuse the
+    /// end of one onto the start of the next.
+    #[must_use]
+    pub fn joiner(self) -> &'static str {
+        match self {
+            Self::Sentence => "",
+            Self::Turn => "\n",
+        }
+    }
+}
+
 /// One upstream corpus: what it is called, how it is cleaned, and where its context comes from.
 ///
-/// `context_segments` is zero for the two social sources because a post and a
+/// `context_units` is zero for the two social sources because a post and a
 /// comment are each composed on their own -- the post above a comment is not what
 /// its author was looking at while typing, and the previous comment in the file
-/// is from a different video entirely. Setting it to zero is what makes their
-/// `context` column null without a single branch anywhere downstream.
+/// is from a different video entirely. Setting it to zero leaves them with only
+/// what the writer had already typed inside their own post as context, which is
+/// exactly what was on their screen.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SourceSpec {
     /// The shard prefix and the value of the `source` column.
     pub name: &'static str,
     /// The Hugging Face repository the fetch half reads.
     pub dataset: &'static str,
-    /// Which residues the prepare half strips before splitting into sentences.
+    /// Which residues the prepare half strips before splitting into units.
     pub cleaning: Cleaning,
-    /// How many preceding segments become a sample's context.
-    pub context_segments: usize,
+    /// What one unit of this source is.
+    pub unit: SegmentUnit,
+    /// How many preceding units become part of a sample's context.
+    pub context_units: usize,
 }
 
 /// Moe Girl Pedia's cleaned 2025-10 dump: one JSON Lines record per article.
@@ -62,7 +97,8 @@ pub const MOEGIRL: SourceSpec = SourceSpec {
         strip_mentions: false,
         strip_reply_prefix: false,
     },
-    context_segments: PROSE_CONTEXT_SEGMENTS,
+    unit: SegmentUnit::Sentence,
+    context_units: DOCUMENT_CONTEXT_UNITS,
 };
 
 /// Douyin posts: the user-written `desc` caption under a video.
@@ -75,7 +111,8 @@ pub const DOUYIN: SourceSpec = SourceSpec {
         strip_mentions: true,
         strip_reply_prefix: false,
     },
-    context_segments: 0,
+    unit: SegmentUnit::Sentence,
+    context_units: 0,
 };
 
 /// Bilibili comments: short, informal, and frequently a reply to another one.
@@ -88,18 +125,55 @@ pub const BILIBILI: SourceSpec = SourceSpec {
         strip_mentions: true,
         strip_reply_prefix: true,
     },
-    context_segments: 0,
+    unit: SegmentUnit::Sentence,
+    context_units: 0,
+};
+
+/// Chinese Wikipedia's `20231101.zh` dump: formal, encyclopaedic, mixed script.
+///
+/// It is the reason the normaliser converts to simplified rather than trusting
+/// the upstream text: an article stores whatever variant its editors used, mixed
+/// within a single paragraph.
+pub const WIKI: SourceSpec = SourceSpec {
+    name: "wiki",
+    dataset: "wikimedia/wikipedia",
+    cleaning: Cleaning::NONE,
+    unit: SegmentUnit::Sentence,
+    context_units: DOCUMENT_CONTEXT_UNITS,
+};
+
+/// The Sina news archive behind `SirlyDreamer/THUCNews`: headline then body.
+pub const NEWS: SourceSpec = SourceSpec {
+    name: "news",
+    dataset: "SirlyDreamer/THUCNews",
+    cleaning: Cleaning::NONE,
+    unit: SegmentUnit::Sentence,
+    context_units: DOCUMENT_CONTEXT_UNITS,
+};
+
+/// The LCCC cleaned conversation corpus: one part per turn, word-segmented.
+///
+/// The only source whose units are turns rather than sentences. A turn is what a
+/// person composes before pressing send, and the turns above it are what they
+/// were looking at while they did -- which is exactly the context an input method
+/// has on screen.
+pub const DIALOGUE: SourceSpec = SourceSpec {
+    name: "dialogue",
+    dataset: "silver/lccc",
+    cleaning: Cleaning::NONE,
+    unit: SegmentUnit::Turn,
+    context_units: DOCUMENT_CONTEXT_UNITS,
 };
 
 /// Every source this crate knows, in the order the CLI lists them.
-pub const SOURCES: [SourceSpec; 3] = [MOEGIRL, DOUYIN, BILIBILI];
+pub const SOURCES: [SourceSpec; 6] = [WIKI, NEWS, DIALOGUE, MOEGIRL, DOUYIN, BILIBILI];
 
 /// One upstream document, untouched apart from being split where upstream split it.
 ///
-/// `parts` is a list rather than a string because the schema is the Python
-/// pipeline's, which had to hold a dialogue's turns; none of the three sources
-/// here splits a record into more than one part, but writing the same column type
-/// keeps either implementation able to read the other's raw shards.
+/// `parts` is a list rather than a string because a dialogue's record is its
+/// turns and each of them is composed on its own. Every other source writes a
+/// single part, and both implementations write the same column type, which is
+/// what lets this one prepare the documents the Python pipeline fetched.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RawDocument {
     /// The upstream identifier, or the content's own hash when it has none.
@@ -175,10 +249,22 @@ mod tests {
     }
 
     #[test]
-    fn only_the_prose_source_carries_context() {
-        assert_eq!(MOEGIRL.context_segments, PROSE_CONTEXT_SEGMENTS);
-        assert_eq!(DOUYIN.context_segments, 0);
-        assert_eq!(BILIBILI.context_segments, 0);
+    fn only_a_source_with_documents_carries_preceding_units_as_context() {
+        for spec in [WIKI, NEWS, DIALOGUE, MOEGIRL] {
+            assert_eq!(spec.context_units, DOCUMENT_CONTEXT_UNITS);
+        }
+        assert_eq!(DOUYIN.context_units, 0);
+        assert_eq!(BILIBILI.context_units, 0);
+    }
+
+    #[test]
+    fn only_the_dialogue_source_is_a_run_of_turns() {
+        assert_eq!(DIALOGUE.unit, SegmentUnit::Turn);
+        assert_eq!(DIALOGUE.unit.joiner(), "\n");
+        for spec in [WIKI, NEWS, MOEGIRL, DOUYIN, BILIBILI] {
+            assert_eq!(spec.unit, SegmentUnit::Sentence);
+            assert_eq!(spec.unit.joiner(), "");
+        }
     }
 
     #[test]

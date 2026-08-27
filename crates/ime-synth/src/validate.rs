@@ -1,13 +1,16 @@
 //! The gate a generated example has to pass to become a training sample.
 //!
-//! Synthetic text gets the *same* filter as fetched text -- `ime-corpus`'s
-//! [`SampleFilter`], unchanged -- because a sample that a downstream stage would
-//! choke on is worse than no sample at all, and because holding synthetic text to
-//! a looser bar than real text is how a corpus rots. Two checks are added on top,
-//! and both are specific to synthesis:
+//! Synthetic text gets the *same* length, coverage and duplicate rules as fetched
+//! text -- `ime-corpus`'s [`SampleFilter`] -- because a sample that a downstream
+//! stage would choke on is worse than no sample at all, and because holding
+//! synthetic text to a looser bar than real text is how a corpus rots. Three
+//! checks are added on top, and all three are specific to synthesis:
 //!
 //! * the sentence must contain its seed term verbatim, which is the only
-//!   mechanical evidence that the grounded prompt was followed at all; and
+//!   mechanical evidence that the grounded prompt was followed at all;
+//! * it must be Chinese throughout, which the corpus filter no longer checks
+//!   because it is handed runs of Han characters and this is handed whatever the
+//!   model wrote; and
 //! * the preceding turn has to be typable too, because it is conditioning text
 //!   the context model will be trained on, even though it is not itself a target
 //!   and so has no minimum length and no duplicate rule.
@@ -19,6 +22,7 @@
 
 use crate::error::Result;
 use crate::llm::Example;
+use ime_corpus::filter::MIN_HAN_RATIO;
 use ime_corpus::text::han_ratio;
 use ime_corpus::{Normalizer, SampleFilter};
 use ime_g2p::text::is_han;
@@ -110,7 +114,7 @@ impl DropCounts {
 #[must_use]
 pub fn is_typable_context(context: &str, lexicon: &Lexicon) -> bool {
     context.chars().count() <= ime_corpus::filter::MAX_CHARACTERS
-        && han_ratio(context) >= ime_corpus::filter::MIN_HAN_RATIO
+        && han_ratio(context) >= MIN_HAN_RATIO
         && !context
             .chars()
             .any(|character| is_han(character) && lexicon.id_of(character).is_none())
@@ -127,6 +131,7 @@ pub struct Validator<'a> {
     filter: SampleFilter<'a>,
     missing_term: usize,
     bad_context: usize,
+    not_chinese_enough: usize,
 }
 
 impl<'a> Validator<'a> {
@@ -139,6 +144,7 @@ impl<'a> Validator<'a> {
             filter: SampleFilter::new(lexicon),
             missing_term: 0,
             bad_context: 0,
+            not_chinese_enough: 0,
         }
     }
 
@@ -163,6 +169,10 @@ impl<'a> Validator<'a> {
             self.bad_context += 1;
             return Ok(None);
         }
+        if han_ratio(&text) < MIN_HAN_RATIO {
+            self.not_chinese_enough += 1;
+            return Ok(None);
+        }
         if !self.filter.accepts(&text) {
             return Ok(None);
         }
@@ -177,9 +187,9 @@ impl<'a> Validator<'a> {
             kept: filter.kept,
             missing_term: self.missing_term,
             bad_context: self.bad_context,
-            too_short: filter.too_short,
-            too_long: filter.too_long,
-            not_chinese_enough: filter.not_chinese_enough,
+            too_short: filter.too_short_run,
+            too_long: filter.too_long_run,
+            not_chinese_enough: self.not_chinese_enough,
             unknown_character: filter.unknown_character,
             duplicate: filter.duplicate,
         }
