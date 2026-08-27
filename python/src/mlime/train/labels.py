@@ -121,16 +121,18 @@ def forced_providers(providers: Sequence[str]) -> Iterator[list[Any]]:
         onnxruntime.InferenceSession = original
 
 
-def load_cuda_annotator(model_dir: Path, batch_size: int) -> Any:
+def load_cuda_annotator(model_dir: Path, batch_size: int, num_workers: int | None = None) -> Any:
     """A g2pW annotator whose ONNX session is running on CUDA.
 
     Raises if the session came up on anything else, because the whole reason to
-    run this on a T4 is the throughput.
+    run this on a T4 is the throughput. *num_workers* is passed through so a
+    calibration run can sweep the loader against a fixed batch size; ``None``
+    takes the platform default, which is what the labelling job wants.
     """
     from mlime.data.g2pw_annotator import G2pwAnnotator
 
     with forced_providers(CUDA_PROVIDERS) as sessions:
-        annotator = G2pwAnnotator(model_dir, batch_size=batch_size)
+        annotator = G2pwAnnotator(model_dir, batch_size=batch_size, num_workers=num_workers)
     if not sessions:
         raise RuntimeError("g2pw built no ONNX session; the upstream API has changed")
     active = sessions[0].get_providers()
@@ -139,7 +141,12 @@ def load_cuda_annotator(model_dir: Path, batch_size: int) -> Any:
             f"the g2pw session came up on {active}; onnxruntime-gpu is not installed "
             "or no CUDA device is visible"
         )
-    log.info("g2pw on cuda", providers=active, batch_size=batch_size)
+    log.info(
+        "g2pw on cuda",
+        providers=active,
+        batch_size=batch_size,
+        num_workers=annotator.num_workers,
+    )
     return annotator
 
 

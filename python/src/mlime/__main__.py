@@ -281,6 +281,9 @@ def train_labels(
     ),
     batch_size: int = typer.Option(512, help="Sentences handed to g2pW at once"),
     onnx_batch_size: int = typer.Option(256, help="Query positions per ONNX call"),
+    num_workers: int = typer.Option(
+        None, help="DataLoader workers g2pW prepares batches with; platform default when omitted"
+    ),
     g2pw_model: Path = typer.Option(None, help="Directory holding the g2pW model"),
     cuda: bool = typer.Option(False, help="Require the ONNX session to run on CUDA"),
     verbose: bool = VERBOSE,
@@ -293,9 +296,9 @@ def train_labels(
     layout = DataLayout(data_dir)
     model_dir = g2pw_model or DEFAULT_MODEL_DIR
     annotator = (
-        load_cuda_annotator(model_dir, onnx_batch_size)
+        load_cuda_annotator(model_dir, onnx_batch_size, num_workers)
         if cuda
-        else G2pwAnnotator(model_dir, batch_size=onnx_batch_size)
+        else G2pwAnnotator(model_dir, batch_size=onnx_batch_size, num_workers=num_workers)
     )
     labels = out or data_dir / "labels"
     counts = asyncio.run(
