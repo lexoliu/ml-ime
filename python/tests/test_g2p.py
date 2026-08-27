@@ -35,7 +35,7 @@ from mlime.data.g2p import (
     annotate,
     compare,
 )
-from mlime.data.g2p_report import by_frequency, summarise, worst_characters
+from mlime.data.g2p_report import by_frequency, by_source, summarise, worst_characters
 from mlime.data.g2pw_annotator import default_workers
 from mlime.data.llm_annotator import LlmAnnotator, parse_readings, prompt_template
 from mlime.data.shards import read_shards
@@ -319,3 +319,22 @@ def test_an_unknowable_core_count_still_leaves_a_worker(monkeypatch: pytest.Monk
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setattr(os, "cpu_count", lambda: None)
     assert default_workers() == 1
+
+
+def test_agreement_is_reported_per_source() -> None:
+    """A pool drawn evenly across sources does not agree evenly, so the table splits it."""
+    table = {row["source"]: row for row in by_source(_annotated()).iter_rows(named=True)}
+    assert table["news"]["sentences"] == 1
+    assert table["news"]["sentence_rate"] == 1.0
+    assert table["wiki"]["sentences"] == 2
+    assert table["wiki"]["sentence_rate"] == 0.5
+    assert table["wiki"]["positions"] == 6
+    assert table["wiki"]["positions_agreed"] == 5
+
+
+def test_the_per_source_table_counts_the_rows_an_eval_draw_could_use() -> None:
+    """Eligibility is the export's rule: agreed end to end, and all-Han."""
+    annotated = _annotated().with_columns(pl.Series("text", ["重要还", "重要还", "重要好!"]))
+    table = {row["source"]: row for row in by_source(annotated).iter_rows(named=True)}
+    assert table["news"]["eligible"] == 1
+    assert table["wiki"]["eligible"] == 0
