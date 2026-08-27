@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -34,6 +36,7 @@ from mlime.data.g2p import (
     compare,
 )
 from mlime.data.g2p_report import by_frequency, summarise, worst_characters
+from mlime.data.g2pw_annotator import default_workers
 from mlime.data.llm_annotator import LlmAnnotator, parse_readings, prompt_template
 from mlime.data.shards import read_shards
 
@@ -296,3 +299,23 @@ def test_the_report_buckets_by_character_frequency() -> None:
     bands = by_frequency(per_character(_annotated()))
     assert bands["positions"].sum() == 9
     assert set(bands["band"].to_list()) == {"top 500"}
+
+
+@pytest.mark.parametrize(
+    ("platform", "cores", "expected"),
+    [("darwin", 12, 0), ("win32", 12, 0), ("linux", 4, 2), ("linux", 1, 1), ("linux2", 8, 4)],
+)
+def test_dataloader_workers_are_linux_only(
+    monkeypatch: pytest.MonkeyPatch, platform: str, cores: int, expected: int
+) -> None:
+    """g2pW's spawned loader workers deadlock on macOS, so only Linux gets any."""
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(os, "cpu_count", lambda: cores)
+    assert default_workers() == expected
+
+
+def test_an_unknowable_core_count_still_leaves_a_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """`os.cpu_count()` may return None; that must not turn into zero workers on Linux."""
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(os, "cpu_count", lambda: None)
+    assert default_workers() == 1
