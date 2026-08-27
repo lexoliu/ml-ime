@@ -1064,6 +1064,7 @@ dependencies = [
     { name = "structlog" },
     { name = "torch" },
     { name = "tqdm" },
+    { name = "transformers" },
     { name = "typer" },
 ]
 
@@ -1099,6 +1100,7 @@ requires-dist = [
     { name = "structlog", specifier = ">=24.4" },
     { name = "torch", specifier = ">=2.13.0" },
     { name = "tqdm", specifier = ">=4.67" },
+    { name = "transformers", specifier = ">=5.16" },
     { name = "typer", specifier = ">=0.15" },
 ]
 provides-extras = ["train"]
