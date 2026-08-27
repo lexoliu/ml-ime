@@ -28,8 +28,11 @@ n-gram IMEs fail hardest, so this is the differentiation, not garnish.
 
 3. **Bilibili comments/danmaku** — `Midsummra/bilibilicomment` (HF) and/or
    VideoIC (5M comments). Real informal typing, short and noisy.
-4. **梗百科 (gengbaike.cn)** — SKIPPED: serves 403 with an anti-bot session
-   cookie even for robots.txt. Not worth fighting; coverage overlaps 1+2.
+4. **梗百科 (gengbaike.cn)** — crawled by the user's own session (2,293
+   entries, data/gengbaike/gengbaike.jsonl) and now the LARGEST grounding
+   source for synthesis: 2,016 of 2,422 grounded seeds (2026-08-27). The
+   earlier "skipped, anti-bot 403" note applied only to crawling from this
+   session; superseded.
 
 ## Douyin / Xiaohongshu (scouted 2026-08-26)
 
