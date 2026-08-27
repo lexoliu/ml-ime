@@ -35,6 +35,16 @@ pub enum Error {
         /// What was wrong with it.
         reason: String,
     },
+    /// A line of the 梗百科 crawl is not an entry.
+    #[error("line {line} of the 梗百科 crawl at {} is not an entry: {reason}", path.display())]
+    NotGengbaikeEntry {
+        /// The file involved.
+        path: PathBuf,
+        /// Which line, counting from one.
+        line: usize,
+        /// What serde said.
+        reason: String,
+    },
     /// Too much of what the endpoint returned failed validation to trust the batch.
     #[error(
         "{dropped} of {examples} generated examples ({percent:.1}%) failed validation, over the \

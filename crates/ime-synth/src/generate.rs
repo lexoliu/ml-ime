@@ -262,7 +262,7 @@ fn accept(
                     text: accepted.text,
                     context: accepted.context,
                 },
-                provenance: Provenance::new(id, seed.term.clone(), seed.source),
+                provenance: Provenance::new(id, seed.term.clone(), seed.source, seed.grounding),
                 source: seed.source,
             });
         }
