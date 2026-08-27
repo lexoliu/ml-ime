@@ -1,4 +1,4 @@
-//! The corpus half of the command line: pull the run-2 sources down and prepare them.
+//! The corpus half of the command line: pull the sources down and prepare them.
 //!
 //! A thin shell over `ime-corpus`, shaped like the Python `mlime corpus` commands
 //! it replaces so that a data root prepared by either is prepared the same way.
@@ -9,7 +9,7 @@
 use anyhow::{Context as _, Result};
 use askama::Template;
 use clap::{Subcommand, ValueEnum};
-use ime_corpus::source::{BILIBILI, DOUYIN, MOEGIRL, SourceSpec};
+use ime_corpus::source::{BILIBILI, DIALOGUE, DOUYIN, MOEGIRL, NEWS, SourceSpec, WIKI};
 use ime_corpus::{DataLayout, PrepareReport};
 use ime_pinyin::{Lexicon, SyllableTable};
 use std::io::Write as _;
@@ -21,6 +21,12 @@ use std::path::PathBuf;
 /// parse a name, and it converts straight into one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 pub enum SourceName {
+    /// Chinese Wikipedia's `20231101.zh` dump.
+    Wiki,
+    /// The Sina news archive behind `THUCNews`.
+    News,
+    /// The LCCC cleaned conversation corpus.
+    Dialogue,
     /// Moe Girl Pedia's cleaned 2025-10 article dump.
     Moegirl,
     /// Douyin post captions.
@@ -32,6 +38,9 @@ pub enum SourceName {
 impl From<SourceName> for SourceSpec {
     fn from(name: SourceName) -> Self {
         match name {
+            SourceName::Wiki => WIKI,
+            SourceName::News => NEWS,
+            SourceName::Dialogue => DIALOGUE,
             SourceName::Moegirl => MOEGIRL,
             SourceName::Douyin => DOUYIN,
             SourceName::Bilibili => BILIBILI,
@@ -43,6 +52,10 @@ impl From<SourceName> for SourceSpec {
 #[derive(Debug, Subcommand)]
 pub enum CorpusCommand {
     /// Download one source and write its raw documents.
+    ///
+    /// Only the three sources this crate fetches itself are downloadable; the
+    /// three prose corpora were fetched by the Python pipeline into the same
+    /// document schema, and `prepare` reads their shards unchanged.
     Fetch {
         /// Which upstream to pull.
         #[arg(long)]
@@ -130,9 +143,8 @@ fn print_report(report: &PrepareReport) -> Result<()> {
     let considered = counts.considered();
     let rows = [
         ("kept", counts.kept),
-        ("too_short", counts.too_short),
-        ("too_long", counts.too_long),
-        ("not_chinese_enough", counts.not_chinese_enough),
+        ("too_short_run", counts.too_short_run),
+        ("too_long_run", counts.too_long_run),
         ("unknown_character", counts.unknown_character),
         ("duplicate", counts.duplicate),
     ];
@@ -185,9 +197,22 @@ mod tests {
 
     #[test]
     fn every_source_name_maps_onto_its_spec() {
-        assert_eq!(SourceSpec::from(SourceName::Moegirl).name, "moegirl");
-        assert_eq!(SourceSpec::from(SourceName::Douyin).name, "douyin");
-        assert_eq!(SourceSpec::from(SourceName::Bilibili).name, "bilibili");
+        let named: Vec<&str> = [
+            SourceName::Wiki,
+            SourceName::News,
+            SourceName::Dialogue,
+            SourceName::Moegirl,
+            SourceName::Douyin,
+            SourceName::Bilibili,
+        ]
+        .into_iter()
+        .map(|name| SourceSpec::from(name).name)
+        .collect();
+        assert_eq!(
+            named,
+            vec!["wiki", "news", "dialogue", "moegirl", "douyin", "bilibili"]
+        );
+        assert_eq!(named.len(), ime_corpus::SOURCES.len());
     }
 
     #[test]
@@ -201,9 +226,8 @@ mod tests {
             },
             counts: FilterCounts {
                 kept: 50,
-                too_short: 30,
-                too_long: 10,
-                not_chinese_enough: 5,
+                too_short_run: 35,
+                too_long_run: 10,
                 unknown_character: 3,
                 duplicate: 2,
             },

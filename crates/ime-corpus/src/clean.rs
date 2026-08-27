@@ -34,6 +34,16 @@ pub struct Cleaning {
     pub strip_reply_prefix: bool,
 }
 
+impl Cleaning {
+    /// No residue removal at all, for a source that carries none.
+    pub const NONE: Self = Self {
+        drop_infobox_lines: false,
+        strip_hashtags: false,
+        strip_mentions: false,
+        strip_reply_prefix: false,
+    };
+}
+
 /// How many lines each line-level rule removed, for the run summary.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct CleaningCounts {
