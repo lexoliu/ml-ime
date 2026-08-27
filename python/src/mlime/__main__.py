@@ -276,6 +276,9 @@ def train_labels(
     data_dir: Path = DATA_DIR,
     out: Path = typer.Option(None, help="Where the label shards go; defaults to <data-dir>/labels"),
     shards: int = typer.Option(None, help="Stop after this many sample shards"),
+    shard: list[str] = typer.Option(
+        None, "--shard", help="Sample shard to label; repeatable, overrides --shards"
+    ),
     batch_size: int = typer.Option(512, help="Sentences handed to g2pW at once"),
     onnx_batch_size: int = typer.Option(256, help="Query positions per ONNX call"),
     g2pw_model: Path = typer.Option(None, help="Directory holding the g2pW model"),
@@ -285,7 +288,7 @@ def train_labels(
     """Label the prepared samples with g2pW, one label shard per sample shard."""
     configure(verbose)
     from mlime.data.g2pw_annotator import DEFAULT_MODEL_DIR, G2pwAnnotator
-    from mlime.train.labels import generate, load_cuda_annotator
+    from mlime.train.labels import generate, load_cuda_annotator, select_shards
 
     layout = DataLayout(data_dir)
     model_dir = g2pw_model or DEFAULT_MODEL_DIR
@@ -297,11 +300,10 @@ def train_labels(
     labels = out or data_dir / "labels"
     counts = asyncio.run(
         generate(
-            layout.samples,
+            select_shards(layout.samples, shard, shards),
             labels,
             annotator,
             sentences_per_batch=batch_size,
-            shards=shards,
             metrics=labels / "throughput.jsonl",
         )
     )
