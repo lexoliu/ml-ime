@@ -23,7 +23,8 @@ use std::path::Path;
 pub struct Shown {
     /// The seed term.
     pub term: String,
-    /// Which seed lexicon it came from.
+    /// Which seed lexicon it came from, written `lexicon+encyclopaedia` when the
+    /// two differ, as they do for every Sogou word 梗百科 explained.
     pub seed_source: String,
     /// The preceding turn, empty when there was none.
     pub context: String,
@@ -38,6 +39,16 @@ pub struct Shown {
 /// If no run has written any, or a shard cannot be read.
 pub fn samples(root: &Path) -> Result<Vec<Sample>> {
     Ok(read_shards(&DataLayout::new(root).samples(), SYNTHETIC)?)
+}
+
+/// How a sample's origin is labelled: the lexicon that proposed the term, and
+/// the source that explained it where that is a different one.
+#[must_use]
+pub fn label(seed_source: &str, grounding: &str) -> String {
+    if seed_source == grounding {
+        return seed_source.to_owned();
+    }
+    format!("{seed_source}+{grounding}")
 }
 
 /// Join a run's samples to their provenance rows.
@@ -62,7 +73,7 @@ pub fn joined(samples: &[Sample], provenance: &[Provenance]) -> Result<Vec<Shown
             })?;
             Ok(Shown {
                 term: origin.term.clone(),
-                seed_source: origin.seed_source.clone(),
+                seed_source: label(&origin.seed_source, &origin.grounding),
                 context: sample.context.clone().unwrap_or_default(),
                 text: sample.text.clone(),
             })
@@ -91,7 +102,7 @@ pub fn draw<T: Clone>(rows: &[T], count: usize, seed: u64) -> Vec<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{SOGOU_PREMIUM, WIKI_SLANG};
+    use crate::source::{GENGBAIKE, SOGOU_PREMIUM, WIKI_SLANG};
 
     fn sample(id: &str, text: &str, context: Option<&str>) -> Sample {
         Sample {
@@ -109,14 +120,15 @@ mod tests {
             sample("b", "东大又赢了", None),
         ];
         let provenance = vec![
-            Provenance::new("b".to_owned(), "东大".to_owned(), SOGOU_PREMIUM),
-            Provenance::new("a".to_owned(), "爷青结".to_owned(), WIKI_SLANG),
+            Provenance::new("b".to_owned(), "东大".to_owned(), SOGOU_PREMIUM, GENGBAIKE),
+            Provenance::new("a".to_owned(), "爷青结".to_owned(), WIKI_SLANG, WIKI_SLANG),
         ];
         let shown = joined(&samples, &provenance).expect("every sample has a row");
         assert_eq!(shown[0].term, "爷青结");
         assert_eq!(shown[0].seed_source, "wiki-slang");
         assert_eq!(shown[0].context, "你追完了吗");
         assert_eq!(shown[1].term, "东大");
+        assert_eq!(shown[1].seed_source, "sogou-premium+gengbaike");
         assert_eq!(shown[1].context, "");
     }
 

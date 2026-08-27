@@ -239,6 +239,7 @@ mod tests {
             term: "爷青结".to_owned(),
             explanation: "爷的青春结束了。感慨自己的青春不再。".to_owned(),
             source: WIKI_SLANG,
+            grounding: WIKI_SLANG,
         }
     }
 
