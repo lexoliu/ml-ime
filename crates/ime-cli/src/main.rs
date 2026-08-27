@@ -3,6 +3,7 @@
 mod corpus;
 mod engine;
 mod g2p;
+mod synth;
 
 use anyhow::{Context as _, Result};
 use askama::Template;
@@ -18,6 +19,7 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use synth::SynthCommand;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -60,6 +62,11 @@ enum Command {
     G2p {
         #[command(subcommand)]
         command: G2pCommand,
+    },
+    /// Grounded LLM synthesis of slang usage sentences, for training only.
+    Synth {
+        #[command(subcommand)]
+        command: SynthCommand,
     },
     /// Emit artefacts for the rest of the engine.
     Export {
@@ -154,6 +161,7 @@ async fn main() -> Result<()> {
         } => run_eval(&model, &eval_set, &search),
         Command::Corpus { command } => corpus::run(command).await,
         Command::G2p { command } => g2p::run(command).await,
+        Command::Synth { command } => synth::run(command).await,
         Command::Export { command } => g2p::run_export(command),
     }
 }

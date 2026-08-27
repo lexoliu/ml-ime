@@ -1731,6 +1731,7 @@ dependencies = [
  "ime-g2p",
  "ime-ngram",
  "ime-pinyin",
+ "ime-synth",
  "serde",
  "serde_json",
  "thiserror",
@@ -1819,6 +1820,25 @@ name = "ime-pinyin"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "ime-synth"
+version = "0.1.0"
+dependencies = [
+ "askama",
+ "async-openai",
+ "futures",
+ "ime-corpus",
+ "ime-g2p",
+ "ime-pinyin",
+ "polars",
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
