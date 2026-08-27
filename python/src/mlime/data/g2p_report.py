@@ -18,6 +18,7 @@ import polars as pl
 from rich.console import Console
 from rich.table import Table
 
+from .export import eligible
 from .g2p import ANNOTATED, REFUSED
 from .shards import read_shards, shard_paths
 
@@ -94,6 +95,35 @@ def by_frequency(characters: pl.DataFrame) -> pl.DataFrame:
     )
 
 
+def by_source(annotated: pl.DataFrame) -> pl.DataFrame:
+    """Agreement per corpus source, and how many of its rows an eval draw could use.
+
+    A pool drawn evenly across sources does not annotate evenly: the sources
+    differ in how much of their text is rare, informal or polyphone-dense, and a
+    single headline rate hides that. The eligible count is the same rule the
+    evaluation export applies, so this table says in advance how large an
+    evaluation set each source can support.
+    """
+    positions = pl.col("agree").list.len()
+    usable = eligible(annotated).group_by("source").len().rename({"len": "eligible"})
+    return (
+        annotated.group_by("source")
+        .agg(
+            pl.len().alias("sentences"),
+            pl.col("agree_all").sum().alias("sentences_agreed"),
+            positions.sum().alias("positions"),
+            pl.col("agree").list.sum().sum().alias("positions_agreed"),
+        )
+        .join(usable, on="source", how="left")
+        .with_columns(
+            pl.col("eligible").fill_null(0),
+            (pl.col("sentences_agreed") / pl.col("sentences")).alias("sentence_rate"),
+            (pl.col("positions_agreed") / pl.col("positions")).alias("character_rate"),
+        )
+        .sort("source")
+    )
+
+
 def worst_characters(characters: pl.DataFrame, limit: int = TOP_DISAGREEMENTS) -> pl.DataFrame:
     """The characters the annotators fight over most, with one example each."""
     return (
@@ -138,6 +168,27 @@ def render(annotated: pl.DataFrame, refusals: int, console: Console | None = Non
             f"{row['rate']:.2%}",
         )
     console.print(bands)
+
+    sources = Table(title="Agreement by source")
+    for column in (
+        "Source",
+        "Sentences",
+        "Sentence agreement",
+        "Positions",
+        "Char agreement",
+        "Eval-eligible",
+    ):
+        sources.add_column(column, justify="right" if column != "Source" else "left")
+    for row in by_source(annotated).iter_rows(named=True):
+        sources.add_row(
+            row["source"],
+            f"{row['sentences']:,}",
+            f"{row['sentence_rate']:.2%}",
+            f"{row['positions']:,}",
+            f"{row['character_rate']:.2%}",
+            f"{row['eligible']:,}",
+        )
+    console.print(sources)
 
     worst = Table(title=f"Top {TOP_DISAGREEMENTS} disagreeing characters")
     for column in ("Char", "Count", "g2pW", "LLM", "Example"):
