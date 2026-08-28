@@ -48,6 +48,9 @@ class TrainingConfig:
     new_lr: float = 1e-4
     warmup_fraction: float = 0.04
     weight_decay: float = 0.01
+    #: Padded positions one step may cost, the fill tower's and the context
+    #: tower's rectangles together -- not the fill tower's alone, which is a
+    #: bound on the smaller half and was how a run came to use four times it.
     token_budget: int = 8192
     gradient_clip: float = 1.0
     seed: int = 0

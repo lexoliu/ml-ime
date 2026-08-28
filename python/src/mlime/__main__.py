@@ -331,7 +331,7 @@ def train_route_a(
         None, "--held-out-shard", help="Shard to score but never train on; repeatable"
     ),
     max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
-    token_budget: int = typer.Option(8192, help="Padded fill-tower positions per step"),
+    token_budget: int = typer.Option(8192, help="Padded positions per step, both towers together"),
     base_lr: float = typer.Option(3e-5, help="Learning rate for the pretrained weights"),
     new_lr: float = typer.Option(1e-4, help="Learning rate for the tables route A adds"),
     seed: int = typer.Option(0, help="Augmentation and initialisation seed"),
@@ -415,7 +415,9 @@ def train_emit(
     out: Path = typer.Option(..., help="Where the JSON Lines scores go"),
     char_table: Path = typer.Option(None, help="ime-pinyin's char_pinyin.tsv"),
     context: bool = typer.Option(True, help="Let the model read each record's context"),
-    token_budget: int = typer.Option(8192, help="Padded fill-tower positions per forward"),
+    token_budget: int = typer.Option(
+        8192, help="Padded positions per forward, both towers together"
+    ),
     records_per_chunk: int = typer.Option(256, help="Records held in memory before writing"),
     verbose: bool = VERBOSE,
 ) -> None:
