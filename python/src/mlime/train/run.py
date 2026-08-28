@@ -158,14 +158,27 @@ def held_out_examples(
     builder: SampleBuilder,
     slices: Slices,
 ) -> list[TrainingExample]:
-    """Build the evaluation slice once, so both passes score the same examples."""
+    """Build the evaluation slice once, so both passes score the same examples.
+
+    Drawn evenly across the held-out shards rather than in file order. The shards
+    are chosen one per source so that the number this produces speaks for the
+    corpus, and any one of them holds several times the whole quota -- read in
+    order, the "held-out accuracy" would be one source's accuracy with six
+    sources' names on it, and whichever source sorted first would silently decide
+    what the run reports.
+    """
     if not slices.held_out:
         return []
-    stream = CorpusStream(paths.samples, paths.labels, builder, shards=slices.held_out)
-    examples = []
-    for example in stream:
-        examples.append(example)
-        if len(examples) >= slices.max_held_out_examples:
+    quota = slices.max_held_out_examples
+    per_shard = max(1, quota // len(slices.held_out))
+    examples: list[TrainingExample] = []
+    for shard in slices.held_out:
+        stream = CorpusStream(paths.samples, paths.labels, builder, shards=[shard])
+        for taken, example in enumerate(stream, start=1):
+            examples.append(example)
+            if taken >= per_shard or len(examples) >= quota:
+                break
+        if len(examples) >= quota:
             break
     return examples
 

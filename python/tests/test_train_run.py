@@ -14,7 +14,10 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from mlime.train.run import Slices
+from mlime.train.lexicon import Lexicon
+from mlime.train.run import RunPaths, Slices, held_out_examples
+from mlime.train.samples import SampleBuilder
+from mlime.train.spans import SpanVocab
 
 
 @pytest.fixture(name="samples")
@@ -27,6 +30,50 @@ def samples_fixture(tmp_path: Path) -> Path:
             {"id": ["a"], "source": ["s"], "text": ["中"], "context": [None]}
         ).write_parquet(directory / f"{name}.parquet")
     return directory
+
+
+def write_pair(root: Path, shard: str, source: str, rows: int) -> None:
+    """A sample shard of *rows* one-character sentences, and the labels for it."""
+    ids = [f"{source}-{index}" for index in range(rows)]
+    (root / "samples").mkdir(parents=True, exist_ok=True)
+    (root / "labels").mkdir(parents=True, exist_ok=True)
+    pl.DataFrame(
+        {
+            "id": ids,
+            "source": [source] * rows,
+            "text": ["中"] * rows,
+            "context": [None] * rows,
+        }
+    ).write_parquet(root / "samples" / shard)
+    pl.DataFrame({"id": ids, "syllables": [["zhong"]] * rows}).write_parquet(
+        root / "labels" / shard
+    )
+
+
+def test_the_held_out_slice_is_drawn_from_every_shard(
+    tmp_path: Path, lexicon: Lexicon, spans: SpanVocab
+) -> None:
+    # The first shard alone could fill the whole quota, which is exactly the
+    # situation that made the in-training evaluation one source's number.
+    write_pair(tmp_path, "bilibili-00001.parquet", "bilibili", 400)
+    write_pair(tmp_path, "wiki-00001.parquet", "wiki", 400)
+    examples = held_out_examples(
+        RunPaths(
+            samples=tmp_path / "samples",
+            labels=tmp_path / "labels",
+            char_table=tmp_path / "unused.tsv",
+            out=tmp_path / "out",
+        ),
+        SampleBuilder(lexicon, spans),
+        Slices(
+            train=("unused.parquet",),
+            held_out=("bilibili-00001.parquet", "wiki-00001.parquet"),
+            max_held_out_examples=100,
+        ),
+    )
+    sources = {example.id.split("-")[0] for example in examples}
+    assert sources == {"bilibili", "wiki"}
+    assert len(examples) == 100
 
 
 def test_everything_not_withheld_is_trained_on(samples: Path) -> None:
