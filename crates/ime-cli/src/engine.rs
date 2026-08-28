@@ -3,7 +3,7 @@
 use ime_decode::{BeamOptions, Candidates, Hypothesis, Uniform, decode};
 use ime_eval::{Hypothesize, Request};
 use ime_ngram::NgramModel;
-use ime_pinyin::{Lexicon, SegmentLattice, SegmentOptions, SyllableTable};
+use ime_pinyin::{Lexicon, SegmentLattice, SegmentOptions, Segmentation, SyllableTable};
 use std::num::NonZeroUsize;
 use thiserror::Error;
 
@@ -79,20 +79,7 @@ impl Baseline {
         pinyin: &str,
         top_k: NonZeroUsize,
     ) -> Result<Vec<Hypothesis>, BaselineError> {
-        let lattice =
-            SegmentLattice::build(pinyin, &self.table, &self.segment).map_err(|source| {
-                BaselineError::Segment {
-                    input: pinyin.to_owned(),
-                    source,
-                }
-            })?;
-        let batch =
-            Candidates::build(&lattice.k_best(&self.segment), &self.lexicon).map_err(|source| {
-                BaselineError::Decode {
-                    input: pinyin.to_owned(),
-                    source,
-                }
-            })?;
+        let (_, batch) = read(pinyin, &self.table, &self.segment, &self.lexicon)?;
         let options = BeamOptions {
             top_k,
             ..self.beam.clone()
@@ -102,6 +89,36 @@ impl Baseline {
             source,
         })
     }
+}
+
+/// Segment *pinyin* and resolve every reading into per-position candidate sets.
+///
+/// The two halves come back together because every caller needs both and they
+/// have to describe the same lattice: the decoder searches the candidate sets,
+/// while the neural bridge needs the segments they came from to know which
+/// letters were typed at each position. Rebuilding one without the other is how
+/// a score file comes to answer a lattice nobody decoded.
+///
+/// # Errors
+///
+/// If the keystrokes have no reading, or a position admits no character.
+pub fn read(
+    pinyin: &str,
+    table: &SyllableTable,
+    options: &SegmentOptions,
+    lexicon: &Lexicon,
+) -> Result<(Vec<Segmentation>, Candidates), BaselineError> {
+    let lattice =
+        SegmentLattice::build(pinyin, table, options).map_err(|source| BaselineError::Segment {
+            input: pinyin.to_owned(),
+            source,
+        })?;
+    let readings = lattice.k_best(options);
+    let batch = Candidates::build(&readings, lexicon).map_err(|source| BaselineError::Decode {
+        input: pinyin.to_owned(),
+        source,
+    })?;
+    Ok((readings, batch))
 }
 
 /// The baseline is deliberately blind to context: it is the control, and the

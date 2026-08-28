@@ -115,6 +115,22 @@ class Lexicon:
         return cached
 
 
+def write_emittable(path: Path, lexicon: Lexicon) -> int:
+    """Write the characters the model can emit, one per line, sorted.
+
+    The decoder needs this set before the model exists: it decides which
+    candidates the lattice asks about, and a lattice listing all 41,923 lexicon
+    characters would be four fifths padding. Only this side knows the answer --
+    it is the character table intersected with the base tokenizer's vocabulary --
+    so it is exported as an artefact of the run rather than recomputed in Rust
+    from a vocabulary file Rust would then have to parse.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{character}\n" for character in lexicon.characters), encoding="utf-8")
+    log.info("emittable set written", path=str(path), characters=lexicon.size)
+    return lexicon.size
+
+
 def build_lexicon(
     readings: Mapping[str, tuple[str, ...]],
     vocabulary: Mapping[str, int],

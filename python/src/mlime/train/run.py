@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -59,6 +60,30 @@ class Slices:
     train: tuple[str, ...]
     held_out: tuple[str, ...]
     max_held_out_examples: int = 4096
+
+    @classmethod
+    def all_but(
+        cls, samples: Path, held_out: Sequence[str], max_held_out_examples: int = 4096
+    ) -> Slices:
+        """Train on every shard under *samples* except the held-out ones.
+
+        A full epoch names four hundred shards, and naming them on a command line
+        is both unreadable and a way to leave one out by accident. Naming what is
+        *withheld* is short, is the part a reader has to check, and cannot
+        silently shrink the training set.
+        """
+        available = [path.name for path in shard_paths(samples, "*")]
+        if not available:
+            raise FileNotFoundError(f"no sample shards under {samples}")
+        missing = set(held_out) - set(available)
+        if missing:
+            raise FileNotFoundError(f"no such shards under {samples}: {sorted(missing)}")
+        withheld = set(held_out)
+        return cls(
+            train=tuple(name for name in available if name not in withheld),
+            held_out=tuple(held_out),
+            max_held_out_examples=max_held_out_examples,
+        )
 
     def __post_init__(self) -> None:
         overlap = set(self.train) & set(self.held_out)
