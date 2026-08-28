@@ -177,7 +177,7 @@ def batches(stream: CorpusStream, collator: Collator, budget: int) -> Iterator[B
     epoch = stream.epoch
     while True:
         stream.set_epoch(epoch)
-        for group in token_budget_batches(iter(stream), budget):
+        for group in token_budget_batches(iter(stream), budget, collator.max_context_tokens):
             yield collator(group)
         epoch += 1
         log.info("epoch finished", epoch=epoch, **stream.builder.counts.as_dict())
@@ -210,7 +210,9 @@ def evaluate(
     was_training = model.training
     model.eval()
     with torch.no_grad():
-        for group in token_budget_batches(iter(examples), token_budget):
+        for group in token_budget_batches(
+            iter(examples), token_budget, collator.max_context_tokens
+        ):
             batch = collator(group).to(device)
             logits = route(batch).logits
             hit, total = count_correct(route.predictions(logits, batch), batch.targets)
@@ -294,6 +296,7 @@ def train(
                 "new_lr": scheduler.get_last_lr()[1],
                 "examples": batch.size,
                 "tokens": batch.tokens,
+                "context_tokens": batch.context_tokens,
                 "seconds": round(time.monotonic() - started, 1),
                 "gates": model.gates(),
             }

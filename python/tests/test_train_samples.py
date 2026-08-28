@@ -30,6 +30,7 @@ from mlime.train.samples import (
     CorpusStream,
     SampleBuilder,
     TrainingExample,
+    context_tail,
     example_rng,
     token_budget_batches,
     type_syllables,
@@ -211,6 +212,54 @@ def test_batches_respect_the_token_budget(lexicon: Lexicon, spans: SpanVocab) ->
     for group in groups:
         width = max(len(example) for example in group) + 2
         assert width * len(group) <= 24
+
+
+def test_a_batch_pays_for_its_context_rectangle_too(lexicon: Lexicon, spans: SpanVocab) -> None:
+    """A batch of short sentences with long contexts is a *small* batch.
+
+    Bounding the fill tower alone, the sentences here are four characters and the
+    budget would admit ten of them; their contexts are the expensive half, and it
+    is that half that took a two-rank run out of memory.
+    """
+    builder = SampleBuilder(lexicon, spans, ALWAYS_FULL)
+    examples = [
+        builder.build(_sample("我爱北京", context="北" * 40), ["wo", "ai", "bei", "jing"], 0)
+        for _ in range(20)
+    ]
+    kept = [example for example in examples if example is not None]
+    assert kept, "the fixture sentence must build"
+    groups = list(token_budget_batches(iter(kept), budget=64, max_context_tokens=16))
+    assert sum(len(group) for group in groups) == len(kept)
+    for group in groups:
+        fill = max(len(example) for example in group) + 2
+        context = max(min(len(example.context or ""), 14) + 2 for example in group)
+        assert (fill + context) * len(group) <= 64
+    # Six positions of fill plus sixteen of context is twenty-two per example.
+    assert max(len(group) for group in groups) == 2
+
+
+def test_a_batch_with_no_context_tower_pays_for_the_fill_alone(
+    lexicon: Lexicon, spans: SpanVocab
+) -> None:
+    builder = SampleBuilder(lexicon, spans, ALWAYS_FULL)
+    kept = [
+        example
+        for example in (
+            builder.build(_sample("我爱北京", context="北" * 40), ["wo", "ai", "bei", "jing"], 0)
+            for _ in range(20)
+        )
+        if example is not None
+    ]
+    groups = list(token_budget_batches(iter(kept), budget=64, max_context_tokens=0))
+    assert max(len(group) for group in groups) == 10
+
+
+def test_the_context_kept_is_the_end_of_it() -> None:
+    """The cursor sits after the context, so its last characters are the useful ones."""
+    assert context_tail("一二三四五六", 5) == "四五六"
+    assert context_tail("一二", 64) == "一二"
+    with pytest.raises(ValueError, match="two sentinels"):
+        context_tail("一二", 2)
 
 
 def test_a_stream_reads_its_shards_and_reaugments(

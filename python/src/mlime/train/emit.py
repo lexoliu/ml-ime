@@ -45,6 +45,7 @@ from mlime.logging import log
 from mlime.train.lexicon import Lexicon
 from mlime.train.model import RouteAConfig, RouteAModel
 from mlime.train.samples import (
+    DEFAULT_CONTEXT_TOKENS,
     IGNORE_INDEX,
     BaseTokenizer,
     Collator,
@@ -224,7 +225,9 @@ def score_chunk(
     admitted = {record.record: record.paths for record in chunk}
 
     with torch.no_grad():
-        for group in token_budget_batches(iter(examples), token_budget):
+        for group in token_budget_batches(
+            iter(examples), token_budget, collator.max_context_tokens
+        ):
             batch = collator(group).to(device)
             logits = model(batch).logits.float()
             for row, example in enumerate(group):
@@ -304,7 +307,7 @@ def emit(
     spans: SpanVocab,
     with_context: bool,
     token_budget: int = 8192,
-    max_context_tokens: int = 128,
+    max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
     records_per_chunk: int = 256,
 ) -> Path:
     """Score *lattice* with *checkpoint* and write the score file beside a meta file.

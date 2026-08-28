@@ -28,6 +28,7 @@ from mlime.train.lexicon import Lexicon, build_lexicon, read_char_readings
 from mlime.train.loop import Accuracy, Distributed, MetricLog, TrainingConfig, evaluate, train
 from mlime.train.model import RouteAConfig, RouteAModel
 from mlime.train.samples import (
+    DEFAULT_CONTEXT_TOKENS,
     Augmentation,
     BaseTokenizer,
     Collator,
@@ -190,7 +191,7 @@ def route_a(
     route: RouteAConfig | None = None,
     augmentation: Augmentation | None = None,
     context_dropout: float = 0.3,
-    max_context_tokens: int = 128,
+    max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
 ) -> RunResult:
     """Train route A over *slices.train* and score *slices.held_out* both ways."""
     route = route or RouteAConfig()
