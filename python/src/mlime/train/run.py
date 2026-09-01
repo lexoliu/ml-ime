@@ -201,6 +201,76 @@ def build_lexicon_for(char_table: Path, tokenizer: BaseTokenizer, spans: SpanVoc
     return build_lexicon(read_char_readings(char_table), vocabulary_of(tokenizer), spans)
 
 
+@dataclass(frozen=True)
+class Vocabularies:
+    """The three tables everything a run does is indexed by.
+
+    They belong together because they are built from one another: the lexicon is
+    the pinyin table intersected with the *base model's* vocabulary, so it cannot
+    be built without the tokenizer, and the spans index both the augmentation and
+    the model's extra embedding table. Anything that reads the corpus the way a
+    run reads it -- training, and counting what training will do -- needs all
+    three, built the same way, which is why they are assembled once here rather
+    than gathered again at each call site.
+    """
+
+    spans: SpanVocab
+    tokenizer: BaseTokenizer
+    lexicon: Lexicon
+
+    @classmethod
+    def load(cls, char_table: Path, base_model: str) -> Vocabularies:
+        """Load the span table, the base model's tokenizer, and the lexicon over both."""
+        spans = SpanVocab.load()
+        tokenizer = load_tokenizer(base_model)
+        return cls(
+            spans=spans,
+            tokenizer=tokenizer,
+            lexicon=build_lexicon_for(char_table, tokenizer, spans),
+        )
+
+    @property
+    def vocabulary(self) -> dict[str, int]:
+        """The base model's ``token -> id`` map."""
+        return vocabulary_of(self.tokenizer)
+
+    def builder(self, augmentation: Augmentation | None, seed: int) -> SampleBuilder:
+        """A builder that types sentences the way *seed* and *augmentation* say."""
+        return SampleBuilder(self.lexicon, self.spans, augmentation, seed=seed)
+
+    def stream(
+        self,
+        paths: RunPaths,
+        shards: Sequence[str],
+        builder: SampleBuilder,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> CorpusStream:
+        """The shards *rank* owns, as the examples one reader of them produces."""
+        return CorpusStream(
+            paths.samples,
+            paths.labels,
+            builder,
+            shards=shards,
+            rank=rank,
+            world_size=world_size,
+        )
+
+    def collator(
+        self,
+        context_dropout: float = 0.3,
+        max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+        seed: int = 0,
+    ) -> Collator:
+        """The collator a run of these settings pads its batches with."""
+        return Collator(
+            self.tokenizer,
+            context_dropout=context_dropout,
+            max_context_tokens=max_context_tokens,
+            seed=seed,
+        )
+
+
 def held_out_examples(
     paths: RunPaths,
     builder: SampleBuilder,
@@ -250,26 +320,13 @@ def route_a(
     """
     route = route or RouteAConfig()
     world = Distributed.from_environment()
-    spans = SpanVocab.load()
-    tokenizer = load_tokenizer(route.base_model)
-    lexicon = build_lexicon_for(paths.char_table, tokenizer, spans)
-    model = RouteAModel.from_pretrained(route, lexicon, spans, vocabulary_of(tokenizer))
+    vocabularies = Vocabularies.load(paths.char_table, route.base_model)
+    spans, tokenizer, lexicon = vocabularies.spans, vocabularies.tokenizer, vocabularies.lexicon
+    model = RouteAModel.from_pretrained(route, lexicon, spans, vocabularies.vocabulary)
 
-    builder = SampleBuilder(lexicon, spans, augmentation, seed=training.seed)
-    stream = CorpusStream(
-        paths.samples,
-        paths.labels,
-        builder,
-        shards=slices.train,
-        rank=world.rank,
-        world_size=world.world_size,
-    )
-    collator = Collator(
-        tokenizer,
-        context_dropout=context_dropout,
-        max_context_tokens=max_context_tokens,
-        seed=training.seed,
-    )
+    builder = vocabularies.builder(augmentation, training.seed)
+    stream = vocabularies.stream(paths, slices.train, builder, world.rank, world.world_size)
+    collator = vocabularies.collator(context_dropout, max_context_tokens, training.seed)
 
     paths.out.mkdir(parents=True, exist_ok=True)
     with MetricLog(paths.out / "metrics.jsonl") as provenance:
