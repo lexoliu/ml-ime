@@ -215,6 +215,26 @@ class Accuracy:
         return self.correct / self.scored if self.scored else 0.0
 
 
+def epoch_groups(
+    stream: CorpusStream, collator: Collator, budget: int, epoch: int
+) -> Iterator[list[TrainingExample]]:
+    """The examples of *epoch*, grouped exactly as the steps of that epoch will be.
+
+    Grouping is not collation, and the two are separated here because three
+    things need the boundaries and none of them needs the tensors: the loop, on
+    its way to collating each group; :meth:`EpochBatches.skip`, walking a resumed
+    stream back to a saved position; and counting how many steps an epoch is
+    worth before a run fixes its schedule.
+
+    The epoch is an argument rather than a detail because it decides what the
+    examples *are*: the augmentation re-samples every epoch, an abbreviated
+    sentence is shorter than a typed-out one, and a batch boundary is a function
+    of the lengths. Counting epoch 0 twice is not counting two epochs.
+    """
+    stream.set_epoch(epoch)
+    return token_budget_batches(iter(stream), budget, collator.max_context_tokens)
+
+
 class EpochBatches(Iterator[Batch]):
     """The stream as collated batches, epoch after epoch, and where in it we are.
 
@@ -240,10 +260,7 @@ class EpochBatches(Iterator[Batch]):
 
     def _open_epoch(self) -> Iterator[list[TrainingExample]]:
         """Start reading :attr:`epoch`, grouped to the budget but not collated."""
-        self.stream.set_epoch(self.epoch)
-        return token_budget_batches(
-            iter(self.stream), self.budget, self.collator.max_context_tokens
-        )
+        return epoch_groups(self.stream, self.collator, self.budget, self.epoch)
 
     def _next_group(self) -> list[TrainingExample]:
         """The next group of examples, rolling into the next epoch at the end of one."""

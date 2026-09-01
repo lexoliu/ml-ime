@@ -13,13 +13,10 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
-import polars as pl
 import pytest
 import torch
 from transformers import BertConfig
 
-from mlime.data.corpus import SAMPLE_SCHEMA, Sample
-from mlime.train.labels import LABEL_SCHEMA
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import (
     Accuracy,
@@ -43,33 +40,6 @@ TINY = BertConfig(
     intermediate_size=64,
     max_position_embeddings=64,
 )
-
-#: Four sentences whose readings exercise a homophone choice and a polyphone.
-CORPUS = [
-    ("我爱北京", ["wo3", "ai4", "bei3", "jing1"], "北京"),
-    ("中重我绿", ["zhong1", "chong2", "wo3", "lv4"], None),
-    ("钟爱北京", ["zhong1", "ai4", "bei3", "jing1"], "钟"),
-    ("我爱绿钟", ["wo3", "ai4", "lv4", "zhong1"], "绿"),
-]
-
-
-@pytest.fixture(name="corpus")
-def corpus_fixture(tmp_path: Path) -> tuple[Path, Path]:
-    """A two-shard corpus with its labels, repeated enough to train on."""
-    samples_dir, labels_dir = tmp_path / "samples", tmp_path / "labels"
-    samples_dir.mkdir()
-    labels_dir.mkdir()
-    for shard in range(2):
-        rows, labels = [], []
-        for index in range(64):
-            text, readings, context = CORPUS[index % len(CORPUS)]
-            sample = Sample(id=f"{shard}-{index}", source="test", text=text, context=context)
-            rows.append(sample.row())
-            labels.append({"id": sample.id, "syllables": readings, "refusal": None})
-        name = f"test-{shard:05d}.parquet"
-        pl.DataFrame(rows, schema=SAMPLE_SCHEMA).write_parquet(samples_dir / name)
-        pl.DataFrame(labels, schema=LABEL_SCHEMA).write_parquet(labels_dir / name)
-    return samples_dir, labels_dir
 
 
 def test_the_warmup_ramps_then_the_cosine_decays() -> None:
@@ -173,29 +143,6 @@ def test_accuracy_is_reported_with_and_without_context(
 
 def test_an_empty_accuracy_is_zero_not_an_error() -> None:
     assert Accuracy(correct=0, scored=0).rate == 0.0
-
-
-@pytest.fixture(name="short_corpus")
-def short_corpus_fixture(tmp_path: Path) -> tuple[Path, Path]:
-    """One shard of eight sentences, so six steps cross an epoch boundary.
-
-    A resume that only ever restarts mid-epoch never exercises the epoch in the
-    position it saved, and the epoch is what re-augments the corpus: land on the
-    wrong one and every example after the resume is typed differently.
-    """
-    samples_dir, labels_dir = tmp_path / "short-samples", tmp_path / "short-labels"
-    samples_dir.mkdir()
-    labels_dir.mkdir()
-    rows, labels = [], []
-    for index in range(8):
-        text, readings, context = CORPUS[index % len(CORPUS)]
-        sample = Sample(id=f"0-{index}", source="test", text=text, context=context)
-        rows.append(sample.row())
-        labels.append({"id": sample.id, "syllables": readings, "refusal": None})
-    name = "test-00000.parquet"
-    pl.DataFrame(rows, schema=SAMPLE_SCHEMA).write_parquet(samples_dir / name)
-    pl.DataFrame(labels, schema=LABEL_SCHEMA).write_parquet(labels_dir / name)
-    return samples_dir, labels_dir
 
 
 #: Six steps over :func:`short_corpus_fixture`: four batches an epoch, so the
