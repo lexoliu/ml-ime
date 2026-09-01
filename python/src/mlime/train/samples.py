@@ -54,6 +54,28 @@ IGNORE_INDEX = -100
 #: The three typing styles, in the order their probabilities are given.
 STYLES = ("full", "abbreviated", "mixed")
 
+#: How wide the context tower's input may be, sentinels included. Sixty-four
+#: covers five sixths of the corpus's contexts whole and bounds the cost of the
+#: rest; the tower is quadratic in this number, and at 128 it was three times the
+#: fill tower's entire cost.
+DEFAULT_CONTEXT_TOKENS = 64
+
+
+def context_tail(context: str, max_tokens: int) -> str:
+    """The end of *context*, which is the part the cursor is next to.
+
+    A tokenizer truncates from the right, and the context runs *up to* the
+    sentence being typed -- so right truncation throws away the words that
+    determine it and keeps the ones furthest from it. Cutting from the left here
+    means the model always sees the characters immediately before the target.
+    Two positions are left for the sentinels the tokenizer adds.
+    """
+    if max_tokens < 3:
+        raise ValueError(
+            f"a context needs room for two sentinels and a character, got {max_tokens}"
+        )
+    return context[-(max_tokens - 2) :]
+
 
 @dataclass(frozen=True)
 class Augmentation:
@@ -357,6 +379,17 @@ class Batch:
         """Padded fill-tower positions the step costs."""
         return int(self.input_ids.shape[0] * self.input_ids.shape[1])
 
+    @property
+    def context_tokens(self) -> int:
+        """Padded context-tower positions the step costs.
+
+        Counted separately and reported separately because it is usually the
+        larger of the two: a target is nine characters on average and the text
+        before it is thirty-two, so the tower nobody thinks about is the one
+        filling the card.
+        """
+        return int(self.context_ids.shape[0] * self.context_ids.shape[1])
+
     def to(self, device: torch.device) -> Batch:
         """The same batch on *device*; the ids stay where they are."""
         return Batch(
@@ -384,7 +417,7 @@ class Collator:
         self,
         tokenizer: BaseTokenizer,
         context_dropout: float = 0.3,
-        max_context_tokens: int = 128,
+        max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
         seed: int = 0,
     ):
         if not 0.0 <= context_dropout <= 1.0:
@@ -418,7 +451,11 @@ class Collator:
             span_positions[row, 1 : length + 1] = True
             targets[row, 1 : length + 1] = torch.tensor(example.targets, dtype=torch.long)
             keep = example.context is not None and self.rng.random() >= self.context_dropout
-            contexts.append(example.context if keep and example.context else "")
+            contexts.append(
+                context_tail(example.context, self.max_context_tokens)
+                if keep and example.context
+                else ""
+            )
             has_context[row] = 1.0 if keep else 0.0
 
         encoded = self.tokenizer(
@@ -442,26 +479,47 @@ class Collator:
 
 
 def token_budget_batches(
-    examples: Iterator[TrainingExample], budget: int
+    examples: Iterator[TrainingExample],
+    budget: int,
+    max_context_tokens: int = 0,
 ) -> Iterator[list[TrainingExample]]:
-    """Group *examples* so each batch's padded fill-tower cost stays under *budget*.
+    """Group *examples* so one step's padded cost stays under *budget*.
 
-    Padded, not summed: the cost of a step is the rectangle the batch occupies,
-    so a single long sentence has to shrink the batch around it. Sentences are
-    capped at 64 characters upstream, which bounds the rectangle a single example
-    can force.
+    The cost is two rectangles and the budget covers their sum. Both are padded,
+    not summed: a step pays for the rectangle each tower occupies, so one long
+    sentence shrinks the batch around it and one long context shrinks it again.
+
+    Bounding only the fill tower -- which is what this did first -- bounds the
+    smaller of the two. Targets average nine characters and the text before them
+    averages thirty-two, so the context tower is most of the step; and a batch of
+    unusually short sentences is an unusually *large* batch, whose context
+    rectangle is then large in both dimensions. That is not a hypothetical: it is
+    what took a two-rank run out of memory ten steps in, on the same budget a
+    one-rank run had held for two hundred.
+
+    A *max_context_tokens* of zero means the contexts are not encoded at all,
+    which is the case wherever only the fill tower is under test.
     """
     if budget <= 0:
         raise ValueError(f"the token budget must be positive, got {budget}")
     batch: list[TrainingExample] = []
-    width = 0
+    fill = context = 0
     for example in examples:
-        candidate = max(width, len(example) + 2)
-        if batch and candidate * (len(batch) + 1) > budget:
+        wide = max(fill, len(example) + 2)
+        deep = max(context, _context_width(example, max_context_tokens))
+        if batch and (wide + deep) * (len(batch) + 1) > budget:
             yield batch
-            batch, width = [], 0
-            candidate = len(example) + 2
+            batch = []
+            wide = len(example) + 2
+            deep = _context_width(example, max_context_tokens)
         batch.append(example)
-        width = candidate
+        fill, context = wide, deep
     if batch:
         yield batch
+
+
+def _context_width(example: TrainingExample, max_context_tokens: int) -> int:
+    """How many context-tower positions *example* would occupy on its own."""
+    if max_context_tokens <= 0:
+        return 0
+    return min(len(example.context or ""), max_context_tokens - 2) + 2
