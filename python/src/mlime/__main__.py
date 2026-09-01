@@ -337,6 +337,11 @@ def train_route_a(
     seed: int = typer.Option(0, help="Augmentation and initialisation seed"),
     fp16: bool = typer.Option(True, help="Train in fp16 with loss scaling"),
     checkpoint_every: int = typer.Option(500, help="Steps between checkpoints"),
+    keep_checkpoints: int = typer.Option(2, help="Numbered checkpoints to keep on disk"),
+    resume: Path = typer.Option(
+        None,
+        help="Continue the run that wrote this checkpoint; every other option must match it",
+    ),
     max_held_out: int = typer.Option(4096, help="Held-out examples to score"),
     verbose: bool = VERBOSE,
 ) -> None:
@@ -376,7 +381,9 @@ def train_route_a(
             seed=seed,
             fp16=fp16,
             checkpoint_every=checkpoint_every,
+            keep_checkpoints=keep_checkpoints,
         ),
+        resume=resume,
     )
     typer.echo(f"loss {result.first_loss:.4f} -> {result.last_loss:.4f} over {result.steps} steps")
     typer.echo(
