@@ -10,6 +10,12 @@ between those two numbers.
 
 Every run records what it was made of: which shards, which labels, which seed,
 and which commit, so a metrics file found six months later is still evidence.
+
+A run can also be longer than one kernel. Then :func:`route_a` is called once per
+segment, each continuing the last one's checkpoint, and every segment but the
+last stops on its wall budget with nothing scored: the held-out numbers describe
+a finished model, and a segment that paused halfway through the schedule has not
+got one to describe.
 """
 
 from __future__ import annotations
@@ -25,7 +31,15 @@ import torch
 from mlime.data.shards import shard_paths
 from mlime.logging import log
 from mlime.train.lexicon import Lexicon, build_lexicon, read_char_readings
-from mlime.train.loop import Accuracy, Distributed, MetricLog, TrainingConfig, evaluate, train
+from mlime.train.loop import (
+    Accuracy,
+    Distributed,
+    MetricLog,
+    Segment,
+    TrainingConfig,
+    evaluate,
+    train,
+)
 from mlime.train.model import RouteAConfig, RouteAModel
 from mlime.train.samples import (
     DEFAULT_CONTEXT_TOKENS,
@@ -103,15 +117,41 @@ class RunResult:
     new metrics file, so its ``first_loss`` is the loss at the step after the
     checkpoint, not the loss the run started from: the run's own first loss is in
     the first segment's file, and the segments are read together.
+
+    A segment that paused on its wall budget has no accuracies, and they are
+    ``None`` rather than zeroes or last-known values: a placeholder here would be
+    quoted as a result, and "0.0 with context" is a number somebody would act on.
+    :attr:`scored` is how a caller asks for them, and it refuses rather than
+    inventing.
     """
 
     metrics: Path
     first_loss: float
     last_loss: float
     steps: int
-    with_context: Accuracy
-    without_context: Accuracy
+    step: int
+    finished: bool
+    with_context: Accuracy | None
+    without_context: Accuracy | None
     gates: list[float]
+
+    def __post_init__(self) -> None:
+        measured = self.with_context is not None and self.without_context is not None
+        if measured != self.finished:
+            raise ValueError(
+                f"a run that {'finished' if self.finished else 'paused'} at step {self.step} "
+                f"{'has no' if measured else 'has'} held-out accuracy"
+            )
+
+    @property
+    def scored(self) -> tuple[Accuracy, Accuracy]:
+        """The accuracies with and without context, or a refusal if it paused."""
+        if self.with_context is None or self.without_context is None:
+            raise ValueError(
+                f"the run paused at step {self.step} and was never scored; "
+                "resume it to the end before quoting an accuracy"
+            )
+        return self.with_context, self.without_context
 
 
 def corpus_digest(paths: list[Path]) -> str:
@@ -249,8 +289,10 @@ def route_a(
                 resume=str(resume) if resume is not None else None,
             )
 
-    metrics = train(model, stream, collator, training, paths.out, world, resume)
-    losses = _losses(metrics)
+    segment = train(model, stream, collator, training, paths.out, world, resume)
+    losses = _losses(segment.metrics)
+    if not segment.finished:
+        return paused_run(segment, losses, model.gates(), builder.counts.as_dict(), world)
     evaluation = held_out_examples(
         paths, SampleBuilder(lexicon, spans, augmentation, seed=training.seed + 1), slices
     )
@@ -258,18 +300,22 @@ def route_a(
     with_context = evaluate(model, evaluation, tokenizer, device, training.token_budget, True)
     without_context = evaluate(model, evaluation, tokenizer, device, training.token_budget, False)
     result = RunResult(
-        metrics=metrics,
+        metrics=segment.metrics,
         first_loss=losses[0],
         last_loss=losses[-1],
         steps=len(losses),
+        step=segment.step,
+        finished=True,
         with_context=with_context,
         without_context=without_context,
         gates=model.gates(),
     )
     if world.is_main:
-        with MetricLog(metrics) as summary:
+        with MetricLog(segment.metrics) as summary:
             summary.write(
                 event="summary",
+                finished=True,
+                step=result.step,
                 first_loss=result.first_loss,
                 last_loss=result.last_loss,
                 logged_steps=result.steps,
@@ -290,6 +336,53 @@ def route_a(
         gates=[round(gate, 5) for gate in result.gates],
     )
     return result
+
+
+def paused_run(
+    segment: Segment,
+    losses: list[float],
+    gates: list[float],
+    build_counts: dict[str, int],
+    world: Distributed,
+) -> RunResult:
+    """The result of a segment that spent its wall budget before the last step.
+
+    The held-out slice is not scored: scoring is minutes of forward passes, and
+    the number it would produce describes a model that is halfway through its
+    schedule, at a learning rate the cosine has not brought down yet. It is not a
+    cheaper version of the run's accuracy, it is a different quantity, and
+    reporting it beside finished runs is how the two get compared.
+    """
+    if world.is_main:
+        with MetricLog(segment.metrics) as summary:
+            summary.write(
+                event="summary",
+                finished=False,
+                step=segment.step,
+                first_loss=losses[0],
+                last_loss=losses[-1],
+                logged_steps=len(losses),
+                gates=gates,
+                build_counts=build_counts,
+            )
+    log.info(
+        "route A segment paused on its wall budget",
+        step=segment.step,
+        first_loss=round(losses[0], 4),
+        last_loss=round(losses[-1], 4),
+        gates=[round(gate, 5) for gate in gates],
+    )
+    return RunResult(
+        metrics=segment.metrics,
+        first_loss=losses[0],
+        last_loss=losses[-1],
+        steps=len(losses),
+        step=segment.step,
+        finished=False,
+        with_context=None,
+        without_context=None,
+        gates=gates,
+    )
 
 
 def _losses(metrics: Path) -> list[float]:
