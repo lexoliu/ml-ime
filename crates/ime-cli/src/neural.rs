@@ -117,7 +117,7 @@ impl Emissions for NoEmissions {
 
 /// The model's log probabilities, read out of a score file.
 struct NeuralEmissions<'a> {
-    scores: HashMap<usize, Vec<Vec<Vec<f32>>>>,
+    scores: &'a HashMap<usize, Vec<Vec<Vec<f32>>>>,
     emittable: &'a Emittable,
     weight: f32,
     floor: f32,
@@ -263,10 +263,15 @@ pub fn emit_lattice(
 /// Score an evaluation set with the n-gram, with the neural emissions, or with
 /// both fused.
 ///
+/// Without a score file the run is the n-gram baseline; without an n-gram it is
+/// the emissions alone; with both, every weight in *weights* is one fused
+/// configuration.
+///
 /// # Errors
 ///
-/// If any input cannot be read, a record cannot be decoded, or a score file does
-/// not describe the lattice the records segment into.
+/// If neither a score file nor an n-gram was given, any input cannot be read, a
+/// record cannot be decoded, or a score file does not describe the lattice the
+/// records segment into.
 #[expect(
     clippy::too_many_arguments,
     reason = "every argument is a distinct axis of the ablation the command exists to run"
@@ -277,13 +282,12 @@ pub fn fused_eval(
     emittable: &Path,
     floor: f32,
     weights: &[f32],
-    with_transition: bool,
     slice: &SliceArgs,
     table: SyllableTable,
     lexicon: Lexicon,
     segment: SegmentOptions,
     beam: &BeamOptions,
-    ngram: &NgramModel,
+    ngram: Option<&NgramModel>,
 ) -> Result<String> {
     let set = load_set(eval_set)?;
     let emittable = load_emittable(emittable, &lexicon)?;
@@ -293,41 +297,40 @@ pub fn fused_eval(
         segment,
     };
     let mut sections = Vec::new();
-    match scores {
-        None => {
-            if !with_transition {
-                bail!("a run with neither emissions nor a transition model scores nothing");
-            }
-            sections.push(Section {
-                emission: "none",
-                weight: 0.0,
-                transition: "kn-trigram",
-                slice: slice.slice.label(),
-                report: measure(&set, slice, &reader, &NoEmissions, ngram, beam)?,
-            });
+    match (scores, ngram) {
+        (None, None) => {
+            bail!("a run with neither emissions nor a transition model scores nothing")
         }
-        Some(path) => {
+        (None, Some(ngram)) => sections.push(Section {
+            emission: "none",
+            weight: 0.0,
+            transition: "kn-trigram",
+            slice: slice.slice.label(),
+            report: measure(&set, slice, &reader, &NoEmissions, ngram, beam)?,
+        }),
+        (Some(path), ngram) => {
             let scores = load_scores(path)?;
             for &weight in weights {
                 let emissions = NeuralEmissions {
-                    scores: scores.clone(),
+                    scores: &scores,
                     emittable: &emittable,
                     weight,
                     floor,
                 };
-                let report = if with_transition {
-                    measure(&set, slice, &reader, &emissions, ngram, beam)?
-                } else {
-                    measure(&set, slice, &reader, &emissions, &NoTransition, beam)?
+                let (transition, report) = match ngram {
+                    Some(ngram) => (
+                        "kn-trigram",
+                        measure(&set, slice, &reader, &emissions, ngram, beam)?,
+                    ),
+                    None => (
+                        "none",
+                        measure(&set, slice, &reader, &emissions, &NoTransition, beam)?,
+                    ),
                 };
                 sections.push(Section {
                     emission: "neural",
                     weight,
-                    transition: if with_transition {
-                        "kn-trigram"
-                    } else {
-                        "none"
-                    },
+                    transition,
                     slice: slice.slice.label(),
                     report,
                 });

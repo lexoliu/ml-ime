@@ -104,9 +104,15 @@ enum Command {
     },
     /// Decode an evaluation set with the neural emissions fused into the beam.
     FusedEval {
-        /// A model written by `train-ngram`.
-        #[arg(long)]
-        model: PathBuf,
+        /// A model written by `train-ngram`. Required unless the run drops the
+        /// transition, and refused when it does: a model that would go unused
+        /// is a mistyped command, not a request.
+        #[arg(
+            long,
+            required_unless_present = "no_transition",
+            conflicts_with = "no_transition"
+        )]
+        model: Option<PathBuf>,
         /// The same JSON Lines evaluation set the lattice was emitted from.
         #[arg(long)]
         eval_set: PathBuf,
@@ -126,7 +132,7 @@ enum Command {
         #[arg(long, value_parser = parse_weight, default_values_t = [1.0f32])]
         weight: Vec<f32>,
         /// Drop the n-gram and decode on the emissions alone.
-        #[arg(long)]
+        #[arg(long, requires = "scores")]
         no_transition: bool,
         #[command(flatten)]
         slice: SliceArgs,
@@ -231,17 +237,16 @@ async fn main() -> Result<()> {
             emittable,
             unscored,
             weight,
-            no_transition,
+            no_transition: _,
             slice,
             search,
         } => fused_eval(&FusedRun {
-            model: &model,
+            model: model.as_deref(),
             eval_set: &eval_set,
             scores: scores.as_deref(),
             emittable: &emittable,
             unscored,
             weights: &weight,
-            with_transition: !no_transition,
             slice: &slice,
             search: &search,
         }),
@@ -338,33 +343,36 @@ fn load_ngram(path: &Path, lexicon: &Lexicon) -> Result<NgramModel> {
 /// a knob the report has to quote and a swapped pair of paths would produce a
 /// number rather than an error.
 struct FusedRun<'a> {
-    model: &'a Path,
+    /// Absent exactly when the run was asked to drop the transition; the
+    /// argument parser holds the two flags to that relationship.
+    model: Option<&'a Path>,
     eval_set: &'a Path,
     scores: Option<&'a Path>,
     emittable: &'a Path,
     unscored: f32,
     weights: &'a [f32],
-    with_transition: bool,
     slice: &'a SliceArgs,
     search: &'a SearchArgs,
 }
 
 fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
     let (table, lexicon) = tables()?;
-    let ngram = load_ngram(run.model, &lexicon)?;
+    let ngram = run
+        .model
+        .map(|path| load_ngram(path, &lexicon))
+        .transpose()?;
     let rendered = neural::fused_eval(
         run.eval_set,
         run.scores,
         run.emittable,
         run.unscored,
         run.weights,
-        run.with_transition,
         run.slice,
         table,
         lexicon,
         run.search.segment(),
         &run.search.beam(),
-        &ngram,
+        ngram.as_ref(),
     )?;
     write!(std::io::stdout(), "{rendered}").context("could not write to stdout")
 }
