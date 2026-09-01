@@ -10,6 +10,12 @@ between those two numbers.
 
 Every run records what it was made of: which shards, which labels, which seed,
 and which commit, so a metrics file found six months later is still evidence.
+
+A run can also be longer than one kernel. Then :func:`route_a` is called once per
+segment, each continuing the last one's checkpoint, and every segment but the
+last stops on its wall budget with nothing scored: the held-out numbers describe
+a finished model, and a segment that paused halfway through the schedule has not
+got one to describe.
 """
 
 from __future__ import annotations
@@ -25,7 +31,15 @@ import torch
 from mlime.data.shards import shard_paths
 from mlime.logging import log
 from mlime.train.lexicon import Lexicon, build_lexicon, read_char_readings
-from mlime.train.loop import Accuracy, Distributed, MetricLog, TrainingConfig, evaluate, train
+from mlime.train.loop import (
+    Accuracy,
+    Distributed,
+    MetricLog,
+    Segment,
+    TrainingConfig,
+    evaluate,
+    train,
+)
 from mlime.train.model import RouteAConfig, RouteAModel
 from mlime.train.samples import (
     DEFAULT_CONTEXT_TOKENS,
@@ -96,15 +110,48 @@ class Slices:
 
 @dataclass(frozen=True)
 class RunResult:
-    """What a run produced, in the form the report quotes."""
+    """What a run produced, in the form the report quotes.
+
+    ``first_loss`` and ``last_loss`` are the first and last losses this
+    *segment*'s metrics file recorded. A run resumed into a new kernel writes a
+    new metrics file, so its ``first_loss`` is the loss at the step after the
+    checkpoint, not the loss the run started from: the run's own first loss is in
+    the first segment's file, and the segments are read together.
+
+    A segment that paused on its wall budget has no accuracies, and they are
+    ``None`` rather than zeroes or last-known values: a placeholder here would be
+    quoted as a result, and "0.0 with context" is a number somebody would act on.
+    :attr:`scored` is how a caller asks for them, and it refuses rather than
+    inventing.
+    """
 
     metrics: Path
     first_loss: float
     last_loss: float
     steps: int
-    with_context: Accuracy
-    without_context: Accuracy
+    step: int
+    finished: bool
+    with_context: Accuracy | None
+    without_context: Accuracy | None
     gates: list[float]
+
+    def __post_init__(self) -> None:
+        measured = self.with_context is not None and self.without_context is not None
+        if measured != self.finished:
+            raise ValueError(
+                f"a run that {'finished' if self.finished else 'paused'} at step {self.step} "
+                f"{'has no' if measured else 'has'} held-out accuracy"
+            )
+
+    @property
+    def scored(self) -> tuple[Accuracy, Accuracy]:
+        """The accuracies with and without context, or a refusal if it paused."""
+        if self.with_context is None or self.without_context is None:
+            raise ValueError(
+                f"the run paused at step {self.step} and was never scored; "
+                "resume it to the end before quoting an accuracy"
+            )
+        return self.with_context, self.without_context
 
 
 def corpus_digest(paths: list[Path]) -> str:
@@ -154,6 +201,76 @@ def build_lexicon_for(char_table: Path, tokenizer: BaseTokenizer, spans: SpanVoc
     return build_lexicon(read_char_readings(char_table), vocabulary_of(tokenizer), spans)
 
 
+@dataclass(frozen=True)
+class Vocabularies:
+    """The three tables everything a run does is indexed by.
+
+    They belong together because they are built from one another: the lexicon is
+    the pinyin table intersected with the *base model's* vocabulary, so it cannot
+    be built without the tokenizer, and the spans index both the augmentation and
+    the model's extra embedding table. Anything that reads the corpus the way a
+    run reads it -- training, and counting what training will do -- needs all
+    three, built the same way, which is why they are assembled once here rather
+    than gathered again at each call site.
+    """
+
+    spans: SpanVocab
+    tokenizer: BaseTokenizer
+    lexicon: Lexicon
+
+    @classmethod
+    def load(cls, char_table: Path, base_model: str) -> Vocabularies:
+        """Load the span table, the base model's tokenizer, and the lexicon over both."""
+        spans = SpanVocab.load()
+        tokenizer = load_tokenizer(base_model)
+        return cls(
+            spans=spans,
+            tokenizer=tokenizer,
+            lexicon=build_lexicon_for(char_table, tokenizer, spans),
+        )
+
+    @property
+    def vocabulary(self) -> dict[str, int]:
+        """The base model's ``token -> id`` map."""
+        return vocabulary_of(self.tokenizer)
+
+    def builder(self, augmentation: Augmentation | None, seed: int) -> SampleBuilder:
+        """A builder that types sentences the way *seed* and *augmentation* say."""
+        return SampleBuilder(self.lexicon, self.spans, augmentation, seed=seed)
+
+    def stream(
+        self,
+        paths: RunPaths,
+        shards: Sequence[str],
+        builder: SampleBuilder,
+        rank: int = 0,
+        world_size: int = 1,
+    ) -> CorpusStream:
+        """The shards *rank* owns, as the examples one reader of them produces."""
+        return CorpusStream(
+            paths.samples,
+            paths.labels,
+            builder,
+            shards=shards,
+            rank=rank,
+            world_size=world_size,
+        )
+
+    def collator(
+        self,
+        context_dropout: float = 0.3,
+        max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+        seed: int = 0,
+    ) -> Collator:
+        """The collator a run of these settings pads its batches with."""
+        return Collator(
+            self.tokenizer,
+            context_dropout=context_dropout,
+            max_context_tokens=max_context_tokens,
+            seed=seed,
+        )
+
+
 def held_out_examples(
     paths: RunPaths,
     builder: SampleBuilder,
@@ -192,30 +309,24 @@ def route_a(
     augmentation: Augmentation | None = None,
     context_dropout: float = 0.3,
     max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+    resume: Path | None = None,
 ) -> RunResult:
-    """Train route A over *slices.train* and score *slices.held_out* both ways."""
+    """Train route A over *slices.train* and score *slices.held_out* both ways.
+
+    With *resume*, this segment continues the run that wrote that checkpoint
+    rather than starting one: same weights, same optimiser, same place in the
+    corpus. The checkpoint carries the config it was written under and refuses
+    anything else, so the chain of kernels is one run or it is an error.
+    """
     route = route or RouteAConfig()
     world = Distributed.from_environment()
-    spans = SpanVocab.load()
-    tokenizer = load_tokenizer(route.base_model)
-    lexicon = build_lexicon_for(paths.char_table, tokenizer, spans)
-    model = RouteAModel.from_pretrained(route, lexicon, spans, vocabulary_of(tokenizer))
+    vocabularies = Vocabularies.load(paths.char_table, route.base_model)
+    spans, tokenizer, lexicon = vocabularies.spans, vocabularies.tokenizer, vocabularies.lexicon
+    model = RouteAModel.from_pretrained(route, lexicon, spans, vocabularies.vocabulary)
 
-    builder = SampleBuilder(lexicon, spans, augmentation, seed=training.seed)
-    stream = CorpusStream(
-        paths.samples,
-        paths.labels,
-        builder,
-        shards=slices.train,
-        rank=world.rank,
-        world_size=world.world_size,
-    )
-    collator = Collator(
-        tokenizer,
-        context_dropout=context_dropout,
-        max_context_tokens=max_context_tokens,
-        seed=training.seed,
-    )
+    builder = vocabularies.builder(augmentation, training.seed)
+    stream = vocabularies.stream(paths, slices.train, builder, world.rank, world.world_size)
+    collator = vocabularies.collator(context_dropout, max_context_tokens, training.seed)
 
     paths.out.mkdir(parents=True, exist_ok=True)
     with MetricLog(paths.out / "metrics.jsonl") as provenance:
@@ -232,10 +343,13 @@ def route_a(
                 route_a=asdict(route),
                 emittable_characters=lexicon.size,
                 typed_spans=lexicon.spans,
+                resume=str(resume) if resume is not None else None,
             )
 
-    metrics = train(model, stream, collator, training, paths.out, world)
-    losses = _losses(metrics)
+    segment = train(model, stream, collator, training, paths.out, world, resume)
+    losses = _losses(segment.metrics)
+    if not segment.finished:
+        return paused_run(segment, losses, model.gates(), builder.counts.as_dict(), world)
     evaluation = held_out_examples(
         paths, SampleBuilder(lexicon, spans, augmentation, seed=training.seed + 1), slices
     )
@@ -243,18 +357,22 @@ def route_a(
     with_context = evaluate(model, evaluation, tokenizer, device, training.token_budget, True)
     without_context = evaluate(model, evaluation, tokenizer, device, training.token_budget, False)
     result = RunResult(
-        metrics=metrics,
+        metrics=segment.metrics,
         first_loss=losses[0],
         last_loss=losses[-1],
         steps=len(losses),
+        step=segment.step,
+        finished=True,
         with_context=with_context,
         without_context=without_context,
         gates=model.gates(),
     )
     if world.is_main:
-        with MetricLog(metrics) as summary:
+        with MetricLog(segment.metrics) as summary:
             summary.write(
                 event="summary",
+                finished=True,
+                step=result.step,
                 first_loss=result.first_loss,
                 last_loss=result.last_loss,
                 logged_steps=result.steps,
@@ -275,6 +393,53 @@ def route_a(
         gates=[round(gate, 5) for gate in result.gates],
     )
     return result
+
+
+def paused_run(
+    segment: Segment,
+    losses: list[float],
+    gates: list[float],
+    build_counts: dict[str, int],
+    world: Distributed,
+) -> RunResult:
+    """The result of a segment that spent its wall budget before the last step.
+
+    The held-out slice is not scored: scoring is minutes of forward passes, and
+    the number it would produce describes a model that is halfway through its
+    schedule, at a learning rate the cosine has not brought down yet. It is not a
+    cheaper version of the run's accuracy, it is a different quantity, and
+    reporting it beside finished runs is how the two get compared.
+    """
+    if world.is_main:
+        with MetricLog(segment.metrics) as summary:
+            summary.write(
+                event="summary",
+                finished=False,
+                step=segment.step,
+                first_loss=losses[0],
+                last_loss=losses[-1],
+                logged_steps=len(losses),
+                gates=gates,
+                build_counts=build_counts,
+            )
+    log.info(
+        "route A segment paused on its wall budget",
+        step=segment.step,
+        first_loss=round(losses[0], 4),
+        last_loss=round(losses[-1], 4),
+        gates=[round(gate, 5) for gate in gates],
+    )
+    return RunResult(
+        metrics=segment.metrics,
+        first_loss=losses[0],
+        last_loss=losses[-1],
+        steps=len(losses),
+        step=segment.step,
+        finished=False,
+        with_context=None,
+        without_context=None,
+        gates=gates,
+    )
 
 
 def _losses(metrics: Path) -> list[float]:

@@ -14,11 +14,15 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 
 from mlime.data import DataLayout
 from mlime.logging import configure
+
+if TYPE_CHECKING:  # the training modules pull in torch; --help must not
+    from mlime.train.run import RunPaths, Slices
 
 app = typer.Typer(help="ml-ime data pipeline", no_args_is_help=True)
 corpus_app = typer.Typer(help="Acquire and filter training corpora", no_args_is_help=True)
@@ -45,6 +49,25 @@ EXCLUDE = typer.Option(
     "--exclude",
     help="JSON Lines file whose `text` fields are held out of the corpus; repeatable",
 )
+
+# What a route A command needs to know to read the corpus the way training will.
+# Shared between `train route-a` and `train count-batches` because a count taken
+# under a different token budget or a different seed is a count of a different
+# run, and two copies of these definitions is how that happens.
+LABELS = typer.Option(None, "--labels", help="Label shards; defaults to <data-dir>/labels")
+CHAR_TABLE = typer.Option(None, "--char-table", help="ime-pinyin's char_pinyin.tsv")
+TRAIN_SHARD = typer.Option(
+    None,
+    "--train-shard",
+    help="Shard to train on; repeatable. Omitted, every shard that is not held out",
+)
+HELD_OUT_SHARD = typer.Option(
+    None, "--held-out-shard", help="Shard to score but never train on; repeatable"
+)
+TOKEN_BUDGET = typer.Option(
+    8192, "--token-budget", help="Padded positions per step, both towers together"
+)
+SEED = typer.Option(0, "--seed", help="Augmentation and initialisation seed")
 
 
 @app.callback()
@@ -316,58 +339,81 @@ def train_labels(
     )
 
 
-@train_app.command("route-a")
-def train_route_a(
-    data_dir: Path = DATA_DIR,
-    labels: Path = typer.Option(None, help="Label shards; defaults to <data-dir>/labels"),
-    out: Path = typer.Option(Path("runs/route-a"), help="Where checkpoints and metrics go"),
-    char_table: Path = typer.Option(None, help="ime-pinyin's char_pinyin.tsv"),
-    train_shard: list[str] = typer.Option(
-        None,
-        "--train-shard",
-        help="Shard to train on; repeatable. Omitted, every shard that is not held out",
-    ),
-    held_out_shard: list[str] = typer.Option(
-        None, "--held-out-shard", help="Shard to score but never train on; repeatable"
-    ),
-    max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
-    token_budget: int = typer.Option(8192, help="Padded positions per step, both towers together"),
-    base_lr: float = typer.Option(3e-5, help="Learning rate for the pretrained weights"),
-    new_lr: float = typer.Option(1e-4, help="Learning rate for the tables route A adds"),
-    seed: int = typer.Option(0, help="Augmentation and initialisation seed"),
-    fp16: bool = typer.Option(True, help="Train in fp16 with loss scaling"),
-    checkpoint_every: int = typer.Option(500, help="Steps between checkpoints"),
-    max_held_out: int = typer.Option(4096, help="Held-out examples to score"),
-    verbose: bool = VERBOSE,
-) -> None:
-    """Train route A on the given shards and score the held-out ones, context on and off."""
-    configure(verbose)
+def route_a_paths(
+    data_dir: Path, labels: Path | None, char_table: Path | None, out: Path
+) -> RunPaths:
+    """The four paths a route A command reads and writes, with the table located.
+
+    The import is inside the body for the same reason the commands' are: this
+    module is also the one that prints ``--help``, and ``mlime.train.run`` pulls
+    in torch.
+    """
     from mlime.data.corpus import default_char_table
-    from mlime.train.loop import TrainingConfig
-    from mlime.train.run import RunPaths, Slices, describe_device, route_a
+    from mlime.train.run import RunPaths
 
     table = char_table or default_char_table()
     if table is None:
         raise typer.BadParameter("no char_pinyin.tsv found above the working directory")
     layout = DataLayout(data_dir)
-    typer.echo(f"device: {describe_device()}")
-    slices = (
-        Slices(
+    return RunPaths(
+        samples=layout.samples,
+        labels=labels or data_dir / "labels",
+        char_table=table,
+        out=out,
+    )
+
+
+def route_a_slices(
+    data_dir: Path, train_shard: list[str], held_out_shard: list[str], max_held_out: int = 4096
+) -> Slices:
+    """Which shards are trained on and which are withheld, named or derived."""
+    from mlime.train.run import Slices
+
+    if train_shard:
+        return Slices(
             train=tuple(train_shard),
             held_out=tuple(held_out_shard or ()),
             max_held_out_examples=max_held_out,
         )
-        if train_shard
-        else Slices.all_but(layout.samples, held_out_shard or (), max_held_out)
-    )
+    return Slices.all_but(DataLayout(data_dir).samples, held_out_shard or (), max_held_out)
+
+
+@train_app.command("route-a")
+def train_route_a(
+    data_dir: Path = DATA_DIR,
+    labels: Path = LABELS,
+    out: Path = typer.Option(Path("runs/route-a"), help="Where checkpoints and metrics go"),
+    char_table: Path = CHAR_TABLE,
+    train_shard: list[str] = TRAIN_SHARD,
+    held_out_shard: list[str] = HELD_OUT_SHARD,
+    max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
+    token_budget: int = TOKEN_BUDGET,
+    base_lr: float = typer.Option(3e-5, help="Learning rate for the pretrained weights"),
+    new_lr: float = typer.Option(1e-4, help="Learning rate for the tables route A adds"),
+    seed: int = SEED,
+    fp16: bool = typer.Option(True, help="Train in fp16 with loss scaling"),
+    checkpoint_every: int = typer.Option(500, help="Steps between checkpoints"),
+    keep_checkpoints: int = typer.Option(2, help="Numbered checkpoints to keep on disk"),
+    wall_budget_seconds: float = typer.Option(
+        None,
+        help="Pause and checkpoint after this many seconds, for a session that gets killed",
+    ),
+    resume: Path = typer.Option(
+        None,
+        help="Continue the run that wrote this checkpoint; every other option must match it",
+    ),
+    max_held_out: int = typer.Option(4096, help="Held-out examples to score"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Train route A on the given shards and score the held-out ones, context on and off."""
+    configure(verbose)
+    from mlime.train.loop import TrainingConfig
+    from mlime.train.run import describe_device, route_a
+
+    typer.echo(f"device: {describe_device()}")
     result = route_a(
-        RunPaths(
-            samples=layout.samples,
-            labels=labels or data_dir / "labels",
-            char_table=table,
-            out=out,
-        ),
-        slices,
+        route_a_paths(data_dir, labels, char_table, out),
+        route_a_slices(data_dir, train_shard, held_out_shard, max_held_out),
         TrainingConfig(
             max_steps=max_steps,
             base_lr=base_lr,
@@ -376,13 +422,67 @@ def train_route_a(
             seed=seed,
             fp16=fp16,
             checkpoint_every=checkpoint_every,
+            keep_checkpoints=keep_checkpoints,
+            wall_budget_seconds=wall_budget_seconds,
         ),
+        resume=resume,
     )
     typer.echo(f"loss {result.first_loss:.4f} -> {result.last_loss:.4f} over {result.steps} steps")
+    if not result.finished:
+        typer.echo(
+            f"paused at step {result.step} of {max_steps}; the next kernel continues it with "
+            f"--resume {out / 'checkpoint-paused.pt'}"
+        )
+        return
+    with_context, without_context = result.scored
     typer.echo(
-        f"held-out character accuracy: context on {result.with_context.rate:.4f}, "
-        f"off {result.without_context.rate:.4f} "
-        f"({result.with_context.scored} characters)"
+        f"held-out character accuracy: context on {with_context.rate:.4f}, "
+        f"off {without_context.rate:.4f} "
+        f"({with_context.scored} characters)"
+    )
+
+
+@train_app.command("count-batches")
+def train_count_batches(
+    out: Path = typer.Option(..., "--out", help="Where the JSON census goes"),
+    data_dir: Path = DATA_DIR,
+    labels: Path = LABELS,
+    char_table: Path = CHAR_TABLE,
+    train_shard: list[str] = TRAIN_SHARD,
+    held_out_shard: list[str] = HELD_OUT_SHARD,
+    token_budget: int = TOKEN_BUDGET,
+    seed: int = SEED,
+    base_model: str = typer.Option("hfl/chinese-macbert-base", help="The base checkpoint"),
+    world_size: int = typer.Option(1, help="Ranks the run will be sharded across"),
+    epochs: int = typer.Option(1, help="Epochs to count"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Count the steps *epochs* of the training shards come to, for --max-steps.
+
+    The cosine schedule ends exactly at ``--max-steps``, so the number has to be
+    the one the loop will actually reach. This replays the loop's own grouping
+    over the same shards at the same epochs and counts the batches; it builds no
+    model and collates nothing.
+    """
+    configure(verbose)
+    from mlime.train.count import count_batches
+    from mlime.train.run import Vocabularies
+
+    paths = route_a_paths(data_dir, labels, char_table, out.parent)
+    census = count_batches(
+        Vocabularies.load(paths.char_table, base_model),
+        paths,
+        route_a_slices(data_dir, train_shard, held_out_shard),
+        token_budget=token_budget,
+        seed=seed,
+        world_size=world_size,
+        epochs=epochs,
+    )
+    census.write(out)
+    typer.echo(
+        f"{census.steps_for_epochs} steps for {epochs} epoch(s) over "
+        f"{len(census.shards)} shards on {world_size} rank(s); "
+        f"per rank {[rank.total for rank in census.ranks]}"
     )
 
 
