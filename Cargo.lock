@@ -1725,6 +1725,7 @@ dependencies = [
  "anyhow",
  "askama",
  "clap",
+ "flate2",
  "ime-corpus",
  "ime-decode",
  "ime-eval",
@@ -1767,6 +1768,8 @@ name = "ime-decode"
 version = "0.1.0"
 dependencies = [
  "ime-pinyin",
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 
@@ -1775,6 +1778,7 @@ name = "ime-eval"
 version = "0.1.0"
 dependencies = [
  "askama",
+ "blake2",
  "serde",
  "serde_json",
  "thiserror",
