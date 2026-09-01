@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -27,6 +28,7 @@ from mlime.train.lexicon import Lexicon, build_lexicon, read_char_readings
 from mlime.train.loop import Accuracy, Distributed, MetricLog, TrainingConfig, evaluate, train
 from mlime.train.model import RouteAConfig, RouteAModel
 from mlime.train.samples import (
+    DEFAULT_CONTEXT_TOKENS,
     Augmentation,
     BaseTokenizer,
     Collator,
@@ -59,6 +61,30 @@ class Slices:
     train: tuple[str, ...]
     held_out: tuple[str, ...]
     max_held_out_examples: int = 4096
+
+    @classmethod
+    def all_but(
+        cls, samples: Path, held_out: Sequence[str], max_held_out_examples: int = 4096
+    ) -> Slices:
+        """Train on every shard under *samples* except the held-out ones.
+
+        A full epoch names four hundred shards, and naming them on a command line
+        is both unreadable and a way to leave one out by accident. Naming what is
+        *withheld* is short, is the part a reader has to check, and cannot
+        silently shrink the training set.
+        """
+        available = [path.name for path in shard_paths(samples, "*")]
+        if not available:
+            raise FileNotFoundError(f"no sample shards under {samples}")
+        missing = set(held_out) - set(available)
+        if missing:
+            raise FileNotFoundError(f"no such shards under {samples}: {sorted(missing)}")
+        withheld = set(held_out)
+        return cls(
+            train=tuple(name for name in available if name not in withheld),
+            held_out=tuple(held_out),
+            max_held_out_examples=max_held_out_examples,
+        )
 
     def __post_init__(self) -> None:
         overlap = set(self.train) & set(self.held_out)
@@ -133,14 +159,27 @@ def held_out_examples(
     builder: SampleBuilder,
     slices: Slices,
 ) -> list[TrainingExample]:
-    """Build the evaluation slice once, so both passes score the same examples."""
+    """Build the evaluation slice once, so both passes score the same examples.
+
+    Drawn evenly across the held-out shards rather than in file order. The shards
+    are chosen one per source so that the number this produces speaks for the
+    corpus, and any one of them holds several times the whole quota -- read in
+    order, the "held-out accuracy" would be one source's accuracy with six
+    sources' names on it, and whichever source sorted first would silently decide
+    what the run reports.
+    """
     if not slices.held_out:
         return []
-    stream = CorpusStream(paths.samples, paths.labels, builder, shards=slices.held_out)
-    examples = []
-    for example in stream:
-        examples.append(example)
-        if len(examples) >= slices.max_held_out_examples:
+    quota = slices.max_held_out_examples
+    per_shard = max(1, quota // len(slices.held_out))
+    examples: list[TrainingExample] = []
+    for shard in slices.held_out:
+        stream = CorpusStream(paths.samples, paths.labels, builder, shards=[shard])
+        for taken, example in enumerate(stream, start=1):
+            examples.append(example)
+            if taken >= per_shard or len(examples) >= quota:
+                break
+        if len(examples) >= quota:
             break
     return examples
 
@@ -152,7 +191,7 @@ def route_a(
     route: RouteAConfig | None = None,
     augmentation: Augmentation | None = None,
     context_dropout: float = 0.3,
-    max_context_tokens: int = 128,
+    max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
 ) -> RunResult:
     """Train route A over *slices.train* and score *slices.held_out* both ways."""
     route = route or RouteAConfig()

@@ -3,6 +3,7 @@
 mod corpus;
 mod engine;
 mod g2p;
+mod neural;
 mod synth;
 
 use anyhow::{Context as _, Result};
@@ -15,6 +16,7 @@ use ime_decode::BeamOptions;
 use ime_eval::{EvalSet, evaluate};
 use ime_ngram::{Counter, NgramModel};
 use ime_pinyin::{Lexicon, SegmentOptions, SyllableTable};
+use neural::{SliceArgs, parse_weight};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::num::NonZeroUsize;
@@ -81,6 +83,59 @@ enum Command {
         /// A JSON Lines evaluation set.
         #[arg(long)]
         eval_set: PathBuf,
+        #[command(flatten)]
+        search: SearchArgs,
+    },
+    /// Write the lattice an evaluation set decodes into, for the neural model to
+    /// score.
+    EmitLattice {
+        /// A JSON Lines evaluation set.
+        #[arg(long)]
+        eval_set: PathBuf,
+        /// Where the JSON Lines lattice goes.
+        #[arg(long)]
+        out: PathBuf,
+        /// The characters the model can emit, one per line, as
+        /// `mlime train emittable` writes them.
+        #[arg(long)]
+        emittable: PathBuf,
+        #[command(flatten)]
+        search: SearchArgs,
+    },
+    /// Decode an evaluation set with the neural emissions fused into the beam.
+    FusedEval {
+        /// A model written by `train-ngram`. Required unless the run drops the
+        /// transition, and refused when it does: a model that would go unused
+        /// is a mistyped command, not a request.
+        #[arg(
+            long,
+            required_unless_present = "no_transition",
+            conflicts_with = "no_transition"
+        )]
+        model: Option<PathBuf>,
+        /// The same JSON Lines evaluation set the lattice was emitted from.
+        #[arg(long)]
+        eval_set: PathBuf,
+        /// A gzipped score file written by `mlime train emit`. Omitted, the run
+        /// is the n-gram baseline over the same slice.
+        #[arg(long)]
+        scores: Option<PathBuf>,
+        /// The same emittable set the lattice was written with.
+        #[arg(long)]
+        emittable: PathBuf,
+        /// What a candidate the model has no output row for scores. Must match
+        /// the floor the score file was written under.
+        #[arg(long, default_value = "-30.0")]
+        unscored: f32,
+        /// A fusion weight to score at; repeatable, which is how the weight is
+        /// tuned on the dev slice in one pass.
+        #[arg(long, value_parser = parse_weight, default_values_t = [1.0f32])]
+        weight: Vec<f32>,
+        /// Drop the n-gram and decode on the emissions alone.
+        #[arg(long, requires = "scores")]
+        no_transition: bool,
+        #[command(flatten)]
+        slice: SliceArgs,
         #[command(flatten)]
         search: SearchArgs,
     },
@@ -159,6 +214,42 @@ async fn main() -> Result<()> {
             eval_set,
             search,
         } => run_eval(&model, &eval_set, &search),
+        Command::EmitLattice {
+            eval_set,
+            out,
+            emittable,
+            search,
+        } => {
+            let (table, lexicon) = tables()?;
+            neural::emit_lattice(
+                &eval_set,
+                &out,
+                &emittable,
+                table,
+                lexicon,
+                search.segment(),
+            )
+        }
+        Command::FusedEval {
+            model,
+            eval_set,
+            scores,
+            emittable,
+            unscored,
+            weight,
+            no_transition: _,
+            slice,
+            search,
+        } => fused_eval(&FusedRun {
+            model: model.as_deref(),
+            eval_set: &eval_set,
+            scores: scores.as_deref(),
+            emittable: &emittable,
+            unscored,
+            weights: &weight,
+            slice: &slice,
+            search: &search,
+        }),
         Command::Corpus { command } => corpus::run(command).await,
         Command::G2p { command } => g2p::run(command).await,
         Command::Synth { command } => synth::run(command).await,
@@ -204,15 +295,7 @@ fn train_ngram(corpus: &Path, out: &Path) -> Result<()> {
 
 fn load_baseline(model: &Path, search: &SearchArgs) -> Result<Baseline> {
     let (table, lexicon) = tables()?;
-    let bytes = fs::read(model)
-        .with_context(|| format!("could not read the model at {}", model.display()))?;
-    let model = NgramModel::from_bytes(&bytes, &lexicon)
-        .context("the model does not match this character lexicon")?;
-    info!(
-        vocabulary = model.vocabulary_size(),
-        trigrams = model.trigram_types(),
-        "loaded the model"
-    );
+    let model = load_ngram(model, &lexicon)?;
     Ok(Baseline::new(
         table,
         lexicon,
@@ -237,6 +320,60 @@ fn decode(model: &Path, pinyin: &str, search: &SearchArgs) -> Result<()> {
             .collect(),
     };
     let rendered = list.render().context("could not render the candidates")?;
+    write!(std::io::stdout(), "{rendered}").context("could not write to stdout")
+}
+
+/// Load a trained n-gram against the generated tables.
+fn load_ngram(path: &Path, lexicon: &Lexicon) -> Result<NgramModel> {
+    let bytes = fs::read(path)
+        .with_context(|| format!("could not read the model at {}", path.display()))?;
+    let model = NgramModel::from_bytes(&bytes, lexicon)
+        .context("the model does not match this character lexicon")?;
+    info!(
+        vocabulary = model.vocabulary_size(),
+        trigrams = model.trigram_types(),
+        "loaded the model"
+    );
+    Ok(model)
+}
+
+/// Everything one fused-eval run is made of.
+///
+/// A struct rather than nine positional arguments, because every one of them is
+/// a knob the report has to quote and a swapped pair of paths would produce a
+/// number rather than an error.
+struct FusedRun<'a> {
+    /// Absent exactly when the run was asked to drop the transition; the
+    /// argument parser holds the two flags to that relationship.
+    model: Option<&'a Path>,
+    eval_set: &'a Path,
+    scores: Option<&'a Path>,
+    emittable: &'a Path,
+    unscored: f32,
+    weights: &'a [f32],
+    slice: &'a SliceArgs,
+    search: &'a SearchArgs,
+}
+
+fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
+    let (table, lexicon) = tables()?;
+    let ngram = run
+        .model
+        .map(|path| load_ngram(path, &lexicon))
+        .transpose()?;
+    let rendered = neural::fused_eval(
+        run.eval_set,
+        run.scores,
+        run.emittable,
+        run.unscored,
+        run.weights,
+        run.slice,
+        table,
+        lexicon,
+        run.search.segment(),
+        &run.search.beam(),
+        ngram.as_ref(),
+    )?;
     write!(std::io::stdout(), "{rendered}").context("could not write to stdout")
 }
 

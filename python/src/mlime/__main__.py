@@ -323,13 +323,15 @@ def train_route_a(
     out: Path = typer.Option(Path("runs/route-a"), help="Where checkpoints and metrics go"),
     char_table: Path = typer.Option(None, help="ime-pinyin's char_pinyin.tsv"),
     train_shard: list[str] = typer.Option(
-        None, "--train-shard", help="Shard to train on; repeatable"
+        None,
+        "--train-shard",
+        help="Shard to train on; repeatable. Omitted, every shard that is not held out",
     ),
     held_out_shard: list[str] = typer.Option(
         None, "--held-out-shard", help="Shard to score but never train on; repeatable"
     ),
     max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
-    token_budget: int = typer.Option(8192, help="Padded fill-tower positions per step"),
+    token_budget: int = typer.Option(8192, help="Padded positions per step, both towers together"),
     base_lr: float = typer.Option(3e-5, help="Learning rate for the pretrained weights"),
     new_lr: float = typer.Option(1e-4, help="Learning rate for the tables route A adds"),
     seed: int = typer.Option(0, help="Augmentation and initialisation seed"),
@@ -347,10 +349,17 @@ def train_route_a(
     table = char_table or default_char_table()
     if table is None:
         raise typer.BadParameter("no char_pinyin.tsv found above the working directory")
-    if not train_shard:
-        raise typer.BadParameter("pass at least one --train-shard")
     layout = DataLayout(data_dir)
     typer.echo(f"device: {describe_device()}")
+    slices = (
+        Slices(
+            train=tuple(train_shard),
+            held_out=tuple(held_out_shard or ()),
+            max_held_out_examples=max_held_out,
+        )
+        if train_shard
+        else Slices.all_but(layout.samples, held_out_shard or (), max_held_out)
+    )
     result = route_a(
         RunPaths(
             samples=layout.samples,
@@ -358,11 +367,7 @@ def train_route_a(
             char_table=table,
             out=out,
         ),
-        Slices(
-            train=tuple(train_shard),
-            held_out=tuple(held_out_shard or ()),
-            max_held_out_examples=max_held_out,
-        ),
+        slices,
         TrainingConfig(
             max_steps=max_steps,
             base_lr=base_lr,
@@ -379,6 +384,75 @@ def train_route_a(
         f"off {result.without_context.rate:.4f} "
         f"({result.with_context.scored} characters)"
     )
+
+
+@train_app.command("emittable")
+def train_emittable(
+    out: Path = typer.Option(..., help="Where the one-character-per-line set goes"),
+    char_table: Path = typer.Option(None, help="ime-pinyin's char_pinyin.tsv"),
+    base_model: str = typer.Option("hfl/chinese-macbert-base", help="The base checkpoint"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Write the characters a route A model over *base_model* can emit."""
+    configure(verbose)
+    from mlime.data.corpus import default_char_table
+    from mlime.train.lexicon import write_emittable
+    from mlime.train.run import build_lexicon_for, load_tokenizer
+    from mlime.train.spans import SpanVocab
+
+    table = char_table or default_char_table()
+    if table is None:
+        raise typer.BadParameter("no char_pinyin.tsv found above the working directory")
+    tokenizer = load_tokenizer(base_model)
+    written = write_emittable(out, build_lexicon_for(table, tokenizer, SpanVocab.load()))
+    typer.echo(f"{written} emittable characters")
+
+
+@train_app.command("emit")
+def train_emit(
+    checkpoint: Path = typer.Option(..., help="A checkpoint written by `train route-a`"),
+    lattice: Path = typer.Option(..., help="A lattice written by `ime-cli emit-lattice`"),
+    out: Path = typer.Option(..., help="Where the JSON Lines scores go"),
+    char_table: Path = typer.Option(None, help="ime-pinyin's char_pinyin.tsv"),
+    context: bool = typer.Option(True, help="Let the model read each record's context"),
+    token_budget: int = typer.Option(
+        8192, help="Padded positions per forward, both towers together"
+    ),
+    records_per_chunk: int = typer.Option(256, help="Records held in memory before writing"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Score a decoder's lattice with a trained route A model."""
+    configure(verbose)
+    from mlime.data.corpus import default_char_table
+    from mlime.train.emit import emit
+    from mlime.train.run import build_lexicon_for, load_tokenizer
+    from mlime.train.spans import SpanVocab
+
+    table = char_table or default_char_table()
+    if table is None:
+        raise typer.BadParameter("no char_pinyin.tsv found above the working directory")
+    spans = SpanVocab.load()
+    tokenizer = load_tokenizer(_base_model(checkpoint))
+    written = emit(
+        checkpoint=checkpoint,
+        lattice=lattice,
+        out=out,
+        tokenizer=tokenizer,
+        lexicon=build_lexicon_for(table, tokenizer, spans),
+        spans=spans,
+        with_context=context,
+        token_budget=token_budget,
+        records_per_chunk=records_per_chunk,
+    )
+    typer.echo(f"scores written to {written}")
+
+
+def _base_model(checkpoint: Path) -> str:
+    """The base checkpoint a trained model was built on, read out of its own file."""
+    import torch
+
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    return str(state["route_a"]["base_model"])
 
 
 def _requested(source: list[str] | None) -> tuple[str, ...]:

@@ -93,6 +93,27 @@ impl Emission for Uniform {
     }
 }
 
+/// A transition model that prefers nothing.
+///
+/// Every character scores zero after every history, so the decoder is driven
+/// entirely by its emission model. This is the neural route stripped of the
+/// n-gram -- the ablation that says how much of the fused number the emissions
+/// earned on their own.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub struct NoTransition;
+
+impl Transition for NoTransition {
+    const HISTORY: usize = 1;
+
+    fn score(&self, _history: History, _candidate: CharId) -> f32 {
+        0.0
+    }
+
+    fn finish(&self, _history: History) -> f32 {
+        0.0
+    }
+}
+
 /// How well a character follows the ones before it.
 pub trait Transition {
     /// How many preceding characters this model conditions on: one for a bigram,

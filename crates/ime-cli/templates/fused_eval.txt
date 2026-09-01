@@ -1,0 +1,3 @@
+{% for section in sections %}emission {{ section.emission }}, weight {{ section.weight|fmt("{:.3}") }}; transition {{ section.transition }}; slice {{ section.slice }}
+{{ section.report }}
+{% endfor %}

@@ -12,11 +12,15 @@
 
 mod beam;
 mod candidates;
+mod emissions;
 mod score;
 
 pub use beam::{BeamOptions, Hypothesis, decode};
 pub use candidates::{CandidatePath, Candidates};
-pub use score::{Emission, History, MAX_HISTORY, Transition, Uniform};
+pub use emissions::{
+    EmissionError, Emittable, LatticePath, LatticeRecord, ScoreRecord, Scored, Weighted,
+};
+pub use score::{Emission, History, MAX_HISTORY, NoTransition, Transition, Uniform};
 
 use thiserror::Error;
 
