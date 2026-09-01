@@ -10,6 +10,7 @@ route A works.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import polars as pl
@@ -23,6 +24,7 @@ from mlime.train.lexicon import Lexicon
 from mlime.train.loop import (
     Accuracy,
     Distributed,
+    EpochBatches,
     MetricLog,
     TrainingConfig,
     cosine_with_warmup,
@@ -30,7 +32,7 @@ from mlime.train.loop import (
     train,
 )
 from mlime.train.model import RouteAConfig, RouteAModel
-from mlime.train.samples import BaseTokenizer, Collator, CorpusStream, SampleBuilder
+from mlime.train.samples import BaseTokenizer, Batch, Collator, CorpusStream, SampleBuilder
 from mlime.train.spans import SpanVocab
 
 TINY = BertConfig(
@@ -171,3 +173,205 @@ def test_accuracy_is_reported_with_and_without_context(
 
 def test_an_empty_accuracy_is_zero_not_an_error() -> None:
     assert Accuracy(correct=0, scored=0).rate == 0.0
+
+
+@pytest.fixture(name="short_corpus")
+def short_corpus_fixture(tmp_path: Path) -> tuple[Path, Path]:
+    """One shard of eight sentences, so six steps cross an epoch boundary.
+
+    A resume that only ever restarts mid-epoch never exercises the epoch in the
+    position it saved, and the epoch is what re-augments the corpus: land on the
+    wrong one and every example after the resume is typed differently.
+    """
+    samples_dir, labels_dir = tmp_path / "short-samples", tmp_path / "short-labels"
+    samples_dir.mkdir()
+    labels_dir.mkdir()
+    rows, labels = [], []
+    for index in range(8):
+        text, readings, context = CORPUS[index % len(CORPUS)]
+        sample = Sample(id=f"0-{index}", source="test", text=text, context=context)
+        rows.append(sample.row())
+        labels.append({"id": sample.id, "syllables": readings, "refusal": None})
+    name = "test-00000.parquet"
+    pl.DataFrame(rows, schema=SAMPLE_SCHEMA).write_parquet(samples_dir / name)
+    pl.DataFrame(labels, schema=LABEL_SCHEMA).write_parquet(labels_dir / name)
+    return samples_dir, labels_dir
+
+
+#: Six steps over :func:`short_corpus_fixture`: four batches an epoch, so the
+#: checkpoint at step 3 is mid-epoch and the steps after it cross into the next.
+RESUMABLE = TrainingConfig(
+    max_steps=6,
+    base_lr=1e-3,
+    new_lr=3e-3,
+    token_budget=24,
+    log_every=1,
+    checkpoint_every=3,
+    fp16=False,
+    seed=3,
+)
+
+
+def tiny_model(lexicon: Lexicon) -> RouteAModel:
+    """The same randomly initialised model every time it is called."""
+    torch.manual_seed(0)
+    return RouteAModel.from_config(TINY, lexicon, RouteAConfig(cross_attention_layers=1))
+
+
+def stream_and_collator(
+    corpus: tuple[Path, Path], lexicon: Lexicon, spans: SpanVocab, tokenizer: BaseTokenizer
+) -> tuple[CorpusStream, Collator]:
+    """A reader and a collator seeded the way every segment of one run seeds them."""
+    samples_dir, labels_dir = corpus
+    return (
+        CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, seed=1)),
+        Collator(tokenizer),
+    )
+
+
+def records(metrics: Path, event: str) -> list[dict[str, object]]:
+    """Every *event* record in a metrics file, in order."""
+    written = [json.loads(line) for line in metrics.read_text().splitlines()]
+    return [record for record in written if record["event"] == event]
+
+
+def step_losses(metrics: Path) -> list[float]:
+    """The loss of every logged step, in order."""
+    return [float(record["loss"]) for record in records(metrics, "step")]
+
+
+def typed(batch: Batch, spans: SpanVocab) -> list[str]:
+    """The spans the batch says were pressed, as the strings they spell."""
+    return [spans.spelling(int(span)) for span in batch.span_ids[batch.span_positions]]
+
+
+def test_a_resumed_run_is_the_run_that_was_not_interrupted(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    whole_dir = tmp_path / "whole"
+    uninterrupted = tiny_model(lexicon)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    whole = train(uninterrupted, stream, collator, RESUMABLE, whole_dir)
+    assert len(step_losses(whole)) == RESUMABLE.max_steps
+
+    resumed_model = tiny_model(lexicon)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    resumed = train(
+        resumed_model,
+        stream,
+        collator,
+        RESUMABLE,
+        tmp_path / "resumed",
+        resume=whole_dir / "checkpoint-000003.pt",
+    )
+
+    # Exactly the losses the uninterrupted run recorded for those steps: the
+    # batches, the augmentation, the dropout, the schedule and the optimiser
+    # state all have to have carried over for these to be the same numbers.
+    assert step_losses(resumed) == step_losses(whole)[3:]
+    assert records(resumed, "resume") == [
+        {
+            "event": "resume",
+            "checkpoint": str(whole_dir / "checkpoint-000003.pt"),
+            "step": 3,
+            "epoch": 0,
+            "index": 3,
+        }
+    ]
+    finished = torch.load(whole_dir / "checkpoint-final.pt", weights_only=False)
+    assert finished["positions"][0]["epoch"] == 1
+    weights = uninterrupted.state_dict()
+    for name, tensor in resumed_model.state_dict().items():
+        assert torch.equal(tensor, weights[name]), name
+
+
+def test_skipping_lands_where_reading_would_have(
+    short_corpus: tuple[Path, Path], lexicon: Lexicon, spans: SpanVocab, tokenizer: BaseTokenizer
+) -> None:
+    read = EpochBatches(*stream_and_collator(short_corpus, lexicon, spans, tokenizer), 24)
+    for _ in range(5):
+        next(read)
+    epoch, index = read.epoch, read.index
+    assert (epoch, index) == (1, 1)  # the fifth batch is into the second epoch
+    wanted = next(read)
+
+    skipped = EpochBatches(*stream_and_collator(short_corpus, lexicon, spans, tokenizer), 24)
+    skipped.skip(epoch, index)
+    assert (skipped.epoch, skipped.index) == (epoch, index)
+    landed = next(skipped)
+    assert landed.ids == wanted.ids
+    assert typed(landed, spans) == typed(wanted, spans)
+    assert (skipped.epoch, skipped.index) == (read.epoch, read.index)
+
+
+def test_a_resume_under_a_different_schedule_is_refused(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    out_dir = tmp_path / "whole"
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    train(tiny_model(lexicon), stream, collator, RESUMABLE, out_dir)
+
+    elsewhere = replace(RESUMABLE, base_lr=RESUMABLE.base_lr * 2, weight_decay=0.5)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    with pytest.raises(ValueError, match=r"base_lr .* weight_decay "):
+        train(
+            tiny_model(lexicon),
+            stream,
+            collator,
+            elsewhere,
+            tmp_path / "elsewhere",
+            resume=out_dir / "checkpoint-000003.pt",
+        )
+
+
+def test_resuming_a_run_that_is_already_finished_is_refused(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    out_dir = tmp_path / "whole"
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    train(tiny_model(lexicon), stream, collator, RESUMABLE, out_dir)
+
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    with pytest.raises(ValueError, match="already at step 6 of 6"):
+        train(
+            tiny_model(lexicon),
+            stream,
+            collator,
+            RESUMABLE,
+            tmp_path / "again",
+            resume=out_dir / "checkpoint-final.pt",
+        )
+
+
+def test_only_the_newest_checkpoints_are_kept(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    out_dir = tmp_path / "rotated"
+    config = replace(RESUMABLE, checkpoint_every=1, keep_checkpoints=2)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    train(tiny_model(lexicon), stream, collator, config, out_dir)
+
+    numbered = sorted(path.name for path in out_dir.glob("checkpoint-[0-9]*.pt"))
+    assert numbered == ["checkpoint-000005.pt", "checkpoint-000006.pt"]
+    assert (out_dir / "checkpoint-final.pt").is_file()
+
+
+def test_a_run_that_keeps_no_checkpoint_is_refused() -> None:
+    with pytest.raises(ValueError, match="keep_checkpoints"):
+        TrainingConfig(max_steps=1, keep_checkpoints=0)

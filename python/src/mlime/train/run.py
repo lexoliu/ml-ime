@@ -96,7 +96,14 @@ class Slices:
 
 @dataclass(frozen=True)
 class RunResult:
-    """What a run produced, in the form the report quotes."""
+    """What a run produced, in the form the report quotes.
+
+    ``first_loss`` and ``last_loss`` are the first and last losses this
+    *segment*'s metrics file recorded. A run resumed into a new kernel writes a
+    new metrics file, so its ``first_loss`` is the loss at the step after the
+    checkpoint, not the loss the run started from: the run's own first loss is in
+    the first segment's file, and the segments are read together.
+    """
 
     metrics: Path
     first_loss: float
@@ -192,8 +199,15 @@ def route_a(
     augmentation: Augmentation | None = None,
     context_dropout: float = 0.3,
     max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+    resume: Path | None = None,
 ) -> RunResult:
-    """Train route A over *slices.train* and score *slices.held_out* both ways."""
+    """Train route A over *slices.train* and score *slices.held_out* both ways.
+
+    With *resume*, this segment continues the run that wrote that checkpoint
+    rather than starting one: same weights, same optimiser, same place in the
+    corpus. The checkpoint carries the config it was written under and refuses
+    anything else, so the chain of kernels is one run or it is an error.
+    """
     route = route or RouteAConfig()
     world = Distributed.from_environment()
     spans = SpanVocab.load()
@@ -232,9 +246,10 @@ def route_a(
                 route_a=asdict(route),
                 emittable_characters=lexicon.size,
                 typed_spans=lexicon.spans,
+                resume=str(resume) if resume is not None else None,
             )
 
-    metrics = train(model, stream, collator, training, paths.out, world)
+    metrics = train(model, stream, collator, training, paths.out, world, resume)
     losses = _losses(metrics)
     evaluation = held_out_examples(
         paths, SampleBuilder(lexicon, spans, augmentation, seed=training.seed + 1), slices
