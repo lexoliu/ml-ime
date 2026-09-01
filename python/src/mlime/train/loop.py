@@ -26,7 +26,7 @@ import math
 import os
 import random
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -69,6 +69,11 @@ class TrainingConfig:
     #: output directory is capped at 20 GB -- a run that fills it loses the
     #: checkpoint it was about to write, which is the one that cannot be lost.
     keep_checkpoints: int = 2
+    #: How long this *segment* may run before it pauses itself, or ``None`` for
+    #: as long as it takes. A Kaggle session is killed at twelve hours and its
+    #: output goes with it, so a segment that means to survive stops itself with
+    #: time to spare and writes a checkpoint the next kernel resumes from.
+    wall_budget_seconds: float | None = None
     fp16: bool = True
 
     def __post_init__(self) -> None:
@@ -78,6 +83,10 @@ class TrainingConfig:
             raise ValueError(f"warmup_fraction must be in [0, 1), got {self.warmup_fraction}")
         if self.keep_checkpoints < 1:
             raise ValueError(f"keep_checkpoints must be at least 1, got {self.keep_checkpoints}")
+        if self.wall_budget_seconds is not None and self.wall_budget_seconds <= 0:
+            raise ValueError(
+                f"wall_budget_seconds must be positive, got {self.wall_budget_seconds}"
+            )
 
     @property
     def warmup_steps(self) -> int:
@@ -175,6 +184,22 @@ class MetricLog:
 
     def __exit__(self, *_: object) -> None:
         self.close()
+
+
+@dataclass(frozen=True)
+class Segment:
+    """What one kernel's worth of a run did.
+
+    A run is now a chain of segments, so "the loop returned" no longer means the
+    run is over: it can also mean the segment spent its wall budget and left a
+    checkpoint. Callers have to tell the two apart -- an unfinished run must not
+    be scored or reported as a result -- so the loop says which it was rather
+    than leaving it to be inferred from a file's existence.
+    """
+
+    metrics: Path
+    step: int
+    finished: bool
 
 
 @dataclass(frozen=True)
@@ -390,17 +415,22 @@ def train(
     out_dir: Path,
     distributed: Distributed | None = None,
     resume: Path | None = None,
-) -> Path:
-    """Run to *config.max_steps* optimiser steps and return the metrics file.
+) -> Segment:
+    """Run towards *config.max_steps* optimiser steps and say what this segment did.
 
-    Returns rather than prints, and writes every step's loss to the metrics file,
-    because "the loss went down" is a claim that has to be checkable after the
-    kernel has been torn down.
+    Writes every step's loss to the metrics file rather than printing it, because
+    "the loss went down" is a claim that has to be checkable after the kernel has
+    been torn down.
 
     With *resume*, the run continues the one that wrote that checkpoint: the same
     weights, the same optimiser and schedule, the same generators, and each rank
     reading on from where it was. The metrics file is this segment's own, so the
     losses of a chained run are read by concatenating the segments' files.
+
+    With *config.wall_budget_seconds*, the segment stops itself when the budget
+    is spent and writes ``checkpoint-paused``. It writes no ``checkpoint-final``:
+    the final checkpoint means the run reached ``max_steps``, and a segment that
+    ran out of clock has not.
     """
     world = distributed or Distributed()
     world.start()
@@ -470,6 +500,7 @@ def train(
     # A segment logs its own first step whatever the interval, so the first loss
     # in a metrics file is always the first step that file's segment ran.
     first_step = step + 1
+    finished = False
     for batch in batches:
         batch = batch.to(device)
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
@@ -502,11 +533,22 @@ def train(
         if step % config.checkpoint_every == 0:
             checkpoints.numbered(step, batches)
         if step >= config.max_steps:
+            finished = True
             break
-    checkpoints.final(step, batches)
+        elapsed = time.monotonic() - started
+        if config.wall_budget_seconds is not None and agreed(
+            world, elapsed >= config.wall_budget_seconds, device
+        ):
+            checkpoints.paused(step, batches)
+            if world.is_main:
+                metrics.write(event="paused", step=step, seconds=round(elapsed, 1))
+            log.info("wall budget spent, segment paused", step=step, seconds=round(elapsed, 1))
+            break
+    if finished:
+        checkpoints.final(step, batches)
     metrics.close()
     world.stop()
-    return metrics.path
+    return Segment(metrics=metrics.path, step=step, finished=finished)
 
 
 def save_checkpoint(
@@ -548,13 +590,35 @@ def checkpoint_step(path: Path) -> int:
 
 
 def rotate_checkpoints(out_dir: Path, keep: int) -> None:
-    """Leave only the newest *keep* numbered checkpoints; ``checkpoint-final`` stays."""
+    """Leave only the newest *keep* numbered checkpoints.
+
+    ``checkpoint-final`` and ``checkpoint-paused`` are not numbered and are not
+    candidates: the first is the run's result and the second is the only thing
+    the next kernel can start from.
+    """
     if keep < 1:
         raise ValueError(f"a run must keep at least one checkpoint, got {keep}")
     numbered = sorted(out_dir.glob("checkpoint-[0-9]*.pt"), key=checkpoint_step)
     for path in numbered[:-keep]:
         path.unlink()
         log.info("checkpoint rotated out", path=str(path))
+
+
+def agreed(world: Distributed, decision: bool, device: torch.device) -> bool:
+    """Rank 0's *decision*, made every rank's.
+
+    Whether the wall clock has run out is measured per rank, and ranks do not
+    reach a step at the same instant, so two of them can measure it differently
+    on the same step. Ranks that disagreed would not disagree politely: the ones
+    that stopped would leave the ones that did not waiting in the next gradient
+    all-reduce, and a hang is worse than either answer. So one rank decides and
+    the rest are told.
+    """
+    if world.world_size == 1:
+        return decision
+    verdict = torch.tensor([int(decision)], dtype=torch.int64, device=device)
+    torch.distributed.broadcast(verdict, src=0)
+    return bool(verdict.item())
 
 
 def gather_positions(world: Distributed, batches: EpochBatches) -> list[dict[str, Any]]:
@@ -602,6 +666,15 @@ class Checkpointer:
         """Write ``checkpoint-final``, which is never rotated out."""
         self._write(self.out_dir / "checkpoint-final.pt", step, batches)
 
+    def paused(self, step: int, batches: EpochBatches) -> None:
+        """Write ``checkpoint-paused``, the one the next kernel resumes from.
+
+        Named rather than numbered so the next kernel knows what to mount without
+        being told a step number, and so rotation cannot take it: a segment that
+        stopped on the clock has no other copy of where it got to.
+        """
+        self._write(self.out_dir / "checkpoint-paused.pt", step, batches)
+
     def _write(self, path: Path, step: int, batches: EpochBatches) -> None:
         """Gather the positions -- all ranks -- and write the file on rank 0."""
         positions = gather_positions(self.world, batches)
@@ -619,17 +692,32 @@ class Checkpointer:
         )
 
 
+#: The one field of :class:`TrainingConfig` a resume may change. Everything else
+#: describes the run, so changing it makes the next segment a different
+#: experiment; the wall budget describes the *kernel* the segment runs in, and
+#: the next kernel is a different one -- a longer session, or a last segment that
+#: means to run to the end -- so holding a chain to one budget would be holding
+#: it to an accident of where the first segment happened to start.
+SEGMENT_FIELDS = frozenset({"wall_budget_seconds"})
+
+
 def refuse_mismatch(
-    path: Path, kind: str, saved: Mapping[str, Any], wanted: Mapping[str, Any]
+    path: Path,
+    kind: str,
+    saved: Mapping[str, Any],
+    wanted: Mapping[str, Any],
+    except_for: Collection[str] = (),
 ) -> None:
     """Refuse to resume when the *kind* record differs, naming every field that does.
 
     Continuing a run under a different schedule is not a resume: the cosine bends
     somewhere else, the warmup is over a different length, and the two segments'
-    metrics do not describe one run. The comparison is over every field, so the
-    refusal names what to change rather than saying only that something did.
+    metrics do not describe one run. The comparison is over every field but
+    *except_for*, so the refusal names what to change rather than saying only
+    that something did.
     """
-    differing = sorted(key for key in set(saved) | set(wanted) if saved.get(key) != wanted.get(key))
+    compared = (set(saved) | set(wanted)) - set(except_for)
+    differing = sorted(key for key in compared if saved.get(key) != wanted.get(key))
     if not differing:
         return
     fields = ", ".join(f"{key} {saved.get(key)!r} -> {wanted.get(key)!r}" for key in differing)
@@ -660,7 +748,7 @@ class Resumption:
                 f"{path} predates resumable training and has no {absent}; "
                 "it can be trained from, but not resumed"
             )
-        refuse_mismatch(path, "training", state["training"], asdict(config))
+        refuse_mismatch(path, "training", state["training"], asdict(config), SEGMENT_FIELDS)
         refuse_mismatch(path, "route_a", state["route_a"], asdict(route))
         positions = state["positions"]
         if len(positions) != world.world_size:

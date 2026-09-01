@@ -338,6 +338,10 @@ def train_route_a(
     fp16: bool = typer.Option(True, help="Train in fp16 with loss scaling"),
     checkpoint_every: int = typer.Option(500, help="Steps between checkpoints"),
     keep_checkpoints: int = typer.Option(2, help="Numbered checkpoints to keep on disk"),
+    wall_budget_seconds: float = typer.Option(
+        None,
+        help="Pause and checkpoint after this many seconds, for a session that gets killed",
+    ),
     resume: Path = typer.Option(
         None,
         help="Continue the run that wrote this checkpoint; every other option must match it",
@@ -382,14 +386,22 @@ def train_route_a(
             fp16=fp16,
             checkpoint_every=checkpoint_every,
             keep_checkpoints=keep_checkpoints,
+            wall_budget_seconds=wall_budget_seconds,
         ),
         resume=resume,
     )
     typer.echo(f"loss {result.first_loss:.4f} -> {result.last_loss:.4f} over {result.steps} steps")
+    if not result.finished:
+        typer.echo(
+            f"paused at step {result.step} of {max_steps}; the next kernel continues it with "
+            f"--resume {out / 'checkpoint-paused.pt'}"
+        )
+        return
+    with_context, without_context = result.scored
     typer.echo(
-        f"held-out character accuracy: context on {result.with_context.rate:.4f}, "
-        f"off {result.without_context.rate:.4f} "
-        f"({result.with_context.scored} characters)"
+        f"held-out character accuracy: context on {with_context.rate:.4f}, "
+        f"off {without_context.rate:.4f} "
+        f"({with_context.scored} characters)"
     )
 
 
