@@ -6,8 +6,8 @@ Kernel `lexoliu/mlime-route-a-v1`, 2×T4 DDP, launched 2026-08-28, evaluated
 ## Verdict
 
 **The kill gate is passed.** With context on, the fused decoder beats the
-trigram baseline by 18.2 points of sentence top-1 on the held-out test slice
-(target was +8). Context is worth +5.6 points inside the fused system and +8.6
+run3 trigram baseline by 16.1 points of sentence top-1 on the held-out test slice
+(target was +8), and the trigram trained on the neural model's own data by 18.2. Context is worth +5.6 points inside the fused system and +8.6
 points for the neural emissions alone. The neural route as designed lives; the
 next step is scaling, not rethinking.
 
@@ -37,30 +37,37 @@ weight was tuned on the dev slice (498 records, hash-selected, `--dev-share
 0.0905`) and everything below is reported on the disjoint test slice (5,027
 records). Decoder settings: beam 16, 8 readings, top-k 8, unscored −30.
 
-Trigram: KN interpolated char trigram trained on the same 10.03M-line v1 subset
-(21.5M trigram types, 272 MiB, 16 s). No eval3 sentence is in that corpus
-(checked by exact match). The laptop's 41M-line run3 trigram (the 55.29% model in
-`notes/baseline-run1.md` lineage) is not on this machine; on the full set the
-subset trigram scores 51.95%, so the gap to the stronger baseline is about 3.3
-points and the fused margin over it is still roughly +15.
+Two trigrams. The *subset* trigram is trained on the same 10.03M-line v1 subset
+the neural model saw (21.5M trigram types, 272 MiB, 16 s; no eval3 sentence is in
+that corpus, checked by exact match). The *run3* trigram is the laptop's 41M-line
+model from `notes/baseline-run1.md`'s lineage (53.9M trigram types, 643 MiB), the
+55.29% baseline the kill gate was written against.
 
 | configuration | top-1 | top-8 | char | MRR@8 |
 |---|---:|---:|---:|---:|
-| trigram only | 51.84% | 59.32% | 87.20% | 0.548 |
+| subset trigram only | 51.84% | 59.32% | 87.20% | 0.548 |
+| run3 trigram only | 55.10% | 62.58% | 88.61% | 0.581 |
 | neural only, context off | 44.84% | 48.40% | 85.33% | 0.462 |
 | neural only, context on | 53.45% | 57.15% | 89.04% | 0.550 |
-| fused, context off, w=1 | 64.47% | 71.12% | 92.18% | 0.672 |
-| **fused, context on, w=1** | **70.02%** | **75.47%** | **93.96%** | **0.722** |
+| fused with subset trigram, context off, w=1 | 64.47% | 71.12% | 92.18% | 0.672 |
+| fused with subset trigram, context on, w=1 | 70.02% | 75.47% | 93.96% | 0.722 |
+| fused with run3 trigram, context off, w=1 | 65.55% | 71.93% | 92.59% | 0.681 |
+| **fused with run3 trigram, context on, w=1** | **71.18%** | **76.69%** | **94.15%** | **0.735** |
+
+Against the run3 trigram the fused, context-on decoder is **+16.1** top-1; against
+the matched subset trigram it is +18.2. Context is worth +5.6 inside the fused
+system either way.
 
 Dev-slice weight sweep (top-1, 498 records):
 
 | weight | 0.25 | 0.5 | 0.75 | 1.0 | 1.5 | 2.0 | 3.0 |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| context on | 65.5 | 70.5 | 72.1 | 72.9 | 72.5 | 73.1 | 69.5 |
-| context off | 62.0 | 65.9 | 66.7 | 67.3 | 65.5 | 64.7 | 60.6 |
+| subset trigram, context on | 65.5 | 70.5 | 72.1 | 72.9 | 72.5 | 73.1 | 69.5 |
+| subset trigram, context off | 62.0 | 65.9 | 66.7 | 67.3 | 65.5 | 64.7 | 60.6 |
+| run3 trigram, context on | — | 71.9 | 73.9 | 74.3 | 73.1 | 72.7 | — |
 
-The plateau is 0.75–2.0 with context and peaks at 1.0 without; 1.0 is used for
-both.
+The plateau is 0.75–2.0 with context and peaks at 1.0 without and with the
+stronger trigram; 1.0 is used throughout.
 
 ## What the numbers say
 
