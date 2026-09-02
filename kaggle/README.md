@@ -46,6 +46,7 @@ json.dump(m,open('$d/kernel-metadata.json','w'),indent=2)" $n
 kaggle kernels push -p $d
 ```
 
-A segment that finishes the run scores the eval3 lattice like v1 did and writes
+A segment that finishes the run scores every `lattice*.jsonl` in the assets (full,
+abbreviated and mixed typing), with context on and off, and writes
 `run-summary.json` with `"finished": true`; one that pauses says which segment
 to push next.
