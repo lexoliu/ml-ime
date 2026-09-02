@@ -8,7 +8,7 @@
 
 use anyhow::{Context as _, Result};
 use askama::Template;
-use clap::{Args, Subcommand};
+use clap::{Args, Subcommand, ValueEnum};
 use ime_g2p::annotate::{ANNOTATED, Sample, annotate, read_annotated, read_samples};
 use ime_g2p::export::{export_eval_set, export_ngram_corpus, export_pool, read_exclusions};
 use ime_g2p::g2pw::{
@@ -17,6 +17,7 @@ use ime_g2p::g2pw::{
 use ime_g2p::llm::{DEFAULT_CONCURRENCY, LlmAnnotator, LlmSettings};
 use ime_g2p::outcome::{Annotator as _, Outcome, compare};
 use ime_g2p::text::han_characters;
+use ime_g2p::typing::{DEFAULT_ABBREVIATE_SYLLABLE, Typing, TypingStyle};
 use ime_g2p::{DataLayout, report};
 use std::io::{BufRead as _, BufReader, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
@@ -148,9 +149,17 @@ pub enum ExportCommand {
         /// Number of evaluation items to draw.
         #[arg(long, default_value_t = 1000)]
         size: usize,
-        /// Sampling seed; the same seed reproduces the same set.
+        /// Sampling seed; the same seed reproduces the same set, whatever it is
+        /// typed as.
         #[arg(long, default_value_t = 0)]
         seed: u64,
+        /// How the drawn sentences are typed.
+        #[arg(long, value_enum, default_value = "full")]
+        typing: TypingArg,
+        /// How often an abbreviating pass drops a syllable to its initial. The
+        /// default is the rate the model was trained under.
+        #[arg(long, default_value_t = DEFAULT_ABBREVIATE_SYLLABLE)]
+        abbreviate_syllable: f64,
     },
     /// Dump prepared targets as one line each, minus the sentences held out for evaluation.
     NgramCorpus {
@@ -179,6 +188,32 @@ pub enum ExportCommand {
         #[arg(long, default_value_t = 0)]
         seed: u64,
     },
+}
+
+/// Which keystrokes an evaluation set is drawn with.
+///
+/// Mirrors [`Typing`] rather than deriving `ValueEnum` on it, for the reason
+/// [`crate::neural::SliceArg`] mirrors its own: the annotation crate has no
+/// business depending on an argument parser.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, ValueEnum)]
+pub enum TypingArg {
+    /// Every syllable typed out, which is what the first eval sets were.
+    Full,
+    /// Each syllable independently dropped to its initial.
+    Abbreviated,
+    /// Full up to a cut inside the sentence, abbreviated after it.
+    Mixed,
+}
+
+impl TypingArg {
+    /// The annotation crate's own name for this style.
+    const fn typing(self) -> Typing {
+        match self {
+            Self::Full => Typing::Full,
+            Self::Abbreviated => Typing::Abbreviated,
+            Self::Mixed => Typing::Mixed,
+        }
+    }
 }
 
 /// One line of a JSON Lines corpus file: the sentence, and nothing else needed.
@@ -262,12 +297,21 @@ pub fn run_export(command: ExportCommand) -> Result<()> {
             out,
             size,
             seed,
+            typing,
+            abbreviate_syllable,
         } => {
+            let style = TypingStyle::new(typing.typing(), abbreviate_syllable)
+                .context("the abbreviation rate is not a probability")?;
             let layout = DataLayout::new(data_dir);
             let rows = read_annotated(&layout.annotations(), ANNOTATED)
                 .context("could not read the annotation shards")?;
-            let written = export_eval_set(&rows, &out, size, seed)?;
-            info!(items = written, path = %out.display(), "evaluation set written");
+            let written = export_eval_set(&rows, &out, size, seed, style)?;
+            info!(
+                items = written,
+                path = %out.display(),
+                typing = %style.typing(),
+                "evaluation set written"
+            );
             Ok(())
         }
         ExportCommand::NgramCorpus {

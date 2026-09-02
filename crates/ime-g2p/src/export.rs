@@ -7,12 +7,18 @@
 //! target string, after the corpus normaliser has already run.
 //!
 //! Three constraints shape what is eligible. The line's `pinyin` field is what a
-//! user *types*, so it is the toneless syllables run together with no separator --
-//! the harness re-segments it, which is half of what is being evaluated. Only
+//! user *types*, so it is the syllables as typed, run together with no separator
+//! -- the harness re-segments it, which is half of what is being evaluated. Only
 //! sentences both annotators agreed on can appear, because a disputed reading
 //! would score a correct conversion as wrong. And the target must be entirely
 //! Han: a comma or a digit inside it has no keystrokes behind it, so it would
 //! make the syllable count disagree with the character count.
+//!
+//! *How* they are typed is a [`TypingStyle`]: full pinyin, abbreviated, or mixed,
+//! the same three styles the training augmentation draws from. One draw exported
+//! three ways gives three sets over the same sentences, which is the only way to
+//! read the difference between them as a difference in typing rather than in
+//! which sentences happened to come up.
 //!
 //! An exclusion that matches nothing is an error rather than a warning: the
 //! held-out sentences came out of these very shards, so a miss means the wrong
@@ -23,6 +29,7 @@ use crate::annotate::{AnnotatedRow, Sample};
 use crate::error::{Error, Result};
 use crate::shards::{read_frame, shard_paths};
 use crate::text::{han_characters, toneless};
+use crate::typing::TypingStyle;
 use rand::SeedableRng as _;
 use rand::rngs::StdRng;
 use serde::{Deserialize, Serialize};
@@ -72,11 +79,17 @@ pub fn eligible(annotated: &[AnnotatedRow]) -> Vec<&AnnotatedRow> {
 
 /// Build one evaluation line, checking the syllables really do cover the target.
 ///
+/// `style` decides what the keystrokes are: the syllables run together for
+/// [`crate::typing::Typing::Full`], and an abbreviating or half-abbreviating typist's keys for
+/// the other two. It is seeded from the row's own text, so a sentence is typed
+/// the same way in every set it is drawn into.
+///
 /// # Errors
 ///
 /// If the row's syllables, its Han characters and its target do not all have the
-/// same length, which means the row should never have been eligible.
-pub fn to_item(row: &AnnotatedRow) -> Result<EvalItem> {
+/// same length, which means the row should never have been eligible, or if the
+/// style cannot type them.
+pub fn to_item(row: &AnnotatedRow, style: TypingStyle) -> Result<EvalItem> {
     let characters = han_characters(&row.text);
     let length = row.text.chars().count();
     if row.g2pw.len() != characters.len() || characters.len() != length {
@@ -87,8 +100,9 @@ pub fn to_item(row: &AnnotatedRow) -> Result<EvalItem> {
             row.g2pw.len()
         )));
     }
+    let syllables: Vec<String> = row.g2pw.iter().map(|syllable| toneless(syllable)).collect();
     Ok(EvalItem {
-        pinyin: row.g2pw.iter().map(|syllable| toneless(syllable)).collect(),
+        pinyin: style.keystrokes(&syllables, &row.text)?,
         text: row.text.clone(),
         context: row.context.clone(),
     })
@@ -222,16 +236,22 @@ pub fn sample_rows<'a, R: Stratified>(
     Ok(drawn)
 }
 
-/// Write the sampled evaluation set to `out_path` as JSON Lines.
+/// Write the sampled evaluation set to `out_path` as JSON Lines, typed `style`.
+///
+/// The draw does not depend on the style: the same `size` and `seed` select the
+/// same sentences in the same order whatever they are typed as, which is what
+/// makes an abbreviated export a twin of a full one rather than a second sample.
 ///
 /// # Errors
 ///
-/// If too few rows are eligible, or the file cannot be written.
+/// If too few rows are eligible, if a row cannot be typed, or if the file cannot
+/// be written.
 pub fn export_eval_set(
     annotated: &[AnnotatedRow],
     out_path: &Path,
     size: usize,
     seed: u64,
+    style: TypingStyle,
 ) -> Result<usize> {
     let rows = eligible(annotated);
     info!(
@@ -242,7 +262,7 @@ pub fn export_eval_set(
     let selected = sample_rows(&rows, size, seed)?;
     let mut handle = create(out_path)?;
     for row in &selected {
-        let item = to_item(row)?;
+        let item = to_item(row, style)?;
         let line = serde_json::to_string(&item).map_err(|error| {
             Error::Invariant(format!("an evaluation item would not serialise: {error}"))
         })?;
@@ -262,6 +282,8 @@ pub fn export_eval_set(
     info!(
         path = %out_path.display(),
         items = selected.len(),
+        typing = %style.typing(),
+        abbreviate_syllable = style.abbreviate_syllable(),
         by_source = ?by_source,
         "evaluation set written"
     );
@@ -478,6 +500,7 @@ fn create(path: &Path) -> Result<BufWriter<std::fs::File>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::typing::Typing;
 
     fn row(
         id: &str,
@@ -527,7 +550,11 @@ mod tests {
 
     #[test]
     fn the_typed_pinyin_is_the_toneless_syllables_run_together() {
-        let item = to_item(&row("a", "wiki", "绿色", &["lü4", "se4"], true)).expect("aligned");
+        let item = to_item(
+            &row("a", "wiki", "绿色", &["lü4", "se4"], true),
+            TypingStyle::default(),
+        )
+        .expect("aligned");
         assert_eq!(item.pinyin, "lvse");
         assert_eq!(item.text, "绿色");
         assert_eq!(item.context, None);
@@ -535,6 +562,35 @@ mod tests {
             serde_json::to_string(&item).expect("serialises"),
             r#"{"pinyin":"lvse","text":"绿色","context":null}"#
         );
+    }
+
+    #[test]
+    fn a_typing_style_changes_the_keystrokes_and_nothing_else() {
+        let source = row(
+            "a",
+            "wiki",
+            "中国人民",
+            &["zhong1", "guo2", "ren2", "min2"],
+            true,
+        );
+        let full = to_item(&source, TypingStyle::default()).expect("aligned");
+        assert_eq!(full.pinyin, "zhongguorenmin");
+        for typing in [Typing::Abbreviated, Typing::Mixed] {
+            let style = TypingStyle::new(typing, crate::typing::DEFAULT_ABBREVIATE_SYLLABLE)
+                .expect("a probability");
+            let item = to_item(&source, style).expect("aligned");
+            assert_eq!(item.text, full.text);
+            assert_eq!(item.context, full.context);
+            assert!(
+                item.pinyin.len() < full.pinyin.len(),
+                "{typing} typed {:?}, which is no shorter than the full spelling",
+                item.pinyin
+            );
+            assert_eq!(
+                item.pinyin,
+                to_item(&source, style).expect("aligned").pinyin
+            );
+        }
     }
 
     #[test]

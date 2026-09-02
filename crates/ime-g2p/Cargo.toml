@@ -11,6 +11,7 @@ rust-version.workspace = true
 [dependencies]
 askama.workspace = true
 async-openai.workspace = true
+blake2.workspace = true
 dotenvy.workspace = true
 futures.workspace = true
 ort.workspace = true
