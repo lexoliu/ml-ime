@@ -1,9 +1,16 @@
 """Label the rest of run3 -- the rows v1 did not draw -- with g2pW, on both T4s.
 
 The rest shards are `<source>-rest-<index>.parquet`, 404 of them holding 31.2M
-rows (`scripts/build_v2_rest.rs`), and one kernel labels a fifth of them: at the
-265 rows/s a v1 kernel measured, a fifth is 6.6 hours, inside the budget with no
-mop-up kernel needed. Push five copies, `KERNEL_INDEX` 0 to 4, two at a time.
+rows (`scripts/build_v2_rest.rs`). Shards whose labels are already mounted --
+from `mlime-run3-rest-labels`, the dataset each round's outputs are added to --
+are left out before the remainder is dealt across `KERNEL_COUNT` kernels, so a
+round that fails or runs out of clock is resumed by re-pushing, not redone. At
+the 125 rows/s one T4 measures, two T4s label a fifth of the rest in about seven
+hours. Push five copies, `KERNEL_INDEX` 0 to 4, two at a time.
+
+The package link is made once, in the controller, before the workers are forked:
+two children racing to create it is what killed a worker at start-up in both v1
+and the first v2 round.
 
 The kernel owns what the package deliberately does not: installing the GPU
 onnxruntime wheel, importing torch first so its CUDA libraries are resident when
@@ -109,9 +116,31 @@ def importable_package() -> Path:
     root = Path("/kaggle/working/packages")
     root.mkdir(parents=True, exist_ok=True)
     link = root / "mlime"
-    if not link.exists():
+    try:
         link.symlink_to(mount, target_is_directory=True)
+    except FileExistsError:
+        if link.resolve() != mount.resolve():
+            raise
     return root
+
+
+def labelled_shards():
+    """The rest shards whose labels some mount already holds.
+
+    A label shard is named after its sample shard, so the labels mount is told
+    from the samples mount by its columns, not its file names.
+    """
+    import polars as pl
+
+    found = set()
+    for directory in directories(INPUTS):
+        shards = sorted(directory.glob("*-rest-*.parquet"))
+        if not shards:
+            continue
+        columns = set(pl.scan_parquet(shards[0]).collect_schema().names())
+        if "syllables" in columns:
+            found.update(shard.name for shard in shards)
+    return found
 
 
 def install() -> None:
@@ -205,13 +234,18 @@ def fork_worker(shards: list[str], device: int) -> int:
 def controller() -> None:
     """Split this kernel's shards across the GPUs and run one worker on each."""
     install()
+    importable_package()
     samples = locate(SAMPLES_MARKER)
-    names = sorted(path.name for path in samples.glob("*.parquet"))
+    done = labelled_shards()
+    names = sorted(path.name for path in samples.glob("*.parquet") if path.name not in done)
     mine = [name for index, name in enumerate(names) if index % KERNEL_COUNT == KERNEL_INDEX]
+    if not mine:
+        raise RuntimeError(f"kernel {KERNEL_INDEX}/{KERNEL_COUNT} has no unlabelled shard left")
     devices = visible_devices()
     per_device = [mine[index :: len(devices)] for index in range(len(devices))]
     print(
-        f"kernel {KERNEL_INDEX}/{KERNEL_COUNT}: {len(names)} shards mounted, {len(mine)} mine, "
+        f"kernel {KERNEL_INDEX}/{KERNEL_COUNT}: {len(names)} shards unlabelled "
+        f"({len(done)} already labelled), {len(mine)} mine, "
         f"devices {devices}, {[len(shards) for shards in per_device]} shards each",
         flush=True,
     )
