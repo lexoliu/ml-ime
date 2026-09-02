@@ -25,6 +25,12 @@ non-Han character has no syllable behind that character; a character outside the
 model's vocabulary cannot be emitted; a reading that no typed span admits would
 train the model towards a candidate it is masked out of. Each of those is a fact
 about the data, and :class:`BuildCounts` is where it shows up.
+
+The one thing that *is* rewritten happens before any of that: the annotator and
+the character table follow different standards on a few dozen characters, and
+:class:`~mlime.train.arbitration.ReadingArbitration` settles each of them by a
+decision recorded in a data file. It is applied to the label as it arrives, so
+every gate downstream tests the reading the run actually trains under.
 """
 
 from __future__ import annotations
@@ -32,7 +38,7 @@ from __future__ import annotations
 import hashlib
 import random
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Protocol
 
@@ -44,6 +50,7 @@ from mlime.data.corpus import Sample
 from mlime.data.shards import shard_paths
 from mlime.data.text import HAN
 from mlime.logging import log
+from mlime.train.arbitration import ReadingArbitration
 from mlime.train.labels import keyboard_form
 from mlime.train.lexicon import Lexicon
 from mlime.train.spans import SpanVocab, initial
@@ -158,11 +165,20 @@ class BuildCounts:
     unknown_span: int = 0
     unemittable_character: int = 0
     target_not_admitted: int = 0
+    #: Label positions the arbitration table rewrote. Positions, not sentences:
+    #: one sentence can carry several, and an arbitrated sentence still lands
+    #: under whichever outcome it reaches. So this one is not an outcome and is
+    #: kept out of :attr:`seen`, which counts samples.
+    reading_arbitrated: int = field(default=0, metadata={"outcome": False})
 
     @property
     def seen(self) -> int:
         """Every sample the builder was offered."""
-        return sum(vars(self).values())
+        return sum(
+            getattr(self, counter.name)
+            for counter in fields(self)
+            if counter.metadata.get("outcome", True)
+        )
 
     def as_dict(self) -> dict[str, int]:
         """The counters, plus the total, ready for a metrics record."""
@@ -191,17 +207,25 @@ class TrainingExample:
 
 
 class SampleBuilder:
-    """Builds one training example from a sample and its readings."""
+    """Builds one training example from a sample and its readings.
+
+    The arbitration table is passed in rather than loaded here, because it is one
+    of the things a run is made of -- like the lexicon and the span inventory --
+    and a builder that loaded its own could differ from the one the provenance
+    record describes.
+    """
 
     def __init__(
         self,
         lexicon: Lexicon,
         spans: SpanVocab,
+        arbitration: ReadingArbitration,
         augmentation: Augmentation | None = None,
         seed: int = 0,
     ):
         self.lexicon = lexicon
         self.spans = spans
+        self.arbitration = arbitration
         self.augmentation = augmentation or Augmentation()
         self.seed = seed
         self.counts = BuildCounts()
@@ -220,7 +244,14 @@ class SampleBuilder:
         if len(characters) != len(syllables):
             self.counts.length_mismatch += 1
             return None
-        readings = tuple(keyboard_form(syllable) for syllable in syllables)
+        labelled = tuple(keyboard_form(syllable) for syllable in syllables)
+        readings = tuple(
+            self.arbitration.reading(character, label)
+            for character, label in zip(characters, labelled, strict=True)
+        )
+        self.counts.reading_arbitrated += sum(
+            arbitrated != label for arbitrated, label in zip(readings, labelled, strict=True)
+        )
         if any(reading not in self.spans for reading in readings):
             self.counts.unknown_span += 1
             return None
