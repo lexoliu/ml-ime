@@ -392,18 +392,22 @@ def main():
         checkpoint = out / "checkpoint-final.pt"
         if not checkpoint.is_file():
             raise RuntimeError("the run finished without writing a final checkpoint")
+        lattices = sorted(assets.glob("lattice*.jsonl"))
+        if not lattices:
+            raise FileNotFoundError(f"no lattice*.jsonl under {assets}")
         scored = {}
-        for context in (True, False):
-            name = "on" if context else "off"
-            scores = WORKING / f"scores-context-{name}.jsonl.gz"
-            code, elapsed = run(
-                emit_argv(checkpoint, assets / "lattice.jsonl", scores, char_table, context),
-                env,
-                str(WORKING / f"emit-{name}.log"),
-            )
-            if code != 0:
-                raise RuntimeError(f"scoring the lattice with context {name} failed")
-            scored[name] = {"bytes": scores.stat().st_size, "seconds": round(elapsed, 1)}
+        for lattice in lattices:
+            for context in (True, False):
+                name = f"{lattice.stem}-context-{'on' if context else 'off'}"
+                scores = WORKING / f"scores-{name}.jsonl.gz"
+                code, elapsed = run(
+                    emit_argv(checkpoint, lattice, scores, char_table, context),
+                    env,
+                    str(WORKING / f"emit-{name}.log"),
+                )
+                if code != 0:
+                    raise RuntimeError(f"scoring {lattice.name} with context {name} failed")
+                scored[name] = {"bytes": scores.stat().st_size, "seconds": round(elapsed, 1)}
         summary["scores"] = scored
         summary["held_out"] = records_of(out / "metrics.jsonl", "summary")[-1]
 
