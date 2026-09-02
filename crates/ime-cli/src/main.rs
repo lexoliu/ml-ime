@@ -430,6 +430,47 @@ mod tests {
     }
 
     #[test]
+    fn the_eval_set_export_defaults_to_full_pinyin_and_takes_the_other_styles() {
+        let default = Cli::parse_from(["ime-cli", "export", "eval-set"]);
+        let Command::Export {
+            command:
+                ExportCommand::EvalSet {
+                    typing,
+                    abbreviate_syllable,
+                    ..
+                },
+        } = default.command
+        else {
+            panic!("expected the eval-set export");
+        };
+        assert_eq!(typing, g2p::TypingArg::Full);
+        assert!((abbreviate_syllable - 0.7).abs() < f64::EPSILON);
+
+        let asked = Cli::parse_from([
+            "ime-cli",
+            "export",
+            "eval-set",
+            "--typing",
+            "mixed",
+            "--abbreviate-syllable",
+            "0.5",
+        ]);
+        let Command::Export {
+            command:
+                ExportCommand::EvalSet {
+                    typing,
+                    abbreviate_syllable,
+                    ..
+                },
+        } = asked.command
+        else {
+            panic!("expected the eval-set export");
+        };
+        assert_eq!(typing, g2p::TypingArg::Mixed);
+        assert!((abbreviate_syllable - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
     fn the_candidate_list_renders_one_ranked_line_each() {
         let list = CandidateList {
             candidates: vec![
