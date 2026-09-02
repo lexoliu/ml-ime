@@ -14,6 +14,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 
+from mlime.train.arbitration import ReadingArbitration
 from mlime.train.lexicon import Lexicon
 from mlime.train.run import RunPaths, Slices, held_out_examples
 from mlime.train.samples import SampleBuilder
@@ -51,7 +52,7 @@ def write_pair(root: Path, shard: str, source: str, rows: int) -> None:
 
 
 def test_the_held_out_slice_is_drawn_from_every_shard(
-    tmp_path: Path, lexicon: Lexicon, spans: SpanVocab
+    tmp_path: Path, lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
 ) -> None:
     # The first shard alone could fill the whole quota, which is exactly the
     # situation that made the in-training evaluation one source's number.
@@ -64,7 +65,7 @@ def test_the_held_out_slice_is_drawn_from_every_shard(
             char_table=tmp_path / "unused.tsv",
             out=tmp_path / "out",
         ),
-        SampleBuilder(lexicon, spans),
+        SampleBuilder(lexicon, spans, arbitration),
         Slices(
             train=("unused.parquet",),
             held_out=("bilibili-00001.parquet", "wiki-00001.parquet"),

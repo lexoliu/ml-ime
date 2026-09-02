@@ -30,6 +30,7 @@ import torch
 
 from mlime.data.shards import shard_paths
 from mlime.logging import log
+from mlime.train.arbitration import ReadingArbitration
 from mlime.train.lexicon import Lexicon, build_lexicon, read_char_readings
 from mlime.train.loop import (
     Accuracy,
@@ -203,30 +204,33 @@ def build_lexicon_for(char_table: Path, tokenizer: BaseTokenizer, spans: SpanVoc
 
 @dataclass(frozen=True)
 class Vocabularies:
-    """The three tables everything a run does is indexed by.
+    """The four tables everything a run does is indexed by.
 
     They belong together because they are built from one another: the lexicon is
     the pinyin table intersected with the *base model's* vocabulary, so it cannot
-    be built without the tokenizer, and the spans index both the augmentation and
-    the model's extra embedding table. Anything that reads the corpus the way a
-    run reads it -- training, and counting what training will do -- needs all
-    three, built the same way, which is why they are assembled once here rather
-    than gathered again at each call site.
+    be built without the tokenizer, the spans index both the augmentation and
+    the model's extra embedding table, and the arbitration table is checked
+    against those same spans. Anything that reads the corpus the way a run reads
+    it -- training, and counting what training will do -- needs all four, built
+    the same way, which is why they are assembled once here rather than gathered
+    again at each call site.
     """
 
     spans: SpanVocab
     tokenizer: BaseTokenizer
     lexicon: Lexicon
+    arbitration: ReadingArbitration
 
     @classmethod
     def load(cls, char_table: Path, base_model: str) -> Vocabularies:
-        """Load the span table, the base model's tokenizer, and the lexicon over both."""
+        """Load the span table, the tokenizer, the lexicon over both, and the arbitration."""
         spans = SpanVocab.load()
         tokenizer = load_tokenizer(base_model)
         return cls(
             spans=spans,
             tokenizer=tokenizer,
             lexicon=build_lexicon_for(char_table, tokenizer, spans),
+            arbitration=ReadingArbitration.load(spans),
         )
 
     @property
@@ -236,7 +240,7 @@ class Vocabularies:
 
     def builder(self, augmentation: Augmentation | None, seed: int) -> SampleBuilder:
         """A builder that types sentences the way *seed* and *augmentation* say."""
-        return SampleBuilder(self.lexicon, self.spans, augmentation, seed=seed)
+        return SampleBuilder(self.lexicon, self.spans, self.arbitration, augmentation, seed=seed)
 
     def stream(
         self,
@@ -337,6 +341,7 @@ def route_a(
                 corpus=corpus_digest(shard_paths(paths.samples, "*")),
                 labels=corpus_digest(shard_paths(paths.labels, "*")),
                 label_source="g2pw",
+                reading_arbitration=vocabularies.arbitration.digest,
                 train_shards=list(slices.train),
                 held_out_shards=list(slices.held_out),
                 augmentation=asdict(augmentation or Augmentation()),
@@ -351,7 +356,7 @@ def route_a(
     if not segment.finished:
         return paused_run(segment, losses, model.gates(), builder.counts.as_dict(), world)
     evaluation = held_out_examples(
-        paths, SampleBuilder(lexicon, spans, augmentation, seed=training.seed + 1), slices
+        paths, vocabularies.builder(augmentation, training.seed + 1), slices
     )
     device = world.device
     with_context = evaluate(model, evaluation, tokenizer, device, training.token_budget, True)

@@ -19,6 +19,7 @@ import pytest
 import torch
 
 from mlime.data.corpus import SAMPLE_SCHEMA, Sample
+from mlime.train.arbitration import ReadingArbitration
 from mlime.train.labels import LABEL_SCHEMA, keyboard_form
 from mlime.train.lexicon import Lexicon
 from mlime.train.samples import (
@@ -120,8 +121,10 @@ def _sample(text: str, context: str | None = None) -> Sample:
     return Sample(id=f"id-{text}", source="test", text=text, context=context)
 
 
-def test_a_built_example_is_aligned_and_resolvable(lexicon: Lexicon, spans: SpanVocab) -> None:
-    builder = SampleBuilder(lexicon, spans, seed=5)
+def test_a_built_example_is_aligned_and_resolvable(
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
+) -> None:
+    builder = SampleBuilder(lexicon, spans, arbitration, seed=5)
     example = builder.build(_sample("我爱北京"), ["wo3", "ai4", "bei3", "jing1"], epoch=0)
     assert example is not None
     assert len(example.spans) == len(example.targets) == len(example.span_ids) == 4
@@ -132,9 +135,9 @@ def test_a_built_example_is_aligned_and_resolvable(lexicon: Lexicon, spans: Span
 
 
 def test_every_target_is_admitted_by_the_span_that_was_typed(
-    lexicon: Lexicon, spans: SpanVocab
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
 ) -> None:
-    builder = SampleBuilder(lexicon, spans, seed=1)
+    builder = SampleBuilder(lexicon, spans, arbitration, seed=1)
     for epoch in range(20):
         example = builder.build(_sample("中重我绿"), ["zhong1", "chong2", "wo3", "lv4"], epoch)
         assert example is not None
@@ -142,8 +145,54 @@ def test_every_target_is_admitted_by_the_span_that_was_typed(
             assert bool(lexicon.candidate_mask[span_id, target])
 
 
-def test_unusable_samples_are_counted_not_patched(lexicon: Lexicon, spans: SpanVocab) -> None:
-    builder = SampleBuilder(lexicon, spans)
+def test_a_taiwan_reading_is_arbitrated_and_the_position_counted(
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
+) -> None:
+    """和 labelled ``han4`` is admitted, and the substitution shows up in the counts.
+
+    g2pW reads the conjunction the Taiwan way and the mainland table lists only
+    ``he``/``hu``/``huo``, so before arbitration this sentence was one of the
+    400,407 the v1 corpus dropped at the admission gate.
+    """
+    builder = SampleBuilder(lexicon, spans, arbitration, ALWAYS_FULL)
+    example = builder.build(_sample("我和北京"), ["wo3", "han4", "bei3", "jing1"], 0)
+    assert example is not None
+    assert example.spans[1] == "he"
+    assert builder.counts.reading_arbitrated == 1
+    assert builder.counts.target_not_admitted == 0
+    assert builder.counts.kept == 1
+
+
+def test_an_unarbitrated_reading_is_left_alone(
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
+) -> None:
+    builder = SampleBuilder(lexicon, spans, arbitration, ALWAYS_FULL)
+    example = builder.build(_sample("我和北京"), ["wo3", "he2", "bei3", "jing1"], 0)
+    assert example is not None
+    assert example.spans == ("wo", "he", "bei", "jing")
+    assert builder.counts.reading_arbitrated == 0
+
+
+def test_arbitrated_positions_are_counted_and_not_samples(
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
+) -> None:
+    """One sentence, two arbitrations: the counter follows positions.
+
+    :attr:`BuildCounts.seen` counts samples, so the position counter has to stay
+    out of it or the census reports more samples than the corpus holds.
+    """
+    builder = SampleBuilder(lexicon, spans, arbitration, ALWAYS_FULL)
+    example = builder.build(_sample("和和北京"), ["han4", "han4", "bei3", "jing1"], 0)
+    assert example is not None
+    assert builder.counts.reading_arbitrated == 2
+    assert builder.counts.seen == 1
+    assert builder.counts.as_dict()["reading_arbitrated"] == 2
+
+
+def test_unusable_samples_are_counted_not_patched(
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
+) -> None:
+    builder = SampleBuilder(lexicon, spans, arbitration)
     assert builder.build(_sample("我爱Python"), ["wo3", "ai4"], 0) is None
     assert builder.counts.not_all_han == 1
     assert builder.build(_sample("我爱"), ["wo3"], 0) is None
@@ -156,9 +205,9 @@ def test_unusable_samples_are_counted_not_patched(lexicon: Lexicon, spans: SpanV
 
 
 def test_context_is_dropped_at_the_stated_rate(
-    lexicon: Lexicon, spans: SpanVocab, tokenizer: BaseTokenizer
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration, tokenizer: BaseTokenizer
 ) -> None:
-    builder = SampleBuilder(lexicon, spans)
+    builder = SampleBuilder(lexicon, spans, arbitration)
     example = builder.build(_sample("我爱北京", context="北京"), ["wo3", "ai4", "bei3", "jing1"], 0)
     assert example is not None
     collator = Collator(tokenizer, context_dropout=0.3, seed=42)
@@ -167,9 +216,9 @@ def test_context_is_dropped_at_the_stated_rate(
 
 
 def test_a_sample_with_no_context_never_claims_one(
-    lexicon: Lexicon, spans: SpanVocab, tokenizer: BaseTokenizer
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration, tokenizer: BaseTokenizer
 ) -> None:
-    builder = SampleBuilder(lexicon, spans)
+    builder = SampleBuilder(lexicon, spans, arbitration)
     example = builder.build(_sample("我爱北京"), ["wo3", "ai4", "bei3", "jing1"], 0)
     assert example is not None
     batch = Collator(tokenizer, context_dropout=0.0)([example])
@@ -177,9 +226,9 @@ def test_a_sample_with_no_context_never_claims_one(
 
 
 def test_the_collated_batch_masks_and_targets_line_up(
-    lexicon: Lexicon, spans: SpanVocab, tokenizer: BaseTokenizer
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration, tokenizer: BaseTokenizer
 ) -> None:
-    builder = SampleBuilder(lexicon, spans)
+    builder = SampleBuilder(lexicon, spans, arbitration)
     examples = [
         builder.build(_sample("我爱北京"), ["wo3", "ai4", "bei3", "jing1"], 0),
         builder.build(_sample("中重"), ["zhong1", "chong2"], 0),
@@ -199,8 +248,10 @@ def test_the_collated_batch_masks_and_targets_line_up(
     )
 
 
-def test_batches_respect_the_token_budget(lexicon: Lexicon, spans: SpanVocab) -> None:
-    builder = SampleBuilder(lexicon, spans)
+def test_batches_respect_the_token_budget(
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
+) -> None:
+    builder = SampleBuilder(lexicon, spans, arbitration)
     examples = []
     for index in range(20):
         text = f"我爱北京{'中' * (index % 3)}"[:4]
@@ -214,14 +265,16 @@ def test_batches_respect_the_token_budget(lexicon: Lexicon, spans: SpanVocab) ->
         assert width * len(group) <= 24
 
 
-def test_a_batch_pays_for_its_context_rectangle_too(lexicon: Lexicon, spans: SpanVocab) -> None:
+def test_a_batch_pays_for_its_context_rectangle_too(
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
+) -> None:
     """A batch of short sentences with long contexts is a *small* batch.
 
     Bounding the fill tower alone, the sentences here are four characters and the
     budget would admit ten of them; their contexts are the expensive half, and it
     is that half that took a two-rank run out of memory.
     """
-    builder = SampleBuilder(lexicon, spans, ALWAYS_FULL)
+    builder = SampleBuilder(lexicon, spans, arbitration, ALWAYS_FULL)
     examples = [
         builder.build(_sample("我爱北京", context="北" * 40), ["wo", "ai", "bei", "jing"], 0)
         for _ in range(20)
@@ -239,9 +292,9 @@ def test_a_batch_pays_for_its_context_rectangle_too(lexicon: Lexicon, spans: Spa
 
 
 def test_a_batch_with_no_context_tower_pays_for_the_fill_alone(
-    lexicon: Lexicon, spans: SpanVocab
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
 ) -> None:
-    builder = SampleBuilder(lexicon, spans, ALWAYS_FULL)
+    builder = SampleBuilder(lexicon, spans, arbitration, ALWAYS_FULL)
     kept = [
         example
         for example in (
@@ -263,7 +316,7 @@ def test_the_context_kept_is_the_end_of_it() -> None:
 
 
 def test_a_stream_reads_its_shards_and_reaugments(
-    tmp_path: Path, lexicon: Lexicon, spans: SpanVocab
+    tmp_path: Path, lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
 ) -> None:
     samples_dir, labels_dir = tmp_path / "samples", tmp_path / "labels"
     samples_dir.mkdir()
@@ -281,7 +334,9 @@ def test_a_stream_reads_its_shards_and_reaugments(
         schema=LABEL_SCHEMA,
     ).write_parquet(labels_dir / "test-00000.parquet")
 
-    stream = CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, seed=3))
+    stream = CorpusStream(
+        samples_dir, labels_dir, SampleBuilder(lexicon, spans, arbitration, seed=3)
+    )
     first = [example.spans for example in stream]
     assert len(first) == 2
     stream.set_epoch(1)
@@ -290,7 +345,7 @@ def test_a_stream_reads_its_shards_and_reaugments(
 
 
 def test_a_missing_label_shard_is_an_error(
-    tmp_path: Path, lexicon: Lexicon, spans: SpanVocab
+    tmp_path: Path, lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
 ) -> None:
     samples_dir, labels_dir = tmp_path / "samples", tmp_path / "labels"
     samples_dir.mkdir()
@@ -298,7 +353,7 @@ def test_a_missing_label_shard_is_an_error(
     pl.DataFrame([_sample("我爱北京").row()], schema=SAMPLE_SCHEMA).write_parquet(
         samples_dir / "test-00000.parquet"
     )
-    stream = CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans))
+    stream = CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, arbitration))
     with pytest.raises(FileNotFoundError, match="no label shard"):
         list(stream)
 
@@ -327,9 +382,9 @@ def test_an_unaligned_example_is_refused() -> None:
 
 
 def test_a_batch_moves_wholesale(
-    lexicon: Lexicon, spans: SpanVocab, tokenizer: BaseTokenizer
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration, tokenizer: BaseTokenizer
 ) -> None:
-    builder = SampleBuilder(lexicon, spans)
+    builder = SampleBuilder(lexicon, spans, arbitration)
     example = builder.build(_sample("我爱北京"), ["wo3", "ai4", "bei3", "jing1"], 0)
     assert example is not None
     batch = Collator(tokenizer)([example])

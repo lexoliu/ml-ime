@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from mlime.data.pinyin_tables import build
+from mlime.data.pinyin_tables import build, read_overrides
 
 MAX_SYLLABLE_LEN = 6
 TYPEABLE = re.compile(r"\A[a-z]+\Z")
@@ -72,3 +72,46 @@ def test_polyphones_and_umlauts_survive(tables: Tables, char: str, expected: set
     _, rows = tables
     readings = {r for c, rs in rows if c == char for r in rs}
     assert expected <= readings, f"{char} lost readings: expected {expected}, got {readings}"
+
+
+@pytest.mark.parametrize(("char", "reading"), sorted(read_overrides().items()))
+def test_overrides_land_in_the_table(tables: Tables, char: str, reading: tuple[str, ...]) -> None:
+    """Every override reaches the generated file, after pypinyin's own readings.
+
+    Otherwise the fix lives only in whoever last ran the generator: CI
+    regenerates and diffs, so a table hand-edited to add ``嗯 en`` fails the
+    build and a table that silently dropped the override does not.
+    """
+    _, rows = tables
+    listed = [readings for c, readings in rows if c == char]
+    assert listed, f"{char} is not in the generated table at all"
+    assert listed[0][-len(reading) :] == list(reading)
+
+
+def test_an_override_pypinyin_already_lists_is_refused(tmp_path: Path) -> None:
+    """A row that has been absorbed upstream is dead weight, and says so."""
+    table = tmp_path / "pinyin_overrides.tsv"
+    table.write_text("嗯\tn\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="already lists"):
+        build(tmp_path / "out", table)
+
+
+def test_an_override_for_a_character_pypinyin_lacks_is_refused(tmp_path: Path) -> None:
+    table = tmp_path / "pinyin_overrides.tsv"
+    table.write_text("\U0002ebe0\tzhi\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="no readings for"):
+        build(tmp_path / "out", table)
+
+
+def test_a_malformed_override_row_is_refused(tmp_path: Path) -> None:
+    table = tmp_path / "pinyin_overrides.tsv"
+    table.write_text("嗯\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="is not a"):
+        read_overrides(table)
+
+
+def test_an_untypeable_override_is_refused(tmp_path: Path) -> None:
+    table = tmp_path / "pinyin_overrides.tsv"
+    table.write_text("嗯\tên\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="no keyboard can produce"):
+        read_overrides(table)
