@@ -14,7 +14,8 @@
   "dataset_sources": [
     "lexoliu/mlime-g2pw-model",
     "lexoliu/mlime-src",
-    "lexoliu/mlime-run3-rest-samples"
+    "lexoliu/mlime-run3-rest-samples",
+    "lexoliu/mlime-run3-rest-labels"
   ],
   "kernel_sources": [],
   "competition_sources": [],
