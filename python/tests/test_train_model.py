@@ -18,6 +18,7 @@ import torch
 from transformers import BertConfig
 
 from mlime.data.corpus import Sample
+from mlime.train.arbitration import ReadingArbitration
 from mlime.train.lexicon import Lexicon
 from mlime.train.model import (
     RouteAConfig,
@@ -49,12 +50,12 @@ def model_fixture(lexicon: Lexicon) -> RouteAModel:
 
 @pytest.fixture(name="make_batch")
 def make_batch_fixture(
-    lexicon: Lexicon, spans: SpanVocab, tokenizer: BaseTokenizer
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration, tokenizer: BaseTokenizer
 ) -> Callable[..., Batch]:
     """A two-example batch, with or without context, collated the way training does."""
 
     def build(context: str | None = "北京大学") -> Batch:
-        builder = SampleBuilder(lexicon, spans, seed=0)
+        builder = SampleBuilder(lexicon, spans, arbitration, seed=0)
         examples = [
             builder.build(
                 Sample(id="a", source="test", text="我爱北京", context=context),

@@ -22,6 +22,7 @@ import pytest
 import torch
 
 from mlime.data.corpus import SAMPLE_SCHEMA, Sample
+from mlime.train.arbitration import ReadingArbitration
 from mlime.train.labels import LABEL_SCHEMA
 from mlime.train.lexicon import Lexicon, build_lexicon
 from mlime.train.spans import SpanVocab
@@ -34,8 +35,10 @@ CORPUS = [
     ("我爱绿钟", ["wo3", "ai4", "lv4", "zhong1"], "绿"),
 ]
 
-#: 中/钟 are homophones, 重 is a polyphone, 绿 carries the ü spelling, and the
-#: rest spell 我爱北京 so that a test sentence reads like one.
+#: 中/钟 are homophones, 重 is a polyphone, 绿 carries the ü spelling, 和 carries
+#: the readings the mainland table really lists for it -- so the arbitration of
+#: its Taiwan label is tested against the real disagreement -- and the rest spell
+#: 我爱北京 so that a test sentence reads like one.
 READINGS = {
     "中": ("zhong",),
     "钟": ("zhong",),
@@ -45,6 +48,7 @@ READINGS = {
     "绿": ("lv", "lu"),
     "北": ("bei",),
     "京": ("jing",),
+    "和": ("he", "hu", "huo"),
 }
 
 
@@ -90,6 +94,12 @@ def lexicon_fixture(spans: SpanVocab) -> Lexicon:
     """A lexicon over :data:`READINGS`, as if the base vocabulary held just those."""
     vocabulary = {character: index + 100 for index, character in enumerate(sorted(READINGS))}
     return build_lexicon(READINGS, vocabulary, spans)
+
+
+@pytest.fixture(name="arbitration")
+def arbitration_fixture(spans: SpanVocab) -> ReadingArbitration:
+    """The real table of decided readings that ships in the package."""
+    return ReadingArbitration.load(spans)
 
 
 @pytest.fixture(name="tokenizer")

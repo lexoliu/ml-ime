@@ -17,6 +17,7 @@ import pytest
 import torch
 from transformers import BertConfig
 
+from mlime.train.arbitration import ReadingArbitration
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import (
     Accuracy,
@@ -70,13 +71,16 @@ def test_the_loss_falls_and_the_run_leaves_its_evidence(
     corpus: tuple[Path, Path],
     lexicon: Lexicon,
     spans: SpanVocab,
+    arbitration: ReadingArbitration,
     tokenizer: BaseTokenizer,
     tmp_path: Path,
 ) -> None:
     samples_dir, labels_dir = corpus
     torch.manual_seed(0)
     model = RouteAModel.from_config(TINY, lexicon, RouteAConfig(cross_attention_layers=1))
-    stream = CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, seed=1))
+    stream = CorpusStream(
+        samples_dir, labels_dir, SampleBuilder(lexicon, spans, arbitration, seed=1)
+    )
     config = TrainingConfig(
         max_steps=40,
         base_lr=1e-3,
@@ -106,12 +110,13 @@ def test_the_schedule_reaches_both_learning_rates(
     corpus: tuple[Path, Path],
     lexicon: Lexicon,
     spans: SpanVocab,
+    arbitration: ReadingArbitration,
     tokenizer: BaseTokenizer,
     tmp_path: Path,
 ) -> None:
     samples_dir, labels_dir = corpus
     model = RouteAModel.from_config(TINY, lexicon, RouteAConfig(cross_attention_layers=1))
-    stream = CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans))
+    stream = CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, arbitration))
     config = TrainingConfig(max_steps=25, token_budget=64, log_every=1, fp16=False)
     metrics_path = train(model, stream, Collator(tokenizer), config, tmp_path / "run").metrics
     steps = [
@@ -126,11 +131,15 @@ def test_the_schedule_reaches_both_learning_rates(
 
 
 def test_accuracy_is_reported_with_and_without_context(
-    corpus: tuple[Path, Path], lexicon: Lexicon, spans: SpanVocab, tokenizer: BaseTokenizer
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
 ) -> None:
     samples_dir, labels_dir = corpus
     model = RouteAModel.from_config(TINY, lexicon, RouteAConfig(cross_attention_layers=1))
-    stream = CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans))
+    stream = CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, arbitration))
     examples = list(stream)
     assert examples
     for with_context in (True, False):
@@ -166,12 +175,16 @@ def tiny_model(lexicon: Lexicon) -> RouteAModel:
 
 
 def stream_and_collator(
-    corpus: tuple[Path, Path], lexicon: Lexicon, spans: SpanVocab, tokenizer: BaseTokenizer
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
 ) -> tuple[CorpusStream, Collator]:
     """A reader and a collator seeded the way every segment of one run seeds them."""
     samples_dir, labels_dir = corpus
     return (
-        CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, seed=1)),
+        CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, arbitration, seed=1)),
         Collator(tokenizer),
     )
 
@@ -196,17 +209,18 @@ def test_a_resumed_run_is_the_run_that_was_not_interrupted(
     short_corpus: tuple[Path, Path],
     lexicon: Lexicon,
     spans: SpanVocab,
+    arbitration: ReadingArbitration,
     tokenizer: BaseTokenizer,
     tmp_path: Path,
 ) -> None:
     whole_dir = tmp_path / "whole"
     uninterrupted = tiny_model(lexicon)
-    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     whole = train(uninterrupted, stream, collator, RESUMABLE, whole_dir).metrics
     assert len(step_losses(whole)) == RESUMABLE.max_steps
 
     resumed_model = tiny_model(lexicon)
-    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     resumed = train(
         resumed_model,
         stream,
@@ -237,16 +251,24 @@ def test_a_resumed_run_is_the_run_that_was_not_interrupted(
 
 
 def test_skipping_lands_where_reading_would_have(
-    short_corpus: tuple[Path, Path], lexicon: Lexicon, spans: SpanVocab, tokenizer: BaseTokenizer
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
 ) -> None:
-    read = EpochBatches(*stream_and_collator(short_corpus, lexicon, spans, tokenizer), 24)
+    read = EpochBatches(
+        *stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer), 24
+    )
     for _ in range(5):
         next(read)
     epoch, index = read.epoch, read.index
     assert (epoch, index) == (1, 1)  # the fifth batch is into the second epoch
     wanted = next(read)
 
-    skipped = EpochBatches(*stream_and_collator(short_corpus, lexicon, spans, tokenizer), 24)
+    skipped = EpochBatches(
+        *stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer), 24
+    )
     skipped.skip(epoch, index)
     assert (skipped.epoch, skipped.index) == (epoch, index)
     landed = next(skipped)
@@ -259,15 +281,16 @@ def test_a_resume_under_a_different_schedule_is_refused(
     short_corpus: tuple[Path, Path],
     lexicon: Lexicon,
     spans: SpanVocab,
+    arbitration: ReadingArbitration,
     tokenizer: BaseTokenizer,
     tmp_path: Path,
 ) -> None:
     out_dir = tmp_path / "whole"
-    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     train(tiny_model(lexicon), stream, collator, RESUMABLE, out_dir)
 
     elsewhere = replace(RESUMABLE, base_lr=RESUMABLE.base_lr * 2, weight_decay=0.5)
-    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     with pytest.raises(ValueError, match=r"base_lr .* weight_decay "):
         train(
             tiny_model(lexicon),
@@ -283,14 +306,15 @@ def test_resuming_a_run_that_is_already_finished_is_refused(
     short_corpus: tuple[Path, Path],
     lexicon: Lexicon,
     spans: SpanVocab,
+    arbitration: ReadingArbitration,
     tokenizer: BaseTokenizer,
     tmp_path: Path,
 ) -> None:
     out_dir = tmp_path / "whole"
-    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     train(tiny_model(lexicon), stream, collator, RESUMABLE, out_dir)
 
-    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     with pytest.raises(ValueError, match="already at step 6 of 6"):
         train(
             tiny_model(lexicon),
@@ -306,12 +330,13 @@ def test_only_the_newest_checkpoints_are_kept(
     short_corpus: tuple[Path, Path],
     lexicon: Lexicon,
     spans: SpanVocab,
+    arbitration: ReadingArbitration,
     tokenizer: BaseTokenizer,
     tmp_path: Path,
 ) -> None:
     out_dir = tmp_path / "rotated"
     config = replace(RESUMABLE, checkpoint_every=1, keep_checkpoints=2)
-    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     train(tiny_model(lexicon), stream, collator, config, out_dir)
 
     numbered = sorted(path.name for path in out_dir.glob("checkpoint-[0-9]*.pt"))
@@ -333,17 +358,18 @@ def test_a_segment_out_of_clock_pauses_and_the_next_one_finishes_the_run(
     short_corpus: tuple[Path, Path],
     lexicon: Lexicon,
     spans: SpanVocab,
+    arbitration: ReadingArbitration,
     tokenizer: BaseTokenizer,
     tmp_path: Path,
 ) -> None:
     whole_dir = tmp_path / "whole"
     uninterrupted = tiny_model(lexicon)
-    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     whole = train(uninterrupted, stream, collator, RESUMABLE, whole_dir)
     assert whole.finished and whole.step == RESUMABLE.max_steps
 
     paused_dir = tmp_path / "paused"
-    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     paused = train(tiny_model(lexicon), stream, collator, SPENT, paused_dir)
     assert (paused.step, paused.finished) == (1, False)
     assert (paused_dir / "checkpoint-paused.pt").is_file()
@@ -355,7 +381,7 @@ def test_a_segment_out_of_clock_pauses_and_the_next_one_finishes_the_run(
     # The budget belongs to the kernel, not to the run, so the segment that
     # finishes it is allowed to have no budget at all.
     resumed_model = tiny_model(lexicon)
-    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     resumed = train(
         resumed_model,
         stream,
@@ -375,19 +401,20 @@ def test_rotation_leaves_the_paused_checkpoint_alone(
     short_corpus: tuple[Path, Path],
     lexicon: Lexicon,
     spans: SpanVocab,
+    arbitration: ReadingArbitration,
     tokenizer: BaseTokenizer,
     tmp_path: Path,
 ) -> None:
     out_dir = tmp_path / "chained"
     every_step = replace(RESUMABLE, checkpoint_every=1, keep_checkpoints=1)
-    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     spent = replace(every_step, wall_budget_seconds=SPENT.wall_budget_seconds)
     train(tiny_model(lexicon), stream, collator, spent, out_dir)
     assert (out_dir / "checkpoint-paused.pt").is_file()
 
     # The next segment writes into the same directory and rotates hard, and the
     # file it is resuming from is the one thing it must not delete.
-    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     train(
         tiny_model(lexicon),
         stream,
@@ -407,15 +434,16 @@ def test_a_budget_may_change_between_segments_but_nothing_else_may(
     short_corpus: tuple[Path, Path],
     lexicon: Lexicon,
     spans: SpanVocab,
+    arbitration: ReadingArbitration,
     tokenizer: BaseTokenizer,
     tmp_path: Path,
 ) -> None:
     out_dir = tmp_path / "paused"
-    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     train(tiny_model(lexicon), stream, collator, SPENT, out_dir)
 
     longer = replace(SPENT, wall_budget_seconds=3600.0, new_lr=SPENT.new_lr / 2)
-    stream, collator = stream_and_collator(short_corpus, lexicon, spans, tokenizer)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     with pytest.raises(ValueError, match="new_lr") as refusal:
         train(
             tiny_model(lexicon),

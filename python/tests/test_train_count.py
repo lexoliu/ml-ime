@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from mlime.train.arbitration import ReadingArbitration
 from mlime.train.count import count_batches
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import EpochBatches
@@ -39,6 +40,7 @@ def batches_in_first_epoch(
     corpus: tuple[Path, Path],
     lexicon: Lexicon,
     spans: SpanVocab,
+    arbitration: ReadingArbitration,
     tokenizer: BaseTokenizer,
     rank: int = 0,
     world_size: int = 1,
@@ -49,7 +51,7 @@ def batches_in_first_epoch(
         CorpusStream(
             samples_dir,
             labels_dir,
-            SampleBuilder(lexicon, spans, seed=SEED),
+            SampleBuilder(lexicon, spans, arbitration, seed=SEED),
             rank=rank,
             world_size=world_size,
         ),
@@ -68,17 +70,18 @@ def test_the_count_is_the_number_of_batches_the_loop_would_take(
     corpus: tuple[Path, Path],
     lexicon: Lexicon,
     spans: SpanVocab,
+    arbitration: ReadingArbitration,
     tokenizer: BaseTokenizer,
     tmp_path: Path,
 ) -> None:
     census = count_batches(
-        Vocabularies(spans=spans, tokenizer=tokenizer, lexicon=lexicon),
+        Vocabularies(spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration),
         census_paths(corpus, tmp_path),
         Slices(train=SHARDS, held_out=()),
         token_budget=BUDGET,
         seed=SEED,
     )
-    taken = batches_in_first_epoch(corpus, lexicon, spans, tokenizer)
+    taken = batches_in_first_epoch(corpus, lexicon, spans, arbitration, tokenizer)
     assert taken > 1
     assert census.ranks[0].epochs == [taken]
     assert census.steps_for_epochs == taken
@@ -89,13 +92,14 @@ def test_every_rank_is_counted_over_the_shards_it_owns(
     corpus: tuple[Path, Path],
     lexicon: Lexicon,
     spans: SpanVocab,
+    arbitration: ReadingArbitration,
     tokenizer: BaseTokenizer,
     tmp_path: Path,
 ) -> None:
     # Shards are dealt out whole, so a rank's count is its own shards' count and
     # not half of everything: the run stops when the shortest rank is done.
     census = count_batches(
-        Vocabularies(spans=spans, tokenizer=tokenizer, lexicon=lexicon),
+        Vocabularies(spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration),
         census_paths(corpus, tmp_path),
         Slices(train=SHARDS, held_out=()),
         token_budget=BUDGET,
@@ -103,7 +107,9 @@ def test_every_rank_is_counted_over_the_shards_it_owns(
         world_size=2,
     )
     counted = [
-        batches_in_first_epoch(corpus, lexicon, spans, tokenizer, rank=rank, world_size=2)
+        batches_in_first_epoch(
+            corpus, lexicon, spans, arbitration, tokenizer, rank=rank, world_size=2
+        )
         for rank in (0, 1)
     ]
     assert [rank.total for rank in census.ranks] == counted
@@ -114,11 +120,12 @@ def test_a_census_covers_every_epoch_and_is_read_back_from_its_file(
     corpus: tuple[Path, Path],
     lexicon: Lexicon,
     spans: SpanVocab,
+    arbitration: ReadingArbitration,
     tokenizer: BaseTokenizer,
     tmp_path: Path,
 ) -> None:
     census = count_batches(
-        Vocabularies(spans=spans, tokenizer=tokenizer, lexicon=lexicon),
+        Vocabularies(spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration),
         census_paths(corpus, tmp_path),
         Slices(train=SHARDS, held_out=()),
         token_budget=BUDGET,
