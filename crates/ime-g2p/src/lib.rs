@@ -28,8 +28,10 @@ pub mod outcome;
 pub mod report;
 pub mod shards;
 pub mod text;
+pub mod typing;
 
 pub use annotate::{AnnotatedRow, AnnotationCounts, RefusedRow, Sample, annotate};
 pub use error::{Error, Result};
 pub use layout::DataLayout;
 pub use outcome::{Annotator, Comparison, Outcome, Reading, Refusal, compare};
+pub use typing::{DEFAULT_ABBREVIATE_SYLLABLE, Typing, TypingStyle, initial};

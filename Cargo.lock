@@ -1790,6 +1790,7 @@ version = "0.1.0"
 dependencies = [
  "askama",
  "async-openai",
+ "blake2",
  "dotenvy",
  "futures",
  "ort",
