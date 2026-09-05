@@ -124,6 +124,24 @@ def importable_package() -> Path:
     return root
 
 
+def samples_mount():
+    """The mount holding the rest *samples*, told from the labels mount by its columns.
+
+    Both mounts hold a shard of the same name, and the order Kaggle lists mounts
+    in is not stable: a lookup by file name alone found the labels mount once,
+    saw every shard already labelled, and had nothing to do.
+    """
+    import polars as pl
+
+    for directory in directories(INPUTS):
+        shard = directory / SAMPLES_MARKER
+        if not shard.is_file():
+            continue
+        if "text" in pl.scan_parquet(shard).collect_schema().names():
+            return directory
+    raise FileNotFoundError(f"no mount holds the rest samples; mounts hold {describe()}")
+
+
 def labelled_shards():
     """The rest shards whose labels some mount already holds.
 
@@ -173,7 +191,7 @@ def worker(shards: list[str], device: int) -> None:
     from mlime.train.labels import generate, load_cuda_annotator, select_shards
 
     configure()
-    samples = locate(SAMPLES_MARKER)
+    samples = samples_mount()
     model = locate("g2pw.onnx", "version")
     paths = select_shards(samples, shards)
     annotator = load_cuda_annotator(model, ONNX_BATCH, None)
@@ -235,7 +253,7 @@ def controller() -> None:
     """Split this kernel's shards across the GPUs and run one worker on each."""
     install()
     importable_package()
-    samples = locate(SAMPLES_MARKER)
+    samples = samples_mount()
     done = labelled_shards()
     names = sorted(path.name for path in samples.glob("*.parquet") if path.name not in done)
     mine = [name for index, name in enumerate(names) if index % KERNEL_COUNT == KERNEL_INDEX]
