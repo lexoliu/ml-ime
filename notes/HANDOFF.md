@@ -1,0 +1,177 @@
+# Handoff — how to run this project without the previous operator
+
+Written 2026-09-16 for whoever (person or model) picks the work up. Everything
+here is self-contained; the previous operator's private memory is not needed.
+Read this file, then `notes/route-a-v1.md`, `notes/v2-data-prep.md` and
+`kaggle/README.md`.
+
+## 0. 一页总览（中文）
+
+- 项目：macOS 中文拼音输入法的神经模型。编码器式非自回归模型（MacBERT 初始化的
+  "填空塔"+带零初始化门控交叉注意力的"上下文塔"），输出逐位置的同音字分布，与
+  KN 三元文法在束搜索里融合。v1 已通过 kill gate（融合、有上下文 71.2% 句准 vs
+  三元文法 55.1%），见 `notes/route-a-v1.md`。
+- 现在在跑 v2：全部 run3 语料（4,128 万条）2 个 epoch，共 244,797 步，在 Kaggle
+  2×T4 上分段跑，每段一个 kernel，靠断点续训接力。截至 9 月 16 日跑到约 19 万步
+  （segment 4 结束后）。
+- 之后完全自动：这台 Mac mini 上的 launchd 每小时跑 `kaggle/chain.sh`，负责推下
+  一段、下载跑完的段、并在跑完 244,797 步的那段自动做评测出 `results.md`。
+- 人要做的只有：看 `data/route-a-v2/chain.log`，出问题按第 5 节排查，最后把
+  `results.md` 写成 `notes/route-a-v2.md`（按第 6 节）。
+- 规则：不直接推 `dev`/`main`；一个问题一个 issue，一个 PR 修一个 issue，PR 目标
+  `dev`，CI 绿了自己合并（squash）。提交必须签名（本机已配好）。
+
+## 1. Machines, credentials, tools
+
+- **This machine**: `lexos-mac-mini` (Apple M1, 8 GB). Repo at
+  `~/Coding/ml-ime`, branch `dev`. Rust toolchain (cargo 1.98), `uv`, Kaggle
+  CLI 2.2.4 (`~/.local/bin/kaggle`), `gh` 2.99 (`~/.local/bin/gh`, logged in
+  as lexoliu with `repo`, `read:org`, `gist`, `admin:ssh_signing_key`).
+- **Git identity/signing**: `user.name "Lexo Liu"`, `user.email me@lexo.cool`,
+  SSH signing with `~/.ssh/id_ed25519` (registered on GitHub as a signing key).
+  The repository ruleset requires signed commits; unsigned PRs show "BLOCKED".
+- **Kaggle auth**: OAuth in `~/.kaggle/credentials.json`. The access token
+  lapses roughly every 12–16 h; right after that every command fails with
+  "Permission 'kernels.get' was denied" / "Authentication required". It
+  refreshes itself within ~1 h. Retry later before doing anything else. If it
+  never recovers: `kaggle auth login` (browser) or save an API token from
+  https://www.kaggle.com/settings/api to `~/.kaggle/access_token`.
+- **Kaggle quota**: `kaggle quota` prints GPU hours used/remaining and the
+  reset time (Saturday 00:00 UTC = Friday 20:00 America/New_York). 30 h/week.
+- **Python env**: `cd python && uv sync --extra train`. Rust: `cargo build
+  --release -p ime-cli` (target dir `target/`, already warm).
+- **Data on this machine** (gitignored `data/`): `run3_pool` (eval3 and the
+  abbreviated/mixed twins, annotations), `run3/ngram.bin` (41M-line trigram,
+  643 MiB, the baseline), `run3/samples`, `run3-v1/{samples,labels}`,
+  `run3-rest/{samples,labels}` (all 404 rest shards labelled),
+  `route-a-assets-v2/` (what the training kernel mounts), `route-a-v1/` (the
+  v1 kernel output and score files), `route-a-v2/s<n>/` (every harvested
+  segment). Nothing under `data/` is on GitHub.
+
+## 2. Kaggle datasets and kernels
+
+| dataset | holds |
+|---|---|
+| `lexoliu/mlime-src` | the `mlime` Python package from `dev` (must be versioned with `--dir-mode tar`, see §5) |
+| `lexoliu/mlime-route-a-assets` | `char_pinyin.tsv`, `emittable.txt`, `syllables.txt`, `typed_spans.txt`, `eval3*.jsonl`, `lattice*.jsonl` |
+| `lexoliu/mlime-run3-v1-samples`, `-labels` | the 10.03M v1 subset and its g2pW labels |
+| `lexoliu/mlime-run3-rest-samples`, `-labels` | the 31.25M rest of run3 and its labels (404 shards each) |
+| `lexoliu/mlime-g2pw-model` | g2pW ONNX (labelling only) |
+
+Kernels: `lexoliu/mlime-route-a-v2-s<n>` is training segment n (script
+`kaggle/route-a-v2/kernel.py`, metadata template beside it). Segment n mounts
+segment n−1's output as a kernel source and resumes from `checkpoint-paused.pt`.
+The first segment counted the exact number of batches (`batch-counts.json`) and
+fixed `max_steps = 244797`; every later segment reads it from the previous
+`run-config.json`. A segment trains on a wall budget (12 h session − 35 min
+reserve; a segment that would reach `max_steps` but not also fit 3 h of scoring
+pauses earlier) and writes `checkpoint-paused.pt`; the segment that reaches
+`max_steps` writes `checkpoint-final.pt`, evaluates the six held-out shards, and
+scores all three lattices with context on and off into
+`scores-<lattice>-context-<on|off>.jsonl.gz`, with `"finished": true` in
+`run-summary.json`.
+
+## 3. The automatic chain (what runs without anyone)
+
+`~/Library/LaunchAgents/cool.lexo.mlime-chain.plist` runs
+`kaggle/chain.sh` every hour (`launchctl list | grep mlime-chain` to see it;
+`launchctl unload/load <plist>` to stop/start). Each run, logged one line to
+`data/route-a-v2/chain.log`:
+
+1. finds the highest pushed segment n;
+2. if it is RUNNING/QUEUED: waits; if ERROR: logs "a person has to look" and stops;
+3. if COMPLETE and `data/route-a-v2/s<n>/run-summary.json` is absent: downloads
+   the output there (2–5 GB, includes the checkpoint) and logs the summary;
+4. if that summary says `"finished": true`: runs `kaggle/finish.sh
+   data/route-a-v2/s<n>` (≈1.5 h of CPU) which writes `results.md` there, then
+   stops pushing;
+5. otherwise pushes segment n+1. A refused push (quota exhausted, token lapsed)
+   is simply retried next hour.
+
+Expected timeline from 2026-09-16: s4 (4 h session, ends ~21:30 EDT Sep 16,
+≈192k steps) → quota reset Fri Sep 18 20:00 EDT → s5 pushed within the hour,
+pauses ≈241k after ~8.5 h (leaving the scoring reserve) → s6 pushed, finishes
+the last ~4k steps, scores, `finished: true` ≈ Sat Sep 19 afternoon → harvested
+and evaluated automatically by Sat evening.
+
+## 4. What a person still does
+
+1. **Watch** `tail data/route-a-v2/chain.log` once a day. "a person has to
+   look" means a kernel errored: `kaggle kernels output lexoliu/mlime-route-a-v2-s<n>
+   -p /tmp/x` and read `mlime-route-a-v2-s<n>.log` (JSON lines; the Python
+   traceback is near the end).
+2. **When `results.md` appears** in the finished segment's directory: write
+   `notes/route-a-v2.md` in the style of `notes/route-a-v1.md` (training
+   table from the segments' `run-summary.json` files, the results table, what
+   the numbers say, next steps), via issue → PR → merge (§7). Compare against
+   the v1 numbers in `notes/route-a-v1.md` and the trigram baselines in
+   `notes/v2-data-prep.md`.
+3. **If a segment must be re-run by hand**: `kaggle/README.md` §"Chaining a
+   training run" has the exact push recipe; to spend a partial quota week, also
+   `sed` `SESSION_SECONDS = 12 * 60 * 60` to the hours you have. Never push a
+   new version of a kernel that is queued or running: it does not cancel the
+   old one and both burn quota — `kaggle kernels delete -y <slug>` first.
+
+## 5. Gotchas that already cost time (do not rediscover them)
+
+- `kaggle datasets version -p DIR` skips subdirectories unless `--dir-mode tar`;
+  `mlime-src` needs it. Verify with `kaggle datasets files <slug> --page-size 200`
+  (paginated: follow "Next Page Token"; 200 per page).
+- Both the samples and the labels datasets hold shards of the same name; find a
+  mount by its parquet columns (`text` vs `syllables`), never by file name.
+- Two forked GPU workers must not race to create the package symlink; the
+  controller creates it once (already fixed in `kaggle/labels-v2`).
+- `kaggle kernels status` for a never-pushed slug says "Cannot access kernel"
+  or "404"; anything else that is not a status is an auth/API error.
+- Running script kernels expose no logs; you only see them after completion.
+- Squash-merging a base branch and deleting it CLOSES PRs stacked on it. Branch
+  every PR from `dev`.
+- The eval sets' dev/test split hashes the keystrokes (`EvalRecord::digest`), so
+  the full/abbreviated/mixed test slices differ by ~20 records (issue #16);
+  `--slice all` is the exact twin comparison.
+- The v1 score files (`data/route-a-v1/scores-*.jsonl.gz`) were emitted against
+  the pre-arbitration character table; the current binary refuses them ("does
+  not describe this lattice"). v2 scores are emitted against
+  `route-a-assets-v2` and match.
+
+## 6. Evaluating by hand
+
+```
+# trigram only, test slice
+target/release/ime-cli fused-eval --model data/run3/ngram.bin \
+  --eval-set data/run3_pool/eval3.jsonl --emittable data/route-a-assets-v2/emittable.txt --slice test
+# neural only
+... --no-transition --scores data/route-a-v2/s6/scores-lattice-context-on.jsonl.gz
+# fused: sweep on dev, report on test
+... --slice dev --scores <scores> --weight 0.5 --weight 0.75 --weight 1 --weight 1.5 --weight 2
+... --slice test --scores <scores> --weight <best>
+```
+
+`eval3-abbreviated.jsonl` / `eval3-mixed.jsonl` pair with
+`scores-lattice-abbreviated-*` / `scores-lattice-mixed-*`. `kaggle/finish.sh
+<segment dir>` does all of this and writes `results.md`.
+
+## 7. Repository workflow
+
+- Never push to `dev` or `main`. Branch from `dev`, commit (signed), `git push -u
+  origin <branch>`, `gh pr create --base dev` with `Fixes #N`, wait for the four
+  CI checks, `gh pr merge <n> --squash --delete-branch`, `git pull --ff-only`.
+- Conventional commit messages; release-plz owns versions and changelog (do not
+  hand-edit them). `main` is release-only and stays the owner's decision.
+- Rust: `cargo clippy -p <crate> --all-targets -- -D warnings`, `cargo test -p
+  <crate>`, `cargo fmt`. Python (from `python/`): `uv run ruff check src tests`,
+  `uv run ruff format --check src tests`, `uv run mypy src`, `uv run pytest -q`.
+  CI also checks that `crates/ime-pinyin/data` matches `mlime gen-pinyin-tables`.
+
+## 8. After v2 — what the previous operator would do next
+
+1. Write `notes/route-a-v2.md` from `results.md` (§4.2) and decide from the
+   abbreviated/mixed numbers whether the NAR + trigram design carries
+   abbreviations, which is the product-critical case.
+2. Fix issue #16 (hash only text+context in `EvalRecord::digest`) so the three
+   eval twins share one dev/test split; re-tune weights once.
+3. The trigram is still load-bearing: neural-only top-8 barely exceeds top-1.
+   An autoregressive rescorer or an iterative refinement pass over the NAR
+   output is the next modelling step.
+4. Inference on macOS (Core ML / ANE) was explicitly parked until the model was
+   trained; `notes/inputmethodkit.md` and `notes/compute.md` hold what was known.
