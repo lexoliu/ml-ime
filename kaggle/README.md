@@ -53,11 +53,14 @@ to push next.
 
 ## Keeping the chain moving without a session
 
-`kaggle/chain.sh` pushes the next segment whenever the highest pushed one is
-COMPLETE, and does nothing else; a refused push (quota, an expired token) is
-retried an hour later. On the Mac mini it runs hourly from launchd
-(`~/Library/LaunchAgents/cool.lexo.mlime-chain.plist`, log in
-`data/route-a-v2/chain.log`). Harvesting, evaluation and the notes stay manual.
+`kaggle/chain.sh` runs hourly from launchd on the Mac mini
+(`~/Library/LaunchAgents/cool.lexo.mlime-chain.plist`, one log line per run in
+`data/route-a-v2/chain.log`). Whenever the highest pushed segment is COMPLETE it
+downloads that segment's output once into `data/route-a-v2/s<n>`, evaluates the
+segment that finished the run with `kaggle/finish.sh` (six fused evals, results
+in `s<n>/results.md`), and otherwise pushes the next segment; a refused push
+(quota, an expired token) is retried an hour later. Only the notes stay manual.
+`notes/HANDOFF.md` is the operator's manual.
 
 A segment that would reach `max_steps` but could not also fit the scoring pauses
 early (`SCORING_RESERVE_SECONDS`), so the run always finishes in a segment with

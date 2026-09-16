@@ -2,9 +2,10 @@
 # Keep the route A v2 training chain moving without anyone watching it.
 #
 # Run hourly (launchd on the Mac mini; see kaggle/README.md). Each run looks at
-# the highest segment that exists on Kaggle: if it is COMPLETE and the next one
-# has not been pushed, the next one is pushed. Nothing else -- harvesting,
-# evaluation and the notes stay with a person. A push that Kaggle refuses (the
+# the highest segment that exists on Kaggle: if it is COMPLETE its output is
+# downloaded once to data/route-a-v2/s<n>, the segment that finished the run is
+# evaluated by kaggle/finish.sh, and otherwise the next segment is pushed. The
+# notes stay with a person. A push that Kaggle refuses (the
 # weekly quota, an expired token) is simply retried an hour later, and a push
 # whose previous segment turns out to have *finished* fails inside the kernel
 # within minutes at no cost, so the script does not need to know.
@@ -46,6 +47,27 @@ case "$last_status" in
   *RUNNING*|*QUEUED*) say "segment $last is $last_status; waiting"; exit 0 ;;
   *ERROR*|*CANCEL*) say "segment $last is $last_status; a person has to look"; exit 0 ;;
 esac
+
+# Harvest: every COMPLETE segment's output lands in data/route-a-v2/s<n> once,
+# and the one that finished the run is evaluated by kaggle/finish.sh.
+harvest() {
+  local n=$1 dir=$REPO/data/route-a-v2/s$1
+  if [ -e "$dir/run-summary.json" ]; then return 0; fi
+  say "downloading segment $n output"
+  mkdir -p "$dir"
+  if ! kaggle kernels output "$SLUG$n" -p "$dir" >> "$dir/download.log" 2>&1 || [ ! -e "$dir/run-summary.json" ]; then
+    say "download of segment $n failed; retry next hour"; return 1
+  fi
+  say "segment $n harvested: $(python3 -c "import json;d=json.load(open('$dir/run-summary.json'));print('steps',d['first_step'],'->',d['last_step'],'loss',round(d['last_loss'],3),'finished',d['finished'])")"
+  if python3 -c "import json,sys;sys.exit(0 if json.load(open('$dir/run-summary.json'))['finished'] else 1)"; then
+    say "segment $n finished the run; evaluating (see $dir/finish.log)"
+    if "$REPO/kaggle/finish.sh" "$dir" > "$dir/finish.log" 2>&1; then say "results in $dir/results.md"; else say "finish.sh failed; see $dir/finish.log"; fi
+  fi
+}
+harvest "$last" || exit 0
+if python3 -c "import json,sys;sys.exit(0 if json.load(open('$REPO/data/route-a-v2/s$last/run-summary.json'))['finished'] else 1)"; then
+  say "the run is finished at segment $last; nothing more to push"; exit 0
+fi
 
 next=$((last + 1))
 if [ "$next" -gt "$MAX_SEGMENT" ]; then say "segment $last complete and no room for segment $next"; exit 0; fi
