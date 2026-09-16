@@ -50,3 +50,16 @@ A segment that finishes the run scores every `lattice*.jsonl` in the assets (ful
 abbreviated and mixed typing), with context on and off, and writes
 `run-summary.json` with `"finished": true`; one that pauses says which segment
 to push next.
+
+## Keeping the chain moving without a session
+
+`kaggle/chain.sh` pushes the next segment whenever the highest pushed one is
+COMPLETE, and does nothing else; a refused push (quota, an expired token) is
+retried an hour later. On the Mac mini it runs hourly from launchd
+(`~/Library/LaunchAgents/cool.lexo.mlime-chain.plist`, log in
+`data/route-a-v2/chain.log`). Harvesting, evaluation and the notes stay manual.
+
+A segment that would reach `max_steps` but could not also fit the scoring pauses
+early (`SCORING_RESERVE_SECONDS`), so the run always finishes in a segment with
+room to score. To spend a partial quota week, stamp `SESSION_SECONDS` smaller at
+push time the way `SEGMENT` is stamped.
