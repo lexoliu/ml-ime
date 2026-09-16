@@ -66,6 +66,14 @@ TOKEN_BUDGET = 16384
 SESSION_SECONDS = 12 * 60 * 60
 RESERVE_SECONDS = 35 * 60
 
+#: What the finishing segment needs after its last step: the held-out
+#: evaluation and six lattice/context scorings, the abbreviated lattice alone
+#: being seven times the full one. A segment that would reach `max_steps` but
+#: not fit this as well pauses early instead, and the next segment finishes
+#: with the whole reserve to spare -- a kernel killed at twelve hours keeps
+#: nothing, scores included.
+SCORING_RESERVE_SECONDS = 3 * 60 * 60
+
 #: Numbered checkpoints kept beside the paused one. One is enough: the paused
 #: checkpoint is what the next segment resumes from, and every checkpoint is the
 #: size of two models.
@@ -306,11 +314,40 @@ def records_of(metrics, event):
 
 
 def previous_segment():
-    """The previous kernel's output: its paused checkpoint and its run config."""
+    """The previous kernel's output: its paused checkpoint, run config and summary."""
     if SEGMENT == 0:
         return None
-    mount = locate("checkpoint-paused.pt", "run-config.json")
-    return mount / "checkpoint-paused.pt", json.loads((mount / "run-config.json").read_text())
+    mount = locate("checkpoint-paused.pt", "run-config.json", "run-summary.json")
+    return (
+        mount / "checkpoint-paused.pt",
+        json.loads((mount / "run-config.json").read_text()),
+        json.loads((mount / "run-summary.json").read_text()),
+    )
+
+
+def training_budget(elapsed, max_steps, previous):
+    """How long this segment may train.
+
+    The session minus what came before it and what has to come after it. If
+    the previous segment's rate says the run would reach `max_steps` in this
+    session but the scoring would not fit behind it, the budget is cut by the
+    scoring reserve so the segment pauses and the next one finishes.
+    """
+    budget = SESSION_SECONDS - RESERVE_SECONDS - elapsed
+    if previous is None:
+        return budget
+    summary = previous[2]
+    steps = summary["last_step"] - summary["first_step"] + 1
+    rate = steps / summary["train_seconds"]
+    predicted = (max_steps - summary["last_step"]) / rate
+    if predicted <= budget < predicted + SCORING_RESERVE_SECONDS:
+        print(
+            f"finishing here would take {predicted:.0f}s of {budget:.0f}s and leave no room to "
+            f"score; pausing after {budget - SCORING_RESERVE_SECONDS:.0f}s instead",
+            flush=True,
+        )
+        return budget - SCORING_RESERVE_SECONDS
+    return budget
 
 
 def main():
@@ -348,12 +385,12 @@ def main():
         config = {"max_steps": int(counts["steps_for_epochs"]), "epochs": EPOCHS}
         resume = None
     else:
-        resume, config = previous
+        resume, config, _ = previous
     config["segment"] = SEGMENT
     config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(config), flush=True)
 
-    wall_budget = SESSION_SECONDS - RESERVE_SECONDS - (time.monotonic() - started)
+    wall_budget = training_budget(time.monotonic() - started, config["max_steps"], previous)
     if wall_budget <= 0:
         raise RuntimeError("the session was spent before training could start")
     code, seconds = run(
