@@ -85,8 +85,11 @@ scores all three lattices with context on and off into
 4. if that summary says `"finished": true`: runs `kaggle/finish.sh
    data/route-a-v2/s<n>` (≈1.5 h of CPU) which writes `results.md` there, then
    stops pushing;
-5. otherwise pushes segment n+1. A refused push (quota exhausted, token lapsed)
-   is simply retried next hour.
+5. otherwise pushes segment n+1, but only when `kaggle quota` shows at least
+   12 h left (a session started into less is killed before it pauses); a
+   refused push (token lapsed) is retried next hour. A segment that ERRORed
+   (typically killed by the quota) is re-pushed once a full session of quota is
+   back, at most three times, after which the log says "a person has to look".
 
 Expected timeline from 2026-09-16: s4 (4 h session, ends ~21:30 EDT Sep 16,
 ≈192k steps) → quota reset Fri Sep 18 20:00 EDT → s5 pushed within the hour,
