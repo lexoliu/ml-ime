@@ -5,21 +5,28 @@ here is self-contained; the previous operator's private memory is not needed.
 Read this file, then `notes/route-a-v1.md`, `notes/v2-data-prep.md` and
 `kaggle/README.md`.
 
-## 0. 一页总览（中文）
+## 0. One-page summary
 
-- 项目：macOS 中文拼音输入法的神经模型。编码器式非自回归模型（MacBERT 初始化的
-  "填空塔"+带零初始化门控交叉注意力的"上下文塔"），输出逐位置的同音字分布，与
-  KN 三元文法在束搜索里融合。v1 已通过 kill gate（融合、有上下文 71.2% 句准 vs
-  三元文法 55.1%），见 `notes/route-a-v1.md`。
-- 现在在跑 v2：全部 run3 语料（4,128 万条）2 个 epoch，共 244,797 步，在 Kaggle
-  2×T4 上分段跑，每段一个 kernel，靠断点续训接力。截至 9 月 16 日跑到约 19 万步
-  （segment 4 结束后）。
-- 之后完全自动：这台 Mac mini 上的 launchd 每小时跑 `kaggle/chain.sh`，负责推下
-  一段、下载跑完的段、并在跑完 244,797 步的那段自动做评测出 `results.md`。
-- 人要做的只有：看 `data/route-a-v2/chain.log`，出问题按第 5 节排查，最后把
-  `results.md` 写成 `notes/route-a-v2.md`（按第 6 节）。
-- 规则：不直接推 `dev`/`main`；一个问题一个 issue，一个 PR 修一个 issue，PR 目标
-  `dev`，CI 绿了自己合并（squash）。提交必须签名（本机已配好）。
+- **Project**: a neural pinyin input method for macOS. An encoder-only,
+  non-autoregressive model (a MacBERT-initialised fill tower plus a context
+  tower attached through zero-initialised gated cross-attention) emits a
+  per-position distribution over homophones, fused with a Kneser-Ney trigram in
+  the beam search. v1 passed the kill gate (fused, context on: 71.2% sentence
+  top-1 against the trigram's 55.1%); see `notes/route-a-v1.md`.
+- **Running now**: v2, two epochs over all of run3 (41.28M segments),
+  244,797 steps on Kaggle 2×T4, as a chain of kernels that resume each other.
+  As of 2026-09-16 the run is at 191,350 steps (after segment 4).
+- **Fully automatic from here**: launchd on this Mac mini runs
+  `kaggle/chain.sh` hourly; it pushes the next segment when the quota allows,
+  downloads every finished segment, and evaluates the segment that reaches
+  244,797 steps into `results.md`.
+- **What a person does**: read `data/route-a-v2/chain.log`, follow section 5
+  when something breaks, and turn `results.md` into `notes/route-a-v2.md`
+  (section 4).
+- **Rules**: never push to `dev` or `main`; one issue per problem, one PR per
+  issue targeting `dev`, squash-merged by the operator once CI is green;
+  commits must be signed (configured on this machine). Documentation is
+  written in English.
 
 ## 1. Machines, credentials, tools
 
