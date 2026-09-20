@@ -2,6 +2,7 @@
 
 use crate::record::EvalSet;
 use askama::Template;
+use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
 use std::num::NonZeroUsize;
 
 /// One thing to decode.
@@ -106,6 +107,31 @@ impl Report {
         }
     }
 
+    /// Fold another report over the same `top_k` into this one.
+    ///
+    /// Every metric is a ratio of summed counters, so merging is order-free:
+    /// two halves of a slice produce the same report however their records were
+    /// observed, which is what lets a run decode its slice in parallel.
+    ///
+    /// # Panics
+    ///
+    /// If *other* ranks a different number of hypotheses.
+    #[must_use]
+    pub fn merge(mut self, other: &Self) -> Self {
+        assert_eq!(
+            self.top_k, other.top_k,
+            "cannot merge reports over a different top_k"
+        );
+        self.records += other.records;
+        self.top1_hits += other.top1_hits;
+        self.topk_hits += other.topk_hits;
+        self.characters += other.characters;
+        self.character_hits += other.character_hits;
+        self.reciprocal_ranks += other.reciprocal_ranks;
+        self.unanswered += other.unanswered;
+        self
+    }
+
     /// How many hypotheses per record the top-k metrics look at.
     #[must_use]
     pub const fn top_k(&self) -> usize {
@@ -192,21 +218,28 @@ fn rate(hits: usize, total: usize) -> f64 {
 
 /// Run *engine* over *set* and report what it got right.
 ///
+/// Records are independent, so they are decoded in parallel and their
+/// observations merged; the report is identical to a sequential run.
+///
 /// # Errors
 ///
 /// Whatever the engine reports on the first record it cannot decode.
 pub fn evaluate<H>(set: &EvalSet, engine: &H, top_k: NonZeroUsize) -> Result<Report, H::Error>
 where
-    H: Hypothesize,
+    H: Hypothesize + Sync,
+    H::Error: Send,
 {
-    let mut report = Report::new(top_k);
-    for record in set.records() {
-        let hypotheses = engine.hypotheses(&Request {
-            pinyin: &record.pinyin,
-            context: record.context.as_deref(),
-            top_k,
-        })?;
-        report.observe(&record.text, &hypotheses);
-    }
-    Ok(report)
+    set.records()
+        .par_iter()
+        .map(|record| {
+            let hypotheses = engine.hypotheses(&Request {
+                pinyin: &record.pinyin,
+                context: record.context.as_deref(),
+                top_k,
+            })?;
+            let mut report = Report::new(top_k);
+            report.observe(&record.text, &hypotheses);
+            Ok(report)
+        })
+        .try_reduce(|| Report::new(top_k), |left, right| Ok(left.merge(&right)))
 }
