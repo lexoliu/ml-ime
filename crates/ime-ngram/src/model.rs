@@ -40,6 +40,19 @@ impl Token {
     }
 }
 
+/// What a history resolves to before any candidate is scored against it.
+///
+/// The two tokens the history names and the backoff weights they select. Both
+/// lookups depend on the history alone, so the decoder pays them once per beam
+/// state rather than once per candidate.
+#[derive(Copy, Clone, Debug)]
+pub struct Context {
+    before: Token,
+    previous: Token,
+    bigram_backoff: f32,
+    trigram_backoff: Option<f32>,
+}
+
 /// A character-level interpolated Kneser-Ney trigram over hanzi.
 ///
 /// Three levels, each backing off into the next: raw trigram counts, then
@@ -127,27 +140,44 @@ impl NgramModel {
         self.pack2(first, second) * self.base() + u64::from(third.0)
     }
 
+    /// The lookups a history needs regardless of the candidate: the bigram
+    /// level's backoff weight off the last token, and the trigram level's off
+    /// the pair.
+    fn context_at(&self, before: Token, previous: Token) -> Context {
+        Context {
+            before,
+            previous,
+            bigram_backoff: self.bigram_backoff[previous.index()],
+            trigram_backoff: self.trigram_backoff.get(self.pack2(before, previous)),
+        }
+    }
+
+    /// `P(current | context)` under the interpolated model.
+    fn probability_at(&self, context: &Context, current: Token) -> f32 {
+        let level1 = self.unigram[current.index()];
+        let level2 = self
+            .bigram
+            .get(self.pack2(context.previous, current))
+            .unwrap_or(0.0)
+            + context.bigram_backoff * level1;
+        match context.trigram_backoff {
+            Some(backoff) => {
+                self.trigram
+                    .get(self.pack3(context.before, context.previous, current))
+                    .unwrap_or(0.0)
+                    + backoff * level2
+            }
+            None => level2,
+        }
+    }
+
     /// `P(current | previous, before)` under the interpolated model.
     ///
     /// Never zero: the unigram level interpolates with a uniform floor and every
     /// discount is strictly positive, so no token is unreachable.
     #[must_use]
     pub fn token_probability(&self, before: Token, previous: Token, current: Token) -> f32 {
-        let level1 = self.unigram[current.index()];
-        let level2 = self
-            .bigram
-            .get(self.pack2(previous, current))
-            .unwrap_or(0.0)
-            + self.bigram_backoff[previous.index()] * level1;
-        match self.trigram_backoff.get(self.pack2(before, previous)) {
-            Some(backoff) => {
-                self.trigram
-                    .get(self.pack3(before, previous, current))
-                    .unwrap_or(0.0)
-                    + backoff * level2
-            }
-            None => level2,
-        }
+        self.probability_at(&self.context_at(before, previous), current)
     }
 
     /// The token standing for *ch*.
@@ -270,13 +300,17 @@ fn slot(history: History, distance: usize) -> Token {
 impl Transition for NgramModel {
     const HISTORY: usize = ORDER - 1;
 
-    fn score(&self, history: History, candidate: CharId) -> f32 {
-        self.token_probability(slot(history, 2), slot(history, 1), Token::of(candidate))
-            .ln()
+    type Context = Context;
+
+    fn context(&self, history: History) -> Context {
+        self.context_at(slot(history, 2), slot(history, 1))
     }
 
-    fn finish(&self, history: History) -> f32 {
-        self.token_probability(slot(history, 2), slot(history, 1), Token::EOS)
-            .ln()
+    fn score(&self, context: &Context, candidate: CharId) -> f32 {
+        self.probability_at(context, Token::of(candidate)).ln()
+    }
+
+    fn finish(&self, context: &Context) -> f32 {
+        self.probability_at(context, Token::EOS).ln()
     }
 }

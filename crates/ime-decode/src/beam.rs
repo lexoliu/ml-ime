@@ -161,8 +161,9 @@ where
         let mut next: Vec<Beam> = Vec::with_capacity(allowed.len());
         index.clear();
         if position == 0 {
+            let context = transition.context(History::START);
             for &ch in allowed {
-                let score = emission.score(path, 0, ch) + transition.score(History::START, ch);
+                let score = emission.score(path, 0, ch) + transition.score(&context, ch);
                 relax(
                     &mut next,
                     &mut index,
@@ -176,10 +177,11 @@ where
             }
         } else {
             for (parent, beam) in beams[position - 1].iter().enumerate() {
+                let context = transition.context(beam.history);
                 for &ch in allowed {
                     let score = beam.score
                         + emission.score(path, position, ch)
-                        + transition.score(beam.history, ch);
+                        + transition.score(&context, ch);
                     relax(
                         &mut next,
                         &mut index,
@@ -204,7 +206,12 @@ where
     let mut finished: Vec<(usize, f32)> = last
         .iter()
         .enumerate()
-        .map(|(slot, beam)| (slot, beam.score + transition.finish(beam.history)))
+        .map(|(slot, beam)| {
+            (
+                slot,
+                beam.score + transition.finish(&transition.context(beam.history)),
+            )
+        })
         .collect();
     finished.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
     finished

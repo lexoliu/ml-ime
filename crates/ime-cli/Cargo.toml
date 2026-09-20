@@ -19,6 +19,7 @@ ime-g2p.workspace = true
 ime-ngram.workspace = true
 ime-pinyin.workspace = true
 ime-synth.workspace = true
+rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

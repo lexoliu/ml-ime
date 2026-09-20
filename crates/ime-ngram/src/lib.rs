@@ -14,7 +14,7 @@ mod model;
 mod table;
 mod train;
 
-pub use model::{NgramModel, ORDER, Token};
+pub use model::{Context, NgramModel, ORDER, Token};
 pub use train::Counter;
 
 use thiserror::Error;
