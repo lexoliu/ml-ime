@@ -85,6 +85,11 @@ pub struct SliceArgs {
     /// hash of the record itself, so it survives the file being reordered.
     #[arg(long, default_value = "0.0905")]
     pub dev_share: f64,
+    /// Sweep every `--weight` on the dev slice, then report the test slice at
+    /// the weight whose sentence top-1 was highest; ties go to the weight given
+    /// first. Replaces `--slice`, and meaningless without a score file to fuse.
+    #[arg(long, requires = "scores", conflicts_with = "slice")]
+    pub select_on_dev: bool,
 }
 
 /// Supplies the emission model for one record's lattice.
@@ -161,6 +166,9 @@ struct Section {
     weight: f32,
     transition: &'static str,
     slice: &'static str,
+    /// Whether the weight won a dev sweep rather than being given on the
+    /// command line.
+    selected: bool,
     report: Report,
 }
 
@@ -268,7 +276,9 @@ pub fn emit_lattice(
 ///
 /// Without a score file the run is the n-gram baseline; without an n-gram it is
 /// the emissions alone; with both, every weight in *weights* is one fused
-/// configuration.
+/// configuration. With `--select-on-dev` the weights are swept on the dev
+/// slice instead and the report closes with the test slice at whichever weight
+/// scored the highest sentence top-1 there.
 ///
 /// # Errors
 ///
@@ -309,34 +319,62 @@ pub fn fused_eval(
             weight: 0.0,
             transition: "kn-trigram",
             slice: slice.slice.label(),
+            selected: false,
             report: measure(&set, slice, &reader, &NoEmissions, ngram, beam)?,
         }),
         (Some(path), ngram) => {
             let scores = load_scores(path)?;
-            for &weight in weights {
+            let measure_at = |which: SliceArg, weight: f32| -> Result<Section> {
                 let emissions = NeuralEmissions {
                     scores: &scores,
                     emittable: &emittable,
                     weight,
                     floor,
                 };
+                let args = SliceArgs {
+                    slice: which,
+                    dev_share: slice.dev_share,
+                    select_on_dev: false,
+                };
                 let (transition, report) = match ngram {
                     Some(ngram) => (
                         "kn-trigram",
-                        measure(&set, slice, &reader, &emissions, ngram, beam)?,
+                        measure(&set, &args, &reader, &emissions, ngram, beam)?,
                     ),
                     None => (
                         "none",
-                        measure(&set, slice, &reader, &emissions, &NoTransition, beam)?,
+                        measure(&set, &args, &reader, &emissions, &NoTransition, beam)?,
                     ),
                 };
-                sections.push(Section {
+                Ok(Section {
                     emission: "neural",
                     weight,
                     transition,
-                    slice: slice.slice.label(),
+                    slice: which.label(),
+                    selected: false,
                     report,
-                });
+                })
+            };
+            if slice.select_on_dev {
+                if weights.is_empty() {
+                    bail!("selecting a weight on dev needs at least one --weight");
+                }
+                for &weight in weights {
+                    sections.push(measure_at(SliceArg::Dev, weight)?);
+                }
+                let mut winner = 0;
+                for (index, section) in sections.iter().enumerate().skip(1) {
+                    if section.report.top1_hits() > sections[winner].report.top1_hits() {
+                        winner = index;
+                    }
+                }
+                let mut test = measure_at(SliceArg::Test, sections[winner].weight)?;
+                test.selected = true;
+                sections.push(test);
+            } else {
+                for &weight in weights {
+                    sections.push(measure_at(slice.slice, weight)?);
+                }
             }
         }
     }
@@ -406,27 +444,37 @@ fn load_emittable(path: &Path, lexicon: &Lexicon) -> Result<Emittable> {
 ///
 /// Gzipped because it is not small: twenty-one million log probabilities is a
 /// couple of hundred megabytes as text and a fifth of that compressed, and the
-/// file has to come off a Kaggle kernel before anything can be measured.
+/// file has to come off a Kaggle kernel before anything can be measured. The
+/// parse, not the decompress, is the expensive half, so the lines are parsed in
+/// parallel and folded into the map in file order, which keeps the
+/// duplicate-record check naming the same line it always did.
 fn load_scores(path: &Path) -> Result<HashMap<usize, Vec<Vec<Vec<f32>>>>> {
     let file = fs::File::open(path)
         .with_context(|| format!("could not read the scores at {}", path.display()))?;
-    let mut scores = HashMap::new();
-    for (index, line) in BufReader::new(MultiGzDecoder::new(file))
+    let lines: Vec<String> = BufReader::new(MultiGzDecoder::new(file))
         .lines()
         .enumerate()
-    {
-        let line =
-            line.with_context(|| format!("could not read line {} of the scores", index + 1))?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let record: ScoreRecord = serde_json::from_str(&line)
-            .with_context(|| format!("line {} of the scores is not a record", index + 1))?;
+        .map(|(index, line)| {
+            line.with_context(|| format!("could not read line {} of the scores", index + 1))
+        })
+        .collect::<Result<_>>()?;
+    let parsed: Vec<(usize, ScoreRecord)> = lines
+        .par_iter()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, line)| {
+            serde_json::from_str::<ScoreRecord>(line)
+                .with_context(|| format!("line {} of the scores is not a record", index + 1))
+                .map(|record| (index + 1, record))
+        })
+        .collect::<Result<_>>()?;
+    let mut scores = HashMap::with_capacity(parsed.len());
+    for (line, record) in parsed {
         if scores.insert(record.record, record.paths).is_some() {
             bail!(
                 "the score file answers record {} twice, at line {}",
                 record.record,
-                index + 1
+                line
             );
         }
     }
