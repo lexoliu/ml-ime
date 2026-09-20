@@ -320,7 +320,15 @@ pub fn fused_eval(
             transition: "kn-trigram",
             slice: slice.slice.label(),
             selected: false,
-            report: measure(&set, slice, &reader, &NoEmissions, ngram, beam)?,
+            report: measure(
+                &set,
+                slice.slice,
+                slice.dev_share,
+                &reader,
+                &NoEmissions,
+                ngram,
+                beam,
+            )?,
         }),
         (Some(path), ngram) => {
             let scores = load_scores(path)?;
@@ -331,19 +339,30 @@ pub fn fused_eval(
                     weight,
                     floor,
                 };
-                let args = SliceArgs {
-                    slice: which,
-                    dev_share: slice.dev_share,
-                    select_on_dev: false,
-                };
                 let (transition, report) = match ngram {
                     Some(ngram) => (
                         "kn-trigram",
-                        measure(&set, &args, &reader, &emissions, ngram, beam)?,
+                        measure(
+                            &set,
+                            which,
+                            slice.dev_share,
+                            &reader,
+                            &emissions,
+                            ngram,
+                            beam,
+                        )?,
                     ),
                     None => (
                         "none",
-                        measure(&set, &args, &reader, &emissions, &NoTransition, beam)?,
+                        measure(
+                            &set,
+                            which,
+                            slice.dev_share,
+                            &reader,
+                            &emissions,
+                            &NoTransition,
+                            beam,
+                        )?,
                     ),
                 };
                 Ok(Section {
@@ -356,9 +375,6 @@ pub fn fused_eval(
                 })
             };
             if slice.select_on_dev {
-                if weights.is_empty() {
-                    bail!("selecting a weight on dev needs at least one --weight");
-                }
                 for &weight in weights {
                     sections.push(measure_at(SliceArg::Dev, weight)?);
                 }
@@ -390,7 +406,8 @@ pub fn fused_eval(
 /// report is identical to a sequential pass.
 fn measure<E, T>(
     set: &EvalSet,
-    slice: &SliceArgs,
+    slice: SliceArg,
+    dev_share: f64,
     reader: &Reader,
     emissions: &E,
     transition: &T,
@@ -403,7 +420,7 @@ where
     set.records()
         .par_iter()
         .enumerate()
-        .filter(|(_, record)| slice.slice.slice().holds(record, slice.dev_share))
+        .filter(|(_, record)| slice.slice().holds(record, dev_share))
         .map(|(index, record)| {
             let (_, candidates) = reader.read(record)?;
             let emission = emissions.model(index, &candidates)?;
@@ -440,42 +457,56 @@ fn load_emittable(path: &Path, lexicon: &Lexicon) -> Result<Emittable> {
     Ok(emittable)
 }
 
+/// Lines of the score file read ahead of the parse at a time: large enough
+/// that the parallel parse dominates the sequential decompress, small enough
+/// that a chunk is a rounding error next to the map it folds into.
+const SCORE_CHUNK: usize = 1 << 16;
+
 /// Read a gzipped score file into the records it answers.
 ///
 /// Gzipped because it is not small: twenty-one million log probabilities is a
 /// couple of hundred megabytes as text and a fifth of that compressed, and the
 /// file has to come off a Kaggle kernel before anything can be measured. The
-/// parse, not the decompress, is the expensive half, so the lines are parsed in
-/// parallel and folded into the map in file order, which keeps the
-/// duplicate-record check naming the same line it always did.
+/// parse, not the decompress, is the expensive half, so each chunk of lines is
+/// parsed in parallel and folded into the map in file order -- the resident
+/// text is one chunk rather than the file, and the duplicate-record check
+/// still names the same line it always did.
 fn load_scores(path: &Path) -> Result<HashMap<usize, Vec<Vec<Vec<f32>>>>> {
     let file = fs::File::open(path)
         .with_context(|| format!("could not read the scores at {}", path.display()))?;
-    let lines: Vec<String> = BufReader::new(MultiGzDecoder::new(file))
+    let mut lines = BufReader::new(MultiGzDecoder::new(file))
         .lines()
-        .enumerate()
-        .map(|(index, line)| {
-            line.with_context(|| format!("could not read line {} of the scores", index + 1))
-        })
-        .collect::<Result<_>>()?;
-    let parsed: Vec<(usize, ScoreRecord)> = lines
-        .par_iter()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, line)| {
-            serde_json::from_str::<ScoreRecord>(line)
-                .with_context(|| format!("line {} of the scores is not a record", index + 1))
-                .map(|record| (index + 1, record))
-        })
-        .collect::<Result<_>>()?;
-    let mut scores = HashMap::with_capacity(parsed.len());
-    for (line, record) in parsed {
-        if scores.insert(record.record, record.paths).is_some() {
-            bail!(
-                "the score file answers record {} twice, at line {}",
-                record.record,
-                line
-            );
+        .enumerate();
+    let mut scores = HashMap::new();
+    loop {
+        let chunk: Vec<(usize, String)> = lines
+            .by_ref()
+            .take(SCORE_CHUNK)
+            .map(|(index, line)| {
+                line.map(|line| (index, line))
+                    .with_context(|| format!("could not read line {} of the scores", index + 1))
+            })
+            .collect::<Result<_>>()?;
+        if chunk.is_empty() {
+            break;
+        }
+        let parsed: Vec<(usize, ScoreRecord)> = chunk
+            .par_iter()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, line)| {
+                serde_json::from_str::<ScoreRecord>(line)
+                    .with_context(|| format!("line {} of the scores is not a record", index + 1))
+                    .map(|record| (*index + 1, record))
+            })
+            .collect::<Result<_>>()?;
+        for (line, record) in parsed {
+            if scores.insert(record.record, record.paths).is_some() {
+                bail!(
+                    "the score file answers record {} twice, at line {}",
+                    record.record,
+                    line
+                );
+            }
         }
     }
     if scores.is_empty() {
