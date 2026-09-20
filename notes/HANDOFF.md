@@ -13,16 +13,17 @@ Read this file, then `notes/route-a-v1.md`, `notes/v2-data-prep.md` and
   per-position distribution over homophones, fused with a Kneser-Ney trigram in
   the beam search. v1 passed the kill gate (fused, context on: 71.2% sentence
   top-1 against the trigram's 55.1%); see `notes/route-a-v1.md`.
-- **Running now**: v2, two epochs over all of run3 (41.28M segments),
-  244,797 steps on Kaggle 2×T4, as a chain of kernels that resume each other.
-  As of 2026-09-16 the run is at 191,350 steps (after segment 4).
-- **Fully automatic from here**: launchd on this Mac mini runs
-  `kaggle/chain.sh` hourly; it pushes the next segment when the quota allows,
-  downloads every finished segment, and evaluates the segment that reaches
-  244,797 steps into `results.md`.
+- **Done**: v2, two epochs over all of run3 (41.28M segments), 244,797
+  steps on Kaggle 2×T4 as a chain of seven kernels that resumed each other,
+  finished 2026-09-19 (segment 6) and evaluated into
+  `data/route-a-v2/s6/results.md`; the write-up is `notes/route-a-v2.md`.
+- **Still running**: launchd on this Mac mini runs `kaggle/chain.sh` hourly;
+  with the run finished every pass logs "the run is finished at segment 6".
+  A v3 run is a new segment 0 (§3, §4.3); the chain then pushes, harvests and
+  evaluates it the same way.
 - **What a person does**: read `data/route-a-v2/chain.log`, follow section 5
-  when something breaks, and turn `results.md` into `notes/route-a-v2.md`
-  (section 4).
+  when something breaks, and turn a finished run's `results.md` into a
+  `notes/route-a-v<n>.md` (section 4).
 - **Rules**: never push to `dev` or `main`; one issue per problem, one PR per
   issue targeting `dev`, squash-merged by the operator once CI is green;
   commits must be signed (configured on this machine). Documentation is
@@ -92,7 +93,8 @@ scores all three lattices with context on and off into
    once the whole download succeeded (a download that breaks off is redone next
    hour) and logs the summary;
 4. if that summary says `"finished": true`: runs `kaggle/finish.sh
-   data/route-a-v2/s<n>` (≈1.5 h of CPU) which writes `results.md` there, then
+   data/route-a-v2/s<n>` (≈15 min on the M1 since PR #38) which writes
+   `results.md` there, then
    stops pushing;
 5. otherwise pushes segment n+1, but only when `kaggle quota` shows at least
    12 h left (a session started into less is killed before it pauses); a
@@ -100,11 +102,11 @@ scores all three lattices with context on and off into
    (typically killed by the quota) is re-pushed once a full session of quota is
    back, at most three times, after which the log says "a person has to look".
 
-Expected timeline from 2026-09-16: s4 (4 h session, ends ~21:30 EDT Sep 16,
-≈192k steps) → quota reset Fri Sep 18 20:00 EDT → s5 pushed within the hour,
-pauses ≈241k after ~8.5 h (leaving the scoring reserve) → s6 pushed, finishes
-the last ~4k steps, scores, `finished: true` ≈ Sat Sep 19 afternoon → harvested
-and evaluated automatically by Sat evening.
+What actually happened: s4 (4 h session, Sep 16) → quota reset Fri Sep 18
+20:00 EDT → s5 pushed at 21:05, paused at 237,960 → s6 pushed Sat Sep 19
+09:07, finished at 244,797 and scored, COMPLETE by 13:00 → the first harvest
+broke off inside the 2.6 GB checkpoint and was mistaken for done (issue #34,
+fixed in PR #35) → harvested 23:44, evaluated overnight.
 
 ## 4. What a person still does
 
@@ -177,9 +179,11 @@ target/release/ime-cli fused-eval --model data/run3/ngram.bin \
 
 ## 8. After v2 — what the previous operator would do next
 
-1. Write `notes/route-a-v2.md` from `results.md` (§4.2) and decide from the
-   abbreviated/mixed numbers whether the NAR + trigram design carries
-   abbreviations, which is the product-critical case.
+1. `notes/route-a-v2.md` is written. Its verdict on abbreviations: the fused
+   decoder is 3.5× the trigram on fully abbreviated sentences (24.3% vs 7.0%
+   top-1) but not usable for them yet, and neural-only top-8 barely exceeds
+   top-1 in every setting, so the next modelling step is a rescorer over the
+   NAR output (item 3), measured on the abbreviated set first.
 2. Fix issue #16 (hash only text+context in `EvalRecord::digest`) so the three
    eval twins share one dev/test split; re-tune weights once.
 3. The trigram is still load-bearing: neural-only top-8 barely exceeds top-1.
