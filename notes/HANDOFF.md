@@ -87,8 +87,10 @@ scores all three lattices with context on and off into
 
 1. finds the highest pushed segment n;
 2. if it is RUNNING/QUEUED: waits; if ERROR: logs "a person has to look" and stops;
-3. if COMPLETE and `data/route-a-v2/s<n>/run-summary.json` is absent: downloads
-   the output there (2–5 GB, includes the checkpoint) and logs the summary;
+3. if COMPLETE and `data/route-a-v2/s<n>/harvested` is absent: downloads the
+   output there (2–5 GB, includes the checkpoint), writes the `harvested` stamp
+   once the whole download succeeded (a download that breaks off is redone next
+   hour) and logs the summary;
 4. if that summary says `"finished": true`: runs `kaggle/finish.sh
    data/route-a-v2/s<n>` (≈1.5 h of CPU) which writes `results.md` there, then
    stops pushing;
