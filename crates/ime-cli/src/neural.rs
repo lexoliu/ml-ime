@@ -32,6 +32,9 @@ use ime_decode::{
 use ime_eval::{EvalRecord, EvalSet, Report, Slice};
 use ime_ngram::NgramModel;
 use ime_pinyin::{Lexicon, SegmentOptions, SyllableTable};
+use rayon::iter::{
+    IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead as _, BufReader, BufWriter, Write};
@@ -343,6 +346,10 @@ pub fn fused_eval(
 }
 
 /// Decode every record of the chosen slice and fold it into one report.
+///
+/// Records are independent, so the slice decodes in parallel and the per-record
+/// observations merge; every metric is a ratio of summed counters, so the
+/// report is identical to a sequential pass.
 fn measure<E, T>(
     set: &EvalSet,
     slice: &SliceArgs,
@@ -352,25 +359,30 @@ fn measure<E, T>(
     beam: &BeamOptions,
 ) -> Result<Report>
 where
-    E: Emissions,
-    T: Transition,
+    E: Emissions + Sync,
+    T: Transition + Sync,
 {
-    let mut report = Report::new(beam.top_k);
-    for (index, record) in set.records().iter().enumerate() {
-        if !slice.slice.slice().holds(record, slice.dev_share) {
-            continue;
-        }
-        let (_, candidates) = reader.read(record)?;
-        let emission = emissions.model(index, &candidates)?;
-        let hypotheses = decode(&candidates, &emission, transition, beam)
-            .with_context(|| format!("could not decode record {index}"))?;
-        let texts: Vec<String> = hypotheses
-            .iter()
-            .map(|hypothesis| hypothesis.text(&reader.lexicon))
-            .collect();
-        report.observe(&record.text, &texts);
-    }
-    Ok(report)
+    set.records()
+        .par_iter()
+        .enumerate()
+        .filter(|(_, record)| slice.slice.slice().holds(record, slice.dev_share))
+        .map(|(index, record)| {
+            let (_, candidates) = reader.read(record)?;
+            let emission = emissions.model(index, &candidates)?;
+            let hypotheses = decode(&candidates, &emission, transition, beam)
+                .with_context(|| format!("could not decode record {index}"))?;
+            let texts: Vec<String> = hypotheses
+                .iter()
+                .map(|hypothesis| hypothesis.text(&reader.lexicon))
+                .collect();
+            let mut report = Report::new(beam.top_k);
+            report.observe(&record.text, &texts);
+            Ok(report)
+        })
+        .try_reduce(
+            || Report::new(beam.top_k),
+            |left, right| Ok(left.merge(&right)),
+        )
 }
 
 /// Read an evaluation set off disk.

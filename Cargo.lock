@@ -1733,6 +1733,7 @@ dependencies = [
  "ime-ngram",
  "ime-pinyin",
  "ime-synth",
+ "rayon",
  "serde",
  "serde_json",
  "thiserror",
