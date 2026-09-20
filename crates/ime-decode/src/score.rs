@@ -105,11 +105,15 @@ pub struct NoTransition;
 impl Transition for NoTransition {
     const HISTORY: usize = 1;
 
-    fn score(&self, _history: History, _candidate: CharId) -> f32 {
+    type Context = ();
+
+    fn context(&self, _history: History) -> Self::Context {}
+
+    fn score(&self, _context: &Self::Context, _candidate: CharId) -> f32 {
         0.0
     }
 
-    fn finish(&self, _history: History) -> f32 {
+    fn finish(&self, _context: &Self::Context) -> f32 {
         0.0
     }
 }
@@ -121,15 +125,24 @@ pub trait Transition {
     /// [`decode`](crate::decode) checks when it is instantiated.
     const HISTORY: usize;
 
-    /// Score of *candidate* following *history*, as a log probability or any
-    /// other quantity where larger is better.
-    fn score(&self, history: History, candidate: CharId) -> f32;
+    /// Everything a score needs of the history, resolved once per beam state.
+    ///
+    /// A context is whatever the model would otherwise look up again for every
+    /// candidate: for the trigram, the two backoff weights the history selects.
+    type Context;
 
-    /// Score of the sequence ending after *history*.
+    /// Resolve *history* into the context candidates are scored against.
+    fn context(&self, history: History) -> Self::Context;
+
+    /// Score of *candidate* following the history *context* was built from, as
+    /// a log probability or any other quantity where larger is better.
+    fn score(&self, context: &Self::Context, candidate: CharId) -> f32;
+
+    /// Score of the sequence ending after the history *context* was built from.
     ///
     /// Without this a decoder is free to end anywhere, and a reading that trails
     /// off mid-word costs no more than one that closes.
-    fn finish(&self, history: History) -> f32;
+    fn finish(&self, context: &Self::Context) -> f32;
 }
 
 #[cfg(test)]

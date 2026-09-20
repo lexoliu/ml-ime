@@ -32,6 +32,9 @@ use ime_decode::{
 use ime_eval::{EvalRecord, EvalSet, Report, Slice};
 use ime_ngram::NgramModel;
 use ime_pinyin::{Lexicon, SegmentOptions, SyllableTable};
+use rayon::iter::{
+    IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
+};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead as _, BufReader, BufWriter, Write};
@@ -82,6 +85,11 @@ pub struct SliceArgs {
     /// hash of the record itself, so it survives the file being reordered.
     #[arg(long, default_value = "0.0905")]
     pub dev_share: f64,
+    /// Sweep every `--weight` on the dev slice, then report the test slice at
+    /// the weight whose sentence top-1 was highest; ties go to the weight given
+    /// first. Replaces `--slice`, and meaningless without a score file to fuse.
+    #[arg(long, requires = "scores", conflicts_with = "slice")]
+    pub select_on_dev: bool,
 }
 
 /// Supplies the emission model for one record's lattice.
@@ -158,6 +166,9 @@ struct Section {
     weight: f32,
     transition: &'static str,
     slice: &'static str,
+    /// Whether the weight won a dev sweep rather than being given on the
+    /// command line.
+    selected: bool,
     report: Report,
 }
 
@@ -265,7 +276,9 @@ pub fn emit_lattice(
 ///
 /// Without a score file the run is the n-gram baseline; without an n-gram it is
 /// the emissions alone; with both, every weight in *weights* is one fused
-/// configuration.
+/// configuration. With `--select-on-dev` the weights are swept on the dev
+/// slice instead and the report closes with the test slice at whichever weight
+/// scored the highest sentence top-1 there.
 ///
 /// # Errors
 ///
@@ -306,11 +319,20 @@ pub fn fused_eval(
             weight: 0.0,
             transition: "kn-trigram",
             slice: slice.slice.label(),
-            report: measure(&set, slice, &reader, &NoEmissions, ngram, beam)?,
+            selected: false,
+            report: measure(
+                &set,
+                slice.slice,
+                slice.dev_share,
+                &reader,
+                &NoEmissions,
+                ngram,
+                beam,
+            )?,
         }),
         (Some(path), ngram) => {
             let scores = load_scores(path)?;
-            for &weight in weights {
+            let measure_at = |which: SliceArg, weight: f32| -> Result<Section> {
                 let emissions = NeuralEmissions {
                     scores: &scores,
                     emittable: &emittable,
@@ -320,20 +342,55 @@ pub fn fused_eval(
                 let (transition, report) = match ngram {
                     Some(ngram) => (
                         "kn-trigram",
-                        measure(&set, slice, &reader, &emissions, ngram, beam)?,
+                        measure(
+                            &set,
+                            which,
+                            slice.dev_share,
+                            &reader,
+                            &emissions,
+                            ngram,
+                            beam,
+                        )?,
                     ),
                     None => (
                         "none",
-                        measure(&set, slice, &reader, &emissions, &NoTransition, beam)?,
+                        measure(
+                            &set,
+                            which,
+                            slice.dev_share,
+                            &reader,
+                            &emissions,
+                            &NoTransition,
+                            beam,
+                        )?,
                     ),
                 };
-                sections.push(Section {
+                Ok(Section {
                     emission: "neural",
                     weight,
                     transition,
-                    slice: slice.slice.label(),
+                    slice: which.label(),
+                    selected: false,
                     report,
-                });
+                })
+            };
+            if slice.select_on_dev {
+                for &weight in weights {
+                    sections.push(measure_at(SliceArg::Dev, weight)?);
+                }
+                let mut winner = 0;
+                for (index, section) in sections.iter().enumerate().skip(1) {
+                    if section.report.top1_hits() > sections[winner].report.top1_hits() {
+                        winner = index;
+                    }
+                }
+                let mut test = measure_at(SliceArg::Test, sections[winner].weight)?;
+                test.selected = true;
+                sections.push(test);
+            } else {
+                for &weight in weights {
+                    sections.push(measure_at(slice.slice, weight)?);
+                }
             }
         }
     }
@@ -343,34 +400,44 @@ pub fn fused_eval(
 }
 
 /// Decode every record of the chosen slice and fold it into one report.
+///
+/// Records are independent, so the slice decodes in parallel and the per-record
+/// observations merge; every metric is a ratio of summed counters, so the
+/// report is identical to a sequential pass.
 fn measure<E, T>(
     set: &EvalSet,
-    slice: &SliceArgs,
+    slice: SliceArg,
+    dev_share: f64,
     reader: &Reader,
     emissions: &E,
     transition: &T,
     beam: &BeamOptions,
 ) -> Result<Report>
 where
-    E: Emissions,
-    T: Transition,
+    E: Emissions + Sync,
+    T: Transition + Sync,
 {
-    let mut report = Report::new(beam.top_k);
-    for (index, record) in set.records().iter().enumerate() {
-        if !slice.slice.slice().holds(record, slice.dev_share) {
-            continue;
-        }
-        let (_, candidates) = reader.read(record)?;
-        let emission = emissions.model(index, &candidates)?;
-        let hypotheses = decode(&candidates, &emission, transition, beam)
-            .with_context(|| format!("could not decode record {index}"))?;
-        let texts: Vec<String> = hypotheses
-            .iter()
-            .map(|hypothesis| hypothesis.text(&reader.lexicon))
-            .collect();
-        report.observe(&record.text, &texts);
-    }
-    Ok(report)
+    set.records()
+        .par_iter()
+        .enumerate()
+        .filter(|(_, record)| slice.slice().holds(record, dev_share))
+        .map(|(index, record)| {
+            let (_, candidates) = reader.read(record)?;
+            let emission = emissions.model(index, &candidates)?;
+            let hypotheses = decode(&candidates, &emission, transition, beam)
+                .with_context(|| format!("could not decode record {index}"))?;
+            let texts: Vec<String> = hypotheses
+                .iter()
+                .map(|hypothesis| hypothesis.text(&reader.lexicon))
+                .collect();
+            let mut report = Report::new(beam.top_k);
+            report.observe(&record.text, &texts);
+            Ok(report)
+        })
+        .try_reduce(
+            || Report::new(beam.top_k),
+            |left, right| Ok(left.merge(&right)),
+        )
 }
 
 /// Read an evaluation set off disk.
@@ -390,32 +457,56 @@ fn load_emittable(path: &Path, lexicon: &Lexicon) -> Result<Emittable> {
     Ok(emittable)
 }
 
+/// Lines of the score file read ahead of the parse at a time: large enough
+/// that the parallel parse dominates the sequential decompress, small enough
+/// that a chunk is a rounding error next to the map it folds into.
+const SCORE_CHUNK: usize = 1 << 16;
+
 /// Read a gzipped score file into the records it answers.
 ///
 /// Gzipped because it is not small: twenty-one million log probabilities is a
 /// couple of hundred megabytes as text and a fifth of that compressed, and the
-/// file has to come off a Kaggle kernel before anything can be measured.
+/// file has to come off a Kaggle kernel before anything can be measured. The
+/// parse, not the decompress, is the expensive half, so each chunk of lines is
+/// parsed in parallel and folded into the map in file order -- the resident
+/// text is one chunk rather than the file, and the duplicate-record check
+/// still names the same line it always did.
 fn load_scores(path: &Path) -> Result<HashMap<usize, Vec<Vec<Vec<f32>>>>> {
     let file = fs::File::open(path)
         .with_context(|| format!("could not read the scores at {}", path.display()))?;
-    let mut scores = HashMap::new();
-    for (index, line) in BufReader::new(MultiGzDecoder::new(file))
+    let mut lines = BufReader::new(MultiGzDecoder::new(file))
         .lines()
-        .enumerate()
-    {
-        let line =
-            line.with_context(|| format!("could not read line {} of the scores", index + 1))?;
-        if line.trim().is_empty() {
-            continue;
+        .enumerate();
+    let mut scores = HashMap::new();
+    loop {
+        let chunk: Vec<(usize, String)> = lines
+            .by_ref()
+            .take(SCORE_CHUNK)
+            .map(|(index, line)| {
+                line.map(|line| (index, line))
+                    .with_context(|| format!("could not read line {} of the scores", index + 1))
+            })
+            .collect::<Result<_>>()?;
+        if chunk.is_empty() {
+            break;
         }
-        let record: ScoreRecord = serde_json::from_str(&line)
-            .with_context(|| format!("line {} of the scores is not a record", index + 1))?;
-        if scores.insert(record.record, record.paths).is_some() {
-            bail!(
-                "the score file answers record {} twice, at line {}",
-                record.record,
-                index + 1
-            );
+        let parsed: Vec<(usize, ScoreRecord)> = chunk
+            .par_iter()
+            .filter(|(_, line)| !line.trim().is_empty())
+            .map(|(index, line)| {
+                serde_json::from_str::<ScoreRecord>(line)
+                    .with_context(|| format!("line {} of the scores is not a record", index + 1))
+                    .map(|record| (*index + 1, record))
+            })
+            .collect::<Result<_>>()?;
+        for (line, record) in parsed {
+            if scores.insert(record.record, record.paths).is_some() {
+                bail!(
+                    "the score file answers record {} twice, at line {}",
+                    record.record,
+                    line
+                );
+            }
         }
     }
     if scores.is_empty() {

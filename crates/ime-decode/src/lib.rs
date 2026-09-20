@@ -98,14 +98,17 @@ mod tests {
     impl Transition for Preference {
         const HISTORY: usize = 1;
 
-        fn score(&self, history: History, candidate: CharId) -> f32 {
-            *self
-                .bigrams
-                .get(&(history.back(1), candidate))
-                .unwrap_or(&-10.0)
+        type Context = Option<CharId>;
+
+        fn context(&self, history: History) -> Self::Context {
+            history.back(1)
         }
 
-        fn finish(&self, _history: History) -> f32 {
+        fn score(&self, context: &Self::Context, candidate: CharId) -> f32 {
+            *self.bigrams.get(&(*context, candidate)).unwrap_or(&-10.0)
+        }
+
+        fn finish(&self, _context: &Self::Context) -> f32 {
             0.0
         }
     }
