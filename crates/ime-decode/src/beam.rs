@@ -70,16 +70,25 @@ impl Hypothesis {
     }
 }
 
-/// A live search state: the last few characters, the score of the best way to
-/// reach them, and where that way came from.
+/// A way of reaching a beam state, before the model has been advanced into it:
+/// the last few characters, the score of the best way there, and where it came
+/// from.
 #[derive(Copy, Clone, Debug)]
-struct Beam {
+struct Candidate {
     history: History,
     score: f32,
     ch: CharId,
     /// Index into the previous position's surviving beams. Meaningless at
     /// position zero.
     parent: usize,
+}
+
+/// A surviving beam: a [`Candidate`] together with the transition model's state
+/// after its last character.
+#[derive(Clone, Debug)]
+struct Beam<S> {
+    candidate: Candidate,
+    state: S,
 }
 
 /// Decode every reading in *candidates* and merge the results.
@@ -95,6 +104,7 @@ pub fn decode<E, T>(
     candidates: &Candidates,
     emission: &E,
     transition: &T,
+    context: Option<&str>,
     options: &BeamOptions,
 ) -> Result<Vec<Hypothesis>, crate::DecodeError>
 where
@@ -118,7 +128,7 @@ where
     let mut merged: Vec<Hypothesis> = Vec::new();
     for (path, reading) in candidates.paths().iter().enumerate() {
         let penalty = options.segmentation_weight * reading.cost();
-        for mut hypothesis in decode_path(path, reading, emission, transition, options) {
+        for mut hypothesis in decode_path(path, reading, emission, transition, context, options) {
             hypothesis.score -= penalty;
             merged.push(hypothesis);
         }
@@ -142,11 +152,18 @@ where
 }
 
 /// Beam Viterbi over a single reading.
+///
+/// Each position scores every candidate against every surviving beam's state,
+/// keeps the best way of reaching each distinct history, truncates to the beam
+/// width, and only then advances the model into the survivors -- one batched
+/// call, so a model whose step is expensive pays for the beams it keeps and not
+/// for the candidates it discards.
 fn decode_path<E, T>(
     path: usize,
     reading: &CandidatePath,
     emission: &E,
     transition: &T,
+    context: Option<&str>,
     options: &BeamOptions,
 ) -> Vec<Hypothesis>
 where
@@ -154,20 +171,20 @@ where
     T: Transition,
 {
     let width = options.beam_width.get();
-    let mut beams: Vec<Vec<Beam>> = Vec::with_capacity(reading.len());
+    let start = transition.start(context);
+    let mut beams: Vec<Vec<Beam<T::State>>> = Vec::with_capacity(reading.len());
     let mut index: HashMap<History, usize> = HashMap::new();
 
     for (position, allowed) in reading.positions().iter().enumerate() {
-        let mut next: Vec<Beam> = Vec::with_capacity(allowed.len());
+        let mut next: Vec<Candidate> = Vec::with_capacity(allowed.len());
         index.clear();
         if position == 0 {
-            let context = transition.context(History::START);
             for &ch in allowed {
-                let score = emission.score(path, 0, ch) + transition.score(&context, ch);
+                let score = emission.score(path, 0, ch) + transition.score(&start, ch);
                 relax(
                     &mut next,
                     &mut index,
-                    Beam {
+                    Candidate {
                         history: History::START.extended(ch).truncated(T::HISTORY),
                         score,
                         ch,
@@ -177,16 +194,15 @@ where
             }
         } else {
             for (parent, beam) in beams[position - 1].iter().enumerate() {
-                let context = transition.context(beam.history);
                 for &ch in allowed {
-                    let score = beam.score
+                    let score = beam.candidate.score
                         + emission.score(path, position, ch)
-                        + transition.score(&context, ch);
+                        + transition.score(&beam.state, ch);
                     relax(
                         &mut next,
                         &mut index,
-                        Beam {
-                            history: beam.history.extended(ch).truncated(T::HISTORY),
+                        Candidate {
+                            history: beam.candidate.history.extended(ch).truncated(T::HISTORY),
                             score,
                             ch,
                             parent,
@@ -197,7 +213,29 @@ where
         }
         next.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
         next.truncate(width);
-        beams.push(next);
+        let steps: Vec<(&T::State, CharId)> = next
+            .iter()
+            .map(|candidate| {
+                let state = if position == 0 {
+                    &start
+                } else {
+                    &beams[position - 1][candidate.parent].state
+                };
+                (state, candidate.ch)
+            })
+            .collect();
+        let states = transition.advance(&steps);
+        assert_eq!(
+            states.len(),
+            steps.len(),
+            "a transition model must return one state per step"
+        );
+        beams.push(
+            next.into_iter()
+                .zip(states)
+                .map(|(candidate, state)| Beam { candidate, state })
+                .collect(),
+        );
     }
 
     let Some(last) = beams.last() else {
@@ -206,12 +244,7 @@ where
     let mut finished: Vec<(usize, f32)> = last
         .iter()
         .enumerate()
-        .map(|(slot, beam)| {
-            (
-                slot,
-                beam.score + transition.finish(&transition.context(beam.history)),
-            )
-        })
+        .map(|(slot, beam)| (slot, beam.candidate.score + transition.finish(&beam.state)))
         .collect();
     finished.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
     finished
@@ -225,29 +258,29 @@ where
 }
 
 /// Keep only the best way of reaching each beam state.
-fn relax(next: &mut Vec<Beam>, index: &mut HashMap<History, usize>, beam: Beam) {
-    match index.entry(beam.history) {
+fn relax(next: &mut Vec<Candidate>, index: &mut HashMap<History, usize>, candidate: Candidate) {
+    match index.entry(candidate.history) {
         Entry::Occupied(slot) => {
             let incumbent = &mut next[*slot.get()];
-            if beam.score > incumbent.score {
-                *incumbent = beam;
+            if candidate.score > incumbent.score {
+                *incumbent = candidate;
             }
         }
         Entry::Vacant(slot) => {
             slot.insert(next.len());
-            next.push(beam);
+            next.push(candidate);
         }
     }
 }
 
 /// Follow the backpointers from a finished beam to the start of the sequence.
-fn reconstruct(beams: &[Vec<Beam>], slot: usize) -> Vec<CharId> {
+fn reconstruct<S>(beams: &[Vec<Beam<S>>], slot: usize) -> Vec<CharId> {
     let mut chars = Vec::with_capacity(beams.len());
     let mut current = slot;
     for level in beams.iter().rev() {
-        let beam = level[current];
-        chars.push(beam.ch);
-        current = beam.parent;
+        let candidate = level[current].candidate;
+        chars.push(candidate.ch);
+        current = candidate.parent;
     }
     chars.reverse();
     chars

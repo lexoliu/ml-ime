@@ -105,44 +105,121 @@ pub struct NoTransition;
 impl Transition for NoTransition {
     const HISTORY: usize = 1;
 
-    type Context = ();
+    type State = ();
 
-    fn context(&self, _history: History) -> Self::Context {}
+    fn start(&self, _context: Option<&str>) -> Self::State {}
 
-    fn score(&self, _context: &Self::Context, _candidate: CharId) -> f32 {
+    fn score(&self, _state: &Self::State, _candidate: CharId) -> f32 {
         0.0
     }
 
-    fn finish(&self, _context: &Self::Context) -> f32 {
+    fn finish(&self, _state: &Self::State) -> f32 {
         0.0
+    }
+
+    fn advance(&self, steps: &[(&Self::State, CharId)]) -> Vec<Self::State> {
+        vec![(); steps.len()]
     }
 }
 
 /// How well a character follows the ones before it.
+///
+/// A transition model is stateful from the decoder's point of view: every beam
+/// carries a [`Transition::State`] that stands for the characters chosen so far,
+/// and the model scores the next character against that state and then advances
+/// it. For an n-gram the state is the backoff weights its last characters select;
+/// for a recurrent model it is the hidden state. The decoder never looks inside
+/// it, so a model with a memory of two characters and one with a memory of the
+/// whole sentence and its context are the same to the search.
 pub trait Transition {
-    /// How many preceding characters this model conditions on: one for a bigram,
-    /// two for a trigram. Must lie in `1..=MAX_HISTORY`, which
-    /// [`decode`](crate::decode) checks when it is instantiated.
+    /// How many preceding characters distinguish two beam states.
+    ///
+    /// Beams whose last `HISTORY` characters agree are merged and only the
+    /// better survives. For an n-gram of that order the merge is exact; for a
+    /// model with a longer memory it is the recombination every beam search over
+    /// such a model makes, and `HISTORY` is how much of the past the search keeps
+    /// apart. Must lie in `1..=MAX_HISTORY`, which [`decode`](crate::decode)
+    /// checks when it is instantiated.
     const HISTORY: usize;
 
-    /// Everything a score needs of the history, resolved once per beam state.
-    ///
-    /// A context is whatever the model would otherwise look up again for every
-    /// candidate: for the trigram, the two backoff weights the history selects.
-    type Context;
+    /// What a beam carries for this model.
+    type State: Clone + Send + Sync;
 
-    /// Resolve *history* into the context candidates are scored against.
-    fn context(&self, history: History) -> Self::Context;
+    /// The state before the first character, given whatever was on screen ahead
+    /// of the sentence -- a model that reads context starts from it, one that
+    /// does not ignores it.
+    fn start(&self, context: Option<&str>) -> Self::State;
 
-    /// Score of *candidate* following the history *context* was built from, as
-    /// a log probability or any other quantity where larger is better.
-    fn score(&self, context: &Self::Context, candidate: CharId) -> f32;
+    /// Score of *candidate* following the characters *state* stands for, as a
+    /// log probability or any other quantity where larger is better.
+    fn score(&self, state: &Self::State, candidate: CharId) -> f32;
 
-    /// Score of the sequence ending after the history *context* was built from.
+    /// Score of the sequence ending after *state*.
     ///
     /// Without this a decoder is free to end anywhere, and a reading that trails
     /// off mid-word costs no more than one that closes.
-    fn finish(&self, context: &Self::Context) -> f32;
+    fn finish(&self, state: &Self::State) -> f32;
+
+    /// The state after each `(state, ch)` step, in the order given.
+    ///
+    /// The decoder calls this once per position and reading with every surviving
+    /// beam, so a model whose step is a matrix product can run them as one batch.
+    /// The result has one state per step.
+    fn advance(&self, steps: &[(&Self::State, CharId)]) -> Vec<Self::State>;
+}
+
+/// Two transition models scored together, each at its own weight.
+///
+/// The state is the pair of states and the score the weighted sum, so a trigram
+/// and a recurrent model can share one search: the trigram supplies what it is
+/// sure of about adjacent characters and the recurrent model the rest of the
+/// sentence. Beams are told apart by the longer of the two memories.
+#[derive(Clone, Debug)]
+pub struct Both<A, B> {
+    /// The first model.
+    pub first: A,
+    /// Weight on the first model's scores.
+    pub first_weight: f32,
+    /// The second model.
+    pub second: B,
+    /// Weight on the second model's scores.
+    pub second_weight: f32,
+}
+
+impl<A: Transition, B: Transition> Transition for Both<A, B> {
+    const HISTORY: usize = if A::HISTORY > B::HISTORY {
+        A::HISTORY
+    } else {
+        B::HISTORY
+    };
+
+    type State = (A::State, B::State);
+
+    fn start(&self, context: Option<&str>) -> Self::State {
+        (self.first.start(context), self.second.start(context))
+    }
+
+    fn score(&self, state: &Self::State, candidate: CharId) -> f32 {
+        self.first_weight * self.first.score(&state.0, candidate)
+            + self.second_weight * self.second.score(&state.1, candidate)
+    }
+
+    fn finish(&self, state: &Self::State) -> f32 {
+        self.first_weight * self.first.finish(&state.0)
+            + self.second_weight * self.second.finish(&state.1)
+    }
+
+    fn advance(&self, steps: &[(&Self::State, CharId)]) -> Vec<Self::State> {
+        let first: Vec<(&A::State, CharId)> =
+            steps.iter().map(|(state, ch)| (&state.0, *ch)).collect();
+        let second: Vec<(&B::State, CharId)> =
+            steps.iter().map(|(state, ch)| (&state.1, *ch)).collect();
+        self.first
+            .advance(&first)
+            .into_iter()
+            .zip(self.second.advance(&second))
+            .collect()
+    }
 }
 
 #[cfg(test)]

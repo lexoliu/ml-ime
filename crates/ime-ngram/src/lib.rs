@@ -277,8 +277,8 @@ mod tests {
             SegmentLattice::build("zhongguorenmin", &table, &options).expect("the input reads");
         let batch =
             Candidates::build(&lattice.k_best(&options), &lexicon).expect("masks are non-empty");
-        let best =
-            decode(&batch, &Uniform, &model, &BeamOptions::default()).expect("the batch decodes");
+        let best = decode(&batch, &Uniform, &model, None, &BeamOptions::default())
+            .expect("the batch decodes");
         assert_eq!(best[0].text(&lexicon), "中国人民");
     }
 
@@ -298,6 +298,7 @@ mod tests {
             &batch,
             &Uniform,
             &model,
+            None,
             &BeamOptions {
                 beam_width: std::num::NonZeroUsize::new(64).expect("64 is not zero"),
                 ..BeamOptions::default()

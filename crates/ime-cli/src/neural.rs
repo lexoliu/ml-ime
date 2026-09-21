@@ -483,8 +483,14 @@ where
         .map(|(index, record)| -> Result<(Report, Vec<DumpRow>)> {
             let (_, candidates) = reader.read(record)?;
             let emission = emissions.model(index, &candidates)?;
-            let hypotheses = decode(&candidates, &emission, transition, beam)
-                .with_context(|| format!("could not decode record {index}"))?;
+            let hypotheses = decode(
+                &candidates,
+                &emission,
+                transition,
+                record.context.as_deref(),
+                beam,
+            )
+            .with_context(|| format!("could not decode record {index}"))?;
             let texts: Vec<String> = hypotheses
                 .iter()
                 .map(|hypothesis| hypothesis.text(&reader.lexicon))

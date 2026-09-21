@@ -1808,6 +1808,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ime-lm"
+version = "0.1.0"
+dependencies = [
+ "ime-decode",
+ "ime-pinyin",
+ "ort",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "thread_local",
+]
+
+[[package]]
 name = "ime-neural"
 version = "0.1.0"
 
