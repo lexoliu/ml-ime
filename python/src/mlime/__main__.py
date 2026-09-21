@@ -569,3 +569,65 @@ def _requested(source: list[str] | None) -> tuple[str, ...]:
 
 if __name__ == "__main__":
     app()
+
+
+@train_app.command("char-lm")
+def train_char_lm(
+    data_dir: Path = DATA_DIR,
+    out: Path = typer.Option(Path("runs/char-lm"), help="Where checkpoints and metrics go"),
+    char_table: Path = CHAR_TABLE,
+    train_shard: list[str] = TRAIN_SHARD,
+    held_out_shard: list[str] = HELD_OUT_SHARD,
+    max_held_out: int = typer.Option(4096, help="Held-out rows scored per evaluation"),
+    max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
+    max_tokens: int = typer.Option(16384, help="Padded positions per step"),
+    lr: float = typer.Option(1e-3, help="Peak learning rate"),
+    embedding: int = typer.Option(384, help="Embedding width"),
+    hidden: int = typer.Option(1024, help="LSTM width"),
+    layers: int = typer.Option(2, help="LSTM layers"),
+    seed: int = SEED,
+    fp16: bool = typer.Option(True, help="Train in fp16 with loss scaling"),
+    checkpoint_every: int = typer.Option(2000, help="Steps between checkpoints"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Train the character language model the decoder's transition runs on."""
+    configure(verbose)
+    from mlime.data.corpus import default_char_table
+    from mlime.train.charlm import CharLmConfig, CharLmTraining, train
+    from mlime.train.loop import Distributed
+
+    table = char_table or default_char_table()
+    if table is None:
+        raise FileNotFoundError("no character table found upwards; pass --char-table")
+    final = train(
+        DataLayout(data_dir).samples,
+        route_a_slices(data_dir, train_shard, held_out_shard, max_held_out),
+        table,
+        out,
+        CharLmConfig(embedding=embedding, hidden=hidden, layers=layers),
+        CharLmTraining(
+            max_steps=max_steps,
+            lr=lr,
+            max_tokens=max_tokens,
+            seed=seed,
+            checkpoint_every=checkpoint_every,
+            held_out_every=checkpoint_every,
+            fp16=fp16,
+        ),
+        Distributed.from_environment(),
+    )
+    typer.echo(str(final))
+
+
+@export_app.command("char-lm")
+def export_char_lm(
+    checkpoint: Path = typer.Argument(..., help="A char-lm checkpoint (charlm-final.pt)"),
+    out: Path = typer.Option(Path("data/char-lm"), help="Where charlm.onnx and charlm.json go"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Export the step graph and manifest the Rust decoder loads."""
+    configure(verbose)
+    from mlime.train.charlm import export_onnx
+
+    graph, manifest = export_onnx(checkpoint, out)
+    typer.echo(f"{graph}\n{manifest}")
