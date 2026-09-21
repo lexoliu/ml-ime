@@ -41,7 +41,7 @@ from torch.utils.data import IterableDataset
 
 from mlime.logging import log
 from mlime.train.lexicon import read_char_readings
-from mlime.train.loop import Distributed, MetricLog, cosine_with_warmup, seed_everything
+from mlime.train.loop import Distributed, MetricLog, agreed, cosine_with_warmup, seed_everything
 from mlime.train.run import Slices
 from mlime.train.samples import context_tail
 
@@ -272,12 +272,20 @@ class CharLmTraining:
     checkpoint_every: int = 2000
     held_out_every: int = 2000
     fp16: bool = True
+    #: Stop after this many seconds and write the final checkpoint from wherever
+    #: the run is, for a session that would otherwise be killed with nothing
+    #: kept; ``None`` runs every step.
+    wall_budget_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if self.max_steps <= 0:
             raise ValueError(f"max_steps must be positive, got {self.max_steps}")
         if not 0.0 <= self.warmup_fraction < 1.0:
             raise ValueError(f"warmup_fraction must be in [0, 1), got {self.warmup_fraction}")
+        if self.wall_budget_seconds is not None and self.wall_budget_seconds <= 0:
+            raise ValueError(
+                f"wall_budget_seconds must be positive, got {self.wall_budget_seconds}"
+            )
 
     @property
     def warmup_steps(self) -> int:
@@ -408,8 +416,16 @@ def train(
     metrics = MetricLog(out / "metrics.jsonl") if world.is_main else None
     started = time.time()
     tokens_seen = 0
+    last_step = training.max_steps
     wrapped.train()
     for step in range(1, training.max_steps + 1):
+        budget = training.wall_budget_seconds
+        if budget is not None and agreed(world, time.time() - started > budget, device):
+            last_step = step - 1
+            if metrics is not None:
+                metrics.write(event="stopped", step=last_step, elapsed=time.time() - started)
+            log.info("wall budget spent; stopping", step=last_step)
+            break
         batch = next(batches)
         tokens, targets = batch.tokens.to(device), batch.targets.to(device)
         with torch.autocast("cuda", dtype=torch.float16, enabled=scaler.is_enabled()):
@@ -444,13 +460,13 @@ def train(
             save_checkpoint(out / "charlm.pt", model, vocab, step, optimizer)
     final = out / "charlm-final.pt"
     if world.is_main:
-        save_checkpoint(final, model, vocab, training.max_steps, optimizer)
+        save_checkpoint(final, model, vocab, last_step, optimizer)
         if held:
             nats = held_out_loss(model, held, device)
             if metrics is not None:
                 metrics.write(
                     event="summary",
-                    step=training.max_steps,
+                    step=last_step,
                     nats_per_char=nats,
                     perplexity=math.exp(nats),
                     parameters=parameters,

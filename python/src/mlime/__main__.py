@@ -588,6 +588,9 @@ def train_char_lm(
     seed: int = SEED,
     fp16: bool = typer.Option(True, help="Train in fp16 with loss scaling"),
     checkpoint_every: int = typer.Option(2000, help="Steps between checkpoints"),
+    wall_budget_seconds: float = typer.Option(
+        None, help="Stop and write the final checkpoint after this many seconds"
+    ),
     verbose: bool = VERBOSE,
 ) -> None:
     """Train the character language model the decoder's transition runs on."""
@@ -613,6 +616,7 @@ def train_char_lm(
             checkpoint_every=checkpoint_every,
             held_out_every=checkpoint_every,
             fp16=fp16,
+            wall_budget_seconds=wall_budget_seconds,
         ),
         Distributed.from_environment(),
     )
