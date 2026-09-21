@@ -6,7 +6,9 @@
 //! there and the characters that position admits. The Python side answers with a
 //! log probability per candidate, in the same order. `fused-eval` reads both
 //! back, decodes with the emissions fused into the same beam Viterbi the
-//! baseline uses, and reports what came out.
+//! baseline uses, and reports what came out. Asked to with `--dump`, it also
+//! writes the beam itself: one JSON Lines file per reported section, one
+//! record's ranked hypotheses and their scores per line.
 //!
 //! Both commands segment through [`engine::read`] with the same
 //! [`SegmentOptions`], because the score file is positional: it identifies a
@@ -35,6 +37,7 @@ use ime_pinyin::{Lexicon, SegmentOptions, SyllableTable};
 use rayon::iter::{
     IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
 };
+use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead as _, BufReader, BufWriter, Write};
@@ -170,6 +173,25 @@ struct Section {
     /// command line.
     selected: bool,
     report: Report,
+    /// The beam of every record in the slice, sorted by record. Filled only
+    /// when a dump directory was given; the report ignores it.
+    rows: Vec<DumpRow>,
+}
+
+/// One line of a dump file: the record's expected text and the beam it
+/// decoded into, best first.
+#[derive(Serialize)]
+struct DumpRow {
+    record: usize,
+    text: String,
+    hypotheses: Vec<DumpedHypothesis>,
+}
+
+/// One hypothesis as the dump records it.
+#[derive(Serialize)]
+struct DumpedHypothesis {
+    text: String,
+    score: f32,
 }
 
 /// Every configuration that was run, as it goes to stdout.
@@ -278,13 +300,14 @@ pub fn emit_lattice(
 /// the emissions alone; with both, every weight in *weights* is one fused
 /// configuration. With `--select-on-dev` the weights are swept on the dev
 /// slice instead and the report closes with the test slice at whichever weight
-/// scored the highest sentence top-1 there.
+/// scored the highest sentence top-1 there. With *dump* every evaluated
+/// section's beam is written there too, one JSON Lines file per section.
 ///
 /// # Errors
 ///
 /// If neither a score file nor an n-gram was given, any input cannot be read, a
-/// record cannot be decoded, or a score file does not describe the lattice the
-/// records segment into.
+/// record cannot be decoded, a score file does not describe the lattice the
+/// records segment into, or the dump cannot be written.
 #[expect(
     clippy::too_many_arguments,
     reason = "every argument is a distinct axis of the ablation the command exists to run"
@@ -296,6 +319,7 @@ pub fn fused_eval(
     floor: f32,
     weights: &[f32],
     slice: &SliceArgs,
+    dump: Option<&Path>,
     table: SyllableTable,
     lexicon: Lexicon,
     segment: SegmentOptions,
@@ -309,27 +333,18 @@ pub fn fused_eval(
         lexicon,
         segment,
     };
+    if let Some(dir) = dump {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("could not create the dump directory {}", dir.display()))?;
+    }
     let mut sections = Vec::new();
     match (scores, ngram) {
         (None, None) => {
             bail!("a run with neither emissions nor a transition model scores nothing")
         }
-        (None, Some(ngram)) => sections.push(Section {
-            emission: "none",
-            weight: 0.0,
-            transition: "kn-trigram",
-            slice: slice.slice.label(),
-            selected: false,
-            report: measure(
-                &set,
-                slice.slice,
-                slice.dev_share,
-                &reader,
-                &NoEmissions,
-                ngram,
-                beam,
-            )?,
-        }),
+        (None, Some(ngram)) => {
+            sections.push(baseline(&set, slice, &reader, ngram, beam, dump.is_some())?);
+        }
         (Some(path), ngram) => {
             let scores = load_scores(path)?;
             let measure_at = |which: SliceArg, weight: f32| -> Result<Section> {
@@ -339,31 +354,30 @@ pub fn fused_eval(
                     weight,
                     floor,
                 };
-                let (transition, report) = match ngram {
-                    Some(ngram) => (
-                        "kn-trigram",
-                        measure(
-                            &set,
-                            which,
-                            slice.dev_share,
-                            &reader,
-                            &emissions,
-                            ngram,
-                            beam,
-                        )?,
-                    ),
-                    None => (
-                        "none",
-                        measure(
-                            &set,
-                            which,
-                            slice.dev_share,
-                            &reader,
-                            &emissions,
-                            &NoTransition,
-                            beam,
-                        )?,
-                    ),
+                let (transition, report, rows) = if let Some(ngram) = ngram {
+                    let (report, rows) = measure(
+                        &set,
+                        which,
+                        slice.dev_share,
+                        &reader,
+                        &emissions,
+                        ngram,
+                        beam,
+                        dump.is_some(),
+                    )?;
+                    ("kn-trigram", report, rows)
+                } else {
+                    let (report, rows) = measure(
+                        &set,
+                        which,
+                        slice.dev_share,
+                        &reader,
+                        &emissions,
+                        &NoTransition,
+                        beam,
+                        dump.is_some(),
+                    )?;
+                    ("none", report, rows)
                 };
                 Ok(Section {
                     emission: "neural",
@@ -372,6 +386,7 @@ pub fn fused_eval(
                     slice: which.label(),
                     selected: false,
                     report,
+                    rows,
                 })
             };
             if slice.select_on_dev {
@@ -394,16 +409,58 @@ pub fn fused_eval(
             }
         }
     }
+    if let Some(dir) = dump {
+        for section in &sections {
+            write_dump(dir, section)?;
+        }
+    }
     Ablation { sections }
         .render()
         .context("could not render the ablation")
+}
+
+/// The n-gram baseline: one section over the requested slice with no
+/// emissions at all.
+fn baseline(
+    set: &EvalSet,
+    slice: &SliceArgs,
+    reader: &Reader,
+    ngram: &NgramModel,
+    beam: &BeamOptions,
+    dump: bool,
+) -> Result<Section> {
+    let (report, rows) = measure(
+        set,
+        slice.slice,
+        slice.dev_share,
+        reader,
+        &NoEmissions,
+        ngram,
+        beam,
+        dump,
+    )?;
+    Ok(Section {
+        emission: "none",
+        weight: 0.0,
+        transition: "kn-trigram",
+        slice: slice.slice.label(),
+        selected: false,
+        report,
+        rows,
+    })
 }
 
 /// Decode every record of the chosen slice and fold it into one report.
 ///
 /// Records are independent, so the slice decodes in parallel and the per-record
 /// observations merge; every metric is a ratio of summed counters, so the
-/// report is identical to a sequential pass.
+/// report is identical to a sequential pass. When *dump* is set, each record's
+/// beam rides along beside its observation and the rows come back sorted by
+/// record; unset, nothing is collected beyond the report.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every argument is a distinct input to the decode the function exists to fold"
+)]
 fn measure<E, T>(
     set: &EvalSet,
     slice: SliceArg,
@@ -412,16 +469,18 @@ fn measure<E, T>(
     emissions: &E,
     transition: &T,
     beam: &BeamOptions,
-) -> Result<Report>
+    dump: bool,
+) -> Result<(Report, Vec<DumpRow>)>
 where
     E: Emissions + Sync,
     T: Transition + Sync,
 {
-    set.records()
+    let (report, mut rows) = set
+        .records()
         .par_iter()
         .enumerate()
         .filter(|(_, record)| slice.slice().holds(record, dev_share))
-        .map(|(index, record)| {
+        .map(|(index, record)| -> Result<(Report, Vec<DumpRow>)> {
             let (_, candidates) = reader.read(record)?;
             let emission = emissions.model(index, &candidates)?;
             let hypotheses = decode(&candidates, &emission, transition, beam)
@@ -432,12 +491,55 @@ where
                 .collect();
             let mut report = Report::new(beam.top_k);
             report.observe(&record.text, &texts);
-            Ok(report)
+            let row = dump.then(|| DumpRow {
+                record: index,
+                text: record.text.clone(),
+                hypotheses: hypotheses
+                    .iter()
+                    .zip(texts)
+                    .map(|(hypothesis, text)| DumpedHypothesis {
+                        text,
+                        score: hypothesis.score(),
+                    })
+                    .collect(),
+            });
+            Ok((report, row.into_iter().collect::<Vec<_>>()))
         })
         .try_reduce(
-            || Report::new(beam.top_k),
-            |left, right| Ok(left.merge(&right)),
-        )
+            || (Report::new(beam.top_k), Vec::new()),
+            |(report, mut rows), (other, more)| {
+                rows.extend(more);
+                Ok((report.merge(&other), rows))
+            },
+        )?;
+    rows.sort_unstable_by_key(|row| row.record);
+    Ok((report, rows))
+}
+
+/// Write one section's beam to its file in the dump directory: a JSON Lines
+/// file named for the section, one record per line in file order.
+///
+/// # Errors
+///
+/// If the file cannot be created or written.
+fn write_dump(dir: &Path, section: &Section) -> Result<()> {
+    let path = dir.join(format!(
+        "{}-w{:.3}-{}-{}.jsonl",
+        section.emission, section.weight, section.transition, section.slice
+    ));
+    let file =
+        fs::File::create(&path).with_context(|| format!("could not create {}", path.display()))?;
+    let mut sink = BufWriter::new(file);
+    for row in &section.rows {
+        serde_json::to_writer(&mut sink, row)
+            .with_context(|| format!("could not serialise a row of {}", path.display()))?;
+        sink.write_all(b"\n")
+            .with_context(|| format!("could not write a row of {}", path.display()))?;
+    }
+    sink.flush()
+        .with_context(|| format!("could not flush {}", path.display()))?;
+    info!(rows = section.rows.len(), path = %path.display(), "wrote the hypotheses");
+    Ok(())
 }
 
 /// Read an evaluation set off disk.

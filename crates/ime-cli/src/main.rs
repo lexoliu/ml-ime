@@ -134,6 +134,11 @@ enum Command {
         /// Drop the n-gram and decode on the emissions alone.
         #[arg(long, requires = "scores")]
         no_transition: bool,
+        /// A directory the beam is dumped to: for every section the run
+        /// evaluates, one JSON Lines file named for the section, one record's
+        /// hypotheses and their scores per line. The report is unchanged.
+        #[arg(long)]
+        dump: Option<PathBuf>,
         #[command(flatten)]
         slice: SliceArgs,
         #[command(flatten)]
@@ -238,6 +243,7 @@ async fn main() -> Result<()> {
             unscored,
             weight,
             no_transition: _,
+            dump,
             slice,
             search,
         } => fused_eval(&FusedRun {
@@ -247,6 +253,7 @@ async fn main() -> Result<()> {
             emittable: &emittable,
             unscored,
             weights: &weight,
+            dump: dump.as_deref(),
             slice: &slice,
             search: &search,
         }),
@@ -351,6 +358,8 @@ struct FusedRun<'a> {
     emittable: &'a Path,
     unscored: f32,
     weights: &'a [f32],
+    /// Where every evaluated section's beam lands, or `None` to report only.
+    dump: Option<&'a Path>,
     slice: &'a SliceArgs,
     search: &'a SearchArgs,
 }
@@ -368,6 +377,7 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
         run.unscored,
         run.weights,
         run.slice,
+        run.dump,
         table,
         lexicon,
         run.search.segment(),
