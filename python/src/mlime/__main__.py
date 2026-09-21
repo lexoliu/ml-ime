@@ -13,6 +13,7 @@ Heavy imports live inside the command bodies: loading an ONNX session or the
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -32,11 +33,13 @@ lexicon_app = typer.Typer(
     help="Manage external word-pinyin lexicons (Sogou scel, etc.)", no_args_is_help=True
 )
 train_app = typer.Typer(help="Route A training and the labels it needs", no_args_is_help=True)
+eval_app = typer.Typer(help="Experiments over the decoder's output", no_args_is_help=True)
 app.add_typer(corpus_app, name="corpus")
 app.add_typer(g2p_app, name="g2p")
 app.add_typer(export_app, name="export")
 app.add_typer(lexicon_app, name="lexicon")
 app.add_typer(train_app, name="train")
+app.add_typer(eval_app, name="eval")
 
 #: A polyphone-dense sentence: 重 chong/zhong, 还 huan/hai, 得 de/dei, 绿 lv.
 PROBE_SENTENCE = "他还了钱还差一点，我得到了那件重要的绿色东西"
@@ -635,3 +638,23 @@ def export_char_lm(
 
     graph, manifest = export_onnx(checkpoint, out)
     typer.echo(f"{graph}\n{manifest}")
+
+
+@eval_app.command("rescore")
+def eval_rescore(
+    dev_dump: Path = typer.Option(..., help="fused-eval --dump file of the dev slice"),
+    test_dump: Path = typer.Option(..., help="fused-eval --dump file of the test slice"),
+    eval_set: Path = typer.Option(..., help="The eval set both dumps were decoded from"),
+    model: str = typer.Option("Qwen/Qwen3-0.6B", help="Pretrained causal LM on the Hub"),
+    device: str = typer.Option(None, help="torch device; defaults to mps, cuda, then cpu"),
+    out: Path = typer.Option(None, help="Where to write the report as JSON"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Rescore the beam's hypotheses with a language model; tune on dev, report on test."""
+    configure(verbose)
+    from mlime.rescore import default_device, rescore
+
+    report = rescore(dev_dump, test_dump, eval_set, model, device or default_device())
+    typer.echo(report.render())
+    if out is not None:
+        out.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")
