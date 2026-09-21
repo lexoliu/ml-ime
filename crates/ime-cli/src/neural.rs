@@ -343,7 +343,7 @@ pub fn fused_eval(
             bail!("a run with neither emissions nor a transition model scores nothing")
         }
         (None, Some(ngram)) => {
-            sections.push(baseline(&set, slice, &reader, ngram, beam, dump.is_some())?)
+            sections.push(baseline(&set, slice, &reader, ngram, beam, dump.is_some())?);
         }
         (Some(path), ngram) => {
             let scores = load_scores(path)?;
@@ -411,7 +411,7 @@ pub fn fused_eval(
     }
     if let Some(dir) = dump {
         for section in &sections {
-            write_dump(dir, section, &section.rows)?;
+            write_dump(dir, section)?;
         }
     }
     Ablation { sections }
@@ -496,8 +496,9 @@ where
                 text: record.text.clone(),
                 hypotheses: hypotheses
                     .iter()
-                    .map(|hypothesis| DumpedHypothesis {
-                        text: hypothesis.text(&reader.lexicon),
+                    .zip(texts)
+                    .map(|(hypothesis, text)| DumpedHypothesis {
+                        text,
                         score: hypothesis.score(),
                     })
                     .collect(),
@@ -521,7 +522,7 @@ where
 /// # Errors
 ///
 /// If the file cannot be created or written.
-fn write_dump(dir: &Path, section: &Section, rows: &[DumpRow]) -> Result<()> {
+fn write_dump(dir: &Path, section: &Section) -> Result<()> {
     let path = dir.join(format!(
         "{}-w{:.3}-{}-{}.jsonl",
         section.emission, section.weight, section.transition, section.slice
@@ -529,7 +530,7 @@ fn write_dump(dir: &Path, section: &Section, rows: &[DumpRow]) -> Result<()> {
     let file =
         fs::File::create(&path).with_context(|| format!("could not create {}", path.display()))?;
     let mut sink = BufWriter::new(file);
-    for row in rows {
+    for row in &section.rows {
         serde_json::to_writer(&mut sink, row)
             .with_context(|| format!("could not serialise a row of {}", path.display()))?;
         sink.write_all(b"\n")
@@ -537,7 +538,7 @@ fn write_dump(dir: &Path, section: &Section, rows: &[DumpRow]) -> Result<()> {
     }
     sink.flush()
         .with_context(|| format!("could not flush {}", path.display()))?;
-    info!(rows = rows.len(), path = %path.display(), "wrote the hypotheses");
+    info!(rows = section.rows.len(), path = %path.display(), "wrote the hypotheses");
     Ok(())
 }
 
