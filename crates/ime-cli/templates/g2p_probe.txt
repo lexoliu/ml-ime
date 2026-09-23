@@ -1,0 +1,6 @@
+endpoint {{ endpoint }}  model {{ model }}
+{{ sentence }}
+  #    Char  g2pw      llm       Agree
+{% for row in rows %}  {{ row.index }}  {{ row.character }}    {{ row.first }}  {{ row.second }}  {{ row.agree }}
+{% endfor %}
+toneless agreement {{ agreed }}/{{ positions }}

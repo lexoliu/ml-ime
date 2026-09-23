@@ -1,0 +1,28 @@
+[package]
+name = "ime-g2p"
+version = "0.1.0"
+description = "Dual pinyin annotation: g2pW over ONNX and an LLM, kept only where they agree"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+askama.workspace = true
+async-openai.workspace = true
+dotenvy.workspace = true
+futures.workspace = true
+ort.workspace = true
+polars.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+unicode-script.workspace = true
+
+[lints]
+workspace = true

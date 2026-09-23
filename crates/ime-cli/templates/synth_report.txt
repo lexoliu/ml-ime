@@ -1,0 +1,25 @@
+model {{ model }}  source {{ source }}  per term {{ per_term }}  concurrency {{ concurrency }}
+
+seeds
+  source          loaded  grounded  ungrounded  unusable  duplicate
+{% for row in seeds %}  {{ row.source }}  {{ row.loaded }}  {{ row.grounded }}  {{ row.ungrounded }}  {{ row.unusable }}  {{ row.duplicate }}
+{% endfor %}
+generation
+  terms {{ terms }}  asked for {{ requested }}  parsed {{ parsed }}  refused terms {{ refusals }}
+  written {{ written }}  {{ per_minute }} terms/min over {{ seconds }}s
+
+validation
+  reason                    count     share
+{% for row in drops %}  {{ row.reason }}  {{ row.count }}  {{ row.share }}
+{% endfor %}
+written by seed source
+{% for row in written_by %}  {{ row.source }}  {{ row.terms }} terms  {{ row.written }} samples
+{% endfor %}{% if refusal_reasons.is_empty() %}{% else %}
+refusals
+{% for row in refusal_reasons %}  {{ row.terms }}  {{ row.reason }}
+{% endfor %}{% endif %}
+{{ shown }} random samples of {{ written }}
+{% for row in samples %}  [{{ row.source }}] {{ row.term }}
+    context  {{ row.context }}
+    text     {{ row.text }}
+{% endfor %}
