@@ -1,0 +1,87 @@
+[project]
+name = "mlime"
+version = "0.1.0"
+description = "Data pipeline and training for ml-ime, a context-conditioned neural Chinese pinyin input method"
+requires-python = ">=3.12"
+dependencies = [
+    "pypinyin>=0.53",
+    "polars>=1.17",
+    "pyarrow>=18",
+    "tqdm>=4.67",
+    "typer>=0.15",
+    "structlog>=24.4",
+    "rich>=13.9",
+    "datasets>=5.0.1",
+    "openai>=3.3.1",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.15.0",
+    "g2pw>=0.1.1",
+    "torch>=2.13.0",
+    "transformers>=5.16",
+    "httpx>=0.28",
+    "opencc>=1.4.2",
+    "regex>=2026.7.19",
+    "jinja2>=3.1.6",
+]
+
+[project.scripts]
+mlime = "mlime.__main__:app"
+
+[project.optional-dependencies]
+train = ["safetensors>=0.4"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8",
+    "pytest>=8.3",
+    "mypy>=1.14",
+    "types-regex>=2026.7.19.20260720",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mlime"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "T20"]
+# RUF001-003 flag characters that "look like" ASCII. Full-width punctuation and
+# full-width Latin are this project's subject matter -- the sentence splitter
+# matches on them and the normaliser exists to fold them -- so every occurrence
+# is deliberate and the rules have no true positives left to find here.
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.mypy]
+strict = true
+
+# None of these ship type information. `mlime.data.g2pw_annotator`,
+# `mlime.data.corpus` and `mlime.data.normalize` are the only modules allowed to
+# import them, so the untypedness stops at those adapters.
+[[tool.mypy.overrides]]
+module = ["g2pw.*", "datasets.*", "opencc.*"]
+ignore_missing_imports = true
+
+# `transformers` and `onnxruntime` ship enough annotations to be followed and not
+# enough to be checked: their constructors are unannotated, so every model object
+# is an untyped call inside a strict module. `mlime.train.model` and
+# `mlime.train.labels` are the only modules allowed to touch them, and both
+# annotate what they get back, so the Any stops at those two boundaries.
+[[tool.mypy.overrides]]
+module = ["transformers.*", "onnxruntime.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[tool.ruff.lint.flake8-bugbear]
+# Typer's entire API is `def command(x: T = typer.Option(...))`. The mutable
+# shared default B008 warns about cannot arise: Typer replaces the sentinel with
+# the parsed value before the body runs.
+extend-immutable-calls = ["typer.Option", "typer.Argument"]

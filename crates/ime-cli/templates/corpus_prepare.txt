@@ -1,0 +1,6 @@
+source {{ source }}  documents {{ documents }}
+lines {{ lines }}  infobox lines dropped {{ infobox_lines }}
+  reason                    count     share
+{% for row in rows %}  {{ row.reason }}  {{ row.count }}  {{ row.share }}
+{% endfor %}considered {{ considered }}  written {{ written }}
+{{ seconds }}s  {{ per_second }} samples/s
