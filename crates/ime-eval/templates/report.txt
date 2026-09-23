@@ -1,0 +1,9 @@
+metric                value   detail
+--------------------  ------  --------------------
+records               {{ self.records() }}
+sentence, top-1       {{ self.top1_accuracy()|fmt("{:.4}") }}  {{ self.top1_hits() }} / {{ self.records() }}
+sentence, top-{{ self.top_k()|fmt("{:<8}") }}{{ self.topk_accuracy()|fmt("{:.4}") }}  {{ self.topk_hits() }} / {{ self.records() }}
+character             {{ self.character_accuracy()|fmt("{:.4}") }}  {{ self.character_hits() }} / {{ self.characters() }}
+MRR@{{ self.top_k()|fmt("{:<18}") }}{{ self.mean_reciprocal_rank()|fmt("{:.4}") }}
+unanswered            {{ self.unanswered() }}
+
