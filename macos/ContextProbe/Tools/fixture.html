@@ -1,0 +1,9 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ml-ime context probe fixture</title>
+<textarea id="t" autofocus rows="10" cols="80">The probe needs a focused text field holding enough text that a request for the sixty-four characters before the caret can actually be satisfied. This paragraph exists only to be that text.</textarea>
+<script>
+  const t = document.getElementById("t");
+  t.focus();
+  t.selectionStart = t.selectionEnd = t.value.length;
+</script>
