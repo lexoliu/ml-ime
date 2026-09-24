@@ -13,6 +13,7 @@ Heavy imports live inside the command bodies: loading an ONNX session or the
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -32,11 +33,13 @@ lexicon_app = typer.Typer(
     help="Manage external word-pinyin lexicons (Sogou scel, etc.)", no_args_is_help=True
 )
 train_app = typer.Typer(help="Route A training and the labels it needs", no_args_is_help=True)
+eval_app = typer.Typer(help="Experiments over the decoder's output", no_args_is_help=True)
 app.add_typer(corpus_app, name="corpus")
 app.add_typer(g2p_app, name="g2p")
 app.add_typer(export_app, name="export")
 app.add_typer(lexicon_app, name="lexicon")
 app.add_typer(train_app, name="train")
+app.add_typer(eval_app, name="eval")
 
 #: A polyphone-dense sentence: 重 chong/zhong, 还 huan/hai, 得 de/dei, 绿 lv.
 PROBE_SENTENCE = "他还了钱还差一点，我得到了那件重要的绿色东西"
@@ -567,10 +570,6 @@ def _requested(source: list[str] | None) -> tuple[str, ...]:
     return tuple(source)
 
 
-if __name__ == "__main__":
-    app()
-
-
 @train_app.command("char-lm")
 def train_char_lm(
     data_dir: Path = DATA_DIR,
@@ -635,3 +634,31 @@ def export_char_lm(
 
     graph, manifest = export_onnx(checkpoint, out)
     typer.echo(f"{graph}\n{manifest}")
+
+
+@eval_app.command("rescore")
+def eval_rescore(
+    dump: Path = typer.Option(..., help="fused-eval --dump file of the slice to rerank"),
+    eval_set: Path = typer.Option(..., help="The eval set the dump was decoded from"),
+    picks: Path = typer.Option(..., help="JSONL of answers so far; appended to, and resumed from"),
+    concurrency: int = typer.Option(8, help="Requests in flight at once"),
+    effort: str = typer.Option("high", help="Reasoning effort; Chinese needs high"),
+    out: Path = typer.Option(None, help="Where to write the report, with every pick, as JSON"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Rerank the beam's hypotheses with the MLIME_LLM_* endpoint and report the slice."""
+    configure(verbose)
+    from typing import cast
+
+    from openai.types.shared import ReasoningEffort
+
+    from mlime.rescore import rescore
+
+    report = rescore(dump, eval_set, picks, concurrency, cast(ReasoningEffort, effort))
+    typer.echo(report.render())
+    if out is not None:
+        out.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")
+
+
+if __name__ == "__main__":
+    app()
