@@ -567,10 +567,6 @@ def _requested(source: list[str] | None) -> tuple[str, ...]:
     return tuple(source)
 
 
-if __name__ == "__main__":
-    app()
-
-
 @train_app.command("char-lm")
 def train_char_lm(
     data_dir: Path = DATA_DIR,
@@ -635,3 +631,7 @@ def export_char_lm(
 
     graph, manifest = export_onnx(checkpoint, out)
     typer.echo(f"{graph}\n{manifest}")
+
+
+if __name__ == "__main__":
+    app()
