@@ -159,7 +159,17 @@ target/release/ime-cli fused-eval --model data/run3/ngram.bin \
 # fused: sweep on dev, report on test
 ... --slice dev --scores <scores> --weight 0.5 --weight 0.75 --weight 1 --weight 1.5 --weight 2
 ... --slice test --scores <scores> --weight <best>
+# the character LM as the transition, alone or fused with the trigram
+... --lm data/char-lm-run/char-lm --scores <scores> --weight <best>
+... --model data/run3/ngram.bin --lm data/char-lm-run/char-lm --lm-weight 1 --scores <scores> --weight <best>
 ```
+
+`--lm <dir>` points at the `charlm.onnx` + `charlm.json` pair that `mlime export
+char-lm` writes (the `char-lm` Kaggle kernel produces it). Given alone it
+replaces the trigram; given with `--model` it is added to the trigram at
+`--lm-weight w` (default 1), and the neural `--weight` sweep then runs over the
+pair. The decoder keeps one recurrent state per beam, so a run with `--lm` is
+slower than the trigram by roughly the model's step cost times the beam.
 
 `eval3-abbreviated.jsonl` / `eval3-mixed.jsonl` pair with
 `scores-lattice-abbreviated-*` / `scores-lattice-mixed-*`. `kaggle/finish.sh

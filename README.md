@@ -24,7 +24,7 @@ keystrokes ──> segmentation lattice ──> per-position homophone masks
                                                │
                                    per-position distributions ⊗ mask
                                                │
-                                   Viterbi with n-gram transitions ──> candidates
+                                   beam search with an n-gram or a character LM ──> candidates
 ```
 
 Three properties fall out of this shape:
@@ -43,8 +43,9 @@ Three properties fall out of this shape:
 | Path | Contents |
 | --- | --- |
 | `crates/ime-pinyin` | Syllable inventory, character lexicon, segmentation lattice, masks |
-| `crates/ime-decode` | Emission/transition traits and the Viterbi pass |
+| `crates/ime-decode` | Emission/transition traits and the beam search |
 | `crates/ime-ngram` | n-gram model: baseline comparator and transition scores |
+| `crates/ime-lm` | Recurrent character language model (ONNX) as a stateful transition |
 | `crates/ime-neural` | Model inference |
 | `crates/ime-eval` | Evaluation harness |
 | `crates/ime-cli` | Command line driver |
