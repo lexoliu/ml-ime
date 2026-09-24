@@ -66,3 +66,16 @@ A segment that would reach `max_steps` but could not also fit the scoring pauses
 early (`SCORING_RESERVE_SECONDS`), so the run always finishes in a segment with
 room to score. To spend a partial quota week, stamp `SESSION_SECONDS` smaller at
 push time the way `SEGMENT` is stamped.
+
+## The same kernel on Colab
+
+`colab/char-lm.sh` runs `char-lm/kernel.py` unchanged on a Colab GPU through the
+[Colab CLI](https://github.com/googlecolab/google-colab-cli) (`uv tool install
+google-colab-cli`, then `colab usage` once to log in). `start` provisions the
+runtime (an A100 by default), uploads the Kaggle credentials and the kernel,
+and runs `colab/stage.py` on the VM, which downloads the four datasets with the
+Kaggle API into `/kaggle/input/<slug>` and launches the kernel as a detached
+process; `status`, `fetch <dir>` and `stop` follow. The kernel sizes itself to
+the GPUs it finds (one rank per GPU, `TOKENS_PER_STEP` split across them), so
+one A100 trains the same batches as Kaggle's two T4s in roughly a third of the
+time, for about 35 compute units.
