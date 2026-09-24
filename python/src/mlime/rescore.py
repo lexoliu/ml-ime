@@ -10,9 +10,10 @@ causal LM conditioned on the record's context, and interpolates that score with
 the beam's own. The interpolation weight is tuned on the dev slice and reported
 on the test slice, the same protocol the fusion weight follows.
 
-The LM score is exact: ``log p(text | context)`` is computed as the log
-probability of ``context + text`` minus that of ``context`` alone, so a tokenizer
-that merges across the boundary cannot bias one hypothesis against another.
+The LM score is ``log p(text | context)``: the context and the text are
+tokenised apart and only the text's tokens are summed, so every hypothesis of a
+record is conditioned on the same context tokens and a tokenizer that merges
+across the boundary cannot bias one hypothesis against another.
 
 Three numbers come out for each slice: the beam's own top-1 (what the dump
 already ranks first), the top-1 after rescoring at the chosen weight, and the
@@ -139,41 +140,55 @@ class LanguageModel:
 
     def _encode(self, text: str) -> list[int]:
         ids: list[int] = self.tokenizer(text, add_special_tokens=False)["input_ids"]
-        return [self.bos, *ids]
+        return ids
 
-    def log_probabilities(self, texts: Sequence[str]) -> list[float]:
-        """``log p(text)`` of every text, one padded forward pass."""
+    def log_probabilities(self, prefix: str, texts: Sequence[str]) -> list[float]:
+        """``log p(text | prefix)`` of every text, one padded forward pass.
+
+        The prefix and each text are tokenised apart, so every row scores the
+        same prefix tokens and only its own continuation counts. Rows are padded
+        on the left, which a rotary model does not notice, so that the
+        continuations end together and the model only has to produce logits for
+        the longest of them: the full vocabulary over the whole prefix would not
+        fit an 8 GB machine.
+        """
         import torch
 
-        encoded = [self._encode(text) for text in texts]
-        width = max(len(ids) for ids in encoded)
+        prefix_ids = [self.bos, *self._encode(prefix)]
+        tails = [self._encode(text) for text in texts]
+        keep = max(len(tail) for tail in tails)
+        rows = [prefix_ids + tail for tail in tails]
+        width = max(len(row) for row in rows)
         pad = self.tokenizer.pad_token_id
         if pad is None:
             pad = self.bos
-        input_ids = torch.full((len(encoded), width), pad, dtype=torch.long)
-        mask = torch.zeros((len(encoded), width), dtype=torch.long)
-        for row, ids in enumerate(encoded):
-            input_ids[row, : len(ids)] = torch.tensor(ids)
-            mask[row, : len(ids)] = 1
+        input_ids = torch.full((len(rows), width), pad, dtype=torch.long)
+        mask = torch.zeros((len(rows), width), dtype=torch.long)
+        counted = torch.zeros((len(rows), keep), dtype=torch.float32)
+        for row, (ids, tail) in enumerate(zip(rows, tails, strict=True)):
+            input_ids[row, width - len(ids) :] = torch.tensor(ids)
+            mask[row, width - len(ids) :] = 1
+            counted[row, keep - len(tail) :] = 1.0
         input_ids = input_ids.to(self.device)
         mask = mask.to(self.device)
+        counted = counted.to(self.device)
         with torch.no_grad():
-            logits = self.model(input_ids=input_ids, attention_mask=mask).logits
-        log_probs = torch.log_softmax(logits[:, :-1].float(), dim=-1)
-        targets = input_ids[:, 1:]
+            # Logits at the last keep + 1 positions; the one at position p
+            # predicts the token at p + 1, so dropping the final one leaves the
+            # predictions for the last keep tokens.
+            logits = self.model(
+                input_ids=input_ids, attention_mask=mask, logits_to_keep=keep + 1
+            ).logits[:, :-1]
+        log_probs = torch.log_softmax(logits.float(), dim=-1)
+        targets = input_ids[:, width - keep :]
         picked = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        picked = picked * mask[:, 1:]
-        return picked.sum(dim=-1).tolist()
+        return (picked * counted).sum(dim=-1).tolist()
 
     def score(self, record: DumpedRecord) -> tuple[float, ...]:
         """``log p(hypothesis | context)`` for every hypothesis of *record*."""
-        prefix = record.context or ""
-        texts = [prefix + h.text for h in record.hypotheses]
-        if prefix:
-            texts.append(prefix)
-        scores = self.log_probabilities(texts)
-        base = scores.pop() if prefix else 0.0
-        return tuple(s - base for s in scores)
+        return tuple(
+            self.log_probabilities(record.context or "", [h.text for h in record.hypotheses])
+        )
 
 
 def score_records(
