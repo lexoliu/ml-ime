@@ -84,9 +84,11 @@ impl Baseline {
             top_k,
             ..self.beam.clone()
         };
-        decode(&batch, &Uniform, &self.model, &options).map_err(|source| BaselineError::Decode {
-            input: pinyin.to_owned(),
-            source,
+        decode(&batch, &Uniform, &self.model, None, &options).map_err(|source| {
+            BaselineError::Decode {
+                input: pinyin.to_owned(),
+                source,
+            }
         })
     }
 }

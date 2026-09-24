@@ -1730,6 +1730,7 @@ dependencies = [
  "ime-decode",
  "ime-eval",
  "ime-g2p",
+ "ime-lm",
  "ime-ngram",
  "ime-pinyin",
  "ime-synth",
@@ -1805,6 +1806,19 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-script",
+]
+
+[[package]]
+name = "ime-lm"
+version = "0.1.0"
+dependencies = [
+ "ime-decode",
+ "ime-pinyin",
+ "ort",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "thread_local",
 ]
 
 [[package]]

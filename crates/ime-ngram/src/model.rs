@@ -2,7 +2,7 @@
 
 use crate::NgramError;
 use crate::table::ProbTable;
-use ime_decode::{History, Transition};
+use ime_decode::Transition;
 use ime_pinyin::{CharId, Lexicon};
 use serde::{Deserialize, Serialize};
 
@@ -287,12 +287,6 @@ impl NgramModel {
     }
 }
 
-/// The token standing for a slot of decoder history: the character it holds, or
-/// [`Token::BOS`] where the slot lies before the start of the sequence.
-fn slot(history: History, distance: usize) -> Token {
-    history.back(distance).map_or(Token::BOS, Token::of)
-}
-
 /// # Panics
 ///
 /// If a [`CharId`] came from a different lexicon than the model was loaded
@@ -300,17 +294,24 @@ fn slot(history: History, distance: usize) -> Token {
 impl Transition for NgramModel {
     const HISTORY: usize = ORDER - 1;
 
-    type Context = Context;
+    type State = Context;
 
-    fn context(&self, history: History) -> Context {
-        self.context_at(slot(history, 2), slot(history, 1))
+    fn start(&self, _context: Option<&str>) -> Context {
+        self.context_at(Token::BOS, Token::BOS)
     }
 
-    fn score(&self, context: &Context, candidate: CharId) -> f32 {
-        self.probability_at(context, Token::of(candidate)).ln()
+    fn score(&self, state: &Context, candidate: CharId) -> f32 {
+        self.probability_at(state, Token::of(candidate)).ln()
     }
 
-    fn finish(&self, context: &Context) -> f32 {
-        self.probability_at(context, Token::EOS).ln()
+    fn finish(&self, state: &Context) -> f32 {
+        self.probability_at(state, Token::EOS).ln()
+    }
+
+    fn advance(&self, steps: &[(&Context, CharId)]) -> Vec<Context> {
+        steps
+            .iter()
+            .map(|(state, ch)| self.context_at(state.previous, Token::of(*ch)))
+            .collect()
     }
 }

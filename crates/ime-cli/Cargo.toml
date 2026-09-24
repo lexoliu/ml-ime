@@ -16,6 +16,7 @@ ime-corpus.workspace = true
 ime-decode.workspace = true
 ime-eval.workspace = true
 ime-g2p.workspace = true
+ime-lm.workspace = true
 ime-ngram.workspace = true
 ime-pinyin.workspace = true
 ime-synth.workspace = true
