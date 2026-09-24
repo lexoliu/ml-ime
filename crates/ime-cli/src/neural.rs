@@ -28,10 +28,11 @@ use askama::Template;
 use clap::{Args, ValueEnum};
 use flate2::read::MultiGzDecoder;
 use ime_decode::{
-    BeamOptions, Candidates, Emission, Emittable, LatticePath, LatticeRecord, NoTransition,
+    BeamOptions, Both, Candidates, Emission, Emittable, LatticePath, LatticeRecord, NoTransition,
     ScoreRecord, Scored, Transition, Uniform, Weighted, decode,
 };
 use ime_eval::{EvalRecord, EvalSet, Report, Slice};
+use ime_lm::CharLm;
 use ime_ngram::NgramModel;
 use ime_pinyin::{Lexicon, SegmentOptions, SyllableTable};
 use rayon::iter::{
@@ -293,6 +294,123 @@ pub fn emit_lattice(
     Ok(())
 }
 
+/// Which transition models a run decodes with.
+///
+/// The n-gram, the character language model, both at once, or neither -- the
+/// last being the emissions alone, the ablation that says what the fill tower
+/// earned on its own.
+#[derive(Copy, Clone)]
+pub enum Models<'a> {
+    /// No transition at all.
+    None,
+    /// The Kneser-Ney trigram.
+    Ngram(&'a NgramModel),
+    /// The recurrent character model.
+    CharLm(&'a CharLm),
+    /// The trigram at weight one and the character model at `lm_weight`.
+    Both {
+        /// The trigram.
+        ngram: &'a NgramModel,
+        /// The character model.
+        lm: &'a CharLm,
+        /// Weight on the character model's scores.
+        lm_weight: f32,
+    },
+}
+
+/// Everything a run needs to score one transition model over its sections.
+struct Run<'a> {
+    set: &'a EvalSet,
+    reader: &'a Reader,
+    scores: Option<&'a HashMap<usize, Vec<Vec<Vec<f32>>>>>,
+    emittable: &'a Emittable,
+    floor: f32,
+    weights: &'a [f32],
+    slice: &'a SliceArgs,
+    beam: &'a BeamOptions,
+    dump: bool,
+}
+
+impl Run<'_> {
+    /// The sections one transition model produces: without a score file the
+    /// transition alone over the requested slice; with one, every weight over
+    /// the slice, or the dev sweep and the test section at its winner.
+    fn sections<T: Transition + Sync>(
+        &self,
+        transition: &T,
+        label: &'static str,
+    ) -> Result<Vec<Section>> {
+        let Some(scores) = self.scores else {
+            let (report, rows) = measure(
+                self.set,
+                self.slice.slice,
+                self.slice.dev_share,
+                self.reader,
+                &NoEmissions,
+                transition,
+                self.beam,
+                self.dump,
+            )?;
+            return Ok(vec![Section {
+                emission: "none",
+                weight: 0.0,
+                transition: label,
+                slice: self.slice.slice.label(),
+                selected: false,
+                report,
+                rows,
+            }]);
+        };
+        let measure_at = |which: SliceArg, weight: f32| -> Result<Section> {
+            let emissions = NeuralEmissions {
+                scores,
+                emittable: self.emittable,
+                weight,
+                floor: self.floor,
+            };
+            let (report, rows) = measure(
+                self.set,
+                which,
+                self.slice.dev_share,
+                self.reader,
+                &emissions,
+                transition,
+                self.beam,
+                self.dump,
+            )?;
+            Ok(Section {
+                emission: "neural",
+                weight,
+                transition: label,
+                slice: which.label(),
+                selected: false,
+                report,
+                rows,
+            })
+        };
+        let mut sections = Vec::new();
+        if self.slice.select_on_dev {
+            for &weight in self.weights {
+                sections.push(measure_at(SliceArg::Dev, weight)?);
+            }
+            let mut winner = 0;
+            for (index, section) in sections.iter().enumerate().skip(1) {
+                if section.report.top1_hits() > sections[winner].report.top1_hits() {
+                    winner = index;
+                }
+            }
+            let mut test = measure_at(SliceArg::Test, sections[winner].weight)?;
+            test.selected = true;
+            sections.push(test);
+        } else {
+            for &weight in self.weights {
+                sections.push(measure_at(self.slice.slice, weight)?);
+            }
+        }
+        Ok(sections)
+    }
+}
+
 /// Score an evaluation set with the n-gram, with the neural emissions, or with
 /// both fused.
 ///
@@ -305,7 +423,7 @@ pub fn emit_lattice(
 ///
 /// # Errors
 ///
-/// If neither a score file nor an n-gram was given, any input cannot be read, a
+/// If any input cannot be read, a
 /// record cannot be decoded, a score file does not describe the lattice the
 /// records segment into, or the dump cannot be written.
 #[expect(
@@ -324,7 +442,7 @@ pub fn fused_eval(
     lexicon: Lexicon,
     segment: SegmentOptions,
     beam: &BeamOptions,
-    ngram: Option<&NgramModel>,
+    transition: Models<'_>,
 ) -> Result<String> {
     let set = load_set(eval_set)?;
     let emittable = load_emittable(emittable, &lexicon)?;
@@ -337,78 +455,36 @@ pub fn fused_eval(
         fs::create_dir_all(dir)
             .with_context(|| format!("could not create the dump directory {}", dir.display()))?;
     }
-    let mut sections = Vec::new();
-    match (scores, ngram) {
-        (None, None) => {
-            bail!("a run with neither emissions nor a transition model scores nothing")
-        }
-        (None, Some(ngram)) => {
-            sections.push(baseline(&set, slice, &reader, ngram, beam, dump.is_some())?);
-        }
-        (Some(path), ngram) => {
-            let scores = load_scores(path)?;
-            let measure_at = |which: SliceArg, weight: f32| -> Result<Section> {
-                let emissions = NeuralEmissions {
-                    scores: &scores,
-                    emittable: &emittable,
-                    weight,
-                    floor,
-                };
-                let (transition, report, rows) = if let Some(ngram) = ngram {
-                    let (report, rows) = measure(
-                        &set,
-                        which,
-                        slice.dev_share,
-                        &reader,
-                        &emissions,
-                        ngram,
-                        beam,
-                        dump.is_some(),
-                    )?;
-                    ("kn-trigram", report, rows)
-                } else {
-                    let (report, rows) = measure(
-                        &set,
-                        which,
-                        slice.dev_share,
-                        &reader,
-                        &emissions,
-                        &NoTransition,
-                        beam,
-                        dump.is_some(),
-                    )?;
-                    ("none", report, rows)
-                };
-                Ok(Section {
-                    emission: "neural",
-                    weight,
-                    transition,
-                    slice: which.label(),
-                    selected: false,
-                    report,
-                    rows,
-                })
-            };
-            if slice.select_on_dev {
-                for &weight in weights {
-                    sections.push(measure_at(SliceArg::Dev, weight)?);
-                }
-                let mut winner = 0;
-                for (index, section) in sections.iter().enumerate().skip(1) {
-                    if section.report.top1_hits() > sections[winner].report.top1_hits() {
-                        winner = index;
-                    }
-                }
-                let mut test = measure_at(SliceArg::Test, sections[winner].weight)?;
-                test.selected = true;
-                sections.push(test);
-            } else {
-                for &weight in weights {
-                    sections.push(measure_at(slice.slice, weight)?);
-                }
-            }
-        }
-    }
+    let scores = scores.map(load_scores).transpose()?;
+    let run = Run {
+        set: &set,
+        reader: &reader,
+        scores: scores.as_ref(),
+        emittable: &emittable,
+        floor,
+        weights,
+        slice,
+        beam,
+        dump: dump.is_some(),
+    };
+    let sections = match transition {
+        Models::None => run.sections(&NoTransition, "none")?,
+        Models::Ngram(ngram) => run.sections(ngram, "kn-trigram")?,
+        Models::CharLm(lm) => run.sections(lm, "char-lm")?,
+        Models::Both {
+            ngram,
+            lm,
+            lm_weight,
+        } => run.sections(
+            &Both {
+                first: ngram,
+                first_weight: 1.0,
+                second: lm,
+                second_weight: lm_weight,
+            },
+            "kn-trigram+char-lm",
+        )?,
+    };
     if let Some(dir) = dump {
         for section in &sections {
             write_dump(dir, section)?;
@@ -417,37 +493,6 @@ pub fn fused_eval(
     Ablation { sections }
         .render()
         .context("could not render the ablation")
-}
-
-/// The n-gram baseline: one section over the requested slice with no
-/// emissions at all.
-fn baseline(
-    set: &EvalSet,
-    slice: &SliceArgs,
-    reader: &Reader,
-    ngram: &NgramModel,
-    beam: &BeamOptions,
-    dump: bool,
-) -> Result<Section> {
-    let (report, rows) = measure(
-        set,
-        slice.slice,
-        slice.dev_share,
-        reader,
-        &NoEmissions,
-        ngram,
-        beam,
-        dump,
-    )?;
-    Ok(Section {
-        emission: "none",
-        weight: 0.0,
-        transition: "kn-trigram",
-        slice: slice.slice.label(),
-        selected: false,
-        report,
-        rows,
-    })
 }
 
 /// Decode every record of the chosen slice and fold it into one report.
@@ -483,8 +528,14 @@ where
         .map(|(index, record)| -> Result<(Report, Vec<DumpRow>)> {
             let (_, candidates) = reader.read(record)?;
             let emission = emissions.model(index, &candidates)?;
-            let hypotheses = decode(&candidates, &emission, transition, beam)
-                .with_context(|| format!("could not decode record {index}"))?;
+            let hypotheses = decode(
+                &candidates,
+                &emission,
+                transition,
+                record.context.as_deref(),
+                beam,
+            )
+            .with_context(|| format!("could not decode record {index}"))?;
             let texts: Vec<String> = hypotheses
                 .iter()
                 .map(|hypothesis| hypothesis.text(&reader.lexicon))

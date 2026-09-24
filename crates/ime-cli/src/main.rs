@@ -14,9 +14,10 @@ use engine::Baseline;
 use g2p::{ExportCommand, G2pCommand};
 use ime_decode::BeamOptions;
 use ime_eval::{EvalSet, evaluate};
+use ime_lm::CharLm;
 use ime_ngram::{Counter, NgramModel};
 use ime_pinyin::{Lexicon, SegmentOptions, SyllableTable};
-use neural::{SliceArgs, parse_weight};
+use neural::{Models, SliceArgs, parse_weight};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::num::NonZeroUsize;
@@ -105,14 +106,24 @@ enum Command {
     /// Decode an evaluation set with the neural emissions fused into the beam.
     FusedEval {
         /// A model written by `train-ngram`. Required unless the run drops the
-        /// transition, and refused when it does: a model that would go unused
-        /// is a mistyped command, not a request.
+        /// transition or decodes with the character model alone, and refused
+        /// when it drops the transition: a model that would go unused is a
+        /// mistyped command, not a request.
         #[arg(
             long,
-            required_unless_present = "no_transition",
+            required_unless_present_any = ["no_transition", "lm"],
             conflicts_with = "no_transition"
         )]
         model: Option<PathBuf>,
+        /// A directory holding `charlm.onnx` and `charlm.json` from `mlime export
+        /// char-lm`: the recurrent character model as the transition, alone or
+        /// fused with the trigram when `--model` is given too.
+        #[arg(long, conflicts_with = "no_transition")]
+        lm: Option<PathBuf>,
+        /// Weight on the character model's scores when it is fused with the
+        /// trigram; alone, it is scored at one.
+        #[arg(long, default_value = "1.0", requires = "lm")]
+        lm_weight: f32,
         /// The same JSON Lines evaluation set the lattice was emitted from.
         #[arg(long)]
         eval_set: PathBuf,
@@ -237,6 +248,8 @@ async fn main() -> Result<()> {
         }
         Command::FusedEval {
             model,
+            lm,
+            lm_weight,
             eval_set,
             scores,
             emittable,
@@ -248,6 +261,8 @@ async fn main() -> Result<()> {
             search,
         } => fused_eval(&FusedRun {
             model: model.as_deref(),
+            lm: lm.as_deref(),
+            lm_weight,
             eval_set: &eval_set,
             scores: scores.as_deref(),
             emittable: &emittable,
@@ -350,9 +365,13 @@ fn load_ngram(path: &Path, lexicon: &Lexicon) -> Result<NgramModel> {
 /// a knob the report has to quote and a swapped pair of paths would produce a
 /// number rather than an error.
 struct FusedRun<'a> {
-    /// Absent exactly when the run was asked to drop the transition; the
-    /// argument parser holds the two flags to that relationship.
+    /// Absent when the run was asked to drop the transition or to decode with
+    /// the character model alone; the argument parser holds the flags to that
+    /// relationship.
     model: Option<&'a Path>,
+    /// The character model's directory, when one takes part.
+    lm: Option<&'a Path>,
+    lm_weight: f32,
     eval_set: &'a Path,
     scores: Option<&'a Path>,
     emittable: &'a Path,
@@ -370,6 +389,23 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
         .model
         .map(|path| load_ngram(path, &lexicon))
         .transpose()?;
+    let lm = run
+        .lm
+        .map(|dir| {
+            CharLm::open(dir, &lexicon)
+                .with_context(|| format!("could not open the character model in {}", dir.display()))
+        })
+        .transpose()?;
+    let transition = match (ngram.as_ref(), lm.as_ref()) {
+        (None, None) => Models::None,
+        (Some(ngram), None) => Models::Ngram(ngram),
+        (None, Some(lm)) => Models::CharLm(lm),
+        (Some(ngram), Some(lm)) => Models::Both {
+            ngram,
+            lm,
+            lm_weight: run.lm_weight,
+        },
+    };
     let rendered = neural::fused_eval(
         run.eval_set,
         run.scores,
@@ -382,7 +418,7 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
         lexicon,
         run.search.segment(),
         &run.search.beam(),
-        ngram.as_ref(),
+        transition,
     )?;
     write!(std::io::stdout(), "{rendered}").context("could not write to stdout")
 }

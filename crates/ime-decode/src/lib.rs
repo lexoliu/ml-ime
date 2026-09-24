@@ -20,7 +20,7 @@ pub use candidates::{CandidatePath, Candidates};
 pub use emissions::{
     EmissionError, Emittable, LatticePath, LatticeRecord, ScoreRecord, Scored, Weighted,
 };
-pub use score::{Emission, History, MAX_HISTORY, NoTransition, Transition, Uniform};
+pub use score::{Both, Emission, History, MAX_HISTORY, NoTransition, Transition, Uniform};
 
 use thiserror::Error;
 
@@ -98,18 +98,22 @@ mod tests {
     impl Transition for Preference {
         const HISTORY: usize = 1;
 
-        type Context = Option<CharId>;
+        type State = Option<CharId>;
 
-        fn context(&self, history: History) -> Self::Context {
-            history.back(1)
+        fn start(&self, _context: Option<&str>) -> Self::State {
+            None
         }
 
-        fn score(&self, context: &Self::Context, candidate: CharId) -> f32 {
-            *self.bigrams.get(&(*context, candidate)).unwrap_or(&-10.0)
+        fn score(&self, state: &Self::State, candidate: CharId) -> f32 {
+            *self.bigrams.get(&(*state, candidate)).unwrap_or(&-10.0)
         }
 
-        fn finish(&self, _context: &Self::Context) -> f32 {
+        fn finish(&self, _state: &Self::State) -> f32 {
             0.0
+        }
+
+        fn advance(&self, steps: &[(&Self::State, CharId)]) -> Vec<Self::State> {
+            steps.iter().map(|(_, ch)| Some(*ch)).collect()
         }
     }
 
@@ -129,7 +133,7 @@ mod tests {
         let (table, lexicon) = fixture();
         let batch = candidates("zhongguo", &table, &lexicon);
         let transition = Preference::new(&lexicon, "中国");
-        let best = decode(&batch, &Uniform, &transition, &BeamOptions::default())
+        let best = decode(&batch, &Uniform, &transition, None, &BeamOptions::default())
             .expect("the batch decodes");
         assert_eq!(best[0].text(&lexicon), "中国");
     }
@@ -139,8 +143,8 @@ mod tests {
         let (table, lexicon) = fixture();
         let batch = candidates("nihao", &table, &lexicon);
         let transition = Preference::new(&lexicon, "你好");
-        let best =
-            decode(&batch, &Uniform, &transition, &BeamOptions::default()).expect("nihao decodes");
+        let best = decode(&batch, &Uniform, &transition, None, &BeamOptions::default())
+            .expect("nihao decodes");
         assert!(best.len() > 1, "expected several hypotheses");
         assert!(
             best.windows(2).all(|w| w[0].score() >= w[1].score()),
@@ -162,7 +166,7 @@ mod tests {
             top_k: std::num::NonZeroUsize::new(3).expect("3 is not zero"),
             ..BeamOptions::default()
         };
-        let best = decode(&batch, &Uniform, &transition, &options).expect("nihao decodes");
+        let best = decode(&batch, &Uniform, &transition, None, &options).expect("nihao decodes");
         assert_eq!(best.len(), 3);
     }
 
@@ -179,8 +183,8 @@ mod tests {
             beam_width: std::num::NonZeroUsize::new(64).expect("64 is not zero"),
             ..BeamOptions::default()
         };
-        let narrow = decode(&batch, &Uniform, &transition, &narrow).expect("decodes");
-        let wide = decode(&batch, &Uniform, &transition, &wide).expect("decodes");
+        let narrow = decode(&batch, &Uniform, &transition, None, &narrow).expect("decodes");
+        let wide = decode(&batch, &Uniform, &transition, None, &wide).expect("decodes");
         assert!(wide[0].score() >= narrow[0].score());
     }
 
@@ -196,8 +200,14 @@ mod tests {
         let batch = candidates("zhong", &table, &lexicon);
         let zhong = lexicon.id_of('钟').expect("钟");
         let transition = Preference::new(&lexicon, "中");
-        let best = decode(&batch, &Insist(zhong), &transition, &BeamOptions::default())
-            .expect("zhong decodes");
+        let best = decode(
+            &batch,
+            &Insist(zhong),
+            &transition,
+            None,
+            &BeamOptions::default(),
+        )
+        .expect("zhong decodes");
         assert_eq!(best[0].text(&lexicon), "钟");
     }
 
