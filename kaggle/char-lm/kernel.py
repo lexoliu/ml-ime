@@ -107,11 +107,17 @@ def samples_mount(marker):
 
 
 def importable_package():
-    """A directory that can go on `PYTHONPATH` and make `mlime` importable."""
+    """A directory that can go on `PYTHONPATH` and make `mlime` importable.
+
+    Only a package that carries the trainer counts: a mount holding an older
+    `mlime` would otherwise be found first and fail at the command line, as one
+    did when a source version still processing left the kernel bound to the
+    one before it.
+    """
     try:
-        return locate("mlime/__init__.py")
+        return locate("mlime/__init__.py", "mlime/train/charlm.py")
     except FileNotFoundError:
-        mount = locate("train/charlm.py", "__init__.py")
+        mount = locate("__init__.py", "train/charlm.py")
     root = WORKING / "packages"
     root.mkdir(parents=True, exist_ok=True)
     link = root / "mlime"
