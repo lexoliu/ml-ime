@@ -161,6 +161,9 @@ target/release/ime-cli fused-eval --model data/run3/ngram.bin \
 ... --slice test --scores <scores> --weight <best>
 ```
 
+`--dump <dir>` writes every record's beam as JSONL; `mlime eval rescore` reranks
+such a dump through the `MLIME_LLM_*` endpoint (`notes/rescore-ceiling.md`).
+
 `eval3-abbreviated.jsonl` / `eval3-mixed.jsonl` pair with
 `scores-lattice-abbreviated-*` / `scores-lattice-mixed-*`. `kaggle/finish.sh
 <segment dir>` does all of this and writes `results.md`.
