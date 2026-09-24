@@ -25,10 +25,11 @@ DATA = WORKING / "data"
 MAX_DEPTH = 4
 
 #: Optimiser steps: two passes over the 41M lines at the token budget below,
-#: 1.65 billion characters a pass, 32k per step across the two ranks.
+#: 1.65 billion characters a pass, 32k per step across the ranks.
 MAX_STEPS = 100_000
-#: Padded positions per step per rank.
-MAX_TOKENS = 16384
+#: Padded positions per step over every rank together, so the run sees the
+#: same batches whether the machine has two T4s or one A100.
+TOKENS_PER_STEP = 32768
 CHECKPOINT_EVERY = 5000
 
 #: One shard per source, withheld from training and scored as held-out nats per
@@ -107,11 +108,17 @@ def samples_mount(marker):
 
 
 def importable_package():
-    """A directory that can go on `PYTHONPATH` and make `mlime` importable."""
+    """A directory that can go on `PYTHONPATH` and make `mlime` importable.
+
+    Only a package that carries the trainer counts: a mount holding an older
+    `mlime` would otherwise be found first and fail at the command line, as one
+    did when a source version still processing left the kernel bound to the
+    one before it.
+    """
     try:
-        return locate("mlime/__init__.py")
+        return locate("mlime/__init__.py", "mlime/train/charlm.py")
     except FileNotFoundError:
-        mount = locate("train/charlm.py", "__init__.py")
+        mount = locate("__init__.py", "train/charlm.py")
     root = WORKING / "packages"
     root.mkdir(parents=True, exist_ok=True)
     link = root / "mlime"
@@ -139,13 +146,20 @@ def stage_samples(sources):
 
 
 def train_argv(char_table, out, wall_budget):
-    """The training command both ranks run."""
+    """The training command every rank runs, one rank per GPU present."""
+    import torch
+
+    ranks = torch.cuda.device_count()
+    if ranks == 0:
+        raise RuntimeError("no CUDA device; the trainer needs at least one")
+    if TOKENS_PER_STEP % ranks:
+        raise RuntimeError(f"{TOKENS_PER_STEP} tokens a step do not split over {ranks} ranks")
     argv = [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--standalone",
-        "--nproc_per_node=2",
+        f"--nproc_per_node={ranks}",
         "-m",
         "mlime",
         "train",
@@ -159,7 +173,7 @@ def train_argv(char_table, out, wall_budget):
         "--max-steps",
         str(MAX_STEPS),
         "--max-tokens",
-        str(MAX_TOKENS),
+        str(TOKENS_PER_STEP // ranks),
         "--checkpoint-every",
         str(CHECKPOINT_EVERY),
         "--wall-budget-seconds",

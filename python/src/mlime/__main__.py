@@ -570,10 +570,6 @@ def _requested(source: list[str] | None) -> tuple[str, ...]:
     return tuple(source)
 
 
-if __name__ == "__main__":
-    app()
-
-
 @train_app.command("char-lm")
 def train_char_lm(
     data_dir: Path = DATA_DIR,
@@ -662,3 +658,7 @@ def eval_rescore(
     typer.echo(report.render())
     if out is not None:
         out.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")
+
+
+if __name__ == "__main__":
+    app()
