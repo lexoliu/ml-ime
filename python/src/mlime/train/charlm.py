@@ -144,16 +144,42 @@ class CharLm(nn.Module):
 
 
 class StepModule(nn.Module):
-    """``CharLm.step`` as a module of its own, the graph the decoder runs."""
+    """``CharLm.step`` as a module of its own, the graph the decoder runs.
 
-    def __init__(self, model: CharLm):
+    With *keep*, the next-character distribution is taken over those ids only
+    -- the probability of each conditioned on the next character being one of
+    them -- and every other id is scored at ``UNREACHABLE``. The decoder only
+    ever proposes characters the lattice can emit, so restricting the alphabet
+    to them loses nothing and cuts the output projection to their share of it.
+    """
+
+    #: The log probability written for an id outside the kept alphabet: far
+    #: below any real score, finite so sums never turn into NaN.
+    UNREACHABLE = -1.0e9
+
+    def __init__(self, model: CharLm, keep: torch.Tensor | None = None):
         super().__init__()
         self.model = model
+        self.keep: torch.Tensor | None
+        if keep is None:
+            self.keep = None
+        else:
+            self.register_buffer("keep", keep)
+            self.register_buffer("kept_weight", model.embed.weight.detach()[keep])
 
     def forward(
         self, token: torch.Tensor, hidden: torch.Tensor, cell: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return self.model.step(token, hidden, cell)
+        if self.keep is None:
+            return self.model.step(token, hidden, cell)
+        model = self.model
+        features, (hidden, cell) = model.lstm(model.embed(token).unsqueeze(1), (hidden, cell))
+        scores = model.project(features.squeeze(1)) @ self.kept_weight.T
+        kept = torch.log_softmax(scores.float(), dim=-1)
+        batch = token.shape[0]
+        full = torch.full((batch, model.embed.num_embeddings), self.UNREACHABLE)
+        index = self.keep.unsqueeze(0).expand(batch, -1)
+        return full.scatter(1, index, kept), hidden, cell
 
 
 def sequence(
@@ -479,13 +505,27 @@ def train(
     return final
 
 
-def export_onnx(checkpoint: Path, out_dir: Path) -> tuple[Path, Path]:
+def kept_ids(vocab: CharVocab, restrict: Path) -> torch.Tensor:
+    """Alphabet ids of the characters listed one per line in *restrict*, plus ``<eos>``."""
+    index = vocab.index
+    chars = [line.strip() for line in restrict.read_text(encoding="utf-8").splitlines()]
+    missing = [ch for ch in chars if ch and ch not in index]
+    if missing:
+        raise ValueError(
+            f"{len(missing)} characters of {restrict} are not in the alphabet: {missing[:5]}"
+        )
+    ids = sorted({index[ch] for ch in chars if ch} | {EOS})
+    return torch.tensor(ids, dtype=torch.long)
+
+
+def export_onnx(checkpoint: Path, out_dir: Path, restrict: Path | None = None) -> tuple[Path, Path]:
     """Write the step graph and its manifest for the Rust decoder.
 
     ``charlm.onnx`` takes ``token [B]``, ``hidden [layers, B, hidden]`` and
     ``cell [layers, B, hidden]`` and returns ``log_probs [B, V]`` (float32,
-    normalised over the alphabet) and the two new states. ``charlm.json`` holds
-    the alphabet in id order and the state shape.
+    normalised over the alphabet, or over the characters of *restrict* plus
+    ``<eos>`` when given, see :class:`StepModule`) and the two new states.
+    ``charlm.json`` holds the alphabet in id order and the state shape.
     """
     device = torch.device("cpu")
     model, vocab, step = load_model(checkpoint, device)
@@ -493,8 +533,9 @@ def export_onnx(checkpoint: Path, out_dir: Path) -> tuple[Path, Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
     graph = out_dir / "charlm.onnx"
     hidden, cell = model.initial_state(2, device)
+    keep = None if restrict is None else kept_ids(vocab, restrict)
     torch.onnx.export(
-        StepModule(model),
+        StepModule(model, keep),
         (torch.tensor([BOS, SEP]), hidden, cell),
         str(graph),
         input_names=["token", "hidden", "cell"],
@@ -519,6 +560,7 @@ def export_onnx(checkpoint: Path, out_dir: Path) -> tuple[Path, Path]:
                 "hidden": model.config.hidden,
                 "context_chars": model.config.context_chars,
                 "specials": {"pad": PAD, "bos": BOS, "eos": EOS, "sep": SEP, "unk": UNK},
+                "restricted_to": None if keep is None else int(keep.numel()),
                 "chars": list(vocab.chars),
             },
             ensure_ascii=False,
@@ -526,5 +568,11 @@ def export_onnx(checkpoint: Path, out_dir: Path) -> tuple[Path, Path]:
         + "\n",
         encoding="utf-8",
     )
-    log.info("exported char-lm", graph=str(graph), manifest=str(manifest), alphabet=len(vocab))
+    log.info(
+        "exported char-lm",
+        graph=str(graph),
+        manifest=str(manifest),
+        alphabet=len(vocab),
+        restricted_to=None if keep is None else int(keep.numel()),
+    )
     return graph, manifest

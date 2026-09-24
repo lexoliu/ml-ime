@@ -626,13 +626,16 @@ def train_char_lm(
 def export_char_lm(
     checkpoint: Path = typer.Argument(..., help="A char-lm checkpoint (charlm-final.pt)"),
     out: Path = typer.Option(Path("data/char-lm"), help="Where charlm.onnx and charlm.json go"),
+    restrict: Path = typer.Option(
+        None, help="Normalise over these characters (one per line, e.g. emittable.txt) plus <eos>"
+    ),
     verbose: bool = VERBOSE,
 ) -> None:
     """Export the step graph and manifest the Rust decoder loads."""
     configure(verbose)
     from mlime.train.charlm import export_onnx
 
-    graph, manifest = export_onnx(checkpoint, out)
+    graph, manifest = export_onnx(checkpoint, out, restrict)
     typer.echo(f"{graph}\n{manifest}")
 
 
