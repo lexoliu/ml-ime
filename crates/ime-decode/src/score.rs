@@ -168,6 +168,30 @@ pub trait Transition {
     fn advance(&self, steps: &[(&Self::State, CharId)]) -> Vec<Self::State>;
 }
 
+/// A shared reference to a model is the model: every method borrows it, so a
+/// decoder can pair or hand around models it does not own.
+impl<T: Transition + ?Sized> Transition for &T {
+    const HISTORY: usize = T::HISTORY;
+
+    type State = T::State;
+
+    fn start(&self, context: Option<&str>) -> Self::State {
+        (**self).start(context)
+    }
+
+    fn score(&self, state: &Self::State, candidate: CharId) -> f32 {
+        (**self).score(state, candidate)
+    }
+
+    fn finish(&self, state: &Self::State) -> f32 {
+        (**self).finish(state)
+    }
+
+    fn advance(&self, steps: &[(&Self::State, CharId)]) -> Vec<Self::State> {
+        (**self).advance(steps)
+    }
+}
+
 /// Two transition models scored together, each at its own weight.
 ///
 /// The state is the pair of states and the score the weighted sum, so a trigram
