@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib import resources
@@ -30,7 +31,7 @@ from pathlib import Path
 
 import regex
 from jinja2 import Template
-from openai import AsyncOpenAI, OpenAIError
+from openai import AsyncOpenAI, OpenAIError, RateLimitError
 from openai.types.shared import ReasoningEffort
 
 from mlime.logging import log
@@ -153,9 +154,9 @@ class Reranker:
         self,
         client: AsyncOpenAI,
         model: str,
-        concurrency: int = 16,
-        retries: int = 2,
-        reasoning_effort: ReasoningEffort = "medium",
+        concurrency: int = 8,
+        retries: int = 12,
+        reasoning_effort: ReasoningEffort = "high",
     ):
         self._client = client
         self._model = model
@@ -187,16 +188,40 @@ class Reranker:
             hypotheses=[h.text for h in record.hypotheses],
         )
 
-    async def choose_all(self, records: Sequence[DumpedRecord], every: int = 500) -> list[Choice]:
-        """Choose for every record concurrently, logging progress every *every* answers."""
+    async def choose_all(
+        self, records: Sequence[DumpedRecord], picks: Path, every: int = 500
+    ) -> list[Choice]:
+        """Choose for every record concurrently, keeping every answer in *picks*.
+
+        *picks* is a JSONL file of ``{"record", "picked"}`` rows appended as
+        answers arrive, so a run cut off by the endpoint's limits resumes from
+        where it stopped instead of paying for the answered records again.
+        """
+        known: dict[int, int] = {}
+        if picks.is_file():
+            with picks.open(encoding="utf-8") as handle:
+                for line in handle:
+                    if line.strip():
+                        row = json.loads(line)
+                        known[int(row["record"])] = int(row["picked"])
+            log.info("resuming", picks=str(picks), answered=len(known))
         done = 0
+        lock = asyncio.Lock()
 
         async def one(record: DumpedRecord) -> Choice:
             nonlocal done
+            if record.index in known:
+                return Choice(record=record, picked=known[record.index])
             choice = await self._one(record)
-            done += 1
-            if done % every == 0:
-                log.info("chosen", records=done, of=len(records))
+            async with lock:
+                if choice.picked is not None:
+                    with picks.open("a", encoding="utf-8") as handle:
+                        handle.write(
+                            json.dumps({"record": record.index, "picked": choice.picked}) + "\n"
+                        )
+                done += 1
+                if done % every == 0:
+                    log.info("chosen", records=done, of=len(records) - len(known))
             return choice
 
         return list(await asyncio.gather(*(one(record) for record in records)))
@@ -211,6 +236,14 @@ class Reranker:
                     return Choice(
                         record=record, picked=parse_choice(content, len(record.hypotheses))
                     )
+                except RateLimitError as error:
+                    last = f"{type(error).__name__}: {error}"
+                    # The subscription meters bursts; back off exponentially,
+                    # jittered so the in-flight requests do not retry as one.
+                    pause = min(60.0, 2.0**attempt) * (0.5 + random.random())
+                    log.debug("rerank rate limited", record=record.index, pause=round(pause, 1))
+                    await asyncio.sleep(pause)
+                    continue
                 except (ValueError, OpenAIError) as error:
                     last = f"{type(error).__name__}: {error}"
             log.debug("rerank retry", record=record.index, attempt=attempt, reason=last)
@@ -278,11 +311,11 @@ class RescoreReport:
 
 
 def rescore(
-    dump: Path, eval_set: Path, concurrency: int, reasoning_effort: ReasoningEffort
+    dump: Path, eval_set: Path, picks: Path, concurrency: int, reasoning_effort: ReasoningEffort
 ) -> RescoreReport:
-    """Rerank every record of *dump* and report the slice."""
+    """Rerank every record of *dump*, resuming from *picks*, and report the slice."""
     reranker = Reranker.from_settings(LlmSettings.load(), concurrency, reasoning_effort)
-    choices = asyncio.run(reranker.choose_all(read_dump(dump, eval_set)))
+    choices = asyncio.run(reranker.choose_all(read_dump(dump, eval_set), picks))
     return RescoreReport(
         model=reranker.model,
         reasoning_effort=str(reasoning_effort),

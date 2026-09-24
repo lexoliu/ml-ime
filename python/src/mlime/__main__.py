@@ -644,8 +644,9 @@ def export_char_lm(
 def eval_rescore(
     dump: Path = typer.Option(..., help="fused-eval --dump file of the slice to rerank"),
     eval_set: Path = typer.Option(..., help="The eval set the dump was decoded from"),
-    concurrency: int = typer.Option(16, help="Requests in flight at once"),
-    effort: str = typer.Option("medium", help="Reasoning effort to ask the endpoint for"),
+    picks: Path = typer.Option(..., help="JSONL of answers so far; appended to, and resumed from"),
+    concurrency: int = typer.Option(8, help="Requests in flight at once"),
+    effort: str = typer.Option("high", help="Reasoning effort; Chinese needs high"),
     out: Path = typer.Option(None, help="Where to write the report, with every pick, as JSON"),
     verbose: bool = VERBOSE,
 ) -> None:
@@ -657,7 +658,7 @@ def eval_rescore(
 
     from mlime.rescore import rescore
 
-    report = rescore(dump, eval_set, concurrency, cast(ReasoningEffort, effort))
+    report = rescore(dump, eval_set, picks, concurrency, cast(ReasoningEffort, effort))
     typer.echo(report.render())
     if out is not None:
         out.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")
