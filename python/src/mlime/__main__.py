@@ -642,19 +642,22 @@ def export_char_lm(
 
 @eval_app.command("rescore")
 def eval_rescore(
-    dev_dump: Path = typer.Option(..., help="fused-eval --dump file of the dev slice"),
-    test_dump: Path = typer.Option(..., help="fused-eval --dump file of the test slice"),
-    eval_set: Path = typer.Option(..., help="The eval set both dumps were decoded from"),
-    model: str = typer.Option("Qwen/Qwen3-0.6B", help="Pretrained causal LM on the Hub"),
-    device: str = typer.Option(None, help="torch device; defaults to mps, cuda, then cpu"),
-    out: Path = typer.Option(None, help="Where to write the report as JSON"),
+    dump: Path = typer.Option(..., help="fused-eval --dump file of the slice to rerank"),
+    eval_set: Path = typer.Option(..., help="The eval set the dump was decoded from"),
+    concurrency: int = typer.Option(16, help="Requests in flight at once"),
+    effort: str = typer.Option("medium", help="Reasoning effort to ask the endpoint for"),
+    out: Path = typer.Option(None, help="Where to write the report, with every pick, as JSON"),
     verbose: bool = VERBOSE,
 ) -> None:
-    """Rescore the beam's hypotheses with a language model; tune on dev, report on test."""
+    """Rerank the beam's hypotheses with the MLIME_LLM_* endpoint and report the slice."""
     configure(verbose)
-    from mlime.rescore import default_device, rescore
+    from typing import cast
 
-    report = rescore(dev_dump, test_dump, eval_set, model, device or default_device())
+    from openai.types.shared import ReasoningEffort
+
+    from mlime.rescore import rescore
+
+    report = rescore(dump, eval_set, concurrency, cast(ReasoningEffort, effort))
     typer.echo(report.render())
     if out is not None:
         out.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")

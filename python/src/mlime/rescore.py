@@ -1,44 +1,42 @@
-"""Rescoring the beam's hypotheses with a pretrained language model.
+"""Rerank the beam's hypotheses with a strong language model behind an API.
 
-The fused decoder ranks a handful of hypotheses per record, and the route A v2
-evaluation found that the ranking, not the candidate set, is not the problem:
-the sentence the user meant is often not among the eight the beam kept. Before
-building a language model into the search, this module measures what a language
-model *after* the search can still recover. It reads the per-record dump
-``ime-cli fused-eval --dump`` writes, scores every hypothesis with a pretrained
-causal LM conditioned on the record's context, and interpolates that score with
-the beam's own. The interpolation weight is tuned on the dev slice and reported
-on the test slice, the same protocol the fusion weight follows.
+Route A's fused decode reaches its ceiling before its top-1 does: the neural
+top-8 sits within a few points of its top-1, and the trigram it is fused with
+scores a character against the two before it. The question this module
+answers is how much a much stronger language model, reading the context and
+the keystrokes, could recover from the beam's own hypotheses *without*
+touching the search -- the ceiling of rescoring -- and therefore how much has
+to come from the search instead.
 
-The LM score is ``log p(text | context)``: the context and the text are
-tokenised apart and only the text's tokens are summed, so every hypothesis of a
-record is conditioned on the same context tokens and a tokenizer that merges
-across the boundary cannot bias one hypothesis against another.
+`fused-eval --dump` writes each record's hypotheses with the decoder's own
+score; this module joins them with the eval set's context and pinyin and asks
+the ``MLIME_LLM_*`` endpoint to pick the hypothesis the user most likely
+meant. The model never sees the expected text.
 
-Three numbers come out for each slice: the beam's own top-1 (what the dump
-already ranks first), the top-1 after rescoring at the chosen weight, and the
-oracle -- how often the expected sentence is among the hypotheses at all -- which
-bounds anything a rescorer can do and says how much has to come from the search
-itself.
+Three numbers come out for a slice: the beam's own top-1 (what the dump
+already ranks first), the top-1 after the model's choice, and the oracle -- how
+often the expected sentence is among the hypotheses at all -- which bounds
+anything a reranker can do and says how much has to come from the search.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
+from importlib import resources
 from pathlib import Path
-from typing import TYPE_CHECKING
 
-import structlog
+import regex
+from jinja2 import Template
+from openai import AsyncOpenAI, OpenAIError
+from openai.types.shared import ReasoningEffort
 
-if TYPE_CHECKING:
-    from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from mlime.logging import log
+from mlime.settings import LlmSettings
 
-log = structlog.get_logger()
-
-#: The interpolation weights swept on the dev slice: ``beam + weight * lm``.
-WEIGHTS: tuple[float, ...] = (0.0, 0.1, 0.2, 0.3, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0)
+PROMPT = "templates/rerank_prompt.txt"
 
 
 @dataclass(frozen=True)
@@ -51,65 +49,74 @@ class Hypothesis:
 
 @dataclass(frozen=True)
 class DumpedRecord:
-    """One line of a ``fused-eval --dump`` file, joined with its eval-set context."""
+    """One line of a ``fused-eval --dump`` file, joined with its eval-set record."""
 
     index: int
     text: str
+    pinyin: str
     context: str | None
     hypotheses: tuple[Hypothesis, ...]
 
 
 @dataclass(frozen=True)
-class ScoredRecord:
-    """A dumped record with a language-model log probability per hypothesis."""
+class Choice:
+    """What the model picked for a record, or why it picked nothing."""
 
     record: DumpedRecord
-    lm: tuple[float, ...]
+    picked: int | None
+    reason: str = ""
 
-    def top1(self, weight: float) -> str:
-        """The hypothesis ranked first when the LM score is added at *weight*."""
-        best = max(
-            range(len(self.record.hypotheses)),
-            key=lambda i: self.record.hypotheses[i].score + weight * self.lm[i],
-        )
-        return self.record.hypotheses[best].text
+    @property
+    def top1(self) -> str:
+        """The reranked answer: the pick, or the beam's own first when there is none."""
+        index = 0 if self.picked is None else self.picked
+        return self.record.hypotheses[index].text
 
 
 @dataclass(frozen=True)
 class SliceResult:
-    """Top-1 accuracies of one slice at every weight, plus its oracle."""
+    """What reranking did on one slice."""
 
     records: int
-    top1_by_weight: dict[float, float]
+    beam_top1: float
+    reranked_top1: float
     oracle: float
+    unanswered: int
 
-    def best_weight(self) -> float:
-        """The first weight, in ``WEIGHTS`` order, with the highest top-1."""
-        best = WEIGHTS[0]
-        for weight in WEIGHTS[1:]:
-            if self.top1_by_weight[weight] > self.top1_by_weight[best]:
-                best = weight
-        return best
+    def as_dict(self) -> dict[str, object]:
+        """A JSON-friendly view."""
+        return {
+            "records": self.records,
+            "beam_top1": self.beam_top1,
+            "reranked_top1": self.reranked_top1,
+            "oracle": self.oracle,
+            "unanswered": self.unanswered,
+        }
 
 
 def read_dump(dump: Path, eval_set: Path) -> list[DumpedRecord]:
-    """Read a dump file and attach each record's context from the eval set."""
-    contexts: list[str | None] = []
+    """Read a dump file and attach each record's pinyin and context from the eval set."""
+    rows: list[dict[str, object]] = []
     with eval_set.open(encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
-                contexts.append(json.loads(line).get("context"))
+        rows.extend(json.loads(line) for line in handle if line.strip())
     records: list[DumpedRecord] = []
     with dump.open(encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
                 continue
             row = json.loads(line)
+            source = rows[row["record"]]
+            if source["text"] != row["text"]:
+                raise ValueError(
+                    f"record {row['record']} of {dump} is {row['text']!r} but the eval set "
+                    f"holds {source['text']!r}; the dump was decoded from another set"
+                )
             records.append(
                 DumpedRecord(
                     index=row["record"],
                     text=row["text"],
-                    context=contexts[row["record"]],
+                    pinyin=str(source["pinyin"]),
+                    context=source.get("context"),
                     hypotheses=tuple(
                         Hypothesis(text=h["text"], score=float(h["score"]))
                         for h in row["hypotheses"]
@@ -120,154 +127,165 @@ def read_dump(dump: Path, eval_set: Path) -> list[DumpedRecord]:
     return records
 
 
-class LanguageModel:
-    """A pretrained causal LM that scores sentences given their context."""
+def prompt_template() -> Template:
+    """The reranking prompt, kept in a file so it can be diffed and reviewed."""
+    source: str = resources.files(__spec__.parent).joinpath(PROMPT).read_text(encoding="utf-8")
+    # `jinja2.Template.__new__` is declared to return `Any`, so pin the type here.
+    template: Template = Template(source, keep_trailing_newline=True)
+    return template
 
-    def __init__(self, name: str, device: str) -> None:
-        import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        self.tokenizer: PreTrainedTokenizerBase = AutoTokenizer.from_pretrained(name)
-        self.model: PreTrainedModel = AutoModelForCausalLM.from_pretrained(
-            name, dtype=torch.float16 if device != "cpu" else torch.float32
-        ).to(device)
-        self.model.eval()
-        self.device = device
-        self.bos = self.tokenizer.bos_token_id
-        if self.bos is None:
-            self.bos = self.tokenizer.eos_token_id
-        log.info("loaded language model", name=name, device=device)
+def parse_choice(content: str, count: int) -> int:
+    """The zero-based index the model answered with, or a ``ValueError``."""
+    numbers = regex.findall(r"\d+", content)
+    if len(numbers) != 1:
+        raise ValueError(f"expected one number in the answer, got {content!r}")
+    picked = int(numbers[0])
+    if not 1 <= picked <= count:
+        raise ValueError(f"the answer {picked} is outside 1..{count}")
+    return picked - 1
 
-    def _encode(self, text: str) -> list[int]:
-        ids: list[int] = self.tokenizer(text, add_special_tokens=False)["input_ids"]
-        return ids
 
-    def log_probabilities(self, prefix: str, texts: Sequence[str]) -> list[float]:
-        """``log p(text | prefix)`` of every text, one padded forward pass.
+class Reranker:
+    """Picks the likeliest hypothesis of each record through a chat completion endpoint."""
 
-        The prefix and each text are tokenised apart, so every row scores the
-        same prefix tokens and only its own continuation counts. Rows are padded
-        on the left, which a rotary model does not notice, so that the
-        continuations end together and the model only has to produce logits for
-        the longest of them: the full vocabulary over the whole prefix would not
-        fit an 8 GB machine.
-        """
-        import torch
+    def __init__(
+        self,
+        client: AsyncOpenAI,
+        model: str,
+        concurrency: int = 16,
+        retries: int = 2,
+        reasoning_effort: ReasoningEffort = "medium",
+    ):
+        self._client = client
+        self._model = model
+        self._retries = retries
+        self._reasoning_effort = reasoning_effort
+        self._template = prompt_template()
+        self._gate = asyncio.Semaphore(concurrency)
 
-        prefix_ids = [self.bos, *self._encode(prefix)]
-        tails = [self._encode(text) for text in texts]
-        keep = max(len(tail) for tail in tails)
-        rows = [prefix_ids + tail for tail in tails]
-        width = max(len(row) for row in rows)
-        pad = self.tokenizer.pad_token_id
-        if pad is None:
-            pad = self.bos
-        input_ids = torch.full((len(rows), width), pad, dtype=torch.long)
-        mask = torch.zeros((len(rows), width), dtype=torch.long)
-        counted = torch.zeros((len(rows), keep), dtype=torch.float32)
-        for row, (ids, tail) in enumerate(zip(rows, tails, strict=True)):
-            input_ids[row, width - len(ids) :] = torch.tensor(ids)
-            mask[row, width - len(ids) :] = 1
-            counted[row, keep - len(tail) :] = 1.0
-        input_ids = input_ids.to(self.device)
-        mask = mask.to(self.device)
-        counted = counted.to(self.device)
-        with torch.no_grad():
-            # Logits at the last keep + 1 positions; the one at position p
-            # predicts the token at p + 1, so dropping the final one leaves the
-            # predictions for the last keep tokens.
-            logits = self.model(
-                input_ids=input_ids, attention_mask=mask, logits_to_keep=keep + 1
-            ).logits[:, :-1]
-        log_probs = torch.log_softmax(logits.float(), dim=-1)
-        targets = input_ids[:, width - keep :]
-        picked = log_probs.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
-        return (picked * counted).sum(dim=-1).tolist()
-
-    def score(self, record: DumpedRecord) -> tuple[float, ...]:
-        """``log p(hypothesis | context)`` for every hypothesis of *record*."""
-        return tuple(
-            self.log_probabilities(record.context or "", [h.text for h in record.hypotheses])
+    @classmethod
+    def from_settings(
+        cls, settings: LlmSettings, concurrency: int, reasoning_effort: ReasoningEffort
+    ) -> Reranker:
+        """Build a client from the ``MLIME_LLM_*`` environment."""
+        client = AsyncOpenAI(base_url=settings.base_url, api_key=settings.api_key)
+        return cls(
+            client, settings.model, concurrency=concurrency, reasoning_effort=reasoning_effort
         )
 
+    @property
+    def model(self) -> str:
+        """The model id the picks come from."""
+        return self._model
 
-def score_records(
-    lm: LanguageModel, records: Sequence[DumpedRecord], every: int = 500
-) -> Iterator[ScoredRecord]:
-    """Score records one at a time, logging progress every *every* records."""
-    for n, record in enumerate(records, 1):
-        yield ScoredRecord(record=record, lm=lm.score(record))
-        if n % every == 0:
-            log.info("scored", records=n, of=len(records))
+    def prompt(self, record: DumpedRecord) -> str:
+        """Render the prompt for *record*."""
+        return self._template.render(
+            context=record.context,
+            pinyin=record.pinyin,
+            hypotheses=[h.text for h in record.hypotheses],
+        )
+
+    async def choose_all(self, records: Sequence[DumpedRecord], every: int = 500) -> list[Choice]:
+        """Choose for every record concurrently, logging progress every *every* answers."""
+        done = 0
+
+        async def one(record: DumpedRecord) -> Choice:
+            nonlocal done
+            choice = await self._one(record)
+            done += 1
+            if done % every == 0:
+                log.info("chosen", records=done, of=len(records))
+            return choice
+
+        return list(await asyncio.gather(*(one(record) for record in records)))
+
+    async def _one(self, record: DumpedRecord) -> Choice:
+        """Choose for one record, retrying a malformed or failed answer."""
+        last = ""
+        for attempt in range(self._retries + 1):
+            async with self._gate:
+                try:
+                    content = await self._complete(record)
+                    return Choice(
+                        record=record, picked=parse_choice(content, len(record.hypotheses))
+                    )
+                except (ValueError, OpenAIError) as error:
+                    last = f"{type(error).__name__}: {error}"
+            log.debug("rerank retry", record=record.index, attempt=attempt, reason=last)
+        log.warning("rerank unanswered", record=record.index, reason=last)
+        return Choice(record=record, picked=None, reason=last)
+
+    async def _complete(self, record: DumpedRecord) -> str:
+        """One chat completion, at the pinned reasoning effort."""
+        response = await self._client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": self.prompt(record)}],
+            reasoning_effort=self._reasoning_effort,
+        )
+        content = response.choices[0].message.content
+        if content is None:
+            raise ValueError("the endpoint returned a message with no content")
+        return content
 
 
-def evaluate(scored: Sequence[ScoredRecord]) -> SliceResult:
-    """Top-1 at every weight, and how often the expected text was in the beam."""
-    top1 = {w: sum(s.top1(w) == s.record.text for s in scored) / len(scored) for w in WEIGHTS}
-    oracle = sum(any(h.text == s.record.text for h in s.record.hypotheses) for s in scored)
-    return SliceResult(records=len(scored), top1_by_weight=top1, oracle=oracle / len(scored))
+def evaluate(choices: Sequence[Choice]) -> SliceResult:
+    """Beam top-1, reranked top-1, and how often the expected text was in the beam."""
+    total = len(choices)
+    return SliceResult(
+        records=total,
+        beam_top1=sum(c.record.hypotheses[0].text == c.record.text for c in choices) / total,
+        reranked_top1=sum(c.top1 == c.record.text for c in choices) / total,
+        oracle=sum(any(h.text == c.record.text for h in c.record.hypotheses) for c in choices)
+        / total,
+        unanswered=sum(c.picked is None for c in choices),
+    )
 
 
 @dataclass(frozen=True)
 class RescoreReport:
-    """What the experiment found on one section of one eval set."""
+    """What the experiment found on one slice of one eval set."""
 
     model: str
-    dev: SliceResult
-    test: SliceResult
-    weight: float
+    reasoning_effort: str
+    result: SliceResult
+    choices: tuple[Choice, ...]
 
     def as_dict(self) -> dict[str, object]:
-        """A JSON-friendly view."""
+        """A JSON-friendly view, with every pick so the picks can be inspected."""
         return {
             "model": self.model,
-            "weight": self.weight,
-            "dev": {
-                "records": self.dev.records,
-                "oracle": self.dev.oracle,
-                "top1_by_weight": {str(w): v for w, v in self.dev.top1_by_weight.items()},
-            },
-            "test": {
-                "records": self.test.records,
-                "oracle": self.test.oracle,
-                "beam_top1": self.test.top1_by_weight[0.0],
-                "rescored_top1": self.test.top1_by_weight[self.weight],
-                "top1_by_weight": {str(w): v for w, v in self.test.top1_by_weight.items()},
-            },
+            "reasoning_effort": self.reasoning_effort,
+            "result": self.result.as_dict(),
+            "choices": [
+                {"record": c.record.index, "picked": c.picked, "reason": c.reason}
+                for c in self.choices
+            ],
         }
 
     def render(self) -> str:
         """A few lines for the terminal."""
-        t = self.test
+        r = self.result
         return "\n".join(
             [
-                f"model {self.model}, weight {self.weight} "
-                f"(chosen on dev, {self.dev.records} records)",
-                f"test ({t.records} records): beam top-1 {t.top1_by_weight[0.0]:.4f}, "
-                f"rescored top-1 {t.top1_by_weight[self.weight]:.4f}, oracle {t.oracle:.4f}",
-                "dev sweep: " + "  ".join(f"{w}:{self.dev.top1_by_weight[w]:.4f}" for w in WEIGHTS),
+                f"model {self.model}, reasoning effort {self.reasoning_effort}",
+                f"{r.records} records: beam top-1 {r.beam_top1:.4f}, "
+                f"reranked top-1 {r.reranked_top1:.4f}, oracle {r.oracle:.4f}, "
+                f"unanswered {r.unanswered}",
             ]
         )
 
 
 def rescore(
-    dev_dump: Path, test_dump: Path, eval_set: Path, model: str, device: str
+    dump: Path, eval_set: Path, concurrency: int, reasoning_effort: ReasoningEffort
 ) -> RescoreReport:
-    """Tune the interpolation on the dev dump and report it on the test dump."""
-    lm = LanguageModel(model, device)
-    dev = evaluate(list(score_records(lm, read_dump(dev_dump, eval_set))))
-    weight = dev.best_weight()
-    log.info("chose weight on dev", weight=weight, top1=dev.top1_by_weight[weight])
-    test = evaluate(list(score_records(lm, read_dump(test_dump, eval_set))))
-    return RescoreReport(model=model, dev=dev, test=test, weight=weight)
-
-
-def default_device() -> str:
-    """Apple GPU when there is one, else CUDA, else the CPU."""
-    import torch
-
-    if torch.backends.mps.is_available():
-        return "mps"
-    if torch.cuda.is_available():
-        return "cuda"
-    return "cpu"
+    """Rerank every record of *dump* and report the slice."""
+    reranker = Reranker.from_settings(LlmSettings.load(), concurrency, reasoning_effort)
+    choices = asyncio.run(reranker.choose_all(read_dump(dump, eval_set)))
+    return RescoreReport(
+        model=reranker.model,
+        reasoning_effort=str(reasoning_effort),
+        result=evaluate(choices),
+        choices=tuple(choices),
+    )
