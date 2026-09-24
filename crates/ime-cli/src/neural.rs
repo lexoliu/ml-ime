@@ -34,7 +34,7 @@ use ime_decode::{
 use ime_eval::{EvalRecord, EvalSet, Report, Slice};
 use ime_lm::CharLm;
 use ime_ngram::NgramModel;
-use ime_pinyin::{Lexicon, SegmentOptions, SyllableTable};
+use ime_pinyin::{CharId, Lexicon, SegmentOptions, SyllableTable};
 use rayon::iter::{
     IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
 };
@@ -299,6 +299,7 @@ pub fn emit_lattice(
 /// The n-gram, the character language model, both at once, or neither -- the
 /// last being the emissions alone, the ablation that says what the fill tower
 /// earned on its own.
+#[derive(Copy, Clone)]
 pub enum Models<'a> {
     /// No transition at all.
     None,
@@ -315,6 +316,40 @@ pub enum Models<'a> {
         /// Weight on the character model's scores.
         lm_weight: f32,
     },
+}
+
+/// A transition model shared rather than owned.
+///
+/// [`Both`] pairs two transitions by value, but the fused run borrows its
+/// models from the caller -- a [`CharLm`] is not `Clone`, its ONNX sessions
+/// living one per decoding thread -- so the pair refers to them. Every method
+/// of the trait borrows the model, so a shared reference forwards the whole
+/// of it.
+struct Shared<'a, T: ?Sized> {
+    /// The model.
+    model: &'a T,
+}
+
+impl<T: Transition + ?Sized> Transition for Shared<'_, T> {
+    const HISTORY: usize = T::HISTORY;
+
+    type State = T::State;
+
+    fn start(&self, context: Option<&str>) -> Self::State {
+        self.model.start(context)
+    }
+
+    fn score(&self, state: &Self::State, candidate: CharId) -> f32 {
+        self.model.score(state, candidate)
+    }
+
+    fn finish(&self, state: &Self::State) -> f32 {
+        self.model.finish(state)
+    }
+
+    fn advance(&self, steps: &[(&Self::State, CharId)]) -> Vec<Self::State> {
+        self.model.advance(steps)
+    }
 }
 
 /// Everything a run needs to score one transition model over its sections.
@@ -476,9 +511,9 @@ pub fn fused_eval(
             lm_weight,
         } => run.sections(
             &Both {
-                first: ngram,
+                first: Shared { model: ngram },
                 first_weight: 1.0,
-                second: lm,
+                second: Shared { model: lm },
                 second_weight: lm_weight,
             },
             "kn-trigram+char-lm",
