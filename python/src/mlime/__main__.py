@@ -663,5 +663,26 @@ def eval_rescore(
         out.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")
 
 
+@eval_app.command("rime")
+def eval_rime(
+    dump: Path = typer.Option(..., help="fused-eval --dump file naming the slice's records"),
+    eval_set: Path = typer.Option(..., help="The eval set the dump was decoded from"),
+    library: Path = typer.Option(..., help="librime's dynamic library, e.g. librime.dylib"),
+    data_dir: Path = typer.Option(..., help="Deployed RIME data directory (rime_deployer --build)"),
+    schema: str = typer.Option("luna_pinyin_simp", help="Schema id to type with"),
+    out: Path = typer.Option(None, help="Where to write the report, with every sentence, as JSON"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Type each record's keystrokes into RIME, accept its defaults, and report the slice."""
+    configure(verbose)
+    from mlime.rescore import read_dump
+    from mlime.rime import measure, write_report
+
+    report = measure(read_dump(dump, eval_set), library, data_dir, schema)
+    typer.echo(report.render())
+    if out is not None:
+        write_report(report, out)
+
+
 if __name__ == "__main__":
     app()

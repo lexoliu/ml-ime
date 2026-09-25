@@ -174,6 +174,13 @@ slower than the trigram by roughly the model's step cost times the beam.
 `--dump <dir>` writes every record's beam as JSONL; `mlime eval rescore` reranks
 such a dump through the `MLIME_LLM_*` endpoint (`notes/rescore-ceiling.md`).
 
+`mlime eval rime --dump <dump> --eval-set <set> --library /opt/homebrew/lib/librime.dylib
+--data-dir data/rime/user` types the same records into RIME through librime's C API
+(`ctypes`, nothing compiled) and reports its default sentence against the beam's;
+the data directory is `rime/plum` `:preset` deployed with `rime_deployer --build`,
+with `luna_pinyin_simp.custom.yaml` disabling the user dictionary
+(`notes/commercial-baselines.md`).
+
 `eval3-abbreviated.jsonl` / `eval3-mixed.jsonl` pair with
 `scores-lattice-abbreviated-*` / `scores-lattice-mixed-*`. `kaggle/finish.sh
 <segment dir>` does all of this and writes `results.md`.
