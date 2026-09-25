@@ -195,12 +195,19 @@ such a dump through the `MLIME_LLM_*` endpoint (`notes/rescore-ceiling.md`).
 1. `notes/route-a-v2.md` is written. Its verdict on abbreviations: the fused
    decoder is 3.5× the trigram on fully abbreviated sentences (24.3% vs 7.0%
    top-1) but not usable for them yet, and neural-only top-8 barely exceeds
-   top-1 in every setting, so the next modelling step is a rescorer over the
-   NAR output (item 3), measured on the abbreviated set first.
-2. Fix issue #16 (hash only text+context in `EvalRecord::digest`) so the three
+   top-1 in every setting.
+2. Issue #40 measured both answers to that. `notes/rescore-ceiling.md`: a
+   GPT-6-class reranker over the beam's eight hypotheses gains 2.5 / 3.6 / 5.4
+   points (full / abbreviated / mixed) and is capped by the oracle, which is
+   30% on abbreviated input. `notes/char-lm-v1.md`: a 30M-parameter character
+   LSTM inside the beam, added to the trigram, gains about 1.2 points on every
+   typing style and leaves top-8 where it was. The beam's contents, not the
+   transition, are the limit; the next measurement is the oracle as a function
+   of beam width with the LM in place, then either a wider beam plus a
+   reranker or a decoder that is not per-position independent.
+3. Fix issue #16 (hash only text+context in `EvalRecord::digest`) so the three
    eval twins share one dev/test split; re-tune weights once.
-3. The trigram is still load-bearing: neural-only top-8 barely exceeds top-1.
-   An autoregressive rescorer or an iterative refinement pass over the NAR
-   output is the next modelling step.
-4. Inference on macOS (Core ML / ANE) was explicitly parked until the model was
+4. Issue #51: measure the commercial IMEs on the eval3 twins, so every number
+   above is relative to the product target rather than to our own trigram.
+5. Inference on macOS (Core ML / ANE) was explicitly parked until the model was
    trained; `notes/inputmethodkit.md` and `notes/compute.md` hold what was known.
