@@ -244,7 +244,7 @@ class Rime:
         if not self._call["get_context"](session, ctypes.byref(context)):
             raise RuntimeError("librime returned no context")
         try:
-            return context.composition.length > 0 and context.menu.num_candidates > 0
+            return bool(context.composition.length > 0 and context.menu.num_candidates > 0)
         finally:
             self._call["free_context"](ctypes.byref(context))
 

@@ -19,11 +19,19 @@ def _record(index: int, text: str, hypotheses: tuple[str, ...]) -> DumpedRecord:
 def test_evaluate_counts_rime_first_page_beam_characters_and_lengths() -> None:
     typed = [
         # both right, expected on the first page
-        Typed(record=_record(0, "你好", ("你好", "拟好")), committed="你好", first_page=("你好", "你")),
+        Typed(
+            record=_record(0, "你好", ("你好", "拟好")), committed="你好", first_page=("你好", "你")
+        ),
         # rime wrong by one character, expected not on the first page, beam right
-        Typed(record=_record(1, "再见", ("再见", "在见")), committed="在见", first_page=("在见", "在")),
+        Typed(
+            record=_record(1, "再见", ("再见", "在见")), committed="在见", first_page=("在见", "在")
+        ),
         # rime committed a shorter sentence
-        Typed(record=_record(2, "谢谢你", ("写写你",)), committed="谢谢", first_page=("谢谢", "谢谢你")),
+        Typed(
+            record=_record(2, "谢谢你", ("写写你",)),
+            committed="谢谢",
+            first_page=("谢谢", "谢谢你"),
+        ),
     ]
     result = evaluate(typed)
     assert result.records == 3

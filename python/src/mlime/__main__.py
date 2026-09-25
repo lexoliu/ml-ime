@@ -690,6 +690,8 @@ def eval_generate(
     typer.echo(report.render())
     if out is not None:
         out.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")
+
+
 @eval_app.command("rime")
 def eval_rime(
     dump: Path = typer.Option(..., help="fused-eval --dump file naming the slice's records"),
