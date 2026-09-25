@@ -663,5 +663,34 @@ def eval_rescore(
         out.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")
 
 
+@eval_app.command("generate")
+def eval_generate(
+    dump: Path = typer.Option(..., help="fused-eval --dump file of the slice to generate for"),
+    eval_set: Path = typer.Option(..., help="The eval set the dump was decoded from"),
+    answers: Path = typer.Option(..., help="JSONL of sentences so far; appended to, resumed from"),
+    concurrency: int = typer.Option(8, help="Requests in flight at once"),
+    effort: str = typer.Option("high", help="Reasoning effort; Chinese needs high"),
+    with_hypotheses: bool = typer.Option(
+        False, "--with-hypotheses", help="Show the beam's hypotheses in the prompt as hints"
+    ),
+    out: Path = typer.Option(None, help="Where to write the report, with every sentence, as JSON"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Write each record's sentence with the MLIME_LLM_* endpoint and report the slice."""
+    configure(verbose)
+    from typing import cast
+
+    from openai.types.shared import ReasoningEffort
+
+    from mlime.generate import generate
+
+    report = generate(
+        dump, eval_set, answers, concurrency, cast(ReasoningEffort, effort), with_hypotheses
+    )
+    typer.echo(report.render())
+    if out is not None:
+        out.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")
+
+
 if __name__ == "__main__":
     app()
