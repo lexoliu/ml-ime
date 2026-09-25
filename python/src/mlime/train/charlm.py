@@ -374,8 +374,8 @@ class Resumption:
         step = int(state["step"])
         if step >= training.max_steps:
             raise ValueError(
-                f"{path} is already at step {step} of {training.max_steps}; "
-                "raise max_steps to run further, or this resume would do nothing"
+                f"{path} is already at step {step} of {training.max_steps}: the run is "
+                "complete, and this resume would do nothing"
             )
         return cls(
             progress=Progress(
