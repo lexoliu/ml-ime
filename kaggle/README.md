@@ -28,7 +28,7 @@ done
 Kaggle runs two kernels at once per account and allows 30 GPU-hours a week, so
 push two, and the next two when those finish.
 | `route-a-v2` | two epochs over all of run3 as a chain of segments; segment 0 counts the steps, every segment trains on a wall budget and pauses resumably |
-| `char-lm` | a two-layer LSTM character language model over the same 41M lines (`mlime train char-lm`, 2×T4 DDP, wall budget), exported to ONNX for `ime-cli fused-eval --lm` |
+| `char-lm` | a character language model over the same 41M lines (`mlime train char-lm`, 2×T4 DDP, wall budget; the kernel's `MODEL` picks the architecture, a 12-layer transformer since `notes/generate-ceiling.md`, the LSTM of `notes/char-lm-v1.md` before it), exported to ONNX (`charlm.onnx`, `prefill.onnx`, `charlm.json`) for `ime-cli fused-eval --lm`. A run longer than one session resumes: push the next session with the previous output added as a kernel source and it continues from that output's `run/charlm.pt` |
 
 ## Chaining a training run
 
