@@ -204,10 +204,12 @@ the context and keystrokes alone, or with the beam's hypotheses as hints
    points (full / abbreviated / mixed) and is capped by the oracle, which is
    30% on abbreviated input. `notes/char-lm-v1.md`: a 30M-parameter character
    LSTM inside the beam, added to the trigram, gains about 1.2 points on every
-   typing style and leaves top-8 where it was. The beam's contents, not the
-   transition, are the limit; the next measurement is the oracle as a function
-   of beam width with the LM in place, then either a wider beam plus a
-   reranker or a decoder that is not per-position independent.
+   typing style and leaves top-8 where it was. `notes/generate-ceiling.md`:
+   128 candidates hold the abbreviated answer 33.5% of the time, and GPT-6
+   Luna writing the sentence from the context and keystrokes ties the decoder
+   on abbreviated input (23.9 vs 24.3) and reaches 36.7 / 49.2 / 84.7
+   (abbreviated / mixed / full) when shown the beam's hypotheses. That is the
+   target; the gap is the reader inside the lattice, not the search.
 3. Fix issue #16 (hash only text+context in `EvalRecord::digest`) so the three
    eval twins share one dev/test split; re-tune weights once.
 4. Issue #51: measure the commercial IMEs on the eval3 twins, so every number
