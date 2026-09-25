@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import random
 from collections.abc import Sequence
 from dataclasses import dataclass
 from importlib import resources
@@ -31,9 +30,9 @@ from pathlib import Path
 
 import regex
 from jinja2 import Template
-from openai import AsyncOpenAI, OpenAIError, RateLimitError
 from openai.types.shared import ReasoningEffort
 
+from mlime.endpoint import Answer, Endpoint, answer_all
 from mlime.logging import log
 from mlime.settings import LlmSettings
 
@@ -150,35 +149,21 @@ def parse_choice(content: str, count: int) -> int:
 class Reranker:
     """Picks the likeliest hypothesis of each record through a chat completion endpoint."""
 
-    def __init__(
-        self,
-        client: AsyncOpenAI,
-        model: str,
-        concurrency: int = 8,
-        retries: int = 12,
-        reasoning_effort: ReasoningEffort = "high",
-    ):
-        self._client = client
-        self._model = model
-        self._retries = retries
-        self._reasoning_effort = reasoning_effort
+    def __init__(self, endpoint: Endpoint):
+        self._endpoint = endpoint
         self._template = prompt_template()
-        self._gate = asyncio.Semaphore(concurrency)
 
     @classmethod
     def from_settings(
         cls, settings: LlmSettings, concurrency: int, reasoning_effort: ReasoningEffort
     ) -> Reranker:
         """Build a client from the ``MLIME_LLM_*`` environment."""
-        client = AsyncOpenAI(base_url=settings.base_url, api_key=settings.api_key)
-        return cls(
-            client, settings.model, concurrency=concurrency, reasoning_effort=reasoning_effort
-        )
+        return cls(Endpoint.from_settings(settings, concurrency, reasoning_effort))
 
     @property
     def model(self) -> str:
         """The model id the picks come from."""
-        return self._model
+        return self._endpoint.model
 
     def prompt(self, record: DumpedRecord) -> str:
         """Render the prompt for *record*."""
@@ -188,79 +173,21 @@ class Reranker:
             hypotheses=[h.text for h in record.hypotheses],
         )
 
-    async def choose_all(
-        self, records: Sequence[DumpedRecord], picks: Path, every: int = 500
-    ) -> list[Choice]:
-        """Choose for every record concurrently, keeping every answer in *picks*.
+    async def choose_all(self, records: Sequence[DumpedRecord], picks: Path) -> list[Choice]:
+        """Choose for every record concurrently, keeping every answer in *picks*."""
 
-        *picks* is a JSONL file of ``{"record", "picked"}`` rows appended as
-        answers arrive, so a run cut off by the endpoint's limits resumes from
-        where it stopped instead of paying for the answered records again.
-        """
-        known: dict[int, int] = {}
-        if picks.is_file():
-            with picks.open(encoding="utf-8") as handle:
-                for line in handle:
-                    if line.strip():
-                        row = json.loads(line)
-                        known[int(row["record"])] = int(row["picked"])
-            log.info("resuming", picks=str(picks), answered=len(known))
-        done = 0
-        lock = asyncio.Lock()
+        async def one(record: DumpedRecord) -> Answer[int]:
+            return await self._endpoint.ask(
+                self.prompt(record),
+                lambda content: parse_choice(content, len(record.hypotheses)),
+                record.index,
+            )
 
-        async def one(record: DumpedRecord) -> Choice:
-            nonlocal done
-            if record.index in known:
-                return Choice(record=record, picked=known[record.index])
-            choice = await self._one(record)
-            async with lock:
-                if choice.picked is not None:
-                    with picks.open("a", encoding="utf-8") as handle:
-                        handle.write(
-                            json.dumps({"record": record.index, "picked": choice.picked}) + "\n"
-                        )
-                done += 1
-                if done % every == 0:
-                    log.info("chosen", records=done, of=len(records) - len(known))
-            return choice
-
-        return list(await asyncio.gather(*(one(record) for record in records)))
-
-    async def _one(self, record: DumpedRecord) -> Choice:
-        """Choose for one record, retrying a malformed or failed answer."""
-        last = ""
-        for attempt in range(self._retries + 1):
-            async with self._gate:
-                try:
-                    content = await self._complete(record)
-                    return Choice(
-                        record=record, picked=parse_choice(content, len(record.hypotheses))
-                    )
-                except RateLimitError as error:
-                    last = f"{type(error).__name__}: {error}"
-                    # The subscription meters bursts; back off exponentially,
-                    # jittered so the in-flight requests do not retry as one.
-                    pause = min(60.0, 2.0**attempt) * (0.5 + random.random())
-                    log.debug("rerank rate limited", record=record.index, pause=round(pause, 1))
-                    await asyncio.sleep(pause)
-                    continue
-                except (ValueError, OpenAIError) as error:
-                    last = f"{type(error).__name__}: {error}"
-            log.debug("rerank retry", record=record.index, attempt=attempt, reason=last)
-        log.warning("rerank unanswered", record=record.index, reason=last)
-        return Choice(record=record, picked=None, reason=last)
-
-    async def _complete(self, record: DumpedRecord) -> str:
-        """One chat completion, at the pinned reasoning effort."""
-        response = await self._client.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "user", "content": self.prompt(record)}],
-            reasoning_effort=self._reasoning_effort,
-        )
-        content = response.choices[0].message.content
-        if content is None:
-            raise ValueError("the endpoint returned a message with no content")
-        return content
+        answers = await answer_all(records, picks, lambda r: r.index, one, int)
+        return [
+            Choice(record=record, picked=answer.value, reason=answer.reason)
+            for record, answer in zip(records, answers, strict=True)
+        ]
 
 
 def evaluate(choices: Sequence[Choice]) -> SliceResult:
