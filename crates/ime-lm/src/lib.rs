@@ -76,35 +76,17 @@ pub enum LmError {
 /// The reserved ids, as the manifest names them.
 #[derive(Debug, Clone, Copy, Deserialize)]
 struct Specials {
-    /// `<pad>`: the training padding, required in the manifest though the
-    /// decoder never feeds it to the model.
-    #[allow(dead_code)]
-    pad: u32,
     bos: u32,
     eos: u32,
     sep: u32,
     unk: u32,
 }
 
-/// Which architecture produced the export, as the manifest names it.
-#[derive(Debug, Clone, Copy, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum Arch {
-    Lstm,
-    Transformer,
-}
-
-/// `charlm.json`.
+/// `charlm.json`, the fields the run consults; the manifest also records the
+/// training step, the architecture and the restricted alphabet size, which
+/// the tensor names and the log-probability rows already carry.
 #[derive(Debug, Deserialize)]
 struct Manifest {
-    /// The training step the export was taken from; provenance the run does not
-    /// consult.
-    #[allow(dead_code)]
-    step: u64,
-    /// The architecture the tensors belong to; the tensor names drive the run
-    /// either way, so this exists only for the manifest to be checked against.
-    #[allow(dead_code)]
-    arch: Arch,
     context_chars: usize,
     /// Names of the tensors `prefill` produces and every beam of a record
     /// shares: empty for the LSTM, the key/value cache over the prelude for the
@@ -114,11 +96,6 @@ struct Manifest {
     /// key/value cache over the sentence so far for the transformer.
     state: Vec<String>,
     specials: Specials,
-    /// How many alphabet ids the export's distribution covers, when it was
-    /// restricted to the emittable characters; the log-probability rows carry
-    /// it already.
-    #[allow(dead_code)]
-    restricted_to: Option<usize>,
     chars: Vec<String>,
 }
 

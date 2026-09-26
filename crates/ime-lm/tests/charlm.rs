@@ -61,8 +61,11 @@ fn run(arch: &str) {
     .expect("expected.json parses");
     assert_eq!(expected.beams.len(), 2, "the fixture has two beams");
 
-    let mut states = vec![model.start(Some(&expected.context))];
-    assert_close(states[0].log_probs(), &expected.prefill, "prefill");
+    let start = model.start(Some(&expected.context));
+    assert_close(start.log_probs(), &expected.prefill, "prefill");
+    // Every beam of a record starts from the same state; two clones of it are
+    // the two beams the fixture recorded.
+    let mut states = vec![start.clone(), start];
 
     let steps = expected.beams[0].chars().count();
     assert_eq!(expected.steps.len(), steps, "one expected row set per step");
@@ -83,7 +86,22 @@ fn run(arch: &str) {
                 )
             })
             .collect();
+        assert_eq!(
+            batch.len(),
+            expected.beams.len(),
+            "every beam is fed a token"
+        );
         states = model.advance(&batch);
+        assert_eq!(
+            states.len(),
+            expected.beams.len(),
+            "one state per beam comes back"
+        );
+        assert_eq!(
+            expected.steps[position].len(),
+            states.len(),
+            "one row per beam"
+        );
         for (row, state) in states.iter().enumerate() {
             assert_close(
                 state.log_probs(),
