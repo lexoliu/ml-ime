@@ -544,13 +544,16 @@ impl Transition for CharLm {
 /// also spread its matrix products over threads or held a private buffer
 /// arena would oversubscribe the machine. Memory patterns pool a session's
 /// activations into one reservation, which measured both slower and ~150 MB
-/// heavier here than letting each buffer come and go.
+/// heavier here than letting each buffer come and go. `Level2` keeps every
+/// fusion the step graph benefits from and measured a hair faster than
+/// `Level3`.
 fn session_builder() -> ort::Result<ort::session::builder::SessionBuilder> {
     Ok(Session::builder()?
-        .with_optimization_level(GraphOptimizationLevel::Level3)?
+        .with_optimization_level(GraphOptimizationLevel::Level2)?
         .with_memory_pattern(false)?
         .with_parallel_execution(false)?
-        .with_intra_threads(1)?)
+        .with_intra_threads(1)?
+        .with_config_entry("session.enable_cpu_mem_arena", "0")?)
 }
 
 /// Open a session for a shared graph. *weights* is the one container the
@@ -561,9 +564,7 @@ fn open_session(
     weights: &PrepackedWeights,
     initializers: &[(String, Arc<DynValue>)],
 ) -> ort::Result<Session> {
-    let mut builder = session_builder()?
-        .with_config_entry("session.enable_cpu_mem_arena", "0")?
-        .with_prepacked_weights(weights)?;
+    let mut builder = session_builder()?.with_prepacked_weights(weights)?;
     for (name, value) in initializers {
         builder = builder.with_initializer(name, Arc::clone(value))?;
     }
