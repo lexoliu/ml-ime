@@ -211,6 +211,9 @@ enum WeightDtype {
     /// IEEE-754 single precision, little-endian, four bytes per element.
     #[serde(rename = "float32")]
     Float32,
+    /// Signed 8-bit integer, the dynamic-quantized `MatMul` weights' element.
+    #[serde(rename = "int8")]
+    Int8,
     /// Signed 64-bit integer, little-endian.
     #[serde(rename = "int64")]
     Int64,
@@ -541,13 +544,16 @@ impl Transition for CharLm {
 /// also spread its matrix products over threads or held a private buffer
 /// arena would oversubscribe the machine. Memory patterns pool a session's
 /// activations into one reservation, which measured both slower and ~150 MB
-/// heavier here than letting each buffer come and go.
+/// heavier here than letting each buffer come and go. `Level2` keeps every
+/// fusion the step graph benefits from and measured a hair faster than
+/// `Level3`.
 fn session_builder() -> ort::Result<ort::session::builder::SessionBuilder> {
     Ok(Session::builder()?
-        .with_optimization_level(GraphOptimizationLevel::Level3)?
+        .with_optimization_level(GraphOptimizationLevel::Level2)?
         .with_memory_pattern(false)?
         .with_parallel_execution(false)?
-        .with_intra_threads(1)?)
+        .with_intra_threads(1)?
+        .with_config_entry("session.enable_cpu_mem_arena", "0")?)
 }
 
 /// Open a session for a shared graph. *weights* is the one container the
@@ -558,9 +564,7 @@ fn open_session(
     weights: &PrepackedWeights,
     initializers: &[(String, Arc<DynValue>)],
 ) -> ort::Result<Session> {
-    let mut builder = session_builder()?
-        .with_config_entry("session.enable_cpu_mem_arena", "0")?
-        .with_prepacked_weights(weights)?;
+    let mut builder = session_builder()?.with_prepacked_weights(weights)?;
     for (name, value) in initializers {
         builder = builder.with_initializer(name, Arc::clone(value))?;
     }
@@ -613,56 +617,72 @@ fn shared_values(map: &Mmap, table: &WeightsFile) -> Result<Vec<(String, Arc<Dyn
     )?;
     let mut values = Vec::with_capacity(table.tensors.len());
     for tensor in &table.tensors {
-        // Only the float tensors become shared `OrtValue`s; the runtime reads
-        // any other dtype out of the mapped file itself.
-        if tensor.dtype != WeightDtype::Float32 {
-            continue;
+        // Only the element types the graphs read as weights become shared
+        // `OrtValue`s; the runtime reads any other dtype out of the mapped
+        // file itself.
+        match tensor.dtype {
+            WeightDtype::Float32 => {
+                shared_value::<f32>(map, &info, tensor, &mismatched, &mut values)?;
+            }
+            WeightDtype::Int8 => {
+                shared_value::<i8>(map, &info, tensor, &mismatched, &mut values)?;
+            }
+            WeightDtype::Int64 => {}
         }
-        let start = usize::try_from(tensor.offset)
-            .map_err(|_| mismatched(format!("the offset of {} overflows usize", tensor.name)))?;
-        let length = usize::try_from(tensor.length)
-            .map_err(|_| mismatched(format!("the length of {} overflows usize", tensor.name)))?;
-        let end = start.checked_add(length);
-        if end.is_none_or(|end| map.get(start..end).is_none()) {
-            return Err(mismatched(format!(
-                "the extent of {} runs past {} bytes",
-                tensor.name,
-                map.len()
-            )));
-        }
-        let elements = tensor.shape.iter().try_fold(1usize, |count, &axis| {
-            count.checked_mul(usize::try_from(axis).ok()?)
-        });
-        if elements.is_none_or(|count| count * size_of::<f32>() != length) {
-            return Err(mismatched(format!(
-                "the extent of {} does not match its shape {:?}",
-                tensor.name, tensor.shape
-            )));
-        }
-        // Safety: the extent is bounds- and shape-checked above, and `map` is
-        // held by `CharLm` in a field that drops after every session and value
-        // built from it. The export pads nothing between tensors, so any
-        // offset is `f32`-aligned because every extent is a whole number of
-        // `f32`s.
-        let data = unsafe { map.as_ptr().add(start) }
-            .cast_mut()
-            .cast::<std::ffi::c_void>();
-        let view = unsafe {
-            TensorRefMut::<f32>::from_raw(
-                info.clone(),
-                data,
-                Shape::new(tensor.shape.iter().copied()),
-            )
-        }?;
-        let ort_ptr = NonNull::new(AsPointer::ptr(&*view).cast_mut())
-            .ok_or_else(|| mismatched(format!("{} has no underlying OrtValue", tensor.name)))?;
-        // `from_raw` borrowed only in the type: the `OrtValue` is ours. Hand
-        // its ownership to a `DynValue` that every session shares.
-        std::mem::forget(view);
-        let value = unsafe { DynValue::from_ptr(ort_ptr, None) };
-        values.push((tensor.name.clone(), Arc::new(value)));
     }
     Ok(values)
+}
+
+/// The shared `OrtValue` of one tensor of *table*: bounds- and shape-checked
+/// against *map*, then handed to every session of the graph as a
+/// `TensorRefMut` whose data pointer addresses the mapping.
+fn shared_value<T: ort::value::PrimitiveTensorElementType + std::fmt::Debug>(
+    map: &Mmap,
+    info: &MemoryInfo,
+    tensor: &WeightTensor,
+    mismatched: &impl Fn(String) -> LmError,
+    values: &mut Vec<(String, Arc<DynValue>)>,
+) -> Result<(), LmError> {
+    let start = usize::try_from(tensor.offset)
+        .map_err(|_| mismatched(format!("the offset of {} overflows usize", tensor.name)))?;
+    let length = usize::try_from(tensor.length)
+        .map_err(|_| mismatched(format!("the length of {} overflows usize", tensor.name)))?;
+    let end = start.checked_add(length);
+    if end.is_none_or(|end| map.get(start..end).is_none()) {
+        return Err(mismatched(format!(
+            "the extent of {} runs past {} bytes",
+            tensor.name,
+            map.len()
+        )));
+    }
+    let elements = tensor.shape.iter().try_fold(1usize, |count, &axis| {
+        count.checked_mul(usize::try_from(axis).ok()?)
+    });
+    if elements.is_none_or(|count| count * size_of::<T>() != length) {
+        return Err(mismatched(format!(
+            "the extent of {} does not match its shape {:?}",
+            tensor.name, tensor.shape
+        )));
+    }
+    // Safety: the extent is bounds- and shape-checked above, and `map` is
+    // held by `CharLm` in a field that drops after every session and value
+    // built from it. The export writes the weights file largest-element
+    // first, so every offset is a multiple of its tensor's element size and
+    // the pointer is aligned for `T`.
+    let data = unsafe { map.as_ptr().add(start) }
+        .cast_mut()
+        .cast::<std::ffi::c_void>();
+    let view = unsafe {
+        TensorRefMut::<T>::from_raw(info.clone(), data, Shape::new(tensor.shape.iter().copied()))
+    }?;
+    let ort_ptr = NonNull::new(AsPointer::ptr(&*view).cast_mut())
+        .ok_or_else(|| mismatched(format!("{} has no underlying OrtValue", tensor.name)))?;
+    // `from_raw` borrowed only in the type: the `OrtValue` is ours. Hand its
+    // ownership to a `DynValue` that every session shares.
+    std::mem::forget(view);
+    let value = unsafe { DynValue::from_ptr(ort_ptr, None) };
+    values.push((tensor.name.clone(), Arc::new(value)));
+    Ok(())
 }
 
 /// A tensor dimension as ONNX Runtime spells it.

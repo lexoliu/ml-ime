@@ -30,7 +30,7 @@ import time
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import onnx
@@ -592,6 +592,16 @@ def _externalize(graph: Path, location: str) -> onnx.ModelProto:
     """
     (graph.parent / location).unlink(missing_ok=True)  # appends otherwise
     model = onnx.load(str(graph))
+    # The file is written back-to-back in initializer order, so a tensor's
+    # offset stays a multiple of its element size when larger elements go
+    # first -- the Rust side hands the runtime raw pointers into the mapped
+    # file, which must be aligned for their dtype.
+    initializers = sorted(
+        model.graph.initializer,
+        key=lambda tensor: -onnx.helper.tensor_dtype_to_np_dtype(tensor.data_type).itemsize,
+    )
+    model.graph.ClearField("initializer")
+    model.graph.initializer.extend(initializers)
     onnx.external_data_helper.convert_model_to_external_data(
         model,
         all_tensors_to_one_file=True,
@@ -665,7 +675,31 @@ def _external_weights(step_graph: Path, prefill_graph: Path) -> dict[str, Any]:
     return {"file": "charlm.weights", "tensors": list(step_table.values())}
 
 
-def export_onnx(checkpoint: Path, out_dir: Path, restrict: Path | None = None) -> tuple[Path, Path]:
+def _quantize_dynamic_int8(graph: Path) -> None:
+    """Rewrite *graph* in place with every MatMul weight dynamic-quantized to int8."""
+    from onnxruntime.quantization import QuantType, quantize_dynamic
+
+    quantized = graph.with_suffix(".quantized.onnx")
+    quantize_dynamic(
+        graph,
+        quantized,
+        op_types_to_quantize=["MatMul"],
+        per_channel=True,
+        # Seven-bit weights: x86 kernels without VNNI multiply u8 x s8 into a
+        # saturating 16-bit lane and full-range int8 overflows it (0.12 nats
+        # off on the fixture), while arm64 loses nothing measurable (0.029).
+        reduce_range=True,
+        weight_type=QuantType.QInt8,
+    )
+    quantized.replace(graph)
+
+
+def export_onnx(
+    checkpoint: Path,
+    out_dir: Path,
+    restrict: Path | None = None,
+    quantize: Literal["int8"] | None = None,
+) -> tuple[Path, Path]:
     """Write the step graph, the prefill graph and their manifest for the Rust decoder.
 
     ``charlm.onnx`` takes ``token [B]``, the prefix tensors (one row each,
@@ -680,7 +714,13 @@ def export_onnx(checkpoint: Path, out_dir: Path, restrict: Path | None = None) -
     initializers coincide, otherwise one file per graph -- which the manifest's
     ``weights`` table maps name-by-name so the Rust decoder can share one
     mapping across its sessions.
+
+    With ``quantize="int8"`` every MatMul's weight is dynamic-quantized to
+    int8 (per channel) between the torch export and externalisation; the
+    manifest table then also carries ``int8`` tensors.
     """
+    if quantize not in (None, "int8"):
+        raise ValueError(f"quantize must be 'int8' or None, got {quantize!r}")
     device = torch.device("cpu")
     model, vocab, step = load_model(checkpoint, device)
     model.eval()
@@ -730,6 +770,9 @@ def export_onnx(checkpoint: Path, out_dir: Path, restrict: Path | None = None) -
         opset_version=17,
         dynamo=False,
     )
+    if quantize == "int8":
+        _quantize_dynamic_int8(step_graph)
+        _quantize_dynamic_int8(prefill_graph)
     weights = _external_weights(step_graph, prefill_graph)
     manifest = out_dir / "charlm.json"
     manifest.write_text(
