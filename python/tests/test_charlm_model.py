@@ -1,6 +1,7 @@
 """Both character LMs: the step graph agrees with the forward pass, the exported graphs
 agree with torch, and a stream of batches resumes from a saved position."""
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -106,7 +107,7 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
     restrict = tmp_path / "emittable.txt"
     restrict.write_text("\n".join(CHARS[:4]) + "\n", encoding="utf-8")
     export_onnx(checkpoint, tmp_path / "export", restrict)
-    manifest = __import__("json").loads((tmp_path / "export" / "charlm.json").read_text())
+    manifest = json.loads((tmp_path / "export" / "charlm.json").read_text())
     assert manifest["arch"] == arch
     assert manifest["restricted_to"] == 5  # four characters plus <eos>
     weights = manifest["weights"]
@@ -158,6 +159,41 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
             expected = restricted(features)[0].numpy()
             np.testing.assert_allclose(log_probs[row], expected, atol=1e-4, rtol=1e-4)
     assert (log_probs[:, VOCAB.index["谢"]] == Restricted.UNREACHABLE).all()
+
+
+def _run_export(dir: Path) -> list[np.ndarray]:
+    """The ``log_probs`` rows of an export over the fixture prelude and two beams."""
+    manifest = json.loads((dir / "charlm.json").read_text())
+    prefill = ort.InferenceSession(str(dir / "prefill.onnx"))
+    step = ort.InferenceSession(str(dir / "charlm.onnx"))
+    prelude = [BOS, *_tokens("你", "好"), SEP]
+    outputs = prefill.run(None, {"tokens": np.array([prelude], dtype=np.int64)})
+    names = ["log_probs", *manifest["prefix"], *manifest["state"]]
+    by_name = dict(zip(names, outputs, strict=True))
+    prefix = {name: by_name[name] for name in manifest["prefix"]}
+    state = {name: np.repeat(by_name[name], 2, axis=0) for name in manifest["state"]}
+    rows = [by_name["log_probs"]]
+    beams = (_tokens("我", "吗"), _tokens("你", "好"))
+    for position in range(len(beams[0])):
+        token = np.array([beam[position] for beam in beams], dtype=np.int64)
+        outputs = step.run(None, {"token": token, **prefix, **state})
+        rows.append(outputs[0])
+        state = dict(zip(manifest["state"], outputs[1:], strict=True))
+    return rows
+
+
+def test_int8_export_scores_within_005_nats_of_fp32(tmp_path: Path) -> None:
+    """The dynamic-quantized graphs load in onnxruntime and track the fp32 export."""
+    checkpoint = tmp_path / "charlm-final.pt"
+    _checkpoint(checkpoint, "transformer")
+    restrict = tmp_path / "emittable.txt"
+    restrict.write_text("\n".join(CHARS[:4]) + "\n", encoding="utf-8")
+    export_onnx(checkpoint, tmp_path / "fp32", restrict)
+    export_onnx(checkpoint, tmp_path / "int8", restrict, quantize="int8")
+    quantized = _run_export(tmp_path / "int8")
+    reference = _run_export(tmp_path / "fp32")
+    for got, want in zip(quantized, reference, strict=True):
+        np.testing.assert_allclose(got, want, atol=0.05)
 
 
 def _shard(path: Path, rows: int, seed: int) -> None:

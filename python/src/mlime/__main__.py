@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import typer
 
@@ -650,13 +650,16 @@ def export_char_lm(
     restrict: Path = typer.Option(
         None, help="Normalise over these characters (one per line, e.g. emittable.txt) plus <eos>"
     ),
+    quantize: Literal["int8"] | None = typer.Option(
+        None, help="Quantize the MatMul weights ('int8' dynamic, per channel)"
+    ),
     verbose: bool = VERBOSE,
 ) -> None:
     """Export the step graph and manifest the Rust decoder loads."""
     configure(verbose)
     from mlime.train.charlm import export_onnx
 
-    graph, manifest = export_onnx(checkpoint, out, restrict)
+    graph, manifest = export_onnx(checkpoint, out, restrict, quantize)
     typer.echo(f"{graph}\n{manifest}")
 
 

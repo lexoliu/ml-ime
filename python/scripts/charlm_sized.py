@@ -17,6 +17,7 @@ import itertools
 import sys
 import tempfile
 from pathlib import Path
+from typing import Literal, cast
 
 import torch
 
@@ -61,6 +62,7 @@ CHAR_PINYIN = "".join(f"{ch}\ta\n" for ch in VOCAB.chars[len(SPECIALS) : len(SPE
 
 def main() -> None:
     out = Path(sys.argv[1])
+    quantize = cast(Literal["int8"], sys.argv[2]) if len(sys.argv) > 2 else None
     out.mkdir(parents=True, exist_ok=True)
     (out / "char_pinyin.tsv").write_text(CHAR_PINYIN, encoding="utf-8")
     torch.manual_seed(2)
@@ -73,7 +75,7 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         checkpoint = Path(tmp) / "charlm-final.pt"
         save_checkpoint(checkpoint, model, VOCAB, progress, optimizer, scheduler, scaler, training)
-        export_onnx(checkpoint, out)
+        export_onnx(checkpoint, out, quantize=quantize)
     log.info("wrote sized export", dir=str(out))
 
 

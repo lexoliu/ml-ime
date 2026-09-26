@@ -212,18 +212,31 @@ class Block(nn.Module):
         return self.merge(x, attended)
 
     def attend(
-        self, x: torch.Tensor, keys: torch.Tensor, values: torch.Tensor
+        self,
+        x: torch.Tensor,
+        prefix_keys: torch.Tensor,
+        prefix_values: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """One new position ``x [B, 1, H]`` against the cached ``keys``/``values`` and itself.
+        """One new position ``x [B, 1, H]`` against the two caches and itself.
 
-        Written with plain matrix products so the step graph exports as a
-        handful of ONNX operators. Returns the output and the new key/value.
+        ``prefix_keys``/``prefix_values`` hold the context's positions and
+        ``keys``/``values`` the sentence's; scoring them separately and
+        concatenating only the scores keeps the prefix cache out of the step's
+        copies. Written with plain matrix products so the step graph exports
+        as a handful of ONNX operators. Returns the output and the new
+        key/value.
         """
         q, k, v = self.split(x)
-        all_keys = torch.cat([keys, k], dim=2)
-        all_values = torch.cat([values, v], dim=2)
-        scores = (q @ all_keys.transpose(-1, -2)) / math.sqrt(self.head_dim)
-        attended = torch.softmax(scores, dim=-1) @ all_values
+        keys = torch.cat([keys, k], dim=2)
+        values = torch.cat([values, v], dim=2)
+        scores = torch.cat(
+            [q @ prefix_keys.transpose(-1, -2), q @ keys.transpose(-1, -2)], dim=-1
+        ) / math.sqrt(self.head_dim)
+        probs = torch.softmax(scores, dim=-1)
+        split = prefix_keys.shape[2]
+        attended = probs[..., :split] @ prefix_values + probs[..., split:] @ values
         return self.merge(x, attended), k, v
 
 
@@ -304,18 +317,19 @@ class TransformerCharLm(CharLm):
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         prefix_keys, prefix_values = prefix
         keys, values = state
-        batch = token.shape[0]
         first = prefix_keys.shape[3] + keys.shape[3]
         x = self.embed_at(token.unsqueeze(1), first)
         new_keys, new_values = [], []
         for layer, block in enumerate(self.layers()):
-            cached_keys = torch.cat(
-                [prefix_keys[:, layer].expand(batch, -1, -1, -1), keys[:, layer]], 2
+            # The prefix stays one row: ``MatMul`` broadcasts it over the
+            # batch where an ``Expand`` would materialise a per-beam copy.
+            x, k, v = block.attend(
+                x,
+                prefix_keys[:, layer],
+                prefix_values[:, layer],
+                keys[:, layer],
+                values[:, layer],
             )
-            cached_values = torch.cat(
-                [prefix_values[:, layer].expand(batch, -1, -1, -1), values[:, layer]], 2
-            )
-            x, k, v = block.attend(x, cached_keys, cached_values)
             new_keys.append(k)
             new_values.append(v)
         keys = torch.cat([keys, torch.stack(new_keys, dim=1)], dim=3)
