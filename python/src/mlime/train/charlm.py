@@ -685,7 +685,10 @@ def _quantize_dynamic_int8(graph: Path) -> None:
         quantized,
         op_types_to_quantize=["MatMul"],
         per_channel=True,
-        reduce_range=False,
+        # Seven-bit weights: x86 kernels without VNNI multiply u8 x s8 into a
+        # saturating 16-bit lane and full-range int8 overflows it (0.12 nats
+        # off on the fixture), while arm64 loses nothing measurable (0.029).
+        reduce_range=True,
         weight_type=QuantType.QInt8,
     )
     quantized.replace(graph)
