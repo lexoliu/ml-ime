@@ -1814,11 +1814,15 @@ version = "0.1.0"
 dependencies = [
  "ime-decode",
  "ime-pinyin",
+ "memmap2",
  "ort",
+ "rand 0.9.5",
  "serde",
  "serde_json",
  "thiserror",
  "thread_local",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

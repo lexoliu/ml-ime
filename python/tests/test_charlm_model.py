@@ -4,6 +4,7 @@ agree with torch, and a stream of batches resumes from a saved position."""
 from pathlib import Path
 
 import numpy as np
+import onnx
 import onnxruntime as ort
 import polars as pl
 import pytest
@@ -108,6 +109,29 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
     manifest = __import__("json").loads((tmp_path / "export" / "charlm.json").read_text())
     assert manifest["arch"] == arch
     assert manifest["restricted_to"] == 5  # four characters plus <eos>
+    weights = manifest["weights"]
+    # One table shared by both graphs, or one per graph.
+    tables = {"step": weights, "prefill": weights} if "file" in weights else weights
+    for graph in ("step", "prefill"):
+        file = tmp_path / "export" / tables[graph]["file"]
+        assert file.is_file()
+        blob = file.read_bytes()
+        proto = onnx.load(
+            tmp_path / "export" / ("prefill.onnx" if graph == "prefill" else "charlm.onnx"),
+            load_external_data=False,
+        )
+        external = {
+            t.name for t in proto.graph.initializer if t.data_location == onnx.TensorProto.EXTERNAL
+        }
+        assert external == {t["name"] for t in tables[graph]["tensors"]}
+        for tensor in tables[graph]["tensors"]:
+            size = np.dtype(tensor["dtype"]).itemsize
+            assert np.prod(tensor["shape"]) * size == tensor["length"]
+            extent = blob[tensor["offset"] : tensor["offset"] + tensor["length"]]
+            assert len(extent) == tensor["length"]
+    # ort reads the initializers out of the weights file, so loading the
+    # graphs at all proves the external references resolve; the torch match
+    # below proves they hold the right bytes.
     prefill = ort.InferenceSession(str(tmp_path / "export" / "prefill.onnx"))
     step = ort.InferenceSession(str(tmp_path / "export" / "charlm.onnx"))
     prelude = [BOS, *_tokens("你", "好"), SEP]

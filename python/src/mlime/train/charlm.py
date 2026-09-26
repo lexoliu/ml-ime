@@ -32,6 +32,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import onnx
+import onnx.external_data_helper
 import polars as pl
 import torch
 from torch import nn
@@ -563,6 +566,105 @@ def batch_axes(names: Sequence[str], axis: int = 0) -> dict[str, dict[int, str]]
     return {name: {axis: "batch"} for name in names}
 
 
+def _external_tensors(model: onnx.ModelProto) -> Iterator[onnx.TensorProto]:
+    """Every initializer of *model*, nested subgraphs included, backed by external data."""
+    graphs = [model.graph]
+    while graphs:
+        graph = graphs.pop()
+        for tensor in graph.initializer:
+            if tensor.data_location == onnx.TensorProto.EXTERNAL:
+                yield tensor
+        for node in graph.node:
+            for attribute in node.attribute:
+                if attribute.HasField("g"):
+                    graphs.append(attribute.g)
+                graphs.extend(attribute.graphs)
+
+
+def _externalize(graph: Path, location: str) -> onnx.ModelProto:
+    """Move every initializer of *graph* into the *location* file beside it.
+
+    *location* is relative to the graph's directory. Returns the saved model
+    reloaded without its external data (``load_external_data=False`` keeps the
+    ``external_data`` entries; a plain ``onnx.load`` folds the bytes back into
+    ``raw_data`` and strips them), so the callers read offsets and lengths of
+    what was written, not of the in-memory proto.
+    """
+    (graph.parent / location).unlink(missing_ok=True)  # appends otherwise
+    model = onnx.load(str(graph))
+    onnx.external_data_helper.convert_model_to_external_data(
+        model,
+        all_tensors_to_one_file=True,
+        location=location,
+        size_threshold=0,
+        convert_attribute=False,
+    )
+    onnx.save_model(model, str(graph))
+    return onnx.load(str(graph), load_external_data=False)
+
+
+def _weights_table(model: onnx.ModelProto) -> dict[str, dict[str, Any]]:
+    """The manifest's tensor table of a saved externalized model, keyed by name."""
+    table = {}
+    for tensor in _external_tensors(model):
+        entries = {entry.key: entry.value for entry in tensor.external_data}
+        table[tensor.name] = {
+            "name": tensor.name,
+            "dtype": np.dtype(onnx.helper.tensor_dtype_to_np_dtype(tensor.data_type)).name,
+            "shape": list(tensor.dims),
+            "offset": int(entries.get("offset", "0")),
+            "length": int(entries["length"]),
+        }
+    return table
+
+
+def _external_weights(step_graph: Path, prefill_graph: Path) -> dict[str, Any]:
+    """Externalize both graphs' weights and return the manifest's ``weights`` value.
+
+    The step and prefill graphs are built from the same parameters, so when
+    their initializer names coincide both point into one ``charlm.weights``;
+    a tensor of one name whose bytes differ fails the export. When the names
+    differ each graph gets its own weights file and the manifest holds one
+    table per graph under ``step``/``prefill``.
+    """
+    step_model = _externalize(step_graph, "charlm.weights")
+    prefill_model = _externalize(prefill_graph, "prefill.weights")
+    step_table = _weights_table(step_model)
+    prefill_table = _weights_table(prefill_model)
+    if set(prefill_table) != set(step_table):
+        log.info("step and prefill tensors differ by name: one weights file each")
+        return {
+            "step": {"file": "charlm.weights", "tensors": list(step_table.values())},
+            "prefill": {"file": "prefill.weights", "tensors": list(prefill_table.values())},
+        }
+    dir = step_graph.parent
+    step_bytes = (dir / "charlm.weights").read_bytes()
+    prefill_bytes = (dir / "prefill.weights").read_bytes()
+    for name, entry in prefill_table.items():
+        theirs = step_table[name]
+        a = prefill_bytes[entry["offset"] : entry["offset"] + entry["length"]]
+        b = step_bytes[theirs["offset"] : theirs["offset"] + theirs["length"]]
+        if a != b:
+            raise ValueError(f"tensor {name!r} differs between the step and prefill graphs")
+    # Repoint every prefill tensor at the shared file's extent of the same
+    # name. The model is serialized directly rather than through
+    # ``onnx.save_model``, which would rewrite the weights file from the
+    # (unloaded) ``raw_data`` fields.
+    for tensor in _external_tensors(prefill_model):
+        entry = step_table[tensor.name]
+        for pair in tensor.external_data:
+            if pair.key == "location":
+                pair.value = "charlm.weights"
+            elif pair.key == "offset":
+                pair.value = str(entry["offset"])
+            elif pair.key == "length":
+                pair.value = str(entry["length"])
+    prefill_graph.write_bytes(prefill_model.SerializeToString())
+    (dir / "prefill.weights").unlink()
+    log.info("step and prefill share charlm.weights", tensors=len(step_table))
+    return {"file": "charlm.weights", "tensors": list(step_table.values())}
+
+
 def export_onnx(checkpoint: Path, out_dir: Path, restrict: Path | None = None) -> tuple[Path, Path]:
     """Write the step graph, the prefill graph and their manifest for the Rust decoder.
 
@@ -573,6 +675,11 @@ def export_onnx(checkpoint: Path, out_dir: Path, restrict: Path | None = None) -
     tensors. ``prefill.onnx`` takes ``tokens [1, T]`` and returns the same
     ``log_probs``, the prefix tensors and the state tensors to start from.
     ``charlm.json`` names the tensors and holds the alphabet in id order.
+    The graphs' initializers live in an external weights file beside the
+    graphs -- ``charlm.weights``, shared when the step and prefill
+    initializers coincide, otherwise one file per graph -- which the manifest's
+    ``weights`` table maps name-by-name so the Rust decoder can share one
+    mapping across its sessions.
     """
     device = torch.device("cpu")
     model, vocab, step = load_model(checkpoint, device)
@@ -623,6 +730,7 @@ def export_onnx(checkpoint: Path, out_dir: Path, restrict: Path | None = None) -
         opset_version=17,
         dynamo=False,
     )
+    weights = _external_weights(step_graph, prefill_graph)
     manifest = out_dir / "charlm.json"
     manifest.write_text(
         json.dumps(
@@ -634,6 +742,7 @@ def export_onnx(checkpoint: Path, out_dir: Path, restrict: Path | None = None) -
                 "state": list(state_names),
                 "specials": {"pad": PAD, "bos": BOS, "eos": EOS, "sep": SEP, "unk": UNK},
                 "restricted_to": None if keep is None else int(keep.numel()),
+                "weights": weights,
                 "chars": list(vocab.chars),
             },
             ensure_ascii=False,
