@@ -164,12 +164,14 @@ target/release/ime-cli fused-eval --model data/run3/ngram.bin \
 ... --model data/run3/ngram.bin --lm data/char-lm-run/char-lm --lm-weight 1 --scores <scores> --weight <best>
 ```
 
-`--lm <dir>` points at the `charlm.onnx` + `charlm.json` pair that `mlime export
-char-lm` writes (the `char-lm` Kaggle kernel produces it). Given alone it
-replaces the trigram; given with `--model` it is added to the trigram at
-`--lm-weight w` (default 1), and the neural `--weight` sweep then runs over the
-pair. The decoder keeps one recurrent state per beam, so a run with `--lm` is
-slower than the trigram by roughly the model's step cost times the beam.
+`--lm <dir>` points at the `prefill.onnx` + `charlm.onnx` + `charlm.json` set
+that `mlime export char-lm` writes (the `char-lm` Kaggle kernel produces it):
+`prefill.onnx` reads the prelude once per record, `charlm.onnx` advances the
+surviving beams a step at a time. Given alone it replaces the trigram; given
+with `--model` it is added to the trigram at `--lm-weight w` (default 1), and
+the neural `--weight` sweep then runs over the pair. The decoder keeps one
+state per beam, so a run with `--lm` is slower than the trigram by roughly the
+model's step cost times the beam.
 
 `--dump <dir>` writes every record's beam as JSONL; `mlime eval rescore` reranks
 such a dump through the `MLIME_LLM_*` endpoint (`notes/rescore-ceiling.md`), and

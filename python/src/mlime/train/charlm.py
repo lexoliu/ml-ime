@@ -1,26 +1,24 @@
-"""A character-level language model for the decoder's transition.
+"""Train and export a character-level language model for the decoder's transition.
 
 The route A v2 evaluation put the limit of the fused decoder in one place: the
 transition. The trigram reads two characters back, the fill tower's emissions
 are independent per position, and between them the beam keeps one good
 hypothesis and seven near-copies of it, which on abbreviated input is not the
-sentence the user meant. This module trains the model that replaces the
-trigram: a recurrent language model over the same characters, conditioned on
-the same context the context tower sees, with a state per beam that the Rust
-decoder carries forward one character at a time.
-
-Recurrent rather than attention-based on purpose. The decoder advances every
-beam by one character per position and merges beams by their last characters;
-a state that is a fixed vector per beam costs the same to carry whether the
-sentence is three characters or thirty, and a step is one matrix product, which
-is what an input method can afford per keystroke.
+sentence the user meant. The models here (:mod:`mlime.train.charlm_model`)
+replace the trigram: a language model over the same characters, conditioned
+on the same context the context tower sees, with a state per beam that the
+Rust decoder carries forward one character at a time.
 
 A training sequence is ``<bos> context <sep> text <eos>`` over the characters
 of ``char_pinyin.tsv`` (the Rust lexicon's alphabet) with everything else
 mapped to ``<unk>``; the loss is taken at every position after ``<bos>``, so
 the context is training data as well as conditioning. At decode time the
-decoder feeds the context and ``<sep>`` through the model once, and the state
-after ``<sep>`` is the start of every beam.
+decoder feeds the context and ``<sep>`` through the model's prefill graph
+once, and what comes out is the start of every beam.
+
+A run is resumable: the checkpoint holds the optimiser, the schedule, the loss
+scaler and each rank's place in its stream of batches, so a session that ends
+at a wall budget continues in the next one from the batch after the last.
 """
 
 from __future__ import annotations
@@ -32,6 +30,7 @@ import time
 from collections.abc import Iterator, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import polars as pl
 import torch
@@ -40,146 +39,32 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import IterableDataset
 
 from mlime.logging import log
-from mlime.train.lexicon import read_char_readings
+from mlime.train.charlm_model import (
+    DEFAULT_CONTEXT_CHARS,
+    CharLm,
+    CharLmConfig,
+    PrefillModule,
+    StepModule,
+    build,
+)
+from mlime.train.charlm_vocab import BOS, EOS, PAD, SEP, UNK, CharVocab
 from mlime.train.loop import Distributed, MetricLog, agreed, cosine_with_warmup, seed_everything
 from mlime.train.run import Slices
 from mlime.train.samples import context_tail
 
-#: The reserved ids, in order; every character of the lexicon follows them.
-SPECIALS: tuple[str, ...] = ("<pad>", "<bos>", "<eos>", "<sep>", "<unk>")
-PAD, BOS, EOS, SEP, UNK = range(len(SPECIALS))
-
-#: Characters of context a sequence keeps, the end nearest the text. Matches the
-#: context tower's window (64 tokens with its two sentinels).
-DEFAULT_CONTEXT_CHARS = 62
-
-
-@dataclass(frozen=True)
-class CharVocab:
-    """The model's alphabet: the specials, then the lexicon's characters sorted."""
-
-    chars: tuple[str, ...]
-
-    @classmethod
-    def from_char_table(cls, char_table: Path) -> CharVocab:
-        """The alphabet of ``char_pinyin.tsv``, in code point order."""
-        return cls(chars=SPECIALS + tuple(sorted(read_char_readings(char_table))))
-
-    def __post_init__(self) -> None:
-        if self.chars[: len(SPECIALS)] != SPECIALS:
-            raise ValueError("a vocabulary must begin with the reserved ids")
-
-    def __len__(self) -> int:
-        return len(self.chars)
-
-    @property
-    def index(self) -> dict[str, int]:
-        """``{character: id}``; built on demand, cached by the caller that loops."""
-        return {ch: i for i, ch in enumerate(self.chars)}
-
-    def encode(self, text: str, index: dict[str, int]) -> list[int]:
-        """Ids of *text*'s characters, ``<unk>`` for any outside the alphabet."""
-        return [index.get(ch, UNK) for ch in text]
-
-
-@dataclass(frozen=True)
-class CharLmConfig:
-    """The model's shape."""
-
-    embedding: int = 384
-    hidden: int = 1024
-    layers: int = 2
-    dropout: float = 0.1
-    context_chars: int = DEFAULT_CONTEXT_CHARS
-
-    def __post_init__(self) -> None:
-        for name in ("embedding", "hidden", "layers", "context_chars"):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
-        if not 0.0 <= self.dropout < 1.0:
-            raise ValueError(f"dropout must be in [0, 1), got {self.dropout}")
-
-
-class CharLm(nn.Module):
-    """Embedding, LSTM stack, projection back to the embedding, tied output."""
-
-    def __init__(self, vocab_size: int, config: CharLmConfig):
-        super().__init__()
-        self.config = config
-        self.embed = nn.Embedding(vocab_size, config.embedding, padding_idx=PAD)
-        self.lstm = nn.LSTM(
-            config.embedding,
-            config.hidden,
-            num_layers=config.layers,
-            batch_first=True,
-            dropout=config.dropout if config.layers > 1 else 0.0,
-        )
-        self.project = nn.Linear(config.hidden, config.embedding)
-        self.dropout = nn.Dropout(config.dropout)
-
-    def logits(self, features: torch.Tensor) -> torch.Tensor:
-        """Scores over the alphabet from LSTM outputs, through the tied embedding."""
-        scores: torch.Tensor = self.project(self.dropout(features)) @ self.embed.weight.T
-        return scores
-
-    def forward(self, tokens: torch.Tensor) -> torch.Tensor:
-        """Logits for the token after each position of ``tokens`` (``[B, T, V]``)."""
-        features, _ = self.lstm(self.dropout(self.embed(tokens)))
-        return self.logits(features)
-
-    def step(
-        self, token: torch.Tensor, hidden: torch.Tensor, cell: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Advance by one token: log probabilities of the next one and the new state.
-
-        ``token`` is ``[B]``; the states are ``[layers, B, hidden]``.
-        """
-        features, (hidden, cell) = self.lstm(self.embed(token).unsqueeze(1), (hidden, cell))
-        return torch.log_softmax(self.logits(features.squeeze(1)).float(), dim=-1), hidden, cell
-
-    def initial_state(self, batch: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
-        """The all-zero state every sequence starts from."""
-        shape = (self.config.layers, batch, self.config.hidden)
-        return torch.zeros(shape, device=device), torch.zeros(shape, device=device)
-
-
-class StepModule(nn.Module):
-    """``CharLm.step`` as a module of its own, the graph the decoder runs.
-
-    With *keep*, the next-character distribution is taken over those ids only
-    -- the probability of each conditioned on the next character being one of
-    them -- and every other id is scored at ``UNREACHABLE``. The decoder only
-    ever proposes characters the lattice can emit, so restricting the alphabet
-    to them loses nothing and cuts the output projection to their share of it.
-    """
-
-    #: The log probability written for an id outside the kept alphabet: far
-    #: below any real score, finite so sums never turn into NaN.
-    UNREACHABLE = -1.0e9
-
-    def __init__(self, model: CharLm, keep: torch.Tensor | None = None):
-        super().__init__()
-        self.model = model
-        self.keep: torch.Tensor | None
-        if keep is None:
-            self.keep = None
-        else:
-            self.register_buffer("keep", keep)
-            self.register_buffer("kept_weight", model.embed.weight.detach()[keep])
-
-    def forward(
-        self, token: torch.Tensor, hidden: torch.Tensor, cell: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if self.keep is None:
-            return self.model.step(token, hidden, cell)
-        model = self.model
-        features, (hidden, cell) = model.lstm(model.embed(token).unsqueeze(1), (hidden, cell))
-        scores = model.project(features.squeeze(1)) @ self.kept_weight.T
-        kept = torch.log_softmax(scores.float(), dim=-1)
-        batch = token.shape[0]
-        full = torch.full((batch, model.embed.num_embeddings), self.UNREACHABLE)
-        index = self.keep.unsqueeze(0).expand(batch, -1)
-        return full.scatter(1, index, kept), hidden, cell
+__all__ = [
+    "BOS",
+    "DEFAULT_CONTEXT_CHARS",
+    "EOS",
+    "PAD",
+    "SEP",
+    "UNK",
+    "CharLmConfig",
+    "CharLmTraining",
+    "CharVocab",
+    "export_onnx",
+    "train",
+]
 
 
 def sequence(
@@ -195,13 +80,16 @@ def sequence(
     return ids
 
 
-def read_sequences(shard: Path, vocab_index: dict[str, int], context_chars: int) -> list[list[int]]:
-    """Every row of a samples shard as a training sequence."""
+def read_sequences(
+    shard: Path, vocab_index: dict[str, int], context_chars: int, max_length: int
+) -> list[list[int]]:
+    """Every row of a samples shard as a training sequence, those over *max_length* dropped."""
     frame = pl.read_parquet(shard, columns=["text", "context"])
-    return [
+    sequences = (
         sequence(text, context, vocab_index, context_chars)
         for text, context in zip(frame["text"], frame["context"], strict=True)
-    ]
+    )
+    return [ids for ids in sequences if len(ids) <= max_length]
 
 
 @dataclass(frozen=True)
@@ -226,13 +114,27 @@ def pad_batch(sequences: Sequence[Sequence[int]]) -> Batch:
     return Batch(tokens=tokens[:, :-1], targets=tokens[:, 1:])
 
 
+@dataclass(frozen=True)
+class Position:
+    """A rank's place in its stream of batches: the next batch it will yield."""
+
+    epoch: int = 0
+    shard: int = 0
+    batch: int = 0
+
+    def __post_init__(self) -> None:
+        if min(self.epoch, self.shard, self.batch) < 0:
+            raise ValueError(f"a stream position is not negative, got {self}")
+
+
 class SequenceBatches(IterableDataset[Batch]):
     """Token-budgeted batches over the rank's share of the shards, epoch after epoch.
 
     Shards are dealt round-robin to ranks and shuffled each epoch; rows are
     shuffled within a shard, then batched in length-sorted buckets so a batch's
     padding is small. The seed makes rank *r*'s epoch *e* the same sequence of
-    batches on every machine, which is what a resumed run needs.
+    batches on every machine, which is what a resumed run needs: ``skip_to`` a
+    position and the stream continues from that batch.
     """
 
     def __init__(
@@ -240,6 +142,7 @@ class SequenceBatches(IterableDataset[Batch]):
         shards: Sequence[Path],
         vocab: CharVocab,
         context_chars: int,
+        max_length: int,
         max_tokens: int,
         world: Distributed,
         seed: int,
@@ -250,27 +153,51 @@ class SequenceBatches(IterableDataset[Batch]):
         self.shards = tuple(shards)
         self.vocab_index = vocab.index
         self.context_chars = context_chars
+        self.max_length = max_length
         self.max_tokens = max_tokens
         self.world = world
         self.seed = seed
         self.bucket_rows = bucket_rows
-        self.epoch = 0
+        self.position = Position()
+
+    def skip_to(self, position: Position) -> None:
+        """Start the stream at *position* instead of the beginning."""
+        self.position = position
 
     def __iter__(self) -> Iterator[Batch]:
+        epoch, first_shard, first_batch = (
+            self.position.epoch,
+            self.position.shard,
+            self.position.batch,
+        )
         while True:
-            rng = random.Random(self.seed * 1_000_003 + self.epoch)
+            rng = random.Random(self.seed * 1_000_003 + epoch)
             order = list(self.shards)
             rng.shuffle(order)
             mine = order[self.world.rank :: self.world.world_size]
-            for shard in mine:
-                rows = read_sequences(shard, self.vocab_index, self.context_chars)
+            for shard_index, shard in enumerate(mine):
+                # The shard's rows and batches are shuffled with the epoch's
+                # generator whether or not they are yielded, so a skipped shard
+                # leaves the generator where a yielded one would.
+                rows = read_sequences(shard, self.vocab_index, self.context_chars, self.max_length)
                 rng.shuffle(rows)
+                batches: list[Batch] = []
                 for start in range(0, len(rows), self.bucket_rows):
                     bucket = sorted(rows[start : start + self.bucket_rows], key=len)
-                    batches = list(self._batches(bucket))
-                    rng.shuffle(batches)
-                    yield from batches
-            self.epoch += 1
+                    chunk = list(self._batches(bucket))
+                    rng.shuffle(chunk)
+                    batches.extend(chunk)
+                if shard_index < first_shard:
+                    continue
+                for batch_index, batch in enumerate(batches):
+                    if shard_index == first_shard and batch_index < first_batch:
+                        continue
+                    self.position = Position(epoch, shard_index, batch_index + 1)
+                    yield batch
+                first_batch = 0
+            epoch += 1
+            first_shard = 0
+            self.position = Position(epoch, 0, 0)
 
     def _batches(self, bucket: Sequence[list[int]]) -> Iterator[Batch]:
         batch: list[list[int]] = []
@@ -340,13 +267,18 @@ def held_out_loss(model: CharLm, batches: Sequence[Batch], device: torch.device)
 
 
 def held_out_batches(
-    shards: Sequence[Path], vocab: CharVocab, context_chars: int, max_tokens: int, limit: int
+    shards: Sequence[Path],
+    vocab: CharVocab,
+    context_chars: int,
+    max_length: int,
+    max_tokens: int,
+    limit: int,
 ) -> list[Batch]:
     """The first *limit* rows of the held-out shards, batched like training data."""
     rows: list[list[int]] = []
     index = vocab.index
     for shard in shards:
-        rows.extend(read_sequences(shard, index, context_chars))
+        rows.extend(read_sequences(shard, index, context_chars, max_length))
         if len(rows) >= limit:
             break
     rows = sorted(rows[:limit], key=len)
@@ -361,17 +293,38 @@ def held_out_batches(
     return batches
 
 
+@dataclass(frozen=True)
+class Progress:
+    """Where a run is: the step, the tokens seen, and every rank's stream position."""
+
+    step: int
+    tokens_seen: int
+    positions: tuple[Position, ...]
+
+
 def save_checkpoint(
-    path: Path, model: CharLm, vocab: CharVocab, step: int, optimizer: torch.optim.Optimizer
+    path: Path,
+    model: CharLm,
+    vocab: CharVocab,
+    progress: Progress,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler,
+    scaler: torch.amp.GradScaler,
+    training: CharLmTraining,
 ) -> None:
-    """Weights, shape, alphabet, optimiser and step, in one file."""
+    """Weights, shape, alphabet, optimiser, schedule, scaler and progress, in one file."""
     torch.save(
         {
-            "step": step,
+            "step": progress.step,
+            "tokens_seen": progress.tokens_seen,
+            "positions": [asdict(position) for position in progress.positions],
             "config": asdict(model.config),
+            "training": asdict(training),
             "vocab": list(vocab.chars),
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
+            "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(),
         },
         path,
     )
@@ -381,9 +334,72 @@ def load_model(path: Path, device: torch.device) -> tuple[CharLm, CharVocab, int
     """A model, its alphabet and the step it was saved at, from a checkpoint."""
     state = torch.load(path, map_location=device, weights_only=False)
     vocab = CharVocab(chars=tuple(state["vocab"]))
-    model = CharLm(len(vocab), CharLmConfig(**state["config"])).to(device)
+    model = build(len(vocab), CharLmConfig(**state["config"])).to(device)
     model.load_state_dict(state["model"])
     return model, vocab, int(state["step"])
+
+
+@dataclass(frozen=True)
+class Resumption:
+    """A checkpoint read back and checked, ready to be poured into a fresh run."""
+
+    progress: Progress
+    model: dict[str, Any]
+    optimizer: dict[str, Any]
+    scheduler: dict[str, Any]
+    scaler: dict[str, Any]
+
+    @classmethod
+    def read(
+        cls, path: Path, config: CharLmConfig, training: CharLmTraining, world: Distributed
+    ) -> Resumption:
+        """Load *path* and refuse it unless it is this run, one session earlier."""
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        for name, expected in (("config", asdict(config)), ("training", asdict(training))):
+            saved = dict(state[name])
+            saved.pop("wall_budget_seconds", None)
+            expected = dict(expected)
+            expected.pop("wall_budget_seconds", None)
+            if saved != expected:
+                raise ValueError(
+                    f"{path} was written for {name} {saved} and this run has {expected}; "
+                    "a resumed run keeps every setting but the wall budget"
+                )
+        positions = state["positions"]
+        if len(positions) != world.world_size:
+            raise ValueError(
+                f"{path} was written by a world of {len(positions)} ranks and this one has "
+                f"{world.world_size}; a rank would read shards it has no position for"
+            )
+        step = int(state["step"])
+        if step >= training.max_steps:
+            raise ValueError(
+                f"{path} is already at step {step} of {training.max_steps}: the run is "
+                "complete, and this resume would do nothing"
+            )
+        return cls(
+            progress=Progress(
+                step=step,
+                tokens_seen=int(state["tokens_seen"]),
+                positions=tuple(Position(**position) for position in positions),
+            ),
+            model=state["model"],
+            optimizer=state["optimizer"],
+            scheduler=state["scheduler"],
+            scaler=state["scaler"],
+        )
+
+
+def gather_positions(
+    world: Distributed, position: Position, device: torch.device
+) -> tuple[Position, ...]:
+    """Every rank's stream position, in rank order, on every rank."""
+    if world.world_size == 1:
+        return (position,)
+    mine = torch.tensor([position.epoch, position.shard, position.batch], device=device)
+    gathered = [torch.zeros_like(mine) for _ in range(world.world_size)]
+    torch.distributed.all_gather(gathered, mine)
+    return tuple(Position(*(int(x) for x in row.tolist())) for row in gathered)
 
 
 def train(
@@ -394,8 +410,9 @@ def train(
     config: CharLmConfig,
     training: CharLmTraining,
     world: Distributed,
+    resume: Path | None = None,
 ) -> Path:
-    """Train from scratch and return the path of the final checkpoint."""
+    """Train, from scratch or from *resume*, and return the path of the final checkpoint."""
     world.start()
     device = world.device
     seed_everything(training.seed, world.rank)
@@ -409,7 +426,7 @@ def train(
         alphabet=len(vocab),
         rank=world.rank,
     )
-    model = CharLm(len(vocab), config).to(device)
+    model = build(len(vocab), config).to(device)
     parameters = sum(p.numel() for p in model.parameters())
     log.info("char-lm model", parameters=parameters, **asdict(config))
     wrapped: nn.Module = model
@@ -422,16 +439,34 @@ def train(
         optimizer, lambda s: cosine_with_warmup(s, training.warmup_steps, training.max_steps)
     )
     scaler = torch.amp.GradScaler("cuda", enabled=training.fp16 and device.type == "cuda")
-    batches = iter(
-        SequenceBatches(
-            train_shards, vocab, config.context_chars, training.max_tokens, world, training.seed
-        )
+    stream = SequenceBatches(
+        train_shards,
+        vocab,
+        config.context_chars,
+        config.max_positions,
+        training.max_tokens,
+        world,
+        training.seed,
     )
+    first_step = 1
+    tokens_seen = 0
+    if resume is not None:
+        resumed = Resumption.read(resume, config, training, world)
+        model.load_state_dict(resumed.model)
+        optimizer.load_state_dict(resumed.optimizer)
+        scheduler.load_state_dict(resumed.scheduler)
+        scaler.load_state_dict(resumed.scaler)
+        stream.skip_to(resumed.progress.positions[world.rank])
+        first_step = resumed.progress.step + 1
+        tokens_seen = resumed.progress.tokens_seen
+        log.info("resumed", path=str(resume), step=resumed.progress.step, rank=world.rank)
+    batches = iter(stream)
     held = (
         held_out_batches(
             held_shards,
             vocab,
             config.context_chars,
+            config.max_positions,
             training.max_tokens,
             slices.max_held_out_examples,
         )
@@ -441,10 +476,15 @@ def train(
     out.mkdir(parents=True, exist_ok=True)
     metrics = MetricLog(out / "metrics.jsonl") if world.is_main else None
     started = time.time()
-    tokens_seen = 0
     last_step = training.max_steps
     wrapped.train()
-    for step in range(1, training.max_steps + 1):
+
+    def checkpoint(path: Path, step: int) -> None:
+        progress = Progress(step, tokens_seen, gather_positions(world, stream.position, device))
+        if world.is_main:
+            save_checkpoint(path, model, vocab, progress, optimizer, scheduler, scaler, training)
+
+    for step in range(first_step, training.max_steps + 1):
         budget = training.wall_budget_seconds
         if budget is not None and agreed(world, time.time() - started > budget, device):
             last_step = step - 1
@@ -482,11 +522,11 @@ def train(
                 event="held_out", step=step, nats_per_char=nats, perplexity=math.exp(nats)
             )
             log.info("held out", step=step, nats_per_char=round(nats, 4))
-        if world.is_main and step % training.checkpoint_every == 0:
-            save_checkpoint(out / "charlm.pt", model, vocab, step, optimizer)
+        if step % training.checkpoint_every == 0:
+            checkpoint(out / "charlm.pt", step)
     final = out / "charlm-final.pt"
+    checkpoint(final, last_step)
     if world.is_main:
-        save_checkpoint(final, model, vocab, last_step, optimizer)
         if held:
             nats = held_out_loss(model, held, device)
             if metrics is not None:
@@ -518,35 +558,67 @@ def kept_ids(vocab: CharVocab, restrict: Path) -> torch.Tensor:
     return torch.tensor(ids, dtype=torch.long)
 
 
-def export_onnx(checkpoint: Path, out_dir: Path, restrict: Path | None = None) -> tuple[Path, Path]:
-    """Write the step graph and its manifest for the Rust decoder.
+def batch_axes(names: Sequence[str], axis: int = 0) -> dict[str, dict[int, str]]:
+    """The dynamic ``batch`` axis of every tensor in *names*."""
+    return {name: {axis: "batch"} for name in names}
 
-    ``charlm.onnx`` takes ``token [B]``, ``hidden [layers, B, hidden]`` and
-    ``cell [layers, B, hidden]`` and returns ``log_probs [B, V]`` (float32,
-    normalised over the alphabet, or over the characters of *restrict* plus
-    ``<eos>`` when given, see :class:`StepModule`) and the two new states.
-    ``charlm.json`` holds the alphabet in id order and the state shape.
+
+def export_onnx(checkpoint: Path, out_dir: Path, restrict: Path | None = None) -> tuple[Path, Path]:
+    """Write the step graph, the prefill graph and their manifest for the Rust decoder.
+
+    ``charlm.onnx`` takes ``token [B]``, the prefix tensors (one row each,
+    shared by the batch) and the state tensors (one row per beam) and returns
+    ``log_probs [B, V]`` (float32, normalised over the alphabet, or over the
+    characters of *restrict* plus ``<eos>`` when given) and the next state
+    tensors. ``prefill.onnx`` takes ``tokens [1, T]`` and returns the same
+    ``log_probs``, the prefix tensors and the state tensors to start from.
+    ``charlm.json`` names the tensors and holds the alphabet in id order.
     """
     device = torch.device("cpu")
     model, vocab, step = load_model(checkpoint, device)
     model.eval()
     out_dir.mkdir(parents=True, exist_ok=True)
-    graph = out_dir / "charlm.onnx"
-    hidden, cell = model.initial_state(2, device)
     keep = None if restrict is None else kept_ids(vocab, restrict)
+    prefix_names, state_names = model.prefix_names, model.state_names
+    next_names = [f"next_{name}" for name in state_names]
+    prelude = torch.tensor([[BOS, SEP]])
+    with torch.no_grad():
+        _, prefix, state = model.prefill(prelude)
+    # Example inputs with two rows in the batch and two characters in the
+    # state, so every dynamic axis is exercised.
+    with torch.no_grad():
+        two = torch.tensor([SEP, SEP])
+        stacked = tuple(tensor.expand(2, *tensor.shape[1:]).contiguous() for tensor in state)
+        _, stacked = model.step(two, prefix, stacked)
+        _, stacked = model.step(two, prefix, stacked)
+    axes: dict[str, dict[int, str]] = {"token": {0: "batch"}, "log_probs": {0: "batch"}}
+    for name in (*state_names, *next_names):
+        axes[name] = {0: "batch"}
+    if model.config.arch == "transformer":
+        # Key/value caches are [batch, layers, heads, time, head_dim].
+        for name in (*prefix_names, *state_names, *next_names):
+            axes.setdefault(name, {})[3] = f"{name}_time"
+    step_graph = out_dir / "charlm.onnx"
     torch.onnx.export(
         StepModule(model, keep),
-        (torch.tensor([BOS, SEP]), hidden, cell),
-        str(graph),
-        input_names=["token", "hidden", "cell"],
-        output_names=["log_probs", "next_hidden", "next_cell"],
+        (two, *prefix, *stacked),
+        str(step_graph),
+        input_names=["token", *prefix_names, *state_names],
+        output_names=["log_probs", *next_names],
+        dynamic_axes=axes,
+        opset_version=17,
+        dynamo=False,
+    )
+    prefill_graph = out_dir / "prefill.onnx"
+    torch.onnx.export(
+        PrefillModule(model, keep),
+        (prelude,),
+        str(prefill_graph),
+        input_names=["tokens"],
+        output_names=["log_probs", *prefix_names, *state_names],
         dynamic_axes={
-            "token": {0: "batch"},
-            "hidden": {1: "batch"},
-            "cell": {1: "batch"},
-            "log_probs": {0: "batch"},
-            "next_hidden": {1: "batch"},
-            "next_cell": {1: "batch"},
+            "tokens": {1: "length"},
+            **{name: axes[name] for name in (*prefix_names, *state_names) if name in axes},
         },
         opset_version=17,
         dynamo=False,
@@ -556,9 +628,10 @@ def export_onnx(checkpoint: Path, out_dir: Path, restrict: Path | None = None) -
         json.dumps(
             {
                 "step": step,
-                "layers": model.config.layers,
-                "hidden": model.config.hidden,
+                "arch": model.config.arch,
                 "context_chars": model.config.context_chars,
+                "prefix": list(prefix_names),
+                "state": list(state_names),
                 "specials": {"pad": PAD, "bos": BOS, "eos": EOS, "sep": SEP, "unk": UNK},
                 "restricted_to": None if keep is None else int(keep.numel()),
                 "chars": list(vocab.chars),
@@ -570,9 +643,10 @@ def export_onnx(checkpoint: Path, out_dir: Path, restrict: Path | None = None) -
     )
     log.info(
         "exported char-lm",
-        graph=str(graph),
+        step_graph=str(step_graph),
+        prefill_graph=str(prefill_graph),
         manifest=str(manifest),
         alphabet=len(vocab),
         restricted_to=None if keep is None else int(keep.numel()),
     )
-    return graph, manifest
+    return step_graph, manifest

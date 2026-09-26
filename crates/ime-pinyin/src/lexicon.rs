@@ -85,11 +85,22 @@ impl Lexicon {
     ///
     /// If the two generated tables disagree, or the character table is malformed.
     pub fn load(table: &SyllableTable) -> Result<Self, LexiconError> {
+        Self::parse(CHAR_PINYIN, table)
+    }
+
+    /// Parse a character table against *table*: `<char>\t<py1>,<py2>,...` per
+    /// line, strictly sorted by character.
+    ///
+    /// # Errors
+    ///
+    /// If the character table is malformed or names a reading the syllable
+    /// table does not hold.
+    pub fn parse(source: &str, table: &SyllableTable) -> Result<Self, LexiconError> {
         let mut chars = Vec::new();
         let mut reading_offsets = vec![0u32];
         let mut reading_ids = Vec::new();
 
-        for (index, raw) in CHAR_PINYIN.lines().enumerate() {
+        for (index, raw) in source.lines().enumerate() {
             let line = index + 1;
             let (ch_field, readings) =
                 raw.split_once('\t')
@@ -201,7 +212,7 @@ impl Lexicon {
     pub fn id_of(&self, ch: char) -> Option<CharId> {
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "load() proved the length fits u32"
+            reason = "parse() proved the length fits u32"
         )]
         self.chars
             .binary_search(&ch)

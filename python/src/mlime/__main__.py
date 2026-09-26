@@ -581,9 +581,14 @@ def train_char_lm(
     max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
     max_tokens: int = typer.Option(16384, help="Padded positions per step"),
     lr: float = typer.Option(1e-3, help="Peak learning rate"),
+    arch: str = typer.Option("lstm", help="lstm or transformer"),
     embedding: int = typer.Option(384, help="Embedding width"),
-    hidden: int = typer.Option(1024, help="LSTM width"),
-    layers: int = typer.Option(2, help="LSTM layers"),
+    hidden: int = typer.Option(1024, help="LSTM width, or the transformer's model width"),
+    layers: int = typer.Option(2, help="LSTM or transformer layers"),
+    heads: int = typer.Option(8, help="Attention heads (transformer)"),
+    feedforward: int = typer.Option(2048, help="Feed-forward width (transformer)"),
+    max_positions: int = typer.Option(512, help="Longest sequence, prelude included"),
+    resume: Path = typer.Option(None, help="Checkpoint of this run's previous session"),
     seed: int = SEED,
     fp16: bool = typer.Option(True, help="Train in fp16 with loss scaling"),
     checkpoint_every: int = typer.Option(2000, help="Steps between checkpoints"),
@@ -594,19 +599,32 @@ def train_char_lm(
 ) -> None:
     """Train the character language model the decoder's transition runs on."""
     configure(verbose)
+    from typing import cast
+
     from mlime.data.corpus import default_char_table
     from mlime.train.charlm import CharLmConfig, CharLmTraining, train
+    from mlime.train.charlm_model import Arch
     from mlime.train.loop import Distributed
 
     table = char_table or default_char_table()
     if table is None:
         raise FileNotFoundError("no character table found upwards; pass --char-table")
+    if arch not in ("lstm", "transformer"):
+        raise ValueError(f"--arch is lstm or transformer, not {arch!r}")
     final = train(
         DataLayout(data_dir).samples,
         route_a_slices(data_dir, train_shard, held_out_shard, max_held_out),
         table,
         out,
-        CharLmConfig(embedding=embedding, hidden=hidden, layers=layers),
+        CharLmConfig(
+            arch=cast(Arch, arch),
+            embedding=embedding,
+            hidden=hidden,
+            layers=layers,
+            heads=heads,
+            feedforward=feedforward,
+            max_positions=max_positions,
+        ),
         CharLmTraining(
             max_steps=max_steps,
             lr=lr,
@@ -618,6 +636,7 @@ def train_char_lm(
             wall_budget_seconds=wall_budget_seconds,
         ),
         Distributed.from_environment(),
+        resume=resume,
     )
     typer.echo(str(final))
 
@@ -625,7 +644,9 @@ def train_char_lm(
 @export_app.command("char-lm")
 def export_char_lm(
     checkpoint: Path = typer.Argument(..., help="A char-lm checkpoint (charlm-final.pt)"),
-    out: Path = typer.Option(Path("data/char-lm"), help="Where charlm.onnx and charlm.json go"),
+    out: Path = typer.Option(
+        Path("data/char-lm"), help="Where charlm.onnx, prefill.onnx and charlm.json go"
+    ),
     restrict: Path = typer.Option(
         None, help="Normalise over these characters (one per line, e.g. emittable.txt) plus <eos>"
     ),
