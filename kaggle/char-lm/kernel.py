@@ -2,11 +2,13 @@
 
 One Kaggle session, 2xT4: `mlime train char-lm` over every run3 sample shard
 (the v1 subset and the rest, staged side by side as `kaggle/route-a-v2` does),
-then `mlime export char-lm`, so the kernel's output holds `charlm.onnx` and
-`charlm.json` ready for `ime-cli --lm`, next to the final checkpoint and the
-metrics. Kaggle kills a session at twelve hours and keeps nothing of it, so the
-trainer is given a wall budget that ends the run with the export still to
-spare; the step count is what two epochs need and the budget is the safety.
+then `mlime export char-lm`, so the kernel's output holds `charlm.onnx`,
+`prefill.onnx` and `charlm.json` ready for `ime-cli --lm`, next to the
+checkpoint and the metrics. Kaggle kills a session at twelve hours and keeps
+nothing of it, so the trainer is given a wall budget that ends the run with the
+export still to spare, and a run that needs more than one session resumes: add
+the previous session's output as a dataset input and the kernel continues from
+its `run/charlm.pt`.
 """
 
 import json
@@ -24,13 +26,27 @@ DATA = WORKING / "data"
 #: How deep the mount namespace is walked. `datasets/<user>/<slug>` is three.
 MAX_DEPTH = 4
 
-#: Optimiser steps: two passes over the 41M lines at the token budget below,
-#: 1.65 billion characters a pass, 32k per step across the ranks.
+#: Optimiser steps: one pass over the 41M lines at the token budget below,
+#: about 1.5 billion characters, 32k per step across the ranks.
 MAX_STEPS = 100_000
 #: Padded positions per step over every rank together, so the run sees the
 #: same batches whether the machine has two T4s or one A100.
 TOKENS_PER_STEP = 32768
 CHECKPOINT_EVERY = 5000
+#: The model. The LSTM of `notes/char-lm-v1.md` was 2 x 1024 over a 384-wide
+#: embedding; the transformer reads the whole sentence and the context through
+#: attention and is what `notes/generate-ceiling.md` asks for.
+MODEL = (
+    "--arch", "transformer",
+    "--embedding", "512",
+    "--hidden", "512",
+    "--layers", "12",
+    "--heads", "8",
+    "--feedforward", "2048",
+    "--max-positions", "512",
+)  # fmt: skip
+#: A previous session's output, mounted as a dataset, that this one resumes.
+RESUME_MARKER = "charlm.pt"
 
 #: One shard per source, withheld from training and scored as held-out nats per
 #: character -- the same six the route A runs hold out.
@@ -145,7 +161,18 @@ def stage_samples(sources):
     print(f"samples: {sum(1 for _ in target.glob('*.parquet'))} shards staged", flush=True)
 
 
-def train_argv(char_table, out, wall_budget):
+def resume_checkpoint():
+    """The checkpoint of a previous session, if one is mounted, else None."""
+    if not INPUTS.is_dir():
+        return None
+    for directory in directories(INPUTS):
+        checkpoint = directory / "run" / RESUME_MARKER
+        if checkpoint.is_file():
+            return checkpoint
+    return None
+
+
+def train_argv(char_table, out, wall_budget, resume):
     """The training command every rank runs, one rank per GPU present."""
     import torch
 
@@ -181,8 +208,11 @@ def train_argv(char_table, out, wall_budget):
         "--seed",
         "0",
     ]
+    argv += MODEL
     for shard in HELD_OUT:
         argv += ["--held-out-shard", shard]
+    if resume is not None:
+        argv += ["--resume", str(resume)]
     return argv
 
 
@@ -234,7 +264,11 @@ def main():
     wall_budget = SESSION_SECONDS - RESERVE_SECONDS - (time.monotonic() - started)
     if wall_budget <= 0:
         raise RuntimeError("the session was spent before training could start")
-    code, seconds = run(train_argv(char_table, out, wall_budget), env, str(WORKING / "train.log"))
+    resume = resume_checkpoint()
+    print(f"resume: {resume}", flush=True)
+    code, seconds = run(
+        train_argv(char_table, out, wall_budget, resume), env, str(WORKING / "train.log")
+    )
     if code != 0:
         raise RuntimeError("training failed; its log is in the kernel output")
 
@@ -243,9 +277,9 @@ def main():
     )
     if code != 0:
         raise RuntimeError("the export failed; its log is in the kernel output")
-    # The numbered checkpoint is a copy of the final one's neighbourhood; only
-    # the final one is worth Kaggle's output cap.
-    (out / "charlm.pt").unlink(missing_ok=True)
+    # The final checkpoint is the one the next session resumes from, under the
+    # name the resume looks for; the numbered one is a copy of its neighbourhood.
+    (out / "charlm-final.pt").replace(out / RESUME_MARKER)
 
     steps = records_of(out / "metrics.jsonl", "step")
     held = records_of(out / "metrics.jsonl", "held_out")

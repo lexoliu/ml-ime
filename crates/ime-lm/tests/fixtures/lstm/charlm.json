@@ -1,0 +1,1 @@
+{"step": 3, "arch": "lstm", "context_chars": 62, "prefix": [], "state": ["hidden", "cell"], "specials": {"pad": 0, "bos": 1, "eos": 2, "sep": 3, "unk": 4}, "restricted_to": 5, "chars": ["<pad>", "<bos>", "<eos>", "<sep>", "<unk>", "你", "好", "吗", "我", "很", "再", "见", "谢"]}
