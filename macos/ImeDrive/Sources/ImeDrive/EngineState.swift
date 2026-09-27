@@ -75,10 +75,14 @@ enum EngineState {
 
     /// Recursively keep only what JSONSerialization can write.
     private static func jsonSafe(_ value: Any) -> Any? {
+        // Bool and NSNumber bridge to each other (`NSNumber(1) as? Bool`
+        // succeeds), so the two are told apart by CoreFoundation type id,
+        // not by cast order.
+        let typeID = CFGetTypeID(value as CFTypeRef)
+        if typeID == CFBooleanGetTypeID() { return value as? Bool }
+        if typeID == CFNumberGetTypeID() { return value as? NSNumber }
         switch value {
         case let v as String: return v
-        case let v as Bool: return v
-        case let v as NSNumber: return v
         case let v as [Any]: return v.compactMap(jsonSafe)
         case let v as [String: Any]:
             var out: [String: Any] = [:]

@@ -70,16 +70,15 @@ final class Driver {
         self.slice = slice
         self.panelHasAxText = panelHasAxText
 
-        // digest < dev_share * u64::MAX, compared as integers — identical
-        // to Python's `digest < limit` for a non-integral limit.
-        let devLimit = UInt64(Self.devShare * Double(UInt64.max))
         var rows: [EvalRow] = []
         var index = 0
         for line in try String(contentsOf: evalSet, encoding: .utf8).split(
             whereSeparator: \.isNewline)
         {
-            guard !line.trimmingCharacters(in: .whitespaces).isEmpty,
-                let data = line.data(using: .utf8),
+            // As the Rust and Python readers do: whitespace-only lines are
+            // skipped, and a record's index is its position among the rest.
+            if line.trimmingCharacters(in: .whitespaces).isEmpty { continue }
+            guard let data = line.data(using: .utf8),
                 let row = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                 let pinyin = row["pinyin"] as? String,
                 let text = row["text"] as? String
@@ -88,12 +87,14 @@ final class Driver {
                     domain: "ImeDrive", code: 1,
                     userInfo: [NSLocalizedDescriptionKey: "bad eval-set line \(index + 1)"])
             }
-            // Same split as Python's slice_indices: a record is development
-            // data when its digest is under dev_share * u64::MAX.
+            // Same split as Rust's Slice::holds and Python's slice_indices:
+            // development data iff digest / u64::MAX < dev_share, in f64.
             let isDev =
-                Blake2b.digest(
-                    pinyin: pinyin, text: text,
-                    context: row["context"] as? String) <= devLimit
+                Double(
+                    Blake2b.digest(
+                        pinyin: pinyin, text: text,
+                        context: row["context"] as? String))
+                / Double(UInt64.max) < Self.devShare
             if slice == "all" || (slice == "dev") == isDev {
                 rows.append(EvalRow(index: index, pinyin: pinyin))
             }
@@ -103,14 +104,29 @@ final class Driver {
 
         var done: Set<Int> = []
         if FileManager.default.fileExists(atPath: outURL.path),
-            let existing = try? String(contentsOf: outURL, encoding: .utf8)
+            let bytes = try? Data(contentsOf: outURL), !bytes.isEmpty
         {
-            for line in existing.split(whereSeparator: \.isNewline) {
-                guard let data = line.data(using: .utf8),
-                    let row = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                    let record = row["record"] as? Int
-                else { continue }
-                done.insert(record)
+            // A kill between the two halves of a line write — or mid-codepoint
+            // — leaves a torn tail. Resume past it: keep only complete lines
+            // and truncate the file back to them, so the tail's record is
+            // retyped instead of appended onto a broken line.
+            var clean = bytes
+            if bytes.last != 0x0A {
+                let lastNewline = bytes.lastIndex(of: 0x0A).map { $0 + 1 } ?? 0
+                let repair = try FileHandle(forWritingTo: outURL)
+                try repair.truncate(atOffset: UInt64(lastNewline))
+                try repair.close()
+                clean = bytes.prefix(lastNewline)
+            }
+            if let existing = String(data: clean, encoding: .utf8) {
+                for line in existing.split(whereSeparator: \.isNewline) {
+                    guard let data = line.data(using: .utf8),
+                        let row = try? JSONSerialization.jsonObject(with: data)
+                            as? [String: Any],
+                        let record = row["record"] as? Int
+                    else { continue }
+                    done.insert(record)
+                }
             }
         }
         self.done = done
@@ -182,10 +198,11 @@ final class Driver {
         typing: do {
             for char in row.pinyin {
                 guard let code = Self.keycodes[char] else {
-                    FileHandle.standardError.write(
-                        "ime-drive: no keycode for \(char.debugDescription), skipping record \(row.index)\n"
-                            .data(using: .utf8)!)
-                    continue
+                    // A keystroke the driver cannot produce is a failed
+                    // record, not a clean line the scorer reads as an
+                    // engine error.
+                    error = "no keycode for \(char.debugDescription)"
+                    break typing
                 }
                 if Date() > deadline {
                     error = "timed out after \(recordTimeoutMs) ms while typing"
@@ -335,12 +352,13 @@ final class Driver {
         }
     }
 
+    /// Post a key down+up pair. No pacing: the bounded state poll after
+    /// each call is the readiness signal.
     private func post(_ code: CGKeyCode) {
         for keyDown in [true, false] {
             let event = CGEvent(keyboardEventSource: eventSource, virtualKey: code, keyDown: keyDown)
             event?.post(tap: .cghidEventTap)
         }
-        usleep(12_000)
     }
 
     /// What the polling waits compare against: the view's text length and
@@ -403,9 +421,11 @@ final class Driver {
         }
     }
 
+    /// One call per line: a kill can still tear the write, but never
+    /// between the record and its newline.
     private func write(_ fields: [String: Any]) {
-        let data = try! JSONSerialization.data(withJSONObject: fields)
+        var data = try! JSONSerialization.data(withJSONObject: fields)
+        data.append(0x0A)
         out.write(data)
-        out.write("\n".data(using: .utf8)!)
     }
 }
