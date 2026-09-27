@@ -13,6 +13,8 @@ default = []
 gpu-coreml = ["ort/coreml"]
 # WebGPU execution provider over Dawn/Metal: `ort`'s `webgpu` feature.
 gpu-webgpu = ["ort/webgpu"]
+# NVIDIA CUDA execution provider: `ort`'s `cuda` feature (the Kaggle T4 leg).
+gpu-cuda = ["ort/cuda"]
 
 [dependencies]
 ime-decode.workspace = true

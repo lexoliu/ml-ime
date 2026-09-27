@@ -55,9 +55,10 @@ use thread_local::ThreadLocal;
 /// Which execution provider a model's sessions run on.
 ///
 /// `cpu` is the decoder's default and always built in; `coreml` (Apple's ANE/
-/// GPU) and `webgpu` (Dawn over Metal) exist behind the `gpu-coreml` and
-/// `gpu-webgpu` cargo features, and asking for one that was not compiled in
-/// is an error at [`CharLm::open`], never a silent CPU session.
+/// GPU), `webgpu` (Dawn over Metal) and `cuda` (NVIDIA's provider) exist
+/// behind the `gpu-coreml`, `gpu-webgpu` and `gpu-cuda` cargo features, and
+/// asking for one that was not compiled in is an error at [`CharLm::open`],
+/// never a silent CPU session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Backend {
     /// ONNX Runtime's CPU kernels; the default.
@@ -67,6 +68,8 @@ pub enum Backend {
     CoreMl,
     /// WebGPU through Dawn (the Metal GPU), behind the `gpu-webgpu` feature.
     WebGpu,
+    /// NVIDIA's CUDA provider, behind the `gpu-cuda` feature.
+    Cuda,
 }
 
 impl Backend {
@@ -85,6 +88,8 @@ impl Backend {
             Self::CoreMl => Ok(vec![ort::ep::CoreML::default().build().error_on_failure()]),
             #[cfg(feature = "gpu-webgpu")]
             Self::WebGpu => Ok(vec![ort::ep::WebGPU::default().build().error_on_failure()]),
+            #[cfg(feature = "gpu-cuda")]
+            Self::Cuda => Ok(vec![ort::ep::CUDA::default().build().error_on_failure()]),
             #[allow(
                 unreachable_patterns,
                 reason = "the arm is reachable only when a gpu-* feature is off; with both on, every Backend variant already has an arm"

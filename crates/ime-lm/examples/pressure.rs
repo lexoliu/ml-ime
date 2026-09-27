@@ -48,7 +48,7 @@ struct Work {
 fn args() -> (PathBuf, usize, SessionShape) {
     let mut args = std::env::args().skip(1);
     let dir = PathBuf::from(args.next().expect(
-        "usage: pressure <export dir written by charlm_sized.py> [--batch N] [--backend cpu|coreml|webgpu] [--ort-verbose]",
+        "usage: pressure <export dir written by charlm_sized.py> [--batch N] [--backend cpu|coreml|webgpu|cuda] [--ort-verbose]",
     ));
     let mut batch = 1usize;
     let mut backend = Backend::Cpu;
@@ -67,6 +67,7 @@ fn args() -> (PathBuf, usize, SessionShape) {
                     "cpu" => Backend::Cpu,
                     "coreml" => Backend::CoreMl,
                     "webgpu" => Backend::WebGpu,
+                    "cuda" => Backend::Cuda,
                     other => panic!("unknown --backend {other:?}"),
                 };
             }

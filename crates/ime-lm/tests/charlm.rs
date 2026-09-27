@@ -181,6 +181,29 @@ fn transformer_rows_from_different_records_match_solo_runs() {
     }
 }
 
+/// A `gpu-cuda` build asked for CUDA where the provider cannot initialise --
+/// no driver, no device, no toolkit libraries -- fails `CharLm::open` with an
+/// error naming the backend, rather than silently running on CPU. On a machine
+/// where CUDA does initialise (the Kaggle T4) the open succeeds and there is
+/// nothing to assert.
+#[cfg(feature = "gpu-cuda")]
+#[test]
+fn cuda_backend_fails_where_cuda_cannot_initialise() {
+    let dir = fixture_dir();
+    let lexicon = lexicon(&dir);
+    let shape = SessionShape {
+        backend: ime_lm::Backend::Cuda,
+        ..SessionShape::default()
+    };
+    match CharLm::open(&dir.join("lstm"), &lexicon, shape) {
+        Err(ime_lm::LmError::Provider { backend, .. }) => {
+            assert_eq!(backend, ime_lm::Backend::Cuda);
+        }
+        Err(error) => panic!("expected the provider failure, got {error}"),
+        Ok(_) => {}
+    }
+}
+
 #[test]
 fn lstm_export_scores_the_fixture_beams() {
     run("lstm");

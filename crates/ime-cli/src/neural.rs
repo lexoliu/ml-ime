@@ -112,6 +112,8 @@ pub enum BackendArg {
     Coreml,
     /// WebGPU through Dawn (the Metal GPU), if the build carries `gpu-webgpu`.
     Webgpu,
+    /// NVIDIA's CUDA provider, if the build carries `gpu-cuda`.
+    Cuda,
 }
 
 impl BackendArg {
@@ -121,6 +123,7 @@ impl BackendArg {
             Self::Cpu => ime_lm::Backend::Cpu,
             Self::Coreml => ime_lm::Backend::CoreMl,
             Self::Webgpu => ime_lm::Backend::WebGpu,
+            Self::Cuda => ime_lm::Backend::Cuda,
         }
     }
 }
