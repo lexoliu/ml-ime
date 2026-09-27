@@ -135,6 +135,7 @@ final class Driver {
             "macos": ProcessInfo.processInfo.operatingSystemVersionString,
             "started": ISO8601DateFormatter().string(from: Date()),
             "pid": Int(ProcessInfo.processInfo.processIdentifier),
+            "engine_state": EngineState.snapshot(engine: engine),
         ]
         if out.offsetInFile == 0 {
             write(meta)
