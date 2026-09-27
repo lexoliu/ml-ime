@@ -12,8 +12,12 @@ import Foundation
 ///
 ///   --list            dump every installed input source as JSON and exit
 ///   --limit N         stop after N records this run (smoke tests)
-///   --key-delay-ms N  delay between keystrokes (default 45)
-///   --settle-ms N     reserved settle budget (default 60)
+///   --key-wait-cap-ms N
+///                     per-key settle budget; the wait ends as soon as the
+///                     view state changes (default 300)
+///   --record-timeout-ms N
+///                     per-record wall budget; exceeding it writes a
+///                     failure line instead of hanging (default 20000)
 ///   --watch-bundle S  extra bundle-id substring whose processes are read for
 ///                     the candidate window before any other app
 struct Args {
@@ -22,8 +26,8 @@ struct Args {
     var out: URL?
     var limit: Int?
     var list = false
-    var keyDelayMs = 45
-    var settleMs = 60
+    var keyWaitCapMs = 300
+    var recordTimeoutMs = 20_000
     var watchBundle: String?
 
     static func parse() -> Args {
@@ -36,13 +40,15 @@ struct Args {
             case "--out": args.out = iterator.next().map(URL.init(fileURLWithPath:))
             case "--limit": args.limit = iterator.next().flatMap(Int.init)
             case "--list": args.list = true
-            case "--key-delay-ms": args.keyDelayMs = iterator.next().flatMap(Int.init) ?? 45
-            case "--settle-ms": args.settleMs = iterator.next().flatMap(Int.init) ?? 60
+            case "--key-wait-cap-ms":
+                args.keyWaitCapMs = iterator.next().flatMap(Int.init) ?? 300
+            case "--record-timeout-ms":
+                args.recordTimeoutMs = iterator.next().flatMap(Int.init) ?? 20_000
             case "--watch-bundle": args.watchBundle = iterator.next()
             case "--help", "-h":
                 let usage =
                     "usage: ime-drive --engine <apple|sogou|baidu> --eval-set f.jsonl "
-                    + "--out o.jsonl [--limit N] [--key-delay-ms N] [--list] "
+                    + "--out o.jsonl [--limit N] [--key-wait-cap-ms N] [--list] "
                     + "[--watch-bundle S]\n"
                 FileHandle.standardError.write(usage.data(using: .utf8)!)
                 exit(0)
@@ -223,8 +229,8 @@ do {
     driver = try Driver(
         engine: args.engine, evalSet: evalSet, out: out, textView: textView,
         watchPids: watchPids, bundleHints: hints, sourceID: source.id,
-        clientBounds: clientBounds, keyDelayMs: args.keyDelayMs,
-        settleMs: args.settleMs)
+        clientBounds: clientBounds, keyWaitCapMs: args.keyWaitCapMs,
+        recordTimeoutMs: args.recordTimeoutMs)
 } catch {
     err("setup failed: \(error.localizedDescription)")
 }
