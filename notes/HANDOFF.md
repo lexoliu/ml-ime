@@ -228,7 +228,15 @@ with `luna_pinyin_simp.custom.yaml` disabling the user dictionary
    and the abbreviated oracle at 32 to 36.30; the beam's shape is unchanged.
 3. Fix issue #16 (hash only text+context in `EvalRecord::digest`) so the three
    eval twins share one dev/test split; re-tune weights once.
-4. Issue #51: measure the commercial IMEs on the eval3 twins, so every number
-   above is relative to the product target rather than to our own trigram.
+4. Issue #51 is measured (`notes/commercial-baselines.md`): RIME through
+   librime, and Apple Pinyin, Sogou and Baidu through `macos/ImeDrive` on a
+   fresh macOS VM per twin (the twins share sentences and every engine learns
+   what it commits, so a second twin on the same machine is contaminated).
+   Test top-1 on full / abbreviated / mixed: Apple 60.10 / 11.64 / 18.77,
+   Sogou 52.99 / 6.89 / 12.02, Baidu 43.23 / 6.93 / 12.36, RIME 39.63 / 4.75 /
+   8.55, against the decoder's 78.16 / 28.26 / 38.54. The decoder leads every
+   engine on every style; the target that remains is the hinted-generation
+   ceiling of `notes/generate-ceiling.md`. Commercial Chinese input methods
+   are installed on cloud VMs only, never on a machine of ours.
 5. Inference on macOS (Core ML / ANE) was explicitly parked until the model was
    trained; `notes/inputmethodkit.md` and `notes/compute.md` hold what was known.
