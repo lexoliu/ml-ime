@@ -36,8 +36,11 @@ final class Driver {
     /// presence detection of panels without accessibility text.
     private let clientBounds: CGRect
     private let eventSource = CGEventSource(stateID: .hidSystemState)
-    private let keyDelay: useconds_t
-    private let settleMs: Int
+    /// Cap on how long a single keystroke's settle wait can run; the wait
+    /// ends as soon as the view state changes.
+    private let keyWaitCapMs: Int
+    /// Per-record wall budget; exceeding it writes a failure line.
+    private let recordTimeoutMs: Int
 
     private let out: FileHandle
     private let done: Set<Int>
@@ -45,7 +48,7 @@ final class Driver {
     init(
         engine: String, evalSet: URL, out outURL: URL, textView: NSTextView,
         watchPids: Set<pid_t>, bundleHints: [String], sourceID: String,
-        clientBounds: CGRect, keyDelayMs: Int, settleMs: Int
+        clientBounds: CGRect, keyWaitCapMs: Int, recordTimeoutMs: Int
     ) throws {
         self.engine = engine
         self.textView = textView
@@ -53,8 +56,8 @@ final class Driver {
         self.bundleHints = bundleHints
         self.sourceID = sourceID
         self.clientBounds = clientBounds
-        keyDelay = useconds_t(keyDelayMs * 1000)
-        self.settleMs = settleMs
+        self.keyWaitCapMs = keyWaitCapMs
+        self.recordTimeoutMs = recordTimeoutMs
 
         var rows: [EvalRow] = []
         var index = 0
@@ -88,7 +91,11 @@ final class Driver {
             }
         }
         self.done = done
-        FileManager.default.createFile(atPath: outURL.path, contents: nil)
+        // The results file is the journal: never truncate it — a line
+        // already written is a record already done.
+        if !FileManager.default.fileExists(atPath: outURL.path) {
+            FileManager.default.createFile(atPath: outURL.path, contents: nil)
+        }
         out = try FileHandle(forWritingTo: outURL)
         out.seekToEndOfFile()
     }
@@ -118,6 +125,11 @@ final class Driver {
             if done.contains(row.index) { continue }
             let result = typeOne(row)
             write(result)
+            if result["failed"] as? Bool == true {
+                FileHandle.standardError.write(
+                    "ime-drive: record \(row.index) failed: \(result["error"] ?? "")\n"
+                        .data(using: .utf8)!)
+            }
             typed += 1
             if typed % 50 == 0 {
                 FileHandle.standardError.write(
@@ -129,47 +141,75 @@ final class Driver {
             "ime-drive: done, \(typed) records this run\n".data(using: .utf8)!)
     }
 
-    /// Type one record and return its JSON line fields.
+    /// Type one record and return its JSON line fields. Every wait is a
+    /// bounded poll on the view state or the candidate window — a record
+    /// costs what the engine needs and no more. Exceeding the per-record
+    /// budget writes a failure line instead of hanging.
     private func typeOne(_ row: EvalRow) -> [String: Any] {
         let start = Date()
+        let deadline = start.addingTimeInterval(Double(recordTimeoutMs) / 1000)
         clearView()
         var sawWindow = false
         var firstPage: [String] = []
-
-        for char in row.pinyin {
-            guard let code = Self.keycodes[char] else {
-                FileHandle.standardError.write(
-                    "ime-drive: no keycode for \(char.debugDescription), skipping record \(row.index)\n"
-                        .data(using: .utf8)!)
-                continue
-            }
-            post(code)
-            usleep(keyDelay)
-        }
-
-        // The engine's process may only have spawned once typing began (SCIM
-        // starts lazily), so refresh the watch set before polling.
-        refreshWatchPids()
-        if let page = waitForCandidates(timeoutMs: 1500) {
-            sawWindow = true
-            firstPage = page
-        } else {
-            // The panel may exist yet expose no text (Baidu): check for an
-            // engine-owned floating window near the text view.
-            sawWindow = CandidateWindow.present(watchPids: watchPids, near: clientBounds)
-        }
-
-        // Accept the first candidate until nothing is composing. A user gets
-        // the same by pressing space.
         var presses = 0
-        let maxPresses = row.pinyin.count + 16
-        while presses < maxPresses && markedTextPending() {
-            post(CGKeyCode(0x31))  // space
-            presses += 1
-            usleep(120_000)
+        var error: String?
+
+        typing: do {
+            for char in row.pinyin {
+                guard let code = Self.keycodes[char] else {
+                    FileHandle.standardError.write(
+                        "ime-drive: no keycode for \(char.debugDescription), skipping record \(row.index)\n"
+                            .data(using: .utf8)!)
+                    continue
+                }
+                if Date() > deadline {
+                    error = "timed out after \(recordTimeoutMs) ms while typing"
+                    break typing
+                }
+                let before = viewState()
+                post(code)
+                waitStateChange(since: before, timeoutMs: keyWaitCapMs, deadline: deadline)
+            }
+
+            // The engine's process may only have spawned once typing began
+            // (SCIM starts lazily), so refresh the watch set before polling.
+            refreshWatchPids()
+            let remaining = Int(deadline.timeIntervalSinceNow * 1000)
+            if remaining <= 0 {
+                error = "timed out after \(recordTimeoutMs) ms before candidates"
+                break typing
+            }
+            if let page = waitForCandidates(timeoutMs: min(1500, remaining)) {
+                sawWindow = true
+                firstPage = page
+            } else {
+                // The panel may exist yet expose no text (Baidu): check for
+                // an engine-owned floating window near the text view.
+                sawWindow = CandidateWindow.present(
+                    watchPids: watchPids, near: clientBounds)
+            }
+
+            // Accept the first candidate until nothing is composing. A user
+            // gets the same by pressing space.
+            let maxPresses = row.pinyin.count + 16
+            while presses < maxPresses {
+                let state = viewState()
+                guard state.markedLength > 0 else { break }
+                if Date() > deadline {
+                    error = "timed out after \(recordTimeoutMs) ms while accepting"
+                    break
+                }
+                post(CGKeyCode(0x31))  // space
+                presses += 1
+                waitStateChange(since: state, timeoutMs: 500, deadline: deadline)
+            }
         }
-        post(CGKeyCode(0x35))  // escape, dropping any remainder
-        usleep(80_000)
+
+        // Escape drops any remainder; the view may not change if nothing was
+        // pending, so this wait is short.
+        let beforeEscape = viewState()
+        post(CGKeyCode(0x35))
+        waitStateChange(since: beforeEscape, timeoutMs: 200, deadline: deadline)
 
         var committed = viewString()
         if let range = markedRange() {
@@ -179,7 +219,7 @@ final class Driver {
                 text.substring(to: range.location)
                 + text.substring(from: range.location + range.length)
         }
-        return [
+        var result: [String: Any] = [
             "record": row.index,
             "engine": engine,
             "committed": committed,
@@ -188,6 +228,11 @@ final class Driver {
             "candidate_window": sawWindow,
             "space_presses": presses,
         ]
+        if let error {
+            result["failed"] = true
+            result["error"] = error
+        }
+        return result
     }
 
     /// Poll until a candidate window's strings stop changing, or the timeout.
@@ -229,24 +274,56 @@ final class Driver {
         usleep(12_000)
     }
 
-    /// Clear the text view for the next record, on the main thread.
+    /// What the polling waits compare against: the view's text length and
+    /// the marked (composing) range. Either one changing means the engine
+    /// reacted to the keystroke.
+    private struct ViewState: Equatable {
+        var textLength: Int
+        var markedLocation: Int
+        var markedLength: Int
+    }
+
+    private func viewState() -> ViewState {
+        let view = textView
+        return DispatchQueue.main.sync {
+            let marked = view.markedRange()
+            return ViewState(
+                textLength: view.string.count,
+                markedLocation: marked.location == NSNotFound ? -1 : marked.location,
+                markedLength: marked.location == NSNotFound ? 0 : marked.length)
+        }
+    }
+
+    /// Poll the view state until it differs from `before` or the timeout —
+    /// the bounded wait that replaced the fixed keystroke delay.
+    private func waitStateChange(since before: ViewState, timeoutMs: Int, deadline: Date) {
+        let cap = Date().addingTimeInterval(Double(timeoutMs) / 1000)
+        let end = min(cap, deadline)
+        while Date() < end {
+            if viewState() != before { return }
+            usleep(5_000)
+        }
+    }
+
+    /// Clear the text view for the next record, on the main thread, then
+    /// wait briefly for the clear to take effect.
     private func clearView() {
         let view = textView
         DispatchQueue.main.sync {
             view.unmarkText()
             view.string = ""
         }
-        usleep(50_000)
+        let deadline = Date().addingTimeInterval(0.5)
+        while Date() < deadline {
+            let state = viewState()
+            if state.textLength == 0, state.markedLength == 0 { return }
+            usleep(10_000)
+        }
     }
 
     private func viewString() -> String {
         let view = textView
         return DispatchQueue.main.sync { view.string }
-    }
-
-    private func markedTextPending() -> Bool {
-        let view = textView
-        return DispatchQueue.main.sync { view.hasMarkedText() }
     }
 
     private func markedRange() -> NSRange? {
