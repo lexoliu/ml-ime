@@ -41,6 +41,10 @@ final class Driver {
     private let keyWaitCapMs: Int
     /// Per-record wall budget; exceeding it writes a failure line.
     private let recordTimeoutMs: Int
+    /// Whether the engine's candidate panel exposes candidates through the
+    /// accessibility tree. When false the panel is read through the window
+    /// server instead: its presence near the client window is the signal.
+    private let panelHasAxText: Bool
 
     private let out: FileHandle
     private let done: Set<Int>
@@ -53,7 +57,7 @@ final class Driver {
         engine: String, evalSet: URL, out outURL: URL, textView: NSTextView,
         watchPids: Set<pid_t>, bundleHints: [String], sourceID: String,
         clientBounds: CGRect, keyWaitCapMs: Int, recordTimeoutMs: Int,
-        slice: String
+        slice: String, panelHasAxText: Bool
     ) throws {
         self.engine = engine
         self.textView = textView
@@ -64,6 +68,7 @@ final class Driver {
         self.keyWaitCapMs = keyWaitCapMs
         self.recordTimeoutMs = recordTimeoutMs
         self.slice = slice
+        self.panelHasAxText = panelHasAxText
 
         // digest < dev_share * u64::MAX, compared as integers — identical
         // to Python's `digest < limit` for a non-integral limit.
@@ -198,14 +203,20 @@ final class Driver {
                 error = "timed out after \(recordTimeoutMs) ms before candidates"
                 break typing
             }
-            if let page = waitForCandidates(timeoutMs: min(1500, remaining)) {
-                sawWindow = true
-                firstPage = page
+            if panelHasAxText {
+                if let page = waitForCandidates(timeoutMs: min(1500, remaining)) {
+                    sawWindow = true
+                    firstPage = page
+                } else {
+                    sawWindow = CandidateWindow.present(
+                        watchPids: watchPids, near: clientBounds)
+                }
             } else {
-                // The panel may exist yet expose no text (Baidu): check for
-                // an engine-owned floating window near the text view.
-                sawWindow = CandidateWindow.present(
-                    watchPids: watchPids, near: clientBounds)
+                // The panel exposes no accessibility text (Baidu draws it
+                // custom): waiting for AX strings always burns the whole
+                // cap, so readiness is the panel's window-server presence
+                // near the client window instead.
+                sawWindow = waitForPanel(timeoutMs: min(1500, remaining))
             }
 
             // Accept the first candidate until nothing is composing. A user
@@ -224,11 +235,17 @@ final class Driver {
             }
         }
 
-        // Escape drops any remainder; the view may not change if nothing was
-        // pending, so this wait is short.
+        // Escape drops any remainder and dismisses the panel; the view may
+        // not change when nothing was pending, so for a panel without
+        // accessibility text the wait ends on the panel leaving the window
+        // server instead of running the cap.
         let beforeEscape = viewState()
         post(CGKeyCode(0x35))
-        waitStateChange(since: beforeEscape, timeoutMs: 200, deadline: deadline)
+        if panelHasAxText {
+            waitStateChange(since: beforeEscape, timeoutMs: 200, deadline: deadline)
+        } else {
+            waitPanelGone(since: beforeEscape, timeoutMs: 200, deadline: deadline)
+        }
 
         var committed = viewString()
         if let range = markedRange() {
@@ -273,6 +290,38 @@ final class Driver {
             usleep(30_000)
         }
         return last
+    }
+
+    /// Poll until the candidate panel is on screen near the client window —
+    /// the readiness signal for an engine whose panel has no accessibility
+    /// text. Like `waitForCandidates`, it needs a couple of consecutive
+    /// sightings so a flickering window is not mistaken for the panel.
+    private func waitForPanel(timeoutMs: Int) -> Bool {
+        let deadline = Date().addingTimeInterval(Double(timeoutMs) / 1000)
+        var seen = 0
+        while Date() < deadline {
+            if CandidateWindow.present(watchPids: watchPids, near: clientBounds) {
+                seen += 1
+                if seen >= 2 { return true }
+            } else {
+                seen = 0
+            }
+            usleep(30_000)
+        }
+        return CandidateWindow.present(watchPids: watchPids, near: clientBounds)
+    }
+
+    /// The escape settle for a panel without accessibility text: the view
+    /// state changing or the panel leaving the window server both mean the
+    /// engine is done with the record.
+    private func waitPanelGone(since before: ViewState, timeoutMs: Int, deadline: Date) {
+        let cap = Date().addingTimeInterval(Double(timeoutMs) / 1000)
+        let end = min(cap, deadline)
+        while Date() < end {
+            if viewState() != before { return }
+            if !CandidateWindow.present(watchPids: watchPids, near: clientBounds) { return }
+            usleep(5_000)
+        }
     }
 
     /// Re-scan for engine processes; input-method helpers start lazily.
