@@ -3,6 +3,7 @@
 use crate::record::EvalSet;
 use askama::Template;
 use rayon::iter::{IntoParallelRefIterator as _, ParallelIterator as _};
+use serde::{Deserialize, Serialize};
 use std::num::NonZeroUsize;
 
 /// One thing to decode.
@@ -58,6 +59,64 @@ pub struct Report {
 /// The fixed-point scale the reciprocal ranks accumulate in.
 const RANK_SCALE: u64 = 1 << 20;
 
+/// What one record's decode contributed, as something that can be written
+/// down and folded back in later.
+///
+/// These are exactly the counters [`Report::observe`] adds, kept as their own
+/// value so a run that records its progress can rebuild a report from its own
+/// lines without decoding anything twice.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+pub struct Observation {
+    /// How many characters the expected text held.
+    pub characters: usize,
+    /// How many of them the top hypothesis placed correctly, position by
+    /// position.
+    pub character_hits: usize,
+    /// Whether the engine returned no hypotheses at all.
+    pub unanswered: bool,
+    /// Where the expected text stood among the top-*k* hypotheses; `None` when
+    /// it never appeared. Rank zero is also the top-1 hit.
+    pub rank: Option<usize>,
+}
+
+impl Observation {
+    /// What *expected* against *hypotheses* contributes at *`top_k`*.
+    ///
+    /// Character accuracy is positional: hypothesis character *i* against
+    /// expected character *i*, over the length of the expected text. Output
+    /// length is the syllable count, so a hypothesis is usually the right
+    /// length -- but only usually, because a wrong segmentation is a wrong
+    /// length, and scoring those against the shorter of the two would reward
+    /// them for it.
+    #[must_use]
+    pub fn new(expected: &str, hypotheses: &[String], top_k: usize) -> Self {
+        let characters = expected.chars().count();
+        let Some(top) = hypotheses.first() else {
+            return Self {
+                characters,
+                character_hits: 0,
+                unanswered: true,
+                rank: None,
+            };
+        };
+        let character_hits = top
+            .chars()
+            .zip(expected.chars())
+            .filter(|(found, want)| found == want)
+            .count();
+        let rank = hypotheses
+            .iter()
+            .take(top_k)
+            .position(|found| found == expected);
+        Self {
+            characters,
+            character_hits,
+            unanswered: false,
+            rank,
+        }
+    }
+}
+
 impl Report {
     /// An empty report that will rank the first `top_k` hypotheses of each
     /// record.
@@ -76,32 +135,28 @@ impl Report {
     }
 
     /// Fold one decoded record into the report.
-    ///
-    /// Character accuracy is positional: hypothesis character *i* against
-    /// expected character *i*, over the length of the expected text. Output
-    /// length is the syllable count, so a hypothesis is usually the right length
-    /// -- but only usually, because a wrong segmentation is a wrong length, and
-    /// scoring those against the shorter of the two would reward them for it.
     pub fn observe(&mut self, expected: &str, hypotheses: &[String]) {
+        self.fold(&Observation::new(expected, hypotheses, self.top_k));
+    }
+
+    /// Fold a record's stored [`Observation`] into the report.
+    ///
+    /// The same arithmetic as [`Report::observe`], replayed from what a run
+    /// wrote down, so a report rebuilt from a progress file is identical to
+    /// the one the decoded records produced. A top-1 hit is a rank of zero,
+    /// which is how `rank` alone carries both sentence metrics.
+    pub fn fold(&mut self, observation: &Observation) {
         self.records += 1;
-        self.characters += expected.chars().count();
-        let Some(top) = hypotheses.first() else {
+        self.characters += observation.characters;
+        if observation.unanswered {
             self.unanswered += 1;
             return;
-        };
-        self.character_hits += top
-            .chars()
-            .zip(expected.chars())
-            .filter(|(found, want)| found == want)
-            .count();
-        if top == expected {
-            self.top1_hits += 1;
         }
-        if let Some(rank) = hypotheses
-            .iter()
-            .take(self.top_k)
-            .position(|found| found == expected)
-        {
+        self.character_hits += observation.character_hits;
+        if let Some(rank) = observation.rank {
+            if rank == 0 {
+                self.top1_hits += 1;
+            }
             self.topk_hits += 1;
             self.reciprocal_ranks += RANK_SCALE / (rank as u64 + 1);
         }

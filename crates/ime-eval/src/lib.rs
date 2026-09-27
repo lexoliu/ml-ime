@@ -10,7 +10,7 @@
 mod metrics;
 mod record;
 
-pub use metrics::{Hypothesize, Report, Request, evaluate};
+pub use metrics::{Hypothesize, Observation, Report, Request, evaluate};
 pub use record::{EvalRecord, EvalSet, Slice};
 
 use thiserror::Error;

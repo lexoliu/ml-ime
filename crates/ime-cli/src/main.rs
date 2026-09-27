@@ -150,6 +150,13 @@ enum Command {
         /// hypotheses and their scores per line. The report is unchanged.
         #[arg(long)]
         dump: Option<PathBuf>,
+        /// A directory the run's per-record progress is kept in: every
+        /// configuration it evaluates keeps a JSON Lines file there, so a
+        /// stopped run resumes where it left off instead of decoding the
+        /// slice again. Resuming under arguments a file was not written with
+        /// is refused.
+        #[arg(long)]
+        progress: Option<PathBuf>,
         #[command(flatten)]
         slice: SliceArgs,
         #[command(flatten)]
@@ -257,6 +264,7 @@ async fn main() -> Result<()> {
             weight,
             no_transition: _,
             dump,
+            progress,
             slice,
             search,
         } => fused_eval(&FusedRun {
@@ -269,6 +277,7 @@ async fn main() -> Result<()> {
             unscored,
             weights: &weight,
             dump: dump.as_deref(),
+            progress: progress.as_deref(),
             slice: &slice,
             search: &search,
         }),
@@ -379,6 +388,9 @@ struct FusedRun<'a> {
     weights: &'a [f32],
     /// Where every evaluated section's beam lands, or `None` to report only.
     dump: Option<&'a Path>,
+    /// Where every configuration's per-record progress lands, or `None` to
+    /// keep nothing between runs.
+    progress: Option<&'a Path>,
     slice: &'a SliceArgs,
     search: &'a SearchArgs,
 }
@@ -406,6 +418,12 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
             lm_weight: run.lm_weight,
         },
     };
+    let progress = run.progress.map(|dir| neural::Progress {
+        dir,
+        model: run.model,
+        lm: run.lm,
+        stop_after: None,
+    });
     let rendered = neural::fused_eval(
         run.eval_set,
         run.scores,
@@ -414,6 +432,7 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
         run.weights,
         run.slice,
         run.dump,
+        progress.as_ref(),
         table,
         lexicon,
         run.search.segment(),
