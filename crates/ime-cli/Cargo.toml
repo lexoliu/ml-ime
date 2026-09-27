@@ -10,7 +10,9 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 askama.workspace = true
+blake2.workspace = true
 clap.workspace = true
+const-hex.workspace = true
 flate2.workspace = true
 ime-corpus.workspace = true
 ime-decode.workspace = true
