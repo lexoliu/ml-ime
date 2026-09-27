@@ -155,7 +155,7 @@ class GuiReport:
         return "\n".join(
             [
                 f"engine {self.engine} ({self.meta.get('input_source_id', 'no meta')})",
-                f"{r.records} records: top-1 {r.rime_top1:.4f}, "
+                f"{r.records} records: top-1 {r.top1:.4f}, "
                 f"first page exact {r.first_page_exact:.4f}, "
                 f"characters right {r.characters_right:.4f} of {r.characters}, "
                 f"length mismatches {r.length_mismatches}, wall {wall}",
