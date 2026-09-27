@@ -272,7 +272,7 @@ class RimeResult:
     """How RIME did on one slice, next to the beam it was measured against."""
 
     records: int
-    rime_top1: float
+    top1: float
     first_page_exact: float
     beam_top1: float | None
     characters: int
@@ -283,7 +283,7 @@ class RimeResult:
         """A JSON-friendly view."""
         return {
             "records": self.records,
-            "rime_top1": self.rime_top1,
+            "top1": self.top1,
             "first_page_exact": self.first_page_exact,
             "beam_top1": self.beam_top1,
             "characters": self.characters,
@@ -298,7 +298,7 @@ def evaluate(typed: Sequence[Typed]) -> RimeResult:
     characters = sum(len(t.record.text) for t in typed)
     return RimeResult(
         records=total,
-        rime_top1=sum(t.committed == t.record.text for t in typed) / total,
+        top1=sum(t.committed == t.record.text for t in typed) / total,
         first_page_exact=sum(t.record.text in t.first_page for t in typed) / total,
         # The beam's top-1 is only defined when the records came from a
         # fused-eval dump; an engine measured through the GUI has none.
@@ -350,7 +350,7 @@ class RimeReport:
         return "\n".join(
             [
                 f"librime {self.version}, schema {self.schema}",
-                f"{r.records} records: rime top-1 {r.rime_top1:.4f}, "
+                f"{r.records} records: top-1 {r.top1:.4f}, "
                 f"first page exact {r.first_page_exact:.4f}"
                 + (f", beam top-1 {r.beam_top1:.4f}" if r.beam_top1 is not None else ""),
                 f"characters right {r.characters_right:.4f} of {r.characters}, "

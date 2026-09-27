@@ -71,7 +71,7 @@ def test_measure_scores_like_eval_rime(tmp_path: Path) -> None:
     report = measure(results, eval_set, "apple", slice_="all")
     r = report.result
     assert r.records == 5
-    assert r.rime_top1 == pytest.approx(3 / 5)
+    assert r.top1 == pytest.approx(3 / 5)
     assert r.first_page_exact == pytest.approx(3 / 5)
     assert r.beam_top1 is None
     assert r.characters == 10
