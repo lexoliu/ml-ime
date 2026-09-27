@@ -274,7 +274,7 @@ class RimeResult:
     records: int
     rime_top1: float
     first_page_exact: float
-    beam_top1: float
+    beam_top1: float | None
     characters: int
     characters_right: float
     length_mismatches: int
@@ -300,7 +300,17 @@ def evaluate(typed: Sequence[Typed]) -> RimeResult:
         records=total,
         rime_top1=sum(t.committed == t.record.text for t in typed) / total,
         first_page_exact=sum(t.record.text in t.first_page for t in typed) / total,
-        beam_top1=sum(t.record.hypotheses[0].text == t.record.text for t in typed) / total,
+        # The beam's top-1 is only defined when the records came from a
+        # fused-eval dump; an engine measured through the GUI has none.
+        beam_top1=(
+            sum(
+                bool(t.record.hypotheses) and t.record.hypotheses[0].text == t.record.text
+                for t in typed
+            )
+            / total
+            if any(t.record.hypotheses for t in typed)
+            else None
+        ),
         characters=characters,
         characters_right=sum(characters_right(t.record.text, t.committed) for t in typed)
         / characters,
@@ -341,7 +351,8 @@ class RimeReport:
             [
                 f"librime {self.version}, schema {self.schema}",
                 f"{r.records} records: rime top-1 {r.rime_top1:.4f}, "
-                f"first page exact {r.first_page_exact:.4f}, beam top-1 {r.beam_top1:.4f}",
+                f"first page exact {r.first_page_exact:.4f}"
+                + (f", beam top-1 {r.beam_top1:.4f}" if r.beam_top1 is not None else ""),
                 f"characters right {r.characters_right:.4f} of {r.characters}, "
                 f"length mismatches {r.length_mismatches}",
             ]
