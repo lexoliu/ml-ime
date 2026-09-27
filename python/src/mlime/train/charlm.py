@@ -702,13 +702,21 @@ def export_onnx(
 ) -> tuple[Path, Path]:
     """Write the step graph, the prefill graph and their manifest for the Rust decoder.
 
-    ``charlm.onnx`` takes ``token [B]``, the prefix tensors (one row each,
-    shared by the batch) and the state tensors (one row per beam) and returns
-    ``log_probs [B, V]`` (float32, normalised over the alphabet, or over the
-    characters of *restrict* plus ``<eos>`` when given) and the next state
-    tensors. ``prefill.onnx`` takes ``tokens [1, T]`` and returns the same
-    ``log_probs``, the prefix tensors and the state tensors to start from.
-    ``charlm.json`` names the tensors and holds the alphabet in id order.
+    ``charlm.onnx`` takes ``token [workers * width]`` -- the batch laid out
+    ``[workers, width]``, each of the ``width``-row blocks one record's
+    beams -- the prefix tensors (one row per worker, left-padded up to the
+    widest prelude) and ``prefix_mask`` (which of each prefix row's
+    positions are real), then the state tensors (one row per beam), and
+    returns ``log_probs [workers * width, V]`` (float32, normalised over the
+    alphabet, or over the characters of *restrict* plus ``<eos>`` when
+    given) and the next state tensors. ``prefill.onnx`` takes ``tokens
+    [1, T]`` and returns the same ``log_probs``, the prefix tensors and the
+    state tensors to start from. The mask input exists only where the model
+    has a prefix: the LSTM's step graph is unchanged and takes no mask.
+    ``charlm.json`` names the tensors and holds the alphabet in id order;
+    its ``layout`` records the step graph's batch layout (``"rectangular"``
+    -- ``[workers, width]``), which ``ime-lm`` refuses to open without, so a
+    stale per-row export fails at load rather than inside a MatMul.
     The graphs' initializers live in an external weights file beside the
     graphs -- ``charlm.weights``, shared when the step and prefill
     initializers coincide, otherwise one file per graph -- which the manifest's
@@ -731,26 +739,44 @@ def export_onnx(
     prelude = torch.tensor([[BOS, SEP]])
     with torch.no_grad():
         _, prefix, state = model.prefill(prelude)
-    # Example inputs with two rows in the batch and two characters in the
-    # state, so every dynamic axis is exercised.
+    # Example inputs of two workers at width two with two characters in the
+    # state, so every dynamic axis -- workers, rows under a worker, time --
+    # is exercised.
     with torch.no_grad():
-        two = torch.tensor([SEP, SEP])
-        stacked = tuple(tensor.expand(2, *tensor.shape[1:]).contiguous() for tensor in state)
-        _, stacked = model.step(two, prefix, stacked)
-        _, stacked = model.step(two, prefix, stacked)
+        four = torch.tensor([SEP] * 4)
+        stacked = tuple(tensor.expand(4, *tensor.shape[1:]).contiguous() for tensor in state)
+        prefix_mask: torch.Tensor | None = None
+        if model.config.arch == "transformer":
+            # The step's prefix is one row per worker; the example's two
+            # workers share the prelude, so its tensors repeat to two rows
+            # and the mask is real positions throughout (a padding-free
+            # batch).
+            prefix = tuple(tensor.expand(2, *tensor.shape[1:]).contiguous() for tensor in prefix)
+            prefix_mask = torch.ones(2, prefix[0].shape[3], dtype=torch.bool)
+        _, stacked = model.step(four, prefix, stacked, prefix_mask)
+        _, stacked = model.step(four, prefix, stacked, prefix_mask)
     axes: dict[str, dict[int, str]] = {"token": {0: "batch"}, "log_probs": {0: "batch"}}
     for name in (*state_names, *next_names):
         axes[name] = {0: "batch"}
+    mask_names: list[str] = []
+    mask_args: tuple[torch.Tensor, ...] = ()
     if model.config.arch == "transformer":
-        # Key/value caches are [batch, layers, heads, time, head_dim].
-        for name in (*prefix_names, *state_names, *next_names):
+        # Key/value caches are [workers, layers, heads, time, head_dim] and
+        # the mask [workers, time]; the workers axis is its own symbol, so
+        # one worker and a lockstep batch both feed the same graph.
+        for name in prefix_names:
+            axes[name] = {0: "workers", 3: f"{name}_time"}
+        for name in (*state_names, *next_names):
             axes.setdefault(name, {})[3] = f"{name}_time"
+        mask_names = ["prefix_mask"]
+        mask_args = (prefix_mask,) if prefix_mask is not None else ()
+        axes["prefix_mask"] = {0: "workers", 1: "prefix_mask_time"}
     step_graph = out_dir / "charlm.onnx"
     torch.onnx.export(
         StepModule(model, keep),
-        (two, *prefix, *stacked),
+        (four, *prefix, *mask_args, *stacked),
         str(step_graph),
-        input_names=["token", *prefix_names, *state_names],
+        input_names=["token", *prefix_names, *mask_names, *state_names],
         output_names=["log_probs", *next_names],
         dynamic_axes=axes,
         opset_version=17,
@@ -783,6 +809,7 @@ def export_onnx(
                 "context_chars": model.config.context_chars,
                 "prefix": list(prefix_names),
                 "state": list(state_names),
+                "layout": "rectangular",
                 "specials": {"pad": PAD, "bos": BOS, "eos": EOS, "sep": SEP, "unk": UNK},
                 "restricted_to": None if keep is None else int(keep.numel()),
                 "weights": weights,

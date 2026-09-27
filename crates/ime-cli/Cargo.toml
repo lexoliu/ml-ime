@@ -7,6 +7,15 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# `--backend coreml` on `fused-eval`: Apple's ANE/GPU provider.
+gpu-coreml = ["ime-lm/gpu-coreml"]
+# `--backend webgpu` on `fused-eval`: Dawn over Metal.
+gpu-webgpu = ["ime-lm/gpu-webgpu"]
+# `--backend cuda` on `fused-eval`: NVIDIA's CUDA provider.
+gpu-cuda = ["ime-lm/gpu-cuda"]
+
 [dependencies]
 anyhow.workspace = true
 askama.workspace = true

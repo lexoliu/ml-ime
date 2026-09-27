@@ -1,6 +1,6 @@
 //! The n-gram baseline as a complete input method.
 
-use ime_decode::{BeamOptions, Candidates, Hypothesis, Uniform, decode};
+use ime_decode::{BeamOptions, Candidates, Hypothesis, Record, Uniform, decode_many};
 use ime_eval::{Hypothesize, Request};
 use ime_ngram::NgramModel;
 use ime_pinyin::{Lexicon, SegmentLattice, SegmentOptions, Segmentation, SyllableTable};
@@ -84,11 +84,19 @@ impl Baseline {
             top_k,
             ..self.beam.clone()
         };
-        decode(&batch, &Uniform, &self.model, None, &options).map_err(|source| {
-            BaselineError::Decode {
-                input: pinyin.to_owned(),
-                source,
-            }
+        decode_many(
+            &[Record {
+                candidates: &batch,
+                emission: Uniform,
+                context: None,
+            }],
+            &self.model,
+            &options,
+        )
+        .map(|mut results| results.pop().expect("one record decodes to one result"))
+        .map_err(|source| BaselineError::Decode {
+            input: pinyin.to_owned(),
+            source,
         })
     }
 }
