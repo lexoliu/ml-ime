@@ -111,3 +111,36 @@ def test_measure_rejects_a_slice_with_no_rows(tmp_path: Path) -> None:
     # dev_share 0 leaves no dev records, so scoring dev has nothing to say.
     with pytest.raises(ValueError, match="no records"):
         measure(results, eval_set, "apple", slice_="dev", dev_share=0.0)
+
+
+def test_measure_refuses_a_mismatched_run_slice(tmp_path: Path) -> None:
+    eval_set = _write(tmp_path, "eval.jsonl", _eval_rows())
+    results = _write(
+        tmp_path,
+        "results.jsonl",
+        [
+            {"type": "meta", "engine": "apple", "slice": "dev"},
+            {"record": 0, "committed": "中国", "first_page": [], "wall_ms": 1},
+        ],
+    )
+    with pytest.raises(ValueError, match="--slice dev"):
+        measure(results, eval_set, "apple", slice_="test")
+    # A run typed with --slice all covers every scoring slice.
+    results_all = _write(
+        tmp_path,
+        "results-all.jsonl",
+        [
+            {"type": "meta", "engine": "apple", "slice": "all"},
+            {"record": 0, "committed": "中国", "first_page": [], "wall_ms": 1},
+        ],
+    )
+    report = measure(results_all, eval_set, "apple", slice_="test", dev_share=0.0)
+    assert report.result.records == 1
+    # Runs written before --slice existed have no meta field and count as all.
+    results_plain = _write(
+        tmp_path,
+        "results-plain.jsonl",
+        [{"record": 0, "committed": "中国", "first_page": [], "wall_ms": 1}],
+    )
+    scored = measure(results_plain, eval_set, "apple", slice_="test", dev_share=0.0)
+    assert scored.result.records == 1
