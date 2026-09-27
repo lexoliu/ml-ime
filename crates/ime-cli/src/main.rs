@@ -157,6 +157,21 @@ enum Command {
         /// is refused.
         #[arg(long)]
         progress: Option<PathBuf>,
+        /// How many records one lockstep decode runs at once. The default of
+        /// one is today's per-record rayon path; more feeds `records x paths x
+        /// beams` rows to each model step, which is what a GPU backend is
+        /// sized for.
+        #[arg(long, default_value = "1")]
+        batch: usize,
+        /// Which backend the character model's sessions run on. Asking for a
+        /// provider the binary was not compiled with is an error, never a
+        /// silent CPU session.
+        #[arg(long, value_enum, default_value = "cpu", requires = "lm")]
+        backend: neural::BackendArg,
+        /// ONNX Runtime's verbose session logging: the provider each graph
+        /// node lands on, the evidence for whether a backend runs the step.
+        #[arg(long, requires = "lm")]
+        ort_verbose: bool,
         #[command(flatten)]
         slice: SliceArgs,
         #[command(flatten)]
@@ -265,6 +280,9 @@ async fn main() -> Result<()> {
             no_transition: _,
             dump,
             progress,
+            batch,
+            backend,
+            ort_verbose,
             slice,
             search,
         } => fused_eval(&FusedRun {
@@ -278,6 +296,9 @@ async fn main() -> Result<()> {
             weights: &weight,
             dump: dump.as_deref(),
             progress: progress.as_deref(),
+            batch,
+            backend: backend.backend(),
+            ort_verbose,
             slice: &slice,
             search: &search,
         }),
@@ -391,8 +412,34 @@ struct FusedRun<'a> {
     /// Where every configuration's per-record progress lands, or `None` to
     /// keep nothing between runs.
     progress: Option<&'a Path>,
+    /// Records per lockstep batch; one is the per-record rayon path.
+    batch: usize,
+    /// Which backend the character model's sessions run on.
+    backend: ime_lm::Backend,
+    /// ONNX Runtime's verbose session logging.
+    ort_verbose: bool,
     slice: &'a SliceArgs,
     search: &'a SearchArgs,
+}
+
+impl FusedRun<'_> {
+    /// The shape the character model's sessions are built to. The lockstep
+    /// path -- `--batch` above one, or any GPU backend -- keeps one session
+    /// for the whole batch, so it gets the machine's intra-op parallelism;
+    /// the per-record rayon path keeps one thread a session, the decoder
+    /// itself being the parallel layer.
+    fn session_shape(&self) -> ime_lm::SessionShape {
+        let lockstep = self.batch > 1 || self.backend != ime_lm::Backend::Cpu;
+        ime_lm::SessionShape {
+            backend: self.backend,
+            intra_threads: if lockstep {
+                std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::MIN)
+            } else {
+                std::num::NonZeroUsize::MIN
+            },
+            verbose_logging: self.ort_verbose,
+        }
+    }
 }
 
 fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
@@ -404,7 +451,7 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
     let lm = run
         .lm
         .map(|dir| {
-            CharLm::open(dir, &lexicon)
+            CharLm::open(dir, &lexicon, run.session_shape())
                 .with_context(|| format!("could not open the character model in {}", dir.display()))
         })
         .transpose()?;
@@ -437,6 +484,7 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
         lexicon,
         run.search.segment(),
         &run.search.beam(),
+        run.batch,
         transition,
     )?;
     write!(std::io::stdout(), "{rendered}").context("could not write to stdout")

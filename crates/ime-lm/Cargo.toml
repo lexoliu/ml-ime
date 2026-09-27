@@ -7,6 +7,13 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Apple Core ML execution provider (ANE/GPU): `ort`'s `coreml` feature.
+gpu-coreml = ["ort/coreml"]
+# WebGPU execution provider over Dawn/Metal: `ort`'s `webgpu` feature.
+gpu-webgpu = ["ort/webgpu"]
+
 [dependencies]
 ime-decode.workspace = true
 ime-pinyin.workspace = true

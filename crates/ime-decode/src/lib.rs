@@ -15,7 +15,7 @@ mod candidates;
 mod emissions;
 mod score;
 
-pub use beam::{BeamOptions, Hypothesis, decode};
+pub use beam::{BeamOptions, Hypothesis, Record, decode_many};
 pub use candidates::{CandidatePath, Candidates};
 pub use emissions::{
     EmissionError, Emittable, LatticePath, LatticeRecord, ScoreRecord, Scored, Weighted,
@@ -70,6 +70,26 @@ mod tests {
         let options = offline();
         let lattice = SegmentLattice::build(input, table, &options).expect("input reads");
         Candidates::build(&lattice.k_best(&options), lexicon).expect("masks are non-empty")
+    }
+
+    /// `decode_many` over one record, as every call here decodes only one.
+    fn decode<E: Emission, T: Transition>(
+        batch: &Candidates,
+        emission: E,
+        transition: &T,
+        context: Option<&str>,
+        options: &BeamOptions,
+    ) -> Result<Vec<Hypothesis>, DecodeError> {
+        decode_many(
+            &[Record {
+                candidates: batch,
+                emission,
+                context,
+            }],
+            transition,
+            options,
+        )
+        .map(|mut results| results.pop().expect("one record decodes to one result"))
     }
 
     /// A transition model that likes exactly one sentence: each character in the
@@ -133,7 +153,7 @@ mod tests {
         let (table, lexicon) = fixture();
         let batch = candidates("zhongguo", &table, &lexicon);
         let transition = Preference::new(&lexicon, "中国");
-        let best = decode(&batch, &Uniform, &transition, None, &BeamOptions::default())
+        let best = decode(&batch, Uniform, &transition, None, &BeamOptions::default())
             .expect("the batch decodes");
         assert_eq!(best[0].text(&lexicon), "中国");
     }
@@ -143,7 +163,7 @@ mod tests {
         let (table, lexicon) = fixture();
         let batch = candidates("nihao", &table, &lexicon);
         let transition = Preference::new(&lexicon, "你好");
-        let best = decode(&batch, &Uniform, &transition, None, &BeamOptions::default())
+        let best = decode(&batch, Uniform, &transition, None, &BeamOptions::default())
             .expect("nihao decodes");
         assert!(best.len() > 1, "expected several hypotheses");
         assert!(
@@ -166,7 +186,7 @@ mod tests {
             top_k: std::num::NonZeroUsize::new(3).expect("3 is not zero"),
             ..BeamOptions::default()
         };
-        let best = decode(&batch, &Uniform, &transition, None, &options).expect("nihao decodes");
+        let best = decode(&batch, Uniform, &transition, None, &options).expect("nihao decodes");
         assert_eq!(best.len(), 3);
     }
 
@@ -183,8 +203,8 @@ mod tests {
             beam_width: std::num::NonZeroUsize::new(64).expect("64 is not zero"),
             ..BeamOptions::default()
         };
-        let narrow = decode(&batch, &Uniform, &transition, None, &narrow).expect("decodes");
-        let wide = decode(&batch, &Uniform, &transition, None, &wide).expect("decodes");
+        let narrow = decode(&batch, Uniform, &transition, None, &narrow).expect("decodes");
+        let wide = decode(&batch, Uniform, &transition, None, &wide).expect("decodes");
         assert!(wide[0].score() >= narrow[0].score());
     }
 
@@ -202,13 +222,51 @@ mod tests {
         let transition = Preference::new(&lexicon, "中");
         let best = decode(
             &batch,
-            &Insist(zhong),
+            Insist(zhong),
             &transition,
             None,
             &BeamOptions::default(),
         )
         .expect("zhong decodes");
         assert_eq!(best[0].text(&lexicon), "钟");
+    }
+
+    #[test]
+    fn a_batch_decodes_each_record_as_if_alone() {
+        let (table, lexicon) = fixture();
+        let batches = [
+            candidates("zhongguo", &table, &lexicon),
+            candidates("nihao", &table, &lexicon),
+        ];
+        let transition = Preference::new(&lexicon, "中国");
+        let options = BeamOptions::default();
+        let together = decode_many(
+            &batches
+                .iter()
+                .map(|batch| Record {
+                    candidates: batch,
+                    emission: Uniform,
+                    context: None,
+                })
+                .collect::<Vec<_>>(),
+            &transition,
+            &options,
+        )
+        .expect("the batch decodes");
+        assert_eq!(together.len(), batches.len());
+        for (batch, results) in batches.iter().zip(&together) {
+            let alone = decode(batch, Uniform, &transition, None, &options).expect("decodes");
+            assert_eq!(results.len(), alone.len());
+            for (batched, solo) in results.iter().zip(&alone) {
+                assert_eq!(batched.chars(), solo.chars());
+                assert_eq!(
+                    batched.score().to_bits(),
+                    solo.score().to_bits(),
+                    "a batched record scores bit-identically to the solo run"
+                );
+                assert_eq!(batched.path(), solo.path());
+            }
+        }
     }
 
     #[test]

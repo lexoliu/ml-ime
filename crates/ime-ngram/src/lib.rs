@@ -91,8 +91,28 @@ pub enum NgramError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ime_decode::{BeamOptions, Candidates, Transition, Uniform, decode};
+    use ime_decode::{BeamOptions, Candidates, Record, Transition, Uniform, decode_many};
     use ime_pinyin::{Lexicon, SegmentLattice, SegmentOptions, SyllableTable};
+
+    /// `decode_many` over one record, as every call here decodes only one.
+    fn decode(
+        batch: &Candidates,
+        model: &NgramModel,
+        options: &BeamOptions,
+    ) -> Vec<ime_decode::Hypothesis> {
+        decode_many(
+            &[Record {
+                candidates: batch,
+                emission: Uniform,
+                context: None,
+            }],
+            model,
+            options,
+        )
+        .expect("the batch decodes")
+        .pop()
+        .expect("one record decodes to one result")
+    }
 
     /// A handful of sentences; small enough to reason about, varied enough that
     /// every order has both singletons and repeats to estimate a discount from.
@@ -277,8 +297,7 @@ mod tests {
             SegmentLattice::build("zhongguorenmin", &table, &options).expect("the input reads");
         let batch =
             Candidates::build(&lattice.k_best(&options), &lexicon).expect("masks are non-empty");
-        let best = decode(&batch, &Uniform, &model, None, &BeamOptions::default())
-            .expect("the batch decodes");
+        let best = decode(&batch, &model, &BeamOptions::default());
         assert_eq!(best[0].text(&lexicon), "中国人民");
     }
 
@@ -296,15 +315,12 @@ mod tests {
             Candidates::build(&lattice.k_best(&options), &lexicon).expect("masks are non-empty");
         let best = decode(
             &batch,
-            &Uniform,
             &model,
-            None,
             &BeamOptions {
                 beam_width: std::num::NonZeroUsize::new(64).expect("64 is not zero"),
                 ..BeamOptions::default()
             },
-        )
-        .expect("the batch decodes");
+        );
         let texts: Vec<String> = best.iter().map(|h| h.text(&lexicon)).collect();
         assert!(
             texts.contains(&"中国人民".to_owned()),

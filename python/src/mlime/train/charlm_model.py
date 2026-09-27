@@ -112,10 +112,16 @@ class CharLm(nn.Module):
         token: torch.Tensor,
         prefix: tuple[torch.Tensor, ...],
         state: tuple[torch.Tensor, ...],
+        prefix_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         """Advance ``token [B]`` on ``state``: features ``[B, H]`` and the new state.
 
-        A prefix tensor has one row and is shared by every row of the batch.
+        A prefix tensor is ``[P, ...]``: one row per record when the batch
+        mixes records, or a single row the batch broadcasts over when every
+        row shares one record's prelude. Rows of the first form are padded on
+        the left up to the widest prelude, and ``prefix_mask [P, T]`` marks
+        the real positions (``None`` reads as all true). A model without
+        prefix tensors ignores the mask.
         """
         raise NotImplementedError
 
@@ -158,6 +164,7 @@ class LstmCharLm(CharLm):
         token: torch.Tensor,
         prefix: tuple[torch.Tensor, ...],
         state: tuple[torch.Tensor, ...],
+        prefix_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         hidden, cell = state
         features, (hidden, cell) = self.lstm(
@@ -216,24 +223,32 @@ class Block(nn.Module):
         x: torch.Tensor,
         prefix_keys: torch.Tensor,
         prefix_values: torch.Tensor,
+        prefix_mask: torch.Tensor,
         keys: torch.Tensor,
         values: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """One new position ``x [B, 1, H]`` against the two caches and itself.
 
-        ``prefix_keys``/``prefix_values`` hold the context's positions and
-        ``keys``/``values`` the sentence's; scoring them separately and
-        concatenating only the scores keeps the prefix cache out of the step's
-        copies. Written with plain matrix products so the step graph exports
-        as a handful of ONNX operators. Returns the output and the new
-        key/value.
+        ``prefix_keys``/``prefix_values`` hold each row's context's positions
+        -- one row when the whole batch shares a record's prelude, one row per
+        batch row otherwise, the real positions right-aligned under
+        ``prefix_mask`` -- and ``keys``/``values`` the sentence's; scoring
+        them separately and concatenating only the scores keeps the prefix
+        cache out of the step's copies. Masked prefix positions take ``-inf``
+        before the softmax, which leaves them weightless however the padding
+        was filled. Written with plain matrix products so the step graph
+        exports as a handful of ONNX operators. Returns the output and the
+        new key/value.
         """
         q, k, v = self.split(x)
         keys = torch.cat([keys, k], dim=2)
         values = torch.cat([values, v], dim=2)
-        scores = torch.cat(
-            [q @ prefix_keys.transpose(-1, -2), q @ keys.transpose(-1, -2)], dim=-1
-        ) / math.sqrt(self.head_dim)
+        prefix_scores = (q @ prefix_keys.transpose(-1, -2)).masked_fill(
+            prefix_mask.logical_not().unsqueeze(1).unsqueeze(1), float("-inf")
+        )
+        scores = torch.cat([prefix_scores, q @ keys.transpose(-1, -2)], dim=-1) / math.sqrt(
+            self.head_dim
+        )
         probs = torch.softmax(scores, dim=-1)
         split = prefix_keys.shape[2]
         attended = probs[..., :split] @ prefix_values + probs[..., split:] @ values
@@ -269,8 +284,14 @@ class TransformerCharLm(CharLm):
         return ("keys", "values")
 
     def embed_at(self, tokens: torch.Tensor, first: int | torch.Tensor) -> torch.Tensor:
-        """Token embeddings plus positions counted from *first* (``[B, T, H]``)."""
-        positions = torch.arange(tokens.shape[1], device=tokens.device) + first
+        """Token embeddings plus positions counted from *first* (``[B, T, H]``).
+
+        *first* is a scalar when every row starts at the same position, or one
+        entry per row ``[B]`` when preludes of different lengths were padded
+        to a common width.
+        """
+        span = torch.arange(tokens.shape[1], device=tokens.device)
+        positions = span + first if isinstance(first, int) else span + first.unsqueeze(-1)
         embedded: torch.Tensor = self.dropout(
             self.input(self.embed(tokens)) + self.positions(positions)
         )
@@ -314,19 +335,31 @@ class TransformerCharLm(CharLm):
         token: torch.Tensor,
         prefix: tuple[torch.Tensor, ...],
         state: tuple[torch.Tensor, ...],
+        prefix_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
         prefix_keys, prefix_values = prefix
         keys, values = state
-        first = prefix_keys.shape[3] + keys.shape[3]
+        if prefix_mask is None:
+            prefix_mask = torch.ones(
+                (prefix_keys.shape[0], prefix_keys.shape[3]),
+                dtype=torch.bool,
+                device=token.device,
+            )
+        # A row's next position is its prelude's real length plus the
+        # sentence's so far, so the mask's count is what ``embed_at`` counts
+        # from and padded prelude positions hold no position id either.
+        first = prefix_mask.sum(-1) + keys.shape[3]
         x = self.embed_at(token.unsqueeze(1), first)
         new_keys, new_values = [], []
         for layer, block in enumerate(self.layers()):
-            # The prefix stays one row: ``MatMul`` broadcasts it over the
-            # batch where an ``Expand`` would materialise a per-beam copy.
+            # A one-row prefix is broadcast by ``MatMul`` where an ``Expand``
+            # would materialise a per-beam copy; per-record rows already hold
+            # the batch.
             x, k, v = block.attend(
                 x,
                 prefix_keys[:, layer],
                 prefix_values[:, layer],
+                prefix_mask,
                 keys[:, layer],
                 values[:, layer],
             )
@@ -381,7 +414,12 @@ class Restricted(nn.Module):
 
 
 class StepModule(nn.Module):
-    """The step graph: ``(token, *prefix, *state) -> (log_probs, *next_state)``."""
+    """The step graph: ``(token, *prefix, mask?, *state) -> (log_probs, *next_state)``.
+
+    The mask input sits between the prefix and state tensors, and exists only
+    where the model has a prefix to mask (the transformer): a model without
+    prefix tensors takes ``(token, *state)`` as before.
+    """
 
     def __init__(self, model: CharLm, keep: torch.Tensor | None = None):
         super().__init__()
@@ -390,7 +428,9 @@ class StepModule(nn.Module):
 
     def forward(self, token: torch.Tensor, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
         split = len(self.model.prefix_names)
-        features, state = self.model.step(token, tensors[:split], tensors[split:])
+        prefix, rest = tensors[:split], tensors[split:]
+        mask, state = (rest[0], rest[1:]) if split else (None, rest)
+        features, state = self.model.step(token, prefix, state, mask)
         return (self.restricted(features), *state)
 
 

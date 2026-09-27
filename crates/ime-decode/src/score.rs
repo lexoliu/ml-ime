@@ -138,8 +138,8 @@ pub trait Transition {
     /// better survives. For an n-gram of that order the merge is exact; for a
     /// model with a longer memory it is the recombination every beam search over
     /// such a model makes, and `HISTORY` is how much of the past the search keeps
-    /// apart. Must lie in `1..=MAX_HISTORY`, which [`decode`](crate::decode)
-    /// checks when it is instantiated.
+    /// apart. Must lie in `1..=MAX_HISTORY`, which
+    /// [`decode_many`](crate::decode_many) checks when it is instantiated.
     const HISTORY: usize;
 
     /// What a beam carries for this model.

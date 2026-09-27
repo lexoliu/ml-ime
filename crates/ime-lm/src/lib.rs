@@ -35,6 +35,7 @@ use ime_decode::{MAX_HISTORY, Transition};
 use ime_pinyin::{CharId, Lexicon};
 use memmap2::Mmap;
 use ort::AsPointer;
+use ort::ep::ExecutionProviderDispatch;
 use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::builder::{GraphOptimizationLevel, PrepackedWeights};
 use ort::session::{Session, SessionInputValue};
@@ -44,11 +45,81 @@ use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::Arc;
 use thiserror::Error;
 use thread_local::ThreadLocal;
+
+/// Which execution provider a model's sessions run on.
+///
+/// `cpu` is the decoder's default and always built in; `coreml` (Apple's ANE/
+/// GPU) and `webgpu` (Dawn over Metal) exist behind the `gpu-coreml` and
+/// `gpu-webgpu` cargo features, and asking for one that was not compiled in
+/// is an error at [`CharLm::open`], never a silent CPU session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    /// ONNX Runtime's CPU kernels; the default.
+    #[default]
+    Cpu,
+    /// Apple's Core ML provider, behind the `gpu-coreml` feature.
+    CoreMl,
+    /// WebGPU through Dawn (the Metal GPU), behind the `gpu-webgpu` feature.
+    WebGpu,
+}
+
+impl Backend {
+    /// The providers a session of this backend registers.
+    ///
+    /// # Errors
+    ///
+    /// If the backend's provider was not compiled into this build.
+    fn providers(self) -> Result<Vec<ExecutionProviderDispatch>, LmError> {
+        match self {
+            Self::Cpu => Ok(Vec::new()),
+            #[cfg(feature = "gpu-coreml")]
+            Self::CoreMl => Ok(vec![ort::ep::CoreML::default().build()]),
+            #[cfg(feature = "gpu-webgpu")]
+            Self::WebGpu => Ok(vec![ort::ep::WebGPU::default().build()]),
+            #[allow(
+                unreachable_patterns,
+                reason = "the arm is reachable only when a gpu-* feature is off; with both on, every Backend variant already has an arm"
+            )]
+            _ => Err(LmError::NotCompiled { backend: self }),
+        }
+    }
+}
+
+/// How a model's sessions are built: the provider they register, the threads
+/// one step spreads over, and whether the runtime logs verbosely.
+///
+/// The caller states the shape the decode will run, because the decoder is
+/// the parallel layer and the session must not fight it: the per-record
+/// rayon path gives every session one intra-op thread, while the lockstep
+/// path runs one session for the whole batch and gives it the machine's
+/// parallelism.
+#[derive(Debug, Clone, Copy)]
+pub struct SessionShape {
+    /// The execution provider the sessions register.
+    pub backend: Backend,
+    /// The threads one session spreads a step over; the default is one, the
+    /// rayon path's shape.
+    pub intra_threads: NonZeroUsize,
+    /// ONNX Runtime's verbose session logging: the provider each node lands
+    /// on is the evidence for whether a backend actually runs the step.
+    pub verbose_logging: bool,
+}
+
+impl Default for SessionShape {
+    fn default() -> Self {
+        Self {
+            backend: Backend::Cpu,
+            intra_threads: NonZeroUsize::MIN,
+            verbose_logging: false,
+        }
+    }
+}
 
 /// The per-thread sessions of one graph, over one shared copy of its weights.
 ///
@@ -67,15 +138,22 @@ struct GraphSessions {
     prepacked: PrepackedWeights,
     /// The graph's initializers, one `OrtValue` each shared by every session.
     initializers: Vec<(String, Arc<DynValue>)>,
+    /// How the sessions are built.
+    shape: SessionShape,
 }
 
 impl GraphSessions {
-    fn new(graph: PathBuf, initializers: Vec<(String, Arc<DynValue>)>) -> Self {
+    fn new(
+        graph: PathBuf,
+        initializers: Vec<(String, Arc<DynValue>)>,
+        shape: SessionShape,
+    ) -> Self {
         Self {
             by_thread: ThreadLocal::new(),
             path: graph,
             prepacked: PrepackedWeights::new(),
             initializers,
+            shape,
         }
     }
 
@@ -86,9 +164,8 @@ impl GraphSessions {
     /// holds `prepacked_weights_container_->mutex_` around them.
     fn session(&self) -> Result<&RefCell<Session>, LmError> {
         self.by_thread.get_or_try(|| {
-            open_session(&self.path, &self.prepacked, &self.initializers)
+            open_session(&self.path, &self.prepacked, &self.initializers, self.shape)
                 .map(RefCell::new)
-                .map_err(LmError::from)
         })
     }
 }
@@ -131,6 +208,12 @@ pub enum LmError {
         path: PathBuf,
         /// How it disagrees with the table.
         reason: String,
+    },
+    /// The backend asked for a provider this build does not carry.
+    #[error("the {backend:?} backend was not compiled in (missing its gpu-* cargo feature)")]
+    NotCompiled {
+        /// The backend that was asked for.
+        backend: Backend,
     },
 }
 
@@ -287,15 +370,23 @@ pub struct CharLm {
 }
 
 impl CharLm {
+    /// The backend this model's sessions run on. A GPU session is one device
+    /// per thread, so callers that parallelise records must check this and
+    /// serialise instead.
+    pub fn backend(&self) -> Backend {
+        self.step_sessions.shape.backend
+    }
+
     /// Open the model in *dir* (`charlm.json`, `prefill.onnx`, `charlm.onnx`)
-    /// for *lexicon*.
+    /// for *lexicon*, its sessions built to *shape*.
     ///
     /// # Errors
     ///
     /// If the manifest cannot be read or names a field the export does not
-    /// write, either graph cannot be loaded, or a character of the lexicon has
-    /// no row in the model's alphabet.
-    pub fn open(dir: &Path, lexicon: &Lexicon) -> Result<Self, LmError> {
+    /// write, either graph cannot be loaded, a character of the lexicon has
+    /// no row in the model's alphabet, or *shape*'s provider was not
+    /// compiled into this build.
+    pub fn open(dir: &Path, lexicon: &Lexicon, shape: SessionShape) -> Result<Self, LmError> {
         let manifest_path = dir.join("charlm.json");
         let raw = fs::read_to_string(&manifest_path).map_err(|source| LmError::Io {
             path: manifest_path.clone(),
@@ -348,8 +439,12 @@ impl CharLm {
             }
         };
         let model = Self {
-            prefill_sessions: GraphSessions::new(dir.join("prefill.onnx"), prefill_initializers),
-            step_sessions: GraphSessions::new(dir.join("charlm.onnx"), step_initializers),
+            prefill_sessions: GraphSessions::new(
+                dir.join("prefill.onnx"),
+                prefill_initializers,
+                shape,
+            ),
+            step_sessions: GraphSessions::new(dir.join("charlm.onnx"), step_initializers, shape),
             prefix: manifest.prefix,
             state: manifest.state,
             context_chars: manifest.context_chars,
@@ -393,35 +488,51 @@ impl CharLm {
         })
     }
 
-    /// Advance a batch: `tokens[i]` applied to `states[i]`, which must all
-    /// share one record's prefix.
+    /// Advance a batch: `tokens[i]` applied to `states[i]`, whose rows may
+    /// come from different records.
+    ///
+    /// The step graph's prefix tensors are one row per batch row: when every
+    /// row shares a record's prelude the single row `prefill` produced goes
+    /// in as-is and broadcasts over the batch (the one-record path makes no
+    /// copies beyond what it always did); when the batch mixes records each
+    /// row's tensor stacks, padded on the left up to the widest prelude, and
+    /// the `prefix_mask` input marks which positions are real. A model
+    /// without prefix tensors (the LSTM) has no mask input and feeds none.
     fn step(&self, states: &[&LmState], tokens: &[u32]) -> Result<Vec<LmState>, LmError> {
         let batch = tokens.len();
         debug_assert_eq!(states.len(), batch, "one state per token");
-        let prefix = &states[0].prefix;
-        for state in states {
-            debug_assert!(
-                Arc::ptr_eq(prefix, &state.prefix),
-                "every state of a step shares the record's prefix"
-            );
-        }
         let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
-            Vec::with_capacity(1 + self.prefix.len() + self.state.len());
+            Vec::with_capacity(2 + self.prefix.len() + self.state.len());
         let tokens: Vec<i64> = tokens.iter().copied().map(i64::from).collect();
         inputs.push((
             Cow::Borrowed("token"),
             Tensor::from_array((vec![dim(batch)], tokens))?.into(),
         ));
-        // The shared tensors go in as the one row `prefill` produced; the step
-        // graph broadcasts them over the batch.
-        for (name, tensor) in self.prefix.iter().zip(prefix.iter()) {
-            let mut shape = Vec::with_capacity(tensor.shape.len() + 1);
-            shape.push(1);
-            shape.extend_from_slice(&tensor.shape);
-            inputs.push((
-                Cow::Owned(name.clone()),
-                TensorRef::from_array_view((shape, tensor.data.as_slice()))?.into(),
-            ));
+        if !self.prefix.is_empty() {
+            if states
+                .iter()
+                .all(|state| Arc::ptr_eq(&state.prefix, &states[0].prefix))
+            {
+                let prefix = &states[0].prefix;
+                for (name, tensor) in self.prefix.iter().zip(prefix.iter()) {
+                    let mut shape = Vec::with_capacity(tensor.shape.len() + 1);
+                    shape.push(1);
+                    shape.extend_from_slice(&tensor.shape);
+                    inputs.push((
+                        Cow::Owned(name.clone()),
+                        TensorRef::from_array_view((shape, tensor.data.as_slice()))?.into(),
+                    ));
+                }
+                // One all-real row: every prelude position of the shared
+                // prefix is a real one.
+                let width = prefix_width(&prefix[0]);
+                inputs.push((
+                    Cow::Borrowed("prefix_mask"),
+                    Tensor::from_array(([1i64, dim(width)], vec![true; width]))?.into(),
+                ));
+            } else {
+                self.push_row_prefixes(&mut inputs, states)?;
+            }
         }
         // The per-beam tensors stack row by row; every row of one tensor has
         // the same shape at the same step.
@@ -474,7 +585,7 @@ impl CharLm {
                     })
                     .collect();
                 LmState {
-                    prefix: Arc::clone(prefix),
+                    prefix: Arc::clone(&states[row].prefix),
                     tensors: Arc::new(tensors),
                     log_probs: Arc::new(
                         log_probs[row * vocabulary..(row + 1) * vocabulary].to_vec(),
@@ -482,6 +593,82 @@ impl CharLm {
                 }
             })
             .collect())
+    }
+
+    /// Feed the `prefix_*` tensors and `prefix_mask` of a batch whose rows
+    /// belong to different records.
+    ///
+    /// Each tensor stacks one row per batch row, every row's time axis (the
+    /// second-to-last) padded on the left up to the widest prelude; the mask
+    /// row is `false` under the padding and `true` under real positions.
+    fn push_row_prefixes<'a>(
+        &'a self,
+        inputs: &mut Vec<(Cow<'a, str>, SessionInputValue<'a>)>,
+        states: &[&LmState],
+    ) -> Result<(), LmError> {
+        let batch = states.len();
+        let reals: Vec<usize> = states
+            .iter()
+            .map(|state| prefix_width(&state.prefix[0]))
+            .collect();
+        let width = reals
+            .iter()
+            .copied()
+            .max()
+            .expect("advance never runs an empty batch");
+        let mut mask = vec![false; batch * width];
+        for (row, &real) in reals.iter().enumerate() {
+            mask[row * width + (width - real)..(row + 1) * width].fill(true);
+        }
+        for (index, name) in self.prefix.iter().enumerate() {
+            // A prefix tensor's row is [..., time, element]; the mask pads
+            // and marks the time axis, second-to-last.
+            let row_shape = &states[0].prefix[index].shape;
+            let time_axis = row_shape.len() - 2;
+            let unit = usize::try_from(row_shape[time_axis + 1]).expect("a shape axis is positive");
+            let slab = elements(&row_shape[..time_axis]);
+            let mut shape = Vec::with_capacity(row_shape.len() + 1);
+            shape.push(dim(batch));
+            for (axis, &value) in row_shape.iter().enumerate() {
+                shape.push(if axis == time_axis { dim(width) } else { value });
+            }
+            let row_len = elements(&shape[1..]);
+            let mut data = vec![0.0; batch * row_len];
+            for (row, state) in states.iter().enumerate() {
+                let source = &state.prefix[index];
+                debug_assert_eq!(
+                    &source.shape[..time_axis],
+                    &row_shape[..time_axis],
+                    "every row of {name} agrees on the static axes"
+                );
+                debug_assert_eq!(
+                    &source.shape[time_axis + 1..],
+                    &row_shape[time_axis + 1..],
+                    "every row of {name} agrees on the static axes"
+                );
+                let real =
+                    usize::try_from(source.shape[time_axis]).expect("a shape axis is positive");
+                debug_assert_eq!(real, reals[row], "a row's prefix tensors share one width");
+                let pad = width - real;
+                let mut dst = row * row_len + pad * unit;
+                let mut src = 0;
+                for _ in 0..slab {
+                    data[dst..dst + real * unit]
+                        .copy_from_slice(&source.data[src..src + real * unit]);
+                    dst += width * unit;
+                    src += real * unit;
+                }
+            }
+            inputs.push((
+                Cow::Owned(name.clone()),
+                Tensor::from_array((shape, data))?.into(),
+            ));
+        }
+        inputs.push((
+            Cow::Borrowed("prefix_mask"),
+            Tensor::from_array(([dim(batch), dim(width)], mask))?.into(),
+        ));
+        Ok(())
     }
 
     /// The sequence the model reads before the first character of the sentence:
@@ -538,22 +725,27 @@ impl Transition for CharLm {
     }
 }
 
-/// The session options every session of a graph shares: one intra-op thread,
-/// no parallel execution, no arena, no memory-pattern reservation -- the
-/// decoder is the parallel layer, one record per thread, and a session that
-/// also spread its matrix products over threads or held a private buffer
-/// arena would oversubscribe the machine. Memory patterns pool a session's
-/// activations into one reservation, which measured both slower and ~150 MB
-/// heavier here than letting each buffer come and go. `Level2` keeps every
-/// fusion the step graph benefits from and measured a hair faster than
-/// `Level3`.
-fn session_builder() -> ort::Result<ort::session::builder::SessionBuilder> {
-    Ok(Session::builder()?
+/// The session options every session of a graph shares, sized by *shape*:
+/// *shape*'s intra-op threads, no parallel execution, no arena, no
+/// memory-pattern reservation. The decoder is the parallel layer, so a
+/// rayon-path session takes one intra-op thread -- a session that also
+/// spread its matrix products over threads or held a private buffer arena
+/// would oversubscribe the machine -- while a lockstep run's one session
+/// takes them all. Memory patterns pool a session's activations into one
+/// reservation, which measured both slower and ~150 MB heavier here than
+/// letting each buffer come and go. `Level2` keeps every fusion the step
+/// graph benefits from and measured a hair faster than `Level3`.
+fn session_builder(shape: SessionShape) -> ort::Result<ort::session::builder::SessionBuilder> {
+    let mut builder = Session::builder()?
         .with_optimization_level(GraphOptimizationLevel::Level2)?
         .with_memory_pattern(false)?
         .with_parallel_execution(false)?
-        .with_intra_threads(1)?
-        .with_config_entry("session.enable_cpu_mem_arena", "0")?)
+        .with_intra_threads(shape.intra_threads.get())?
+        .with_config_entry("session.enable_cpu_mem_arena", "0")?;
+    if shape.verbose_logging {
+        builder = builder.with_log_level(ort::logging::LogLevel::Verbose)?;
+    }
+    Ok(builder)
 }
 
 /// Open a session for a shared graph. *weights* is the one container the
@@ -563,12 +755,24 @@ fn open_session(
     graph: &Path,
     weights: &PrepackedWeights,
     initializers: &[(String, Arc<DynValue>)],
-) -> ort::Result<Session> {
-    let mut builder = session_builder()?.with_prepacked_weights(weights)?;
-    for (name, value) in initializers {
-        builder = builder.with_initializer(name, Arc::clone(value))?;
+    shape: SessionShape,
+) -> Result<Session, LmError> {
+    let providers = shape.backend.providers()?;
+    let mut builder = session_builder(shape)?;
+    builder = builder
+        .with_prepacked_weights(weights)
+        .map_err(ort::Error::from)?;
+    if !providers.is_empty() {
+        builder = builder
+            .with_execution_providers(providers)
+            .map_err(ort::Error::from)?;
     }
-    builder.commit_from_file(graph)
+    for (name, value) in initializers {
+        builder = builder
+            .with_initializer(name, Arc::clone(value))
+            .map_err(ort::Error::from)?;
+    }
+    Ok(builder.commit_from_file(graph)?)
 }
 
 /// Map *dir*`/`*file* once, or hand back the mapping already made.
@@ -692,6 +896,11 @@ fn shared_value<T: ort::value::PrimitiveTensorElementType + std::fmt::Debug>(
 )]
 const fn dim(n: usize) -> i64 {
     n as i64
+}
+
+/// The width of a prefix tensor's time axis: its second-to-last.
+fn prefix_width(tensor: &StateTensor) -> usize {
+    usize::try_from(tensor.shape[tensor.shape.len() - 2]).expect("a shape axis is positive")
 }
 
 /// The element count of a tensor of *shape*: the product of its axes.

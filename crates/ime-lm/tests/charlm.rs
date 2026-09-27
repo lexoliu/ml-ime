@@ -8,7 +8,7 @@
 //! ../crates/ime-lm/tests/fixtures`.
 
 use ime_decode::Transition;
-use ime_lm::{CharLm, LmState};
+use ime_lm::{CharLm, LmState, SessionShape};
 use ime_pinyin::{CharId, Lexicon, SyllableTable};
 use serde::Deserialize;
 use std::fs;
@@ -53,7 +53,8 @@ fn assert_close(got: &[f32], want: &[f32], what: &str) {
 fn run(arch: &str) {
     let dir = fixture_dir();
     let lexicon = lexicon(&dir);
-    let model = CharLm::open(&dir.join(arch), &lexicon).expect("the fixture opens");
+    let model = CharLm::open(&dir.join(arch), &lexicon, SessionShape::default())
+        .expect("the fixture opens");
     let expected: Expected = serde_json::from_str(
         &fs::read_to_string(dir.join(arch).join("expected.json"))
             .expect("expected.json is committed with the fixture"),
@@ -109,6 +110,74 @@ fn run(arch: &str) {
                 &format!("{arch} step {position} beam {row}"),
             );
         }
+    }
+}
+
+/// Rows from different records in one `advance` keep their own prefixes: a
+/// batch alternating two preludes of different lengths -- so the shorter is
+/// padded -- scores each row as if it had run alone.
+#[test]
+fn transformer_rows_from_different_records_match_solo_runs() {
+    let dir = fixture_dir();
+    let lexicon = lexicon(&dir);
+    let model = CharLm::open(&dir.join("transformer"), &lexicon, SessionShape::default())
+        .expect("the fixture opens");
+    let expected: Expected = serde_json::from_str(
+        &fs::read_to_string(dir.join("transformer").join("expected.json"))
+            .expect("expected.json is committed with the fixture"),
+    )
+    .expect("expected.json parses");
+
+    // A second prelude half as long, so its row of the batch is padded.
+    let short: String = expected
+        .context
+        .chars()
+        .take(expected.context.chars().count() / 2)
+        .collect();
+    let token = |beam: usize| {
+        let character = expected.beams[beam]
+            .chars()
+            .next()
+            .expect("every beam has tokens");
+        lexicon
+            .id_of(character)
+            .expect("fixture characters are in the lexicon")
+    };
+    // What each record's two beams score run on their own.
+    let solo = |context: &str| {
+        let start = model.start(Some(context));
+        let states = [start.clone(), start];
+        let batch: Vec<(&LmState, CharId)> = states
+            .iter()
+            .zip(0..2)
+            .map(|(state, beam)| (state, token(beam)))
+            .collect();
+        model.advance(&batch)
+    };
+    let alone_long = solo(&expected.context);
+    let alone_short = solo(&short);
+
+    // One batch alternating the two records.
+    let long = model.start(Some(&expected.context));
+    let short_start = model.start(Some(&short));
+    let batch: Vec<(&LmState, CharId)> = [&long, &short_start, &long, &short_start]
+        .into_iter()
+        .enumerate()
+        .map(|(row, state)| (state, token(row / 2)))
+        .collect();
+    let mixed = model.advance(&batch);
+    assert_eq!(mixed.len(), 4, "one state per row comes back");
+    for (row, state) in mixed.iter().enumerate() {
+        let solo = if row % 2 == 0 {
+            &alone_long[row / 2]
+        } else {
+            &alone_short[row / 2]
+        };
+        assert_close(
+            state.log_probs(),
+            solo.log_probs(),
+            &format!("mixed batch row {row}"),
+        );
     }
 }
 

@@ -29,8 +29,8 @@ use blake2::{Blake2b, Digest as _, digest::consts::U8};
 use clap::{Args, ValueEnum};
 use flate2::read::MultiGzDecoder;
 use ime_decode::{
-    BeamOptions, Both, Candidates, Emission, Emittable, LatticePath, LatticeRecord, NoTransition,
-    ScoreRecord, Scored, Transition, Uniform, Weighted, decode,
+    BeamOptions, Both, Candidates, Emission, Emittable, Hypothesis, LatticePath, LatticeRecord,
+    NoTransition, Record, ScoreRecord, Scored, Transition, Uniform, Weighted, decode_many,
 };
 use ime_eval::{EvalRecord, EvalSet, Observation, Report, Slice};
 use ime_lm::CharLm;
@@ -97,6 +97,32 @@ pub struct SliceArgs {
     /// first. Replaces `--slice`, and meaningless without a score file to fuse.
     #[arg(long, requires = "scores", conflicts_with = "slice")]
     pub select_on_dev: bool,
+}
+
+/// A `--backend` answer, translated to the crate's own [`Backend`].
+///
+/// Mirrors [`ime_lm::Backend`] rather than deriving `ValueEnum` on it, because
+/// the model crate has no business depending on an argument parser.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, ValueEnum)]
+pub enum BackendArg {
+    /// ONNX Runtime's CPU kernels.
+    #[default]
+    Cpu,
+    /// Apple's Core ML provider, if the build carries `gpu-coreml`.
+    Coreml,
+    /// WebGPU through Dawn (the Metal GPU), if the build carries `gpu-webgpu`.
+    Webgpu,
+}
+
+impl BackendArg {
+    /// The model crate's name for this backend.
+    pub const fn backend(self) -> ime_lm::Backend {
+        match self {
+            Self::Cpu => ime_lm::Backend::Cpu,
+            Self::Coreml => ime_lm::Backend::CoreMl,
+            Self::Webgpu => ime_lm::Backend::WebGpu,
+        }
+    }
 }
 
 /// Supplies the emission model for one record's lattice.
@@ -361,6 +387,9 @@ struct Run<'a> {
     weights: &'a [f32],
     slice: &'a SliceArgs,
     beam: &'a BeamOptions,
+    /// How many records one `decode_many` call decodes in lockstep. One keeps
+    /// the per-record rayon path; more runs the records' steps as one batch.
+    batch: usize,
     dump: bool,
     progress: Option<&'a Progress<'a>>,
 }
@@ -369,11 +398,16 @@ impl Run<'_> {
     /// The sections one transition model produces: without a score file the
     /// transition alone over the requested slice; with one, every weight over
     /// the slice, or the dev sweep and the test section at its winner.
+    ///
+    /// *lockstep* runs the slice serially through `decode_many` chunks even
+    /// when `batch` is one -- a GPU-backed model cannot share its device with
+    /// the rayon's per-record parallelism the CPU path uses.
     fn sections<T: Transition + Sync>(
         &self,
         transition: &T,
         label: &'static str,
         lm_weight: f32,
+        lockstep: bool,
     ) -> Result<Vec<Section>> {
         let request = |weight: f32| {
             self.progress.map(|progress| ProgressRequest {
@@ -400,6 +434,8 @@ impl Run<'_> {
                 &NoEmissions,
                 transition,
                 self.beam,
+                self.batch,
+                lockstep,
                 self.dump,
                 request.as_ref(),
             )?;
@@ -429,6 +465,8 @@ impl Run<'_> {
                 &emissions,
                 transition,
                 self.beam,
+                self.batch,
+                lockstep,
                 self.dump,
                 request.as_ref(),
             )?;
@@ -475,6 +513,10 @@ impl Run<'_> {
 /// scored the highest sentence top-1 there. With *dump* every evaluated
 /// section's beam is written there too, one JSON Lines file per section.
 ///
+/// *batch* is how many records one `decode_many` call runs in lockstep: one
+/// keeps the per-record rayon path, more feeds `records x paths x beams` rows
+/// to each model step, which is the shape a GPU backend is sized for.
+///
 /// # Errors
 ///
 /// If any input cannot be read, a
@@ -498,6 +540,7 @@ pub fn fused_eval(
     lexicon: Lexicon,
     segment: SegmentOptions,
     beam: &BeamOptions,
+    batch: usize,
     transition: Models<'_>,
 ) -> Result<String> {
     let set = load_set(eval_set)?;
@@ -524,13 +567,16 @@ pub fn fused_eval(
         weights,
         slice,
         beam,
+        batch,
         dump: dump.is_some(),
         progress,
     };
     let sections = match transition {
-        Models::None => run.sections(&NoTransition, "none", 1.0)?,
-        Models::Ngram(ngram) => run.sections(ngram, "kn-trigram", 1.0)?,
-        Models::CharLm(lm) => run.sections(lm, "char-lm", 1.0)?,
+        Models::None => run.sections(&NoTransition, "none", 1.0, false)?,
+        Models::Ngram(ngram) => run.sections(ngram, "kn-trigram", 1.0, false)?,
+        Models::CharLm(lm) => {
+            run.sections(lm, "char-lm", 1.0, lm.backend() != ime_lm::Backend::Cpu)?
+        }
         Models::Both {
             ngram,
             lm,
@@ -544,6 +590,7 @@ pub fn fused_eval(
             },
             "kn-trigram+char-lm",
             lm_weight,
+            lm.backend() != ime_lm::Backend::Cpu,
         )?,
     };
     if let Some(dir) = dump {
@@ -575,6 +622,8 @@ fn measure<E, T>(
     emissions: &E,
     transition: &T,
     beam: &BeamOptions,
+    batch: usize,
+    lockstep: bool,
     dump: bool,
     progress: Option<&ProgressRequest<'_>>,
 ) -> Result<(Report, Vec<DumpRow>)>
@@ -584,7 +633,21 @@ where
 {
     if let Some(progress) = progress {
         return measure_resumable(
-            set, slice, dev_share, reader, emissions, transition, beam, dump, progress,
+            set, slice, dev_share, reader, emissions, transition, beam, batch, lockstep, dump,
+            progress,
+        );
+    }
+    if batch > 1 || lockstep {
+        return measure_batched(
+            set,
+            slice,
+            dev_share,
+            reader,
+            emissions,
+            transition,
+            beam,
+            batch.max(1),
+            dump,
         );
     }
     let (report, mut rows) = set
@@ -595,13 +658,16 @@ where
         .map(|(index, record)| -> Result<(Report, Vec<DumpRow>)> {
             let (_, candidates) = reader.read(record)?;
             let emission = emissions.model(index, &candidates)?;
-            let hypotheses = decode(
-                &candidates,
-                &emission,
+            let hypotheses = decode_many(
+                &[Record {
+                    candidates: &candidates,
+                    emission,
+                    context: record.context.as_deref(),
+                }],
                 transition,
-                record.context.as_deref(),
                 beam,
             )
+            .map(|mut results| results.pop().expect("one record decodes to one result"))
             .with_context(|| format!("could not decode record {index}"))?;
             let texts: Vec<String> = hypotheses
                 .iter()
@@ -631,6 +697,115 @@ where
             },
         )?;
     rows.sort_unstable_by_key(|row| row.record);
+    Ok((report, rows))
+}
+
+/// Decode one batch of records in lockstep.
+///
+/// Every record's lattice and emission model is built before the decode
+/// starts, because `decode_many` borrows all of them at once.
+///
+/// # Errors
+///
+/// If a record cannot be read, its scores do not describe its lattice, or the
+/// batch cannot be decoded.
+fn decode_chunk<E, T>(
+    chunk: &[(usize, &EvalRecord)],
+    reader: &Reader,
+    emissions: &E,
+    transition: &T,
+    beam: &BeamOptions,
+) -> Result<Vec<Vec<Hypothesis>>>
+where
+    E: Emissions,
+    T: Transition,
+{
+    let mut lattices = Vec::with_capacity(chunk.len());
+    for &(index, record) in chunk {
+        let (_, candidates) = reader.read(record)?;
+        lattices.push((index, record, candidates));
+    }
+    let mut requests = Vec::with_capacity(lattices.len());
+    for (index, record, candidates) in &lattices {
+        requests.push(Record {
+            candidates,
+            emission: emissions.model(*index, candidates)?,
+            context: record.context.as_deref(),
+        });
+    }
+    decode_many(&requests, transition, beam).with_context(|| {
+        format!(
+            "could not decode records {}..={}",
+            chunk[0].0,
+            chunk[chunk.len() - 1].0
+        )
+    })
+}
+
+/// Decode the slice's records in lockstep batches of *batch* records each.
+///
+/// Batched because the transition's step is one `advance` call covering the
+/// whole batch's rows, so chunks run serially: the batch is where the records
+/// run together, not a thread pool.
+///
+/// # Errors
+///
+/// If a record cannot be read, its scores do not describe its lattice, or a
+/// batch cannot be decoded.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "it takes exactly what `measure` does minus what progress needs"
+)]
+fn measure_batched<E, T>(
+    set: &EvalSet,
+    slice: SliceArg,
+    dev_share: f64,
+    reader: &Reader,
+    emissions: &E,
+    transition: &T,
+    beam: &BeamOptions,
+    batch: usize,
+    dump: bool,
+) -> Result<(Report, Vec<DumpRow>)>
+where
+    E: Emissions,
+    T: Transition,
+{
+    let selected: Vec<(usize, &EvalRecord)> = set
+        .records()
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| slice.slice().holds(record, dev_share))
+        .collect();
+    let mut report = Report::new(beam.top_k);
+    let mut rows = Vec::new();
+    let mut done = 0usize;
+    for chunk in selected.chunks(batch) {
+        let results = decode_chunk(chunk, reader, emissions, transition, beam)?;
+        for (&(index, record), hypotheses) in chunk.iter().zip(results) {
+            let texts: Vec<String> = hypotheses
+                .iter()
+                .map(|hypothesis| hypothesis.text(&reader.lexicon))
+                .collect();
+            report.observe(&record.text, &texts);
+            if dump {
+                rows.push(DumpRow {
+                    record: index,
+                    text: record.text.clone(),
+                    hypotheses: hypotheses
+                        .iter()
+                        .zip(texts)
+                        .map(|(hypothesis, text)| DumpedHypothesis {
+                            text,
+                            score: hypothesis.score(),
+                        })
+                        .collect(),
+                });
+            }
+        }
+        done += chunk.len();
+        info!(done, total = selected.len(), "decoded a lockstep batch");
+    }
     Ok((report, rows))
 }
 
@@ -983,6 +1158,8 @@ fn measure_resumable<E, T>(
     emissions: &E,
     transition: &T,
     beam: &BeamOptions,
+    batch: usize,
+    lockstep: bool,
     dump: bool,
     progress: &ProgressRequest<'_>,
 ) -> Result<(Report, Vec<DumpRow>)>
@@ -1025,18 +1202,46 @@ where
     if let Some(stop_after) = progress.stop_after {
         pending.truncate(stop_after);
     }
+    if batch > 1 || lockstep {
+        for chunk in pending.chunks(batch.max(1)) {
+            let results = decode_chunk(chunk, reader, emissions, transition, beam)?;
+            for (&(index, record), hypotheses) in chunk.iter().zip(results) {
+                let texts: Vec<String> = hypotheses
+                    .iter()
+                    .map(|hypothesis| hypothesis.text(&reader.lexicon))
+                    .collect();
+                journal.send(ProgressLine {
+                    record: index,
+                    observation: Observation::new(&record.text, &texts, beam.top_k.get()),
+                    hypotheses: hypotheses
+                        .iter()
+                        .zip(texts)
+                        .map(|(hypothesis, text)| DumpedHypothesis {
+                            text,
+                            score: hypothesis.score(),
+                        })
+                        .collect(),
+                })?;
+            }
+        }
+        journal.finish()?;
+        return fold_journal(&journal, set, beam, dump);
+    }
     pending
         .par_iter()
         .map(|&(index, record)| -> Result<()> {
             let (_, candidates) = reader.read(record)?;
             let emission = emissions.model(index, &candidates)?;
-            let hypotheses = decode(
-                &candidates,
-                &emission,
+            let hypotheses = decode_many(
+                &[Record {
+                    candidates: &candidates,
+                    emission,
+                    context: record.context.as_deref(),
+                }],
                 transition,
-                record.context.as_deref(),
                 beam,
             )
+            .map(|mut results| results.pop().expect("one record decodes to one result"))
             .with_context(|| format!("could not decode record {index}"))?;
             let texts: Vec<String> = hypotheses
                 .iter()
@@ -1057,6 +1262,22 @@ where
         })
         .collect::<Result<Vec<()>>>()?;
     journal.finish()?;
+    fold_journal(&journal, set, beam, dump)
+}
+
+/// Fold a closed progress file into the section's report and dump rows --
+/// identical whether the run was interrupted or not.
+///
+/// # Errors
+///
+/// If the file cannot be read back or a line names a record the set does not
+/// hold.
+fn fold_journal(
+    journal: &Journal,
+    set: &EvalSet,
+    beam: &BeamOptions,
+    dump: bool,
+) -> Result<(Report, Vec<DumpRow>)> {
     let mut report = Report::new(beam.top_k);
     let mut rows = Vec::new();
     for line in journal.lines()? {
@@ -1361,6 +1582,7 @@ mod tests {
                     beam_width: NonZeroUsize::new(16).expect("16 is not zero"),
                     ..BeamOptions::default()
                 },
+                1,
                 transition,
             )
         }
@@ -1590,8 +1812,12 @@ mod tests {
         assert!(dev > 0 && dev < total, "the fixture must split");
         let table = SyllableTable::load();
         let lm_lexicon = Lexicon::parse(&lexicon, &table).expect("the fixture lexicon parses");
-        let lm = CharLm::open(&fixtures.join("transformer"), &lm_lexicon)
-            .expect("the transformer fixture opens");
+        let lm = CharLm::open(
+            &fixtures.join("transformer"),
+            &lm_lexicon,
+            ime_lm::SessionShape::default(),
+        )
+        .expect("the transformer fixture opens");
         let lm_dir = fixtures.join("transformer");
         let weights = [0.5, 1.0];
         let baseline = fixture
