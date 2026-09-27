@@ -223,6 +223,9 @@ with `luna_pinyin_simp.custom.yaml` disabling the user dictionary
    on abbreviated input (23.9 vs 24.3) and reaches 36.7 / 49.2 / 84.7
    (abbreviated / mixed / full) when shown the beam's hypotheses. That is the
    target; the gap is the reader inside the lattice, not the search.
+   `notes/char-lm-v2.md`: the 60M-parameter transformer reader (3.70
+   nats/char, int8 export) takes the fused decoder to 28.26 / 38.54 / 78.16
+   and the abbreviated oracle at 32 to 36.30; the beam's shape is unchanged.
 3. Fix issue #16 (hash only text+context in `EvalRecord::digest`) so the three
    eval twins share one dev/test split; re-tune weights once.
 4. Issue #51: measure the commercial IMEs on the eval3 twins, so every number
