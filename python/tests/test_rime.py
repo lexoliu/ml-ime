@@ -35,7 +35,7 @@ def test_evaluate_counts_rime_first_page_beam_characters_and_lengths() -> None:
     ]
     result = evaluate(typed)
     assert result.records == 3
-    assert result.rime_top1 == pytest.approx(1 / 3)
+    assert result.top1 == pytest.approx(1 / 3)
     assert result.first_page_exact == pytest.approx(2 / 3)
     assert result.beam_top1 == pytest.approx(2 / 3)
     assert result.characters == 7
