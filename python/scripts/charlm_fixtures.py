@@ -94,11 +94,16 @@ def _expected(export: Path) -> dict:
     names = ["log_probs", *manifest["prefix"], *manifest["state"]]
     by_name = dict(zip(names, outputs, strict=True))
     prefix = {name: by_name[name] for name in manifest["prefix"]}
+    mask = (
+        {"prefix_mask": np.ones((1, prefix["prefix_keys"].shape[3]), dtype=np.bool_)}
+        if prefix
+        else {}
+    )
     state = {name: np.repeat(by_name[name], len(BEAMS), axis=0) for name in manifest["state"]}
     steps = []
     for position in range(len(BEAMS[0])):
         token = np.array([index[beam[position]] for beam in BEAMS], dtype=np.int64)
-        outputs = step.run(None, {"token": token, **prefix, **state})
+        outputs = step.run(None, {"token": token, **prefix, **mask, **state})
         steps.append(outputs[0].tolist())
         state = dict(zip(manifest["state"], outputs[1:], strict=True))
     return {

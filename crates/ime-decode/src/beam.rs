@@ -91,22 +91,156 @@ struct Beam<S> {
     state: S,
 }
 
-/// Decode every reading in *candidates* and merge the results.
+/// One record decoded in lockstep with a batch's other records.
 ///
-/// Hypotheses from different readings compete on one scale -- sequence score
-/// minus the weighted segmentation cost -- and identical sentences reached by
-/// different readings collapse to the best-scoring one.
+/// Everything [`decode_many`] needs of one typed string that is not shared
+/// with the batch's other records: its own lattice, its own emission model
+/// over that lattice's paths, and its own context.
+pub struct Record<'a, E> {
+    /// The readings of the record's keystrokes.
+    pub candidates: &'a Candidates,
+    /// The emission scores, indexed by `candidates`' own paths.
+    pub emission: E,
+    /// The text on screen before the keystrokes, for transition models that
+    /// read context.
+    pub context: Option<&'a str>,
+}
+
+/// One reading of one record, mid-search.
+///
+/// A worker's current position is how many beam levels it has filled, so every
+/// live worker of the batch stands at the same position index in the same
+/// round, and one [`Transition::advance`] call covers all of them.
+struct Worker<'a, S> {
+    /// Which record of the batch the reading belongs to.
+    record: usize,
+    /// The reading's index in the record's [`Candidates::paths`].
+    path: usize,
+    /// The reading being decoded.
+    reading: &'a CandidatePath,
+    /// The state position zero advances from: `start` over the record's
+    /// context.
+    start: S,
+    /// The beam levels filled so far, one per position decoded.
+    beams: Vec<Vec<Beam<S>>>,
+}
+
+impl<S> Worker<'_, S> {
+    /// Whether the worker still has a position to decode.
+    fn pending(&self) -> bool {
+        self.beams.len() < self.reading.len()
+    }
+
+    /// Score this worker's candidates at its current position down to the
+    /// `width` survivors the model will be advanced into.
+    ///
+    /// Each position scores every candidate against every surviving beam's
+    /// state and keeps the best way of reaching each distinct history; the
+    /// caller gathers the survivors' `(state, ch)` steps into the batch's one
+    /// `advance` call, so a model whose step is expensive pays for the beams
+    /// the batch keeps and not for the candidates it discards.
+    fn survivors<E, T>(
+        &self,
+        emission: &E,
+        transition: &T,
+        width: usize,
+        index: &mut HashMap<History, usize>,
+    ) -> Vec<Candidate>
+    where
+        E: Emission,
+        T: Transition<State = S>,
+    {
+        let position = self.beams.len();
+        let allowed = &self.reading.positions()[position];
+        let mut next: Vec<Candidate> = Vec::with_capacity(allowed.len());
+        index.clear();
+        if position == 0 {
+            for &ch in allowed {
+                let score = emission.score(self.path, 0, ch) + transition.score(&self.start, ch);
+                relax(
+                    &mut next,
+                    index,
+                    Candidate {
+                        history: History::START.extended(ch).truncated(T::HISTORY),
+                        score,
+                        ch,
+                        parent: 0,
+                    },
+                );
+            }
+        } else {
+            for (parent, beam) in self.beams[position - 1].iter().enumerate() {
+                for &ch in allowed {
+                    let score = beam.candidate.score
+                        + emission.score(self.path, position, ch)
+                        + transition.score(&beam.state, ch);
+                    relax(
+                        &mut next,
+                        index,
+                        Candidate {
+                            history: beam.candidate.history.extended(ch).truncated(T::HISTORY),
+                            score,
+                            ch,
+                            parent,
+                        },
+                    );
+                }
+            }
+        }
+        next.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+        next.truncate(width);
+        next
+    }
+
+    /// Follow the backpointers from a finished beam to the start of the
+    /// sequence.
+    fn reconstruct(&self, slot: usize) -> Vec<CharId> {
+        let mut chars = Vec::with_capacity(self.beams.len());
+        let mut current = slot;
+        for level in self.beams.iter().rev() {
+            let candidate = level[current].candidate;
+            chars.push(candidate.ch);
+            current = candidate.parent;
+        }
+        chars.reverse();
+        chars
+    }
+}
+
+/// Decode every reading of every record in *records* in lockstep and merge
+/// each record's results.
+///
+/// Each record's readings each become one worker, and the per-position loop
+/// runs over all of them at once: at every position every live worker's
+/// surviving candidates are scored, gathered into one [`Transition::advance`]
+/// call over `records x paths x beams` rows, and scattered back. A worker
+/// ends when its reading runs out; a record is done when its last worker is.
+/// The call a model pays per step is the batch's, so a reader on a GPU prices
+/// its weights read once per step rather than once per record.
+///
+/// Within one record, hypotheses from different readings compete on one scale
+/// -- sequence score minus the weighted segmentation cost -- and identical
+/// sentences reached by different readings collapse to the best-scoring one.
+/// The answer has one entry per record, in the records' order.
 ///
 /// # Errors
 ///
-/// If *candidates* is empty, which [`Candidates::build`] already rules out.
-pub fn decode<E, T>(
-    candidates: &Candidates,
-    emission: &E,
+/// If a record's lattice is empty, which [`Candidates::build`] already rules
+/// out.
+///
+/// # Panics
+///
+/// If the transition model does not return one state per step, which is a bug
+/// in the model, not an error in the input.
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "the only panic is the contract on Transition::advance, a bug in the model rather than bad input"
+)]
+pub fn decode_many<E, T>(
+    records: &[Record<'_, E>],
     transition: &T,
-    context: Option<&str>,
     options: &BeamOptions,
-) -> Result<Vec<Hypothesis>, crate::DecodeError>
+) -> Result<Vec<Vec<Hypothesis>>, crate::DecodeError>
 where
     E: Emission,
     T: Transition,
@@ -121,138 +255,118 @@ where
             "a transition model cannot condition on more than MAX_HISTORY characters"
         );
     }
-    if candidates.is_empty() {
-        return Err(crate::DecodeError::NoSegmentations);
-    }
-
-    let mut merged: Vec<Hypothesis> = Vec::new();
-    for (path, reading) in candidates.paths().iter().enumerate() {
-        let penalty = options.segmentation_weight * reading.cost();
-        for mut hypothesis in decode_path(path, reading, emission, transition, context, options) {
-            hypothesis.score -= penalty;
-            merged.push(hypothesis);
+    for record in records {
+        if record.candidates.is_empty() {
+            return Err(crate::DecodeError::NoSegmentations);
         }
     }
-    merged.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
-
-    let mut seen: HashSet<&[CharId]> = HashSet::new();
-    let mut keep = Vec::with_capacity(options.top_k.get());
-    for (index, hypothesis) in merged.iter().enumerate() {
-        if keep.len() == options.top_k.get() {
-            break;
-        }
-        if seen.insert(hypothesis.chars.as_slice()) {
-            keep.push(index);
-        }
-    }
-    Ok(keep
-        .into_iter()
-        .map(|index| merged[index].clone())
-        .collect())
-}
-
-/// Beam Viterbi over a single reading.
-///
-/// Each position scores every candidate against every surviving beam's state,
-/// keeps the best way of reaching each distinct history, truncates to the beam
-/// width, and only then advances the model into the survivors -- one batched
-/// call, so a model whose step is expensive pays for the beams it keeps and not
-/// for the candidates it discards.
-fn decode_path<E, T>(
-    path: usize,
-    reading: &CandidatePath,
-    emission: &E,
-    transition: &T,
-    context: Option<&str>,
-    options: &BeamOptions,
-) -> Vec<Hypothesis>
-where
-    E: Emission,
-    T: Transition,
-{
     let width = options.beam_width.get();
-    let start = transition.start(context);
-    let mut beams: Vec<Vec<Beam<T::State>>> = Vec::with_capacity(reading.len());
-    let mut index: HashMap<History, usize> = HashMap::new();
-
-    for (position, allowed) in reading.positions().iter().enumerate() {
-        let mut next: Vec<Candidate> = Vec::with_capacity(allowed.len());
-        index.clear();
-        if position == 0 {
-            for &ch in allowed {
-                let score = emission.score(path, 0, ch) + transition.score(&start, ch);
-                relax(
-                    &mut next,
-                    &mut index,
-                    Candidate {
-                        history: History::START.extended(ch).truncated(T::HISTORY),
-                        score,
-                        ch,
-                        parent: 0,
-                    },
-                );
-            }
-        } else {
-            for (parent, beam) in beams[position - 1].iter().enumerate() {
-                for &ch in allowed {
-                    let score = beam.candidate.score
-                        + emission.score(path, position, ch)
-                        + transition.score(&beam.state, ch);
-                    relax(
-                        &mut next,
-                        &mut index,
-                        Candidate {
-                            history: beam.candidate.history.extended(ch).truncated(T::HISTORY),
-                            score,
-                            ch,
-                            parent,
-                        },
-                    );
-                }
-            }
+    let mut workers: Vec<Worker<'_, T::State>> = Vec::new();
+    for (record, request) in records.iter().enumerate() {
+        for (path, reading) in request.candidates.paths().iter().enumerate() {
+            workers.push(Worker {
+                record,
+                path,
+                reading,
+                start: transition.start(request.context),
+                beams: Vec::with_capacity(reading.len()),
+            });
         }
-        next.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
-        next.truncate(width);
-        let steps: Vec<(&T::State, CharId)> = next
-            .iter()
-            .map(|candidate| {
+    }
+    let mut index: HashMap<History, usize> = HashMap::new();
+    while workers.iter().any(Worker::pending) {
+        // Score: each live worker relaxes its candidates to the best way of
+        // reaching each history and truncates to the beam width, the same
+        // shape a single-record search has; then every survivor's step goes
+        // on the batch's one list, each worker's as a contiguous run in
+        // worker order -- the guarantee `Transition::advance` is built on.
+        let mut steps: Vec<(&T::State, CharId)> = Vec::new();
+        let mut chosen: Vec<Vec<Candidate>> = Vec::with_capacity(workers.len());
+        for worker in workers.iter().filter(|worker| worker.pending()) {
+            let next = worker.survivors(
+                &records[worker.record].emission,
+                transition,
+                width,
+                &mut index,
+            );
+            let position = worker.beams.len();
+            for candidate in &next {
                 let state = if position == 0 {
-                    &start
+                    &worker.start
                 } else {
-                    &beams[position - 1][candidate.parent].state
+                    &worker.beams[position - 1][candidate.parent].state
                 };
-                (state, candidate.ch)
-            })
-            .collect();
+                steps.push((state, candidate.ch));
+            }
+            chosen.push(next);
+        }
         let states = transition.advance(&steps);
         assert_eq!(
             states.len(),
             steps.len(),
             "a transition model must return one state per step"
         );
-        beams.push(
-            next.into_iter()
-                .zip(states)
-                .map(|(candidate, state)| Beam { candidate, state })
-                .collect(),
-        );
+        let mut states = states.into_iter();
+        for (worker, next) in workers
+            .iter_mut()
+            .filter(|worker| worker.pending())
+            .zip(chosen)
+        {
+            worker.beams.push(
+                next.into_iter()
+                    .zip(&mut states)
+                    .map(|(candidate, state)| Beam { candidate, state })
+                    .collect(),
+            );
+        }
+        debug_assert!(states.next().is_none(), "every advanced state lands");
     }
 
-    let Some(last) = beams.last() else {
-        return Vec::new();
-    };
-    let mut finished: Vec<(usize, f32)> = last
-        .iter()
-        .enumerate()
-        .map(|(slot, beam)| (slot, beam.candidate.score + transition.finish(&beam.state)))
-        .collect();
-    finished.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-    finished
+    Ok(finish(&workers, records.len(), transition, options))
+}
+
+/// Fold finished workers into one ranked hypothesis list per record.
+fn finish<T: Transition>(
+    workers: &[Worker<'_, T::State>],
+    records: usize,
+    transition: &T,
+    options: &BeamOptions,
+) -> Vec<Vec<Hypothesis>> {
+    let mut merged: Vec<Vec<Hypothesis>> = (0..records).map(|_| Vec::new()).collect();
+    for worker in workers {
+        let Some(last) = worker.beams.last() else {
+            continue;
+        };
+        let penalty = options.segmentation_weight * worker.reading.cost();
+        let mut finished: Vec<(usize, f32)> = last
+            .iter()
+            .enumerate()
+            .map(|(slot, beam)| (slot, beam.candidate.score + transition.finish(&beam.state)))
+            .collect();
+        finished.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
+        merged[worker.record].extend(finished.into_iter().map(|(slot, score)| Hypothesis {
+            chars: worker.reconstruct(slot),
+            score: score - penalty,
+            path: worker.path,
+        }));
+    }
+    merged
         .into_iter()
-        .map(|(slot, score)| Hypothesis {
-            chars: reconstruct(&beams, slot),
-            score,
-            path,
+        .map(|mut hypotheses| {
+            hypotheses.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+            let mut seen: HashSet<&[CharId]> = HashSet::new();
+            let mut keep = Vec::with_capacity(options.top_k.get());
+            for (index, hypothesis) in hypotheses.iter().enumerate() {
+                if keep.len() == options.top_k.get() {
+                    break;
+                }
+                if seen.insert(hypothesis.chars.as_slice()) {
+                    keep.push(index);
+                }
+            }
+            keep.into_iter()
+                .map(|index| hypotheses[index].clone())
+                .collect()
         })
         .collect()
 }
@@ -271,17 +385,4 @@ fn relax(next: &mut Vec<Candidate>, index: &mut HashMap<History, usize>, candida
             next.push(candidate);
         }
     }
-}
-
-/// Follow the backpointers from a finished beam to the start of the sequence.
-fn reconstruct<S>(beams: &[Vec<Beam<S>>], slot: usize) -> Vec<CharId> {
-    let mut chars = Vec::with_capacity(beams.len());
-    let mut current = slot;
-    for level in beams.iter().rev() {
-        let candidate = level[current].candidate;
-        chars.push(candidate.ch);
-        current = candidate.parent;
-    }
-    chars.reverse();
-    chars
 }

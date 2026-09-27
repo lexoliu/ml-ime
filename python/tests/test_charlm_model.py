@@ -11,6 +11,7 @@ import polars as pl
 import pytest
 import torch
 
+from mlime.logging import log
 from mlime.train.charlm import (
     BOS,
     SEP,
@@ -89,6 +90,69 @@ def test_two_beams_over_one_prefix_score_as_two_sequences(arch: str) -> None:
             torch.testing.assert_close(got[row], expected, atol=1e-5, rtol=1e-5)
 
 
+def _pad_left(tensor: torch.Tensor, width: int) -> torch.Tensor:
+    """``[..., T, hd]`` padded to ``width`` on the left of the time axis."""
+    pad = width - tensor.shape[-2]
+    if pad == 0:
+        return tensor
+    return torch.cat([torch.zeros(*tensor.shape[:-2], pad, tensor.shape[-1]), tensor], dim=-2)
+
+
+def test_a_padded_batch_step_equals_per_record_steps() -> None:
+    """Workers whose preludes differ step in one padded batch as they do alone.
+
+    The batch is laid out ``[workers, width]``: two workers of two rows each,
+    the narrower prelude's prefix row padded on the left.
+    """
+    torch.manual_seed(3)
+    model = build(len(VOCAB), CONFIGS["transformer"]).eval()
+    restricted = Restricted(model, None)
+    preludes = (
+        torch.tensor([[BOS, *_tokens("你", "好", "很"), SEP]]),
+        torch.tensor([[BOS, *_tokens("再"), SEP]]),
+    )
+    width = 2  # rows per worker
+    with torch.no_grad():
+        runs = [model.prefill(prelude) for prelude in preludes]
+        tokens = torch.tensor(_tokens("我", "吗", "你", "好"))
+        solo = [
+            model.step(
+                tokens[row * width : (row + 1) * width],
+                run[1],
+                tuple(tensor.expand(width, *tensor.shape[1:]).contiguous() for tensor in run[2]),
+            )
+            for row, run in enumerate(runs)
+        ]
+        # The batch's prefix stacks one row per worker, the shorter one padded
+        # on the left; the mask marks each row's real prelude positions.
+        prelude_width = max(prefix[0].shape[3] for _, prefix, _ in runs)
+        prefix = tuple(
+            torch.cat([_pad_left(run[1][i], prelude_width) for run in runs])
+            for i in range(len(runs[0][1]))
+        )
+        mask = torch.zeros(len(runs), prelude_width, dtype=torch.bool)
+        for row, (_, row_prefix, _) in enumerate(runs):
+            mask[row, prelude_width - row_prefix[0].shape[3] :] = True
+        state = tuple(
+            torch.cat([run[2][i].expand(width, *run[2][i].shape[1:]) for run in runs])
+            for i in range(2)
+        )
+        features, next_state = model.step(tokens, prefix, state, mask)
+        got = restricted(features)
+        diffs = [
+            (got[row] - restricted(solo[row // width][0])[row % width]).abs().max().item()
+            for row in range(len(runs) * width)
+        ]
+        log.info("padded batch vs per-record step", max_abs_diff=max(diffs))
+        for row in range(len(runs) * width):
+            worker, beam = divmod(row, width)
+            torch.testing.assert_close(
+                got[row], restricted(solo[worker][0])[beam], atol=1e-5, rtol=1e-5
+            )
+            for tensor, wanted in zip(next_state, solo[worker][1], strict=True):
+                torch.testing.assert_close(tensor[row], wanted[beam], atol=1e-5, rtol=1e-5)
+
+
 def _checkpoint(path: Path, arch: str) -> None:
     torch.manual_seed(2)
     model = build(len(VOCAB), CONFIGS[arch])
@@ -141,10 +205,11 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
     names = ["log_probs", *manifest["prefix"], *manifest["state"]]
     by_name = dict(zip(names, outputs, strict=True))
     prefix = {name: by_name[name] for name in manifest["prefix"]}
+    mask = _prefix_mask(prefix)
     state = {name: np.repeat(by_name[name], 2, axis=0) for name in manifest["state"]}
     for position in range(2):
         token = np.array([beam[position] for beam in beams], dtype=np.int64)
-        outputs = step.run(None, {"token": token, **prefix, **state})
+        outputs = step.run(None, {"token": token, **prefix, **mask, **state})
         log_probs = outputs[0]
         state = dict(zip(manifest["state"], outputs[1:], strict=True))
     from mlime.train.charlm import load_model
@@ -161,6 +226,14 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
     assert (log_probs[:, VOCAB.index["谢"]] == Restricted.UNREACHABLE).all()
 
 
+def _prefix_mask(prefix: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """The step's ``prefix_mask`` input: one all-real row, as wide as the prefix."""
+    if not prefix:
+        return {}
+    width = next(iter(prefix.values())).shape[3]
+    return {"prefix_mask": np.ones((1, width), dtype=np.bool_)}
+
+
 def _run_export(dir: Path) -> list[np.ndarray]:
     """The ``log_probs`` rows of an export over the fixture prelude and two beams."""
     manifest = json.loads((dir / "charlm.json").read_text())
@@ -171,12 +244,13 @@ def _run_export(dir: Path) -> list[np.ndarray]:
     names = ["log_probs", *manifest["prefix"], *manifest["state"]]
     by_name = dict(zip(names, outputs, strict=True))
     prefix = {name: by_name[name] for name in manifest["prefix"]}
+    mask = _prefix_mask(prefix)
     state = {name: np.repeat(by_name[name], 2, axis=0) for name in manifest["state"]}
     rows = [by_name["log_probs"]]
     beams = (_tokens("我", "吗"), _tokens("你", "好"))
     for position in range(len(beams[0])):
         token = np.array([beam[position] for beam in beams], dtype=np.int64)
-        outputs = step.run(None, {"token": token, **prefix, **state})
+        outputs = step.run(None, {"token": token, **prefix, **mask, **state})
         rows.append(outputs[0])
         state = dict(zip(manifest["state"], outputs[1:], strict=True))
     return rows
