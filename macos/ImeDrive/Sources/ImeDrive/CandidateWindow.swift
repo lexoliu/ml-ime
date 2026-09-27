@@ -174,15 +174,17 @@ enum CandidateWindow {
     }
 
     /// Strip the row label a candidate window prepends ("1.", "1 ", "2、") and
-    /// whitespace; the candidates themselves remain.
+    /// whitespace. A label is digits FOLLOWED by a separator — a string like
+    /// "3D打印" keeps its leading digit, since it is the candidate.
     static func normalize(_ strings: [String]) -> [String] {
         var result: [String] = []
         for raw in strings {
             var text = raw
-            while let first = text.unicodeScalars.first,
-                CharacterSet(charactersIn: "0123456789.、:：)）]】_- ").contains(first)
+            if let range = text.range(
+                of: #"^[0-9]+\s*[\.、:：)）]】_\- ]\s*"#, options: .regularExpression),
+                !range.isEmpty
             {
-                text = String(text.unicodeScalars.dropFirst())
+                text.removeSubrange(range)
             }
             text = text.trimmingCharacters(in: .whitespaces)
             if !text.isEmpty { result.append(text) }

@@ -52,14 +52,18 @@ def slice_indices(rows: Sequence[dict[str, Any]], slice_: str, dev_share: float)
     """The eval-set indices belonging to *slice_* ("test", "dev" or "all").
 
     A record is development data when ``digest / u64::MAX < dev_share`` — the
-    same comparison ``Slice::holds`` makes.
+    same comparison ``Slice::holds`` makes, done in f64 in all three
+    implementations so every u64 classifies identically.
     """
+    if slice_ not in ("dev", "test", "all"):
+        raise ValueError(f"slice {slice_!r} is not one of 'dev', 'test', 'all'")
     assert 0.0 <= dev_share <= 1.0, f"dev_share {dev_share} is not a share"
-    limit = dev_share * float(2**64 - 1)
+    u64_max = float(2**64 - 1)
     dev = {
         index
         for index, row in enumerate(rows)
-        if digest(str(row["pinyin"]), str(row["text"]), row.get("context") or None) < limit
+        if float(digest(str(row["pinyin"]), str(row["text"]), row.get("context") or None)) / u64_max
+        < dev_share
     }
     if slice_ == "dev":
         return sorted(dev)
@@ -87,25 +91,48 @@ class GuiRow:
 
 
 def read_results(path: Path) -> tuple[dict[str, Any], list[GuiRow]]:
-    """The run's meta line (if any) and one row per typed record."""
+    """The run's meta line (if any) and one row per typed record.
+
+    Strict: nothing is skipped silently. A line that fails to parse — most
+    often a torn tail from a killed run — raises a ValueError saying to start
+    the driver again on the same --out path (it repairs the tail). The meta
+    line is the first line of the file; a second one, or a duplicate record
+    index, is an error too.
+    """
     meta: dict[str, Any] = {}
     rows: list[GuiRow] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        record = json.loads(line)
+    seen: set[int] = set()
+    repair = f"start the driver again on {path} as its --out path (it repairs the tail)"
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"{path}:{number}: unreadable journal line ({error}); {repair}"
+            ) from error
+        if not isinstance(record, dict):
+            raise ValueError(f"{path}:{number}: journal line is not an object; {repair}")
         if "record" not in record:
-            meta = record
-            continue
-        rows.append(
-            GuiRow(
+            if number == 1:
+                meta = record
+                continue
+            raise ValueError(f"{path}:{number}: a meta line past the first line; {repair}")
+        try:
+            row = GuiRow(
                 index=int(record["record"]),
                 committed=str(record["committed"]),
                 first_page=tuple(str(s) for s in record.get("first_page", [])),
                 wall_ms=int(record["wall_ms"]),
                 candidate_window=bool(record.get("candidate_window", True)),
             )
-        )
+        except (KeyError, TypeError, ValueError) as error:
+            raise ValueError(
+                f"{path}:{number}: malformed journal line ({error}); {repair}"
+            ) from error
+        if row.index in seen:
+            raise ValueError(f"{path}:{number}: record {row.index} appears twice; {repair}")
+        seen.add(row.index)
+        rows.append(row)
     return meta, rows
 
 
@@ -176,6 +203,12 @@ def measure(
     rows = read_eval_set(eval_set)
     keep = set(slice_indices(rows, slice_, dev_share))
     meta, gui_rows = read_results(results)
+    ran_engine = meta.get("engine")
+    if ran_engine is not None and ran_engine != engine:
+        raise ValueError(
+            f"{results} was typed by engine {ran_engine!r}, not {engine!r}; "
+            "a mismatched report would carry the wrong engine's name"
+        )
     ran = meta.get("slice", "all")
     if ran not in ("all", slice_):
         raise ValueError(f"{results} was typed with --slice {ran}; cannot score the {slice_} slice")
