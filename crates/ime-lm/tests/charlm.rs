@@ -191,6 +191,59 @@ fn transformer_rows_from_different_records_match_solo_runs() {
     }
 }
 
+/// A manifest whose `layout` is not `"rectangular"` is an export built for
+/// another batch layout: its graphs load and step until a broadcasting
+/// operator fails on the wrong shape, so `open` refuses it -- naming the
+/// directory and the re-export -- whether the field holds a foreign value or
+/// is absent, as every pre-rectangle manifest is.
+#[test]
+fn a_manifest_of_another_layout_is_refused() {
+    let dir = fixture_dir();
+    let lexicon = lexicon(&dir);
+    let fixture: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
+        &fs::read_to_string(dir.join("transformer").join("charlm.json"))
+            .expect("the fixture manifest is committed"),
+    )
+    .expect("the fixture manifest parses");
+
+    let temp = std::env::temp_dir().join(format!("ime-lm-layout-{}", std::process::id()));
+    fs::create_dir_all(&temp).expect("the temp dir is made");
+    for layout in [Some("per-row"), None] {
+        let mut manifest = fixture.clone();
+        match layout {
+            Some(layout) => {
+                manifest.insert("layout".to_owned(), layout.into());
+            }
+            None => {
+                manifest.remove("layout");
+            }
+        }
+        fs::write(
+            temp.join("charlm.json"),
+            serde_json::to_string(&manifest).expect("the manifest serialises"),
+        )
+        .expect("the manifest is written");
+        // `open` must refuse at the manifest, before the graphs -- absent in
+        // the temp dir -- are ever read.
+        match CharLm::open(&temp, &lexicon, shape()) {
+            Err(error @ ime_lm::LmError::Layout { .. }) => {
+                let message = error.to_string();
+                assert!(
+                    message.contains(&temp.display().to_string()),
+                    "the error names the export's directory: {message}"
+                );
+                assert!(
+                    message.contains("re-export"),
+                    "the error says to re-export: {message}"
+                );
+            }
+            Err(error) => panic!("expected the layout refusal, got {error}"),
+            Ok(_) => panic!("a manifest with layout {layout:?} opened anyway"),
+        }
+    }
+    fs::remove_dir_all(&temp).ok();
+}
+
 /// A `gpu-cuda` build asked for CUDA where the provider cannot initialise --
 /// no driver, no device, no toolkit libraries -- fails `CharLm::open` with an
 /// error naming the backend, rather than silently running on CPU. On a machine

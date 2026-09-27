@@ -6,9 +6,13 @@
 //! `mlime export char-lm` writes the files this crate loads:
 //! `charlm.json`, a manifest that names the model's tensors and holds the
 //! alphabet in id order, the two ONNX graphs the manifest describes, and the
-//! weights file the graphs' initializers live in. `prefill.onnx` reads the
-//! prelude (`<bos> context <sep>`) once and produces the state every beam
-//! starts from; `charlm.onnx` advances a batch of beams by one character and
+//! weights file the graphs' initializers live in. The manifest's `layout`
+//! names the step graph's batch layout, and a manifest without the one this
+//! build reads is refused at open -- a graph written for another layout
+//! would load and step until a broadcasting operator failed on it.
+//! `prefill.onnx` reads the prelude (`<bos> context <sep>`) once and
+//! produces the state every beam starts from; `charlm.onnx` advances a
+//! batch of beams by one character and
 //! returns the log probabilities of the next.
 //!
 //! A state is two kinds of tensor. The *prefix* tensors are what the prelude
@@ -208,6 +212,18 @@ pub enum LmError {
         #[source]
         source: serde_json::Error,
     },
+    /// The manifest's `layout` is not the one batch layout this build reads;
+    /// a graph written for another would load and run until a broadcasting
+    /// operator failed on it, so the check happens at open.
+    #[error(
+        "the export at {path} has a step-graph batch layout of {layout:?}, not \"rectangular\": re-export it with `mlime export char-lm`"
+    )]
+    Layout {
+        /// The export's directory.
+        path: PathBuf,
+        /// What the manifest's `layout` held; `None` when it lacks the field.
+        layout: Option<String>,
+    },
     /// ONNX Runtime refused the graph or a run.
     #[error("onnx runtime failed")]
     Onnx(#[from] ort::Error),
@@ -254,6 +270,10 @@ struct Specials {
     unk: u32,
 }
 
+/// The only step-graph batch layout this build reads; the manifest's
+/// `layout` must hold it exactly.
+const STEP_LAYOUT: &str = "rectangular";
+
 /// `charlm.json`, the fields the run consults; the manifest also records the
 /// training step, the architecture and the restricted alphabet size, which
 /// the tensor names and the log-probability rows already carry.
@@ -267,6 +287,9 @@ struct Manifest {
     /// Names of the per-beam tensors: `hidden`/`cell` for the LSTM, the
     /// key/value cache over the sentence so far for the transformer.
     state: Vec<String>,
+    /// The step graph's batch layout; absent on exports written before the
+    /// field existed, which is exactly what [`CharLm::open`] refuses.
+    layout: Option<String>,
     /// Where the graphs' initializers live: one shared file's table, or one
     /// table per graph when the step and prefill tensors have different names.
     weights: WeightsTable,
@@ -410,8 +433,10 @@ impl CharLm {
     ///
     /// # Errors
     ///
-    /// If the manifest cannot be read or names a field the export does not
-    /// write, either graph cannot be loaded, a character of the lexicon has
+    /// If the manifest cannot be read, declares a batch layout other than
+    /// `rectangular` (absent on exports written before the field existed),
+    /// or names a field the export does not write, either graph cannot be
+    /// loaded, a character of the lexicon has
     /// no row in the model's alphabet, or *shape*'s provider was not
     /// compiled into this build.
     pub fn open(dir: &Path, lexicon: &Lexicon, shape: SessionShape) -> Result<Self, LmError> {
@@ -425,6 +450,12 @@ impl CharLm {
                 path: manifest_path,
                 source,
             })?;
+        if manifest.layout.as_deref() != Some(STEP_LAYOUT) {
+            return Err(LmError::Layout {
+                path: dir.to_path_buf(),
+                layout: manifest.layout,
+            });
+        }
         let alphabet: HashMap<char, u32> = (0u32..)
             .zip(&manifest.chars)
             .filter_map(|(id, entry)| {

@@ -713,7 +713,10 @@ def export_onnx(
     [1, T]`` and returns the same ``log_probs``, the prefix tensors and the
     state tensors to start from. The mask input exists only where the model
     has a prefix: the LSTM's step graph is unchanged and takes no mask.
-    ``charlm.json`` names the tensors and holds the alphabet in id order.
+    ``charlm.json`` names the tensors and holds the alphabet in id order;
+    its ``layout`` records the step graph's batch layout (``"rectangular"``
+    -- ``[workers, width]``), which ``ime-lm`` refuses to open without, so a
+    stale per-row export fails at load rather than inside a MatMul.
     The graphs' initializers live in an external weights file beside the
     graphs -- ``charlm.weights``, shared when the step and prefill
     initializers coincide, otherwise one file per graph -- which the manifest's
@@ -806,6 +809,7 @@ def export_onnx(
                 "context_chars": model.config.context_chars,
                 "prefix": list(prefix_names),
                 "state": list(state_names),
+                "layout": "rectangular",
                 "specials": {"pad": PAD, "bos": BOS, "eos": EOS, "sep": SEP, "unk": UNK},
                 "restricted_to": None if keep is None else int(keep.numel()),
                 "weights": weights,
