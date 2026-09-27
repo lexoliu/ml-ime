@@ -1724,7 +1724,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "askama",
+ "blake2",
  "clap",
+ "const-hex",
  "flate2",
  "ime-corpus",
  "ime-decode",

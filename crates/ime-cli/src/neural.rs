@@ -23,26 +23,29 @@
 //! difference between the models.
 
 use crate::engine::read;
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use askama::Template;
+use blake2::{Blake2b, Digest as _, digest::consts::U8};
 use clap::{Args, ValueEnum};
 use flate2::read::MultiGzDecoder;
 use ime_decode::{
     BeamOptions, Both, Candidates, Emission, Emittable, LatticePath, LatticeRecord, NoTransition,
     ScoreRecord, Scored, Transition, Uniform, Weighted, decode,
 };
-use ime_eval::{EvalRecord, EvalSet, Report, Slice};
+use ime_eval::{EvalRecord, EvalSet, Observation, Report, Slice};
 use ime_lm::CharLm;
 use ime_ngram::NgramModel;
 use ime_pinyin::{Lexicon, SegmentOptions, SyllableTable};
 use rayon::iter::{
     IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
 };
-use serde::Serialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead as _, BufReader, BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Sender};
+use std::thread::{self, JoinHandle};
 use tracing::info;
 
 /// Which part of the evaluation set a command runs over.
@@ -188,8 +191,10 @@ struct DumpRow {
     hypotheses: Vec<DumpedHypothesis>,
 }
 
-/// One hypothesis as the dump records it.
-#[derive(Serialize)]
+/// One hypothesis as the dump records it. Deserializable because the
+/// progress file stores the same shape and a resumed run builds its dump out
+/// of it again.
+#[derive(Debug, Serialize, Deserialize)]
 struct DumpedHypothesis {
     text: String,
     score: f32,
@@ -318,17 +323,46 @@ pub enum Models<'a> {
     },
 }
 
+/// Resumable per-record progress for `fused-eval` (`--progress`).
+///
+/// Set, every `measure` call of the run keeps a JSON Lines file in *dir* named
+/// for the part of the configuration that says which decode it is -- the
+/// inputs, the slice, the emission weight, the transition. The file's first
+/// line is the whole configuration key and every later line is one record's
+/// outcome, so a stopped run is continued by re-running the same command with
+/// the same directory, and resuming under arguments the file was not written
+/// with is refused rather than restarted.
+pub struct Progress<'a> {
+    /// The directory the per-configuration files are kept in.
+    pub dir: &'a Path,
+    /// The path the n-gram model was loaded from, when it was.
+    pub model: Option<&'a Path>,
+    /// The directory the character model was loaded from, when it was.
+    pub lm: Option<&'a Path>,
+    /// Stop every section after this many newly written records -- the test
+    /// stand-in for a kill, since the command line never sets it.
+    #[doc(hidden)]
+    pub stop_after: Option<usize>,
+}
+
 /// Everything a run needs to score one transition model over its sections.
 struct Run<'a> {
     set: &'a EvalSet,
+    /// Where the set was read from; part of the progress key.
+    eval_set: &'a Path,
     reader: &'a Reader,
     scores: Option<&'a HashMap<usize, Vec<Vec<Vec<f32>>>>>,
+    /// Where the score file was read from; part of the progress key.
+    scores_path: Option<&'a Path>,
     emittable: &'a Emittable,
+    /// Where the emittable set was read from; part of the progress key.
+    emittable_path: &'a Path,
     floor: f32,
     weights: &'a [f32],
     slice: &'a SliceArgs,
     beam: &'a BeamOptions,
     dump: bool,
+    progress: Option<&'a Progress<'a>>,
 }
 
 impl Run<'_> {
@@ -339,8 +373,25 @@ impl Run<'_> {
         &self,
         transition: &T,
         label: &'static str,
+        lm_weight: f32,
     ) -> Result<Vec<Section>> {
+        let request = |weight: f32| {
+            self.progress.map(|progress| ProgressRequest {
+                dir: progress.dir,
+                stop_after: progress.stop_after,
+                eval_set: self.eval_set,
+                scores: self.scores_path,
+                emittable: self.emittable_path,
+                model: progress.model,
+                lm: progress.lm,
+                lm_weight,
+                floor: self.floor,
+                weight,
+                transition: label,
+            })
+        };
         let Some(scores) = self.scores else {
+            let request = request(0.0);
             let (report, rows) = measure(
                 self.set,
                 self.slice.slice,
@@ -350,6 +401,7 @@ impl Run<'_> {
                 transition,
                 self.beam,
                 self.dump,
+                request.as_ref(),
             )?;
             return Ok(vec![Section {
                 emission: "none",
@@ -368,6 +420,7 @@ impl Run<'_> {
                 weight,
                 floor: self.floor,
             };
+            let request = request(weight);
             let (report, rows) = measure(
                 self.set,
                 which,
@@ -377,6 +430,7 @@ impl Run<'_> {
                 transition,
                 self.beam,
                 self.dump,
+                request.as_ref(),
             )?;
             Ok(Section {
                 emission: "neural",
@@ -425,19 +479,21 @@ impl Run<'_> {
 ///
 /// If any input cannot be read, a
 /// record cannot be decoded, a score file does not describe the lattice the
-/// records segment into, or the dump cannot be written.
+/// records segment into, the dump cannot be written, or a progress file was
+/// written under a different configuration.
 #[expect(
     clippy::too_many_arguments,
     reason = "every argument is a distinct axis of the ablation the command exists to run"
 )]
 pub fn fused_eval(
     eval_set: &Path,
-    scores: Option<&Path>,
-    emittable: &Path,
+    scores_path: Option<&Path>,
+    emittable_path: &Path,
     floor: f32,
     weights: &[f32],
     slice: &SliceArgs,
     dump: Option<&Path>,
+    progress: Option<&Progress<'_>>,
     table: SyllableTable,
     lexicon: Lexicon,
     segment: SegmentOptions,
@@ -445,7 +501,7 @@ pub fn fused_eval(
     transition: Models<'_>,
 ) -> Result<String> {
     let set = load_set(eval_set)?;
-    let emittable = load_emittable(emittable, &lexicon)?;
+    let emittable = load_emittable(emittable_path, &lexicon)?;
     let reader = Reader {
         table,
         lexicon,
@@ -455,22 +511,26 @@ pub fn fused_eval(
         fs::create_dir_all(dir)
             .with_context(|| format!("could not create the dump directory {}", dir.display()))?;
     }
-    let scores = scores.map(load_scores).transpose()?;
+    let scores = scores_path.map(load_scores).transpose()?;
     let run = Run {
         set: &set,
+        eval_set,
         reader: &reader,
         scores: scores.as_ref(),
+        scores_path,
         emittable: &emittable,
+        emittable_path,
         floor,
         weights,
         slice,
         beam,
         dump: dump.is_some(),
+        progress,
     };
     let sections = match transition {
-        Models::None => run.sections(&NoTransition, "none")?,
-        Models::Ngram(ngram) => run.sections(ngram, "kn-trigram")?,
-        Models::CharLm(lm) => run.sections(lm, "char-lm")?,
+        Models::None => run.sections(&NoTransition, "none", 1.0)?,
+        Models::Ngram(ngram) => run.sections(ngram, "kn-trigram", 1.0)?,
+        Models::CharLm(lm) => run.sections(lm, "char-lm", 1.0)?,
         Models::Both {
             ngram,
             lm,
@@ -483,6 +543,7 @@ pub fn fused_eval(
                 second_weight: lm_weight,
             },
             "kn-trigram+char-lm",
+            lm_weight,
         )?,
     };
     if let Some(dir) = dump {
@@ -515,11 +576,17 @@ fn measure<E, T>(
     transition: &T,
     beam: &BeamOptions,
     dump: bool,
+    progress: Option<&ProgressRequest<'_>>,
 ) -> Result<(Report, Vec<DumpRow>)>
 where
     E: Emissions + Sync,
     T: Transition + Sync,
 {
+    if let Some(progress) = progress {
+        return measure_resumable(
+            set, slice, dev_share, reader, emissions, transition, beam, dump, progress,
+        );
+    }
     let (report, mut rows) = set
         .records()
         .par_iter()
@@ -563,6 +630,453 @@ where
                 Ok((report.merge(&other), rows))
             },
         )?;
+    rows.sort_unstable_by_key(|row| row.record);
+    Ok((report, rows))
+}
+
+/// Everything a `measure` call needs to keep progress: where the files live
+/// and every input its configuration key pins down.
+struct ProgressRequest<'a> {
+    /// The directory the per-configuration files are kept in.
+    dir: &'a Path,
+    /// The test stand-in for a kill: stop after this many new records.
+    stop_after: Option<usize>,
+    eval_set: &'a Path,
+    scores: Option<&'a Path>,
+    emittable: &'a Path,
+    model: Option<&'a Path>,
+    lm: Option<&'a Path>,
+    lm_weight: f32,
+    floor: f32,
+    /// The emission weight this call decodes at.
+    weight: f32,
+    /// The transition's label in the report.
+    transition: &'static str,
+}
+
+/// The part of a configuration that names a progress file: which records are
+/// decoded, over which inputs, at which emission weight, through which
+/// transition.
+///
+/// Everything else a run can change is checked against the file's header
+/// instead of being part of the name, so that resuming under different search
+/// settings is refused rather than restarted under another name -- a restart
+/// is exactly what `--progress` exists to avoid.
+#[derive(Debug, Serialize, Deserialize)]
+struct Name {
+    eval_set: PathBuf,
+    scores: Option<PathBuf>,
+    emittable: PathBuf,
+    model: Option<PathBuf>,
+    lm: Option<PathBuf>,
+    slice: String,
+    weight: f32,
+    transition: String,
+}
+
+/// The whole configuration a `measure` call ran under, serialised as the
+/// progress file's first line. Resuming requires an exact match; a mismatch
+/// names the fields that differ.
+#[derive(Debug, Serialize, Deserialize)]
+struct Key {
+    /// Which decode this is: the part the file is named for.
+    #[serde(flatten)]
+    name: Name,
+    /// The character model's weight within the fused transition.
+    lm_weight: f32,
+    /// What a candidate the model has no row for scores.
+    floor: f32,
+    /// How many readings of the keystrokes are decoded.
+    max_paths: usize,
+    /// Whether a lone initial may stand for a syllable.
+    allow_abbreviation: bool,
+    /// Whether a trailing half-typed syllable is accepted.
+    incomplete_tail: bool,
+    /// The flat cost of one more character position.
+    segment_cost: f32,
+    /// The weight on a segment's log ambiguity.
+    ambiguity_weight: f32,
+    /// The penalty on unconventional segmentations.
+    segmentation_weight: f32,
+    /// How many beam states survive each position.
+    beam_width: usize,
+    /// How many hypotheses each record is ranked on.
+    top_k: usize,
+    /// The share of the set the dev slice holds.
+    dev_share: f64,
+}
+
+/// One record's outcome: one line of the progress file.
+#[derive(Debug, Serialize, Deserialize)]
+struct ProgressLine {
+    /// The record's index in the evaluation set.
+    record: usize,
+    /// What the record contributed to the report.
+    #[serde(flatten)]
+    observation: Observation,
+    /// The beam it decoded into, kept so that a resumed run's `--dump` is the
+    /// file an uninterrupted run's would have been.
+    hypotheses: Vec<DumpedHypothesis>,
+}
+
+/// One configuration's progress file.
+///
+/// The file's first line is the key it was written under; every later line is
+/// one record's outcome, appended by a single writer thread the parallel
+/// decode hands lines to over a channel, flushed as it lands. A kill at any
+/// moment loses at most the record in flight.
+struct Journal {
+    /// Where the file lives, so the report can be folded back out of it.
+    path: PathBuf,
+    /// Records the file already held when it was opened.
+    done: HashSet<usize>,
+    /// The channel to the writer thread.
+    sender: Option<Sender<ProgressLine>>,
+    /// The writer thread, joined on close.
+    writer: Option<JoinHandle<Result<()>>>,
+}
+
+impl Journal {
+    /// Open the file for *key* in *dir*: read the records it already holds,
+    /// refuse a key it was not written under, and start the writer that
+    /// appends what this run decodes.
+    ///
+    /// # Errors
+    ///
+    /// If the directory cannot be created, the file cannot be read or
+    /// written, its header was written under another configuration, or a
+    /// complete line of it is not a record's outcome.
+    fn open(dir: &Path, key: &Key) -> Result<Self> {
+        fs::create_dir_all(dir).with_context(|| {
+            format!("could not create the progress directory {}", dir.display())
+        })?;
+        let path = dir.join(format!("{}.jsonl", digest(&key.name)?));
+        let mut done = HashSet::new();
+        match fs::read(&path) {
+            Ok(bytes) => {
+                // A line is committed only once its newline has landed; a
+                // trailing fragment is the record a kill cut off mid-write and
+                // is dropped so the next append does not glue onto it.
+                let complete = bytes
+                    .iter()
+                    .rposition(|&byte| byte == b'\n')
+                    .map_or(0, |end| end + 1);
+                if complete == 0 {
+                    // No complete line means the run that created the file was
+                    // stopped before its header landed; nothing was committed,
+                    // so starting the file over restarts nothing.
+                    write_header(&path, key)?;
+                } else {
+                    let text = std::str::from_utf8(&bytes[..complete])
+                        .with_context(|| format!("{} is not UTF-8", path.display()))?;
+                    check_header(text, key, &path)?;
+                    for line in read_outcomes(text, &path)? {
+                        done.insert(line.record);
+                    }
+                    if complete < bytes.len() {
+                        fs::File::options()
+                            .write(true)
+                            .open(&path)
+                            .with_context(|| format!("could not truncate {}", path.display()))?
+                            .set_len(u64::try_from(complete).expect("a file length fits in u64"))
+                            .with_context(|| format!("could not truncate {}", path.display()))?;
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                write_header(&path, key)?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("could not read the progress file {}", path.display())
+                });
+            }
+        }
+        info!(
+            path = %path.display(),
+            done = done.len(),
+            "opened the progress file"
+        );
+        let (sender, receiver) = mpsc::channel::<ProgressLine>();
+        let writer_path = path.clone();
+        let writer = thread::spawn(move || -> Result<()> {
+            let mut sink = fs::File::options()
+                .append(true)
+                .open(&writer_path)
+                .with_context(|| {
+                    format!("could not open {} for appending", writer_path.display())
+                })?;
+            while let Ok(line) = receiver.recv() {
+                serde_json::to_writer(&mut sink, &line).with_context(|| {
+                    format!("could not serialise a record of {}", writer_path.display())
+                })?;
+                sink.write_all(b"\n").with_context(|| {
+                    format!("could not write a record of {}", writer_path.display())
+                })?;
+                sink.flush()
+                    .with_context(|| format!("could not flush {}", writer_path.display()))?;
+            }
+            Ok(())
+        });
+        Ok(Self {
+            path,
+            done,
+            sender: Some(sender),
+            writer: Some(writer),
+        })
+    }
+
+    /// Hand one finished record's outcome to the writer.
+    ///
+    /// # Errors
+    ///
+    /// If the writer thread is gone.
+    fn send(&self, line: ProgressLine) -> Result<()> {
+        self.sender
+            .as_ref()
+            .context("the progress file is already closed")?
+            .send(line)
+            .map_err(|_| anyhow!("the progress writer for {} stopped", self.path.display()))
+    }
+
+    /// Close the file: the channel ends, the writer flushes its last line and
+    /// is joined.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the writer last failed on.
+    fn finish(&mut self) -> Result<()> {
+        drop(self.sender.take());
+        if let Some(writer) = self.writer.take() {
+            writer.join().map_err(|_| {
+                anyhow!("the progress writer for {} panicked", self.path.display())
+            })??;
+        }
+        Ok(())
+    }
+
+    /// Every record line the file holds, oldest first in file order -- which a
+    /// parallel decode does not promise.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be read or a line is not a record's outcome.
+    fn lines(&self) -> Result<Vec<ProgressLine>> {
+        let bytes = fs::read(&self.path)
+            .with_context(|| format!("could not re-read {}", self.path.display()))?;
+        let complete = bytes
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |end| end + 1);
+        let text = std::str::from_utf8(&bytes[..complete])
+            .with_context(|| format!("{} is not UTF-8", self.path.display()))?;
+        read_outcomes(text, &self.path)
+    }
+}
+
+/// The file one configuration's progress is kept in: `<hash>.jsonl`, the hash
+/// of the name's serialised form.
+fn digest(name: &Name) -> Result<String> {
+    let serialised =
+        serde_json::to_vec(name).context("could not serialise the progress file's name")?;
+    Ok(const_hex::encode(Blake2b::<U8>::digest(&serialised)))
+}
+
+/// Start a fresh progress file under *key*: the file's first line is the key
+/// itself.
+fn write_header(path: &Path, key: &Key) -> Result<()> {
+    let mut file =
+        fs::File::create(path).with_context(|| format!("could not create {}", path.display()))?;
+    serde_json::to_writer(&mut file, key)
+        .with_context(|| format!("could not write the header of {}", path.display()))?;
+    file.write_all(b"\n")
+        .with_context(|| format!("could not write the header of {}", path.display()))?;
+    file.flush()
+        .with_context(|| format!("could not flush {}", path.display()))
+}
+
+/// Refuse *path* when its first line was written under another configuration.
+fn check_header(text: &str, key: &Key, path: &Path) -> Result<()> {
+    let header = text
+        .lines()
+        .next()
+        .context("the progress file holds no configuration header")?;
+    let stored: Key = serde_json::from_str(header).with_context(|| {
+        format!(
+            "the first line of {} is not a configuration key",
+            path.display()
+        )
+    })?;
+    let differing = differing(&stored, key)?;
+    if !differing.is_empty() {
+        bail!(
+            "the progress file {} was written under a different configuration: {}",
+            path.display(),
+            differing.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// The fields on which a stored key and this run's disagree, each rendered as
+/// `name (stored, wanted)` for the refusal.
+fn differing(stored: &Key, key: &Key) -> Result<Vec<String>> {
+    let stored = serde_json::to_value(stored).context("could not re-serialise the stored key")?;
+    let key = serde_json::to_value(key).context("could not serialise the key")?;
+    let (serde_json::Value::Object(stored), serde_json::Value::Object(key)) = (stored, key) else {
+        bail!("a configuration key is not an object");
+    };
+    let render = |value: Option<&serde_json::Value>| {
+        value.map_or_else(|| "unset".to_owned(), ToString::to_string)
+    };
+    let mut differing: Vec<String> = key
+        .keys()
+        .filter(|field| stored.get(*field) != key.get(*field))
+        .map(|field| {
+            format!(
+                "{field} ({} != {})",
+                render(stored.get(field)),
+                render(key.get(field))
+            )
+        })
+        .collect();
+    differing.sort();
+    Ok(differing)
+}
+
+/// The record lines of a progress file's *text*: every complete line but the
+/// header.
+fn read_outcomes(text: &str, path: &Path) -> Result<Vec<ProgressLine>> {
+    if text.is_empty() {
+        bail!("{} holds no configuration header", path.display());
+    }
+    let mut lines = Vec::new();
+    let mut seen = HashSet::new();
+    for (index, raw) in text.lines().enumerate().skip(1) {
+        let line: ProgressLine = serde_json::from_str(raw).with_context(|| {
+            format!(
+                "line {} of {} is not a record's outcome",
+                index + 1,
+                path.display()
+            )
+        })?;
+        if !seen.insert(line.record) {
+            bail!("{} lists record {} twice", path.display(), line.record);
+        }
+        lines.push(line);
+    }
+    Ok(lines)
+}
+
+/// Decode the slice's pending records, appending each outcome to the
+/// configuration's progress file as it lands, then fold the report out of the
+/// file's lines so it is identical whether or not the run was interrupted.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "it takes exactly what `measure` does plus what the progress file needs"
+)]
+fn measure_resumable<E, T>(
+    set: &EvalSet,
+    slice: SliceArg,
+    dev_share: f64,
+    reader: &Reader,
+    emissions: &E,
+    transition: &T,
+    beam: &BeamOptions,
+    dump: bool,
+    progress: &ProgressRequest<'_>,
+) -> Result<(Report, Vec<DumpRow>)>
+where
+    E: Emissions + Sync,
+    T: Transition + Sync,
+{
+    let key = Key {
+        name: Name {
+            eval_set: progress.eval_set.to_owned(),
+            scores: progress.scores.map(Path::to_owned),
+            emittable: progress.emittable.to_owned(),
+            model: progress.model.map(Path::to_owned),
+            lm: progress.lm.map(Path::to_owned),
+            slice: slice.label().to_owned(),
+            weight: progress.weight,
+            transition: progress.transition.to_owned(),
+        },
+        lm_weight: progress.lm_weight,
+        floor: progress.floor,
+        max_paths: reader.segment.max_paths,
+        allow_abbreviation: reader.segment.allow_abbreviation,
+        incomplete_tail: reader.segment.allow_incomplete_tail,
+        segment_cost: reader.segment.segment_cost,
+        ambiguity_weight: reader.segment.ambiguity_weight,
+        segmentation_weight: beam.segmentation_weight,
+        beam_width: beam.beam_width.get(),
+        top_k: beam.top_k.get(),
+        dev_share,
+    };
+    let mut journal = Journal::open(progress.dir, &key)?;
+    let mut pending: Vec<(usize, &EvalRecord)> = set
+        .records()
+        .par_iter()
+        .enumerate()
+        .filter(|(_, record)| slice.slice().holds(record, dev_share))
+        .filter(|(index, _)| !journal.done.contains(index))
+        .collect();
+    pending.sort_unstable_by_key(|(index, _)| *index);
+    if let Some(stop_after) = progress.stop_after {
+        pending.truncate(stop_after);
+    }
+    pending
+        .par_iter()
+        .map(|&(index, record)| -> Result<()> {
+            let (_, candidates) = reader.read(record)?;
+            let emission = emissions.model(index, &candidates)?;
+            let hypotheses = decode(
+                &candidates,
+                &emission,
+                transition,
+                record.context.as_deref(),
+                beam,
+            )
+            .with_context(|| format!("could not decode record {index}"))?;
+            let texts: Vec<String> = hypotheses
+                .iter()
+                .map(|hypothesis| hypothesis.text(&reader.lexicon))
+                .collect();
+            journal.send(ProgressLine {
+                record: index,
+                observation: Observation::new(&record.text, &texts, beam.top_k.get()),
+                hypotheses: hypotheses
+                    .iter()
+                    .zip(texts)
+                    .map(|(hypothesis, text)| DumpedHypothesis {
+                        text,
+                        score: hypothesis.score(),
+                    })
+                    .collect(),
+            })
+        })
+        .collect::<Result<Vec<()>>>()?;
+    journal.finish()?;
+    let mut report = Report::new(beam.top_k);
+    let mut rows = Vec::new();
+    for line in journal.lines()? {
+        let record = set.records().get(line.record).with_context(|| {
+            format!(
+                "{} names record {}, but the eval set holds {}",
+                journal.path.display(),
+                line.record,
+                set.len()
+            )
+        })?;
+        report.fold(&line.observation);
+        if dump {
+            rows.push(DumpRow {
+                record: line.record,
+                text: record.text.clone(),
+                hypotheses: line.hypotheses,
+            });
+        }
+    }
     rows.sort_unstable_by_key(|row| row.record);
     Ok((report, rows))
 }
@@ -690,6 +1204,458 @@ pub fn parse_weight(raw: &str) -> Result<f32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A fresh temporary directory per test, removed on drop.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "ml-ime-fused-eval-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir_all(&dir).expect("the scratch directory is creatable");
+            Self(dir)
+        }
+
+        fn path(&self, file: &str) -> PathBuf {
+            self.0.join(file)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A synthetic fused-eval fixture: an eval set, an emittable set and a
+    /// score file answering them with zeros. Zero scores carry no signal,
+    /// which is what makes the decode deterministic and a dev sweep break its
+    /// ties to the first weight.
+    struct Fixture {
+        scratch: Scratch,
+        eval_set: PathBuf,
+        emittable: PathBuf,
+        scores: PathBuf,
+        progress_dir: PathBuf,
+        /// The `char_pinyin.tsv` the run's lexicon is parsed from; empty for
+        /// the generated lexicon.
+        lexicon: String,
+    }
+
+    impl Fixture {
+        /// Build a fixture over *records* (`(pinyin, expected)` pairs), with
+        /// *emittable* the characters the pretend model can score and
+        /// *lexicon* the character table, or empty for the generated one.
+        fn new(records: &[(&str, &str)], emittable: &str, lexicon: &str) -> Self {
+            let scratch = Scratch::new("fixture");
+            let eval_set = scratch.path("eval.jsonl");
+            let mut source = String::new();
+            for &(pinyin, text) in records {
+                let record = EvalRecord {
+                    pinyin: pinyin.to_owned(),
+                    text: text.to_owned(),
+                    context: None,
+                };
+                source.push_str(&serde_json::to_string(&record).expect("a record serialises"));
+                source.push('\n');
+            }
+            fs::write(&eval_set, source).expect("the eval set writes");
+            let emittable_path = scratch.path("emittable.txt");
+            fs::write(&emittable_path, emittable).expect("the emittable set writes");
+            let fixture = Self {
+                progress_dir: scratch.path("progress"),
+                scores: scratch.path("scores.jsonl.gz"),
+                scratch,
+                eval_set,
+                emittable: emittable_path,
+                lexicon: lexicon.to_owned(),
+            };
+            fixture.write_scores();
+            fixture
+        }
+
+        /// The lexicon this fixture decodes with.
+        fn lexicon(&self) -> Lexicon {
+            let table = SyllableTable::load();
+            if self.lexicon.is_empty() {
+                Lexicon::load(&table).expect("the generated lexicon loads")
+            } else {
+                Lexicon::parse(&self.lexicon, &table).expect("the fixture lexicon parses")
+            }
+        }
+
+        /// Write the score file that answers this fixture's lattice with zeros.
+        fn write_scores(&self) {
+            let lattice = self.scratch.path("lattice.jsonl");
+            emit_lattice(
+                &self.eval_set,
+                &lattice,
+                &self.emittable,
+                SyllableTable::load(),
+                self.lexicon(),
+                segment(),
+            )
+            .expect("the lattice emits");
+            let source = fs::read_to_string(&lattice).expect("the lattice reads");
+            let file = fs::File::create(&self.scores).expect("the score file is creatable");
+            let mut sink = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+            for raw in source.lines() {
+                let lattice: LatticeRecord =
+                    serde_json::from_str(raw).expect("a lattice record parses");
+                let paths = lattice
+                    .paths
+                    .iter()
+                    .map(|path| {
+                        path.candidates
+                            .iter()
+                            .map(|candidates| vec![0.0; candidates.chars().count()])
+                            .collect()
+                    })
+                    .collect();
+                let record = ScoreRecord {
+                    record: lattice.record,
+                    paths,
+                };
+                serde_json::to_writer(&mut sink, &record).expect("a score record serialises");
+                sink.write_all(b"\n").expect("a score record writes");
+            }
+            sink.finish().expect("the score file flushes");
+        }
+
+        /// One `fused-eval` run over the fixture.
+        ///
+        /// # Errors
+        ///
+        /// Whatever the run reports.
+        fn run(
+            &self,
+            weights: &[f32],
+            dev_share: f64,
+            select_on_dev: bool,
+            transition: Models<'_>,
+            progress: Option<&Progress<'_>>,
+        ) -> Result<String> {
+            fused_eval(
+                &self.eval_set,
+                Some(&self.scores),
+                &self.emittable,
+                -30.0,
+                weights,
+                &SliceArgs {
+                    slice: SliceArg::All,
+                    dev_share,
+                    select_on_dev,
+                },
+                None,
+                progress,
+                SyllableTable::load(),
+                self.lexicon(),
+                segment(),
+                &BeamOptions {
+                    beam_width: NonZeroUsize::new(16).expect("16 is not zero"),
+                    ..BeamOptions::default()
+                },
+                transition,
+            )
+        }
+
+        /// A `Progress` into this fixture's directory.
+        fn progress<'a>(&'a self, stop_after: Option<usize>, lm: Option<&'a Path>) -> Progress<'a> {
+            Progress {
+                dir: &self.progress_dir,
+                model: None,
+                lm,
+                stop_after,
+            }
+        }
+
+        /// How many records fall in the dev slice at *share*, with the total.
+        fn dev_records(&self, share: f64) -> (usize, usize) {
+            let set =
+                EvalSet::parse(&fs::read_to_string(&self.eval_set).expect("the eval set reads"))
+                    .expect("the eval set parses");
+            let dev = set
+                .records()
+                .iter()
+                .filter(|record| Slice::Dev.holds(record, share))
+                .count();
+            (dev, set.len())
+        }
+
+        /// The files a *slice* pass keeps its progress in, with their bytes.
+        fn pass_files(&self, slice: &str) -> Vec<(PathBuf, Vec<u8>)> {
+            let mut files = fs::read_dir(&self.progress_dir)
+                .expect("the progress directory reads")
+                .map(|entry| entry.expect("an entry reads").path())
+                .filter(|path| {
+                    fs::read_to_string(path)
+                        .expect("a progress file reads")
+                        .lines()
+                        .next()
+                        .and_then(|header| serde_json::from_str::<serde_json::Value>(header).ok())
+                        .is_some_and(|key| key["slice"].as_str() == Some(slice))
+                })
+                .map(|path| {
+                    let bytes = fs::read(&path).expect("a progress file reads");
+                    (path, bytes)
+                })
+                .collect::<Vec<_>>();
+            files.sort();
+            files
+        }
+
+        /// The progress files, `<hash>.jsonl`, as `(header, record lines)`.
+        fn progress_files(&self) -> Vec<(serde_json::Value, Vec<String>)> {
+            let mut files = fs::read_dir(&self.progress_dir)
+                .expect("the progress directory reads")
+                .map(|entry| entry.expect("an entry reads").path())
+                .collect::<Vec<_>>();
+            files.sort();
+            files
+                .iter()
+                .map(|path| {
+                    let source = fs::read_to_string(path).expect("a progress file reads");
+                    let mut lines = source.lines();
+                    let header: serde_json::Value =
+                        serde_json::from_str(lines.next().expect("a progress file has a header"))
+                            .expect("the header parses");
+                    let records = lines.map(str::to_owned).collect();
+                    (header, records)
+                })
+                .collect()
+        }
+    }
+
+    /// The record lines a progress file's bytes carry (header excluded).
+    fn record_lines(bytes: &[u8]) -> Vec<String> {
+        let text = String::from_utf8(bytes.to_vec()).expect("a progress file is UTF-8");
+        let mut lines = text.lines().skip(1).map(str::to_owned).collect::<Vec<_>>();
+        lines.sort();
+        lines
+    }
+
+    /// The segment options the runs and their lattice share: exact readings
+    /// only, so the fixture's eight syllables need no abbreviation or partial
+    /// tail to stay decodable.
+    fn segment() -> SegmentOptions {
+        SegmentOptions {
+            allow_abbreviation: false,
+            allow_incomplete_tail: false,
+            ..SegmentOptions::default()
+        }
+    }
+
+    #[test]
+    fn a_resumed_run_reports_what_an_uninterrupted_one_did() {
+        let fixture = Fixture::new(
+            &[
+                ("nihao", "你好"),
+                ("zhongguo", "中国"),
+                ("renmin", "人民"),
+                ("yinhang", "银行"),
+                ("beijing", "北京"),
+                ("tianqi", "天气"),
+                ("women", "我们"),
+                ("zaijian", "再见"),
+                ("henhao", "很好"),
+                ("xiexie", "谢谢"),
+            ],
+            "你\n好\n中\n国\n人\n民\n银\n行\n北\n京\n天\n气\n我\n们\n再\n见\n很\n谢",
+            "",
+        );
+        let baseline = fixture
+            .run(&[1.0], 0.5, false, Models::None, None)
+            .expect("the uninterrupted run decodes");
+        fixture
+            .run(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress(Some(3), None)),
+            )
+            .expect("the stopped run decodes");
+        let resumed = fixture
+            .run(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress(None, None)),
+            )
+            .expect("the resumed run decodes");
+        assert_eq!(resumed, baseline);
+        let files = fixture.progress_files();
+        assert_eq!(files.len(), 1, "one configuration, one file");
+        assert_eq!(
+            files[0].1.len(),
+            10,
+            "every record landed exactly once: no line was written twice on resume"
+        );
+        // Resuming a finished run decodes nothing and reports the same.
+        let again = fixture
+            .run(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress(None, None)),
+            )
+            .expect("the finished run decodes");
+        assert_eq!(again, baseline);
+        assert_eq!(fixture.progress_files()[0].1.len(), 10);
+    }
+
+    #[test]
+    fn a_resumed_run_under_changed_arguments_is_refused() {
+        let fixture = Fixture::new(
+            &[("nihao", "你好"), ("zhongguo", "中国"), ("renmin", "人民")],
+            "你\n好\n中\n国\n人\n民",
+            "",
+        );
+        fixture
+            .run(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress(None, None)),
+            )
+            .expect("the first run decodes");
+        let refused = fixture
+            .run(
+                &[1.0],
+                0.75,
+                false,
+                Models::None,
+                Some(&fixture.progress(None, None)),
+            )
+            .expect_err("a changed dev share must be refused");
+        let message = format!("{refused:#}");
+        assert!(
+            message.contains("dev_share"),
+            "the refusal names the field that changed: {message}"
+        );
+        // A different weight is a different configuration -- its own file,
+        // not an error.
+        fixture
+            .run(
+                &[0.5],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress(None, None)),
+            )
+            .expect("another weight is another file, not a refusal");
+        assert_eq!(fixture.progress_files().len(), 2);
+    }
+
+    #[test]
+    fn select_on_dev_resumes_each_pass_on_its_own_file() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ime-lm/tests/fixtures");
+        let lexicon =
+            fs::read_to_string(fixtures.join("char_pinyin.tsv")).expect("the table reads");
+        // The fixture lexicon covers eight syllables, and a record fails to
+        // read if any segmentation of its keystrokes needs one outside them --
+        // so the records stick to `ni`, `zai` and `wo`, the three whose every
+        // concatenation segments in exactly one way (the other five split into
+        // uncovered pieces: `m`/`a`, `he`/`n`, `ha`/`o`, `ji`/`an`, `xi`/`e`).
+        let fixture = Fixture::new(
+            &[
+                ("niwo", "你我"),
+                ("woni", "我你"),
+                ("nizai", "你再"),
+                ("zaini", "再你"),
+                ("wozai", "我再"),
+                ("zaiwo", "再我"),
+                ("nini", "你你"),
+                ("wowo", "我我"),
+                ("zaizai", "再再"),
+                ("niwozai", "你我再"),
+                ("wozaini", "我再你"),
+                ("zainiwo", "再你我"),
+            ],
+            "你\n再\n我",
+            &lexicon,
+        );
+        // Both halves of the set must be populated for the sweep to mean
+        // anything.
+        let (dev, total) = fixture.dev_records(0.4);
+        assert!(dev > 0 && dev < total, "the fixture must split");
+        let table = SyllableTable::load();
+        let lm_lexicon = Lexicon::parse(&lexicon, &table).expect("the fixture lexicon parses");
+        let lm = CharLm::open(&fixtures.join("transformer"), &lm_lexicon)
+            .expect("the transformer fixture opens");
+        let lm_dir = fixtures.join("transformer");
+        let weights = [0.5, 1.0];
+        let baseline = fixture
+            .run(&weights, 0.4, true, Models::CharLm(&lm), None)
+            .expect("the uninterrupted run decodes");
+        fixture
+            .run(
+                &weights,
+                0.4,
+                true,
+                Models::CharLm(&lm),
+                Some(&fixture.progress(Some(1), Some(&lm_dir))),
+            )
+            .expect("the stopped run decodes");
+        let resumed = fixture
+            .run(
+                &weights,
+                0.4,
+                true,
+                Models::CharLm(&lm),
+                Some(&fixture.progress(None, Some(&lm_dir))),
+            )
+            .expect("the resumed run decodes");
+        assert_eq!(resumed, baseline);
+        // Two dev weights and the test pass at the winner are three files.
+        let files = fixture.progress_files();
+        assert_eq!(files.len(), 3, "dev sweep plus test pass");
+        for (header, lines) in &files {
+            let expected = match header["slice"].as_str() {
+                Some("dev") => dev,
+                Some("test") => total - dev,
+                other => panic!("a pass writes to a named slice, not {other:?}"),
+            };
+            assert_eq!(lines.len(), expected, "every record of the slice landed");
+        }
+        // Each file resumes on its own: deleting the test file re-decodes the
+        // test pass only, and the dev files are left untouched.
+        let dev_files = fixture.pass_files("dev");
+        let test_files = fixture.pass_files("test");
+        assert_eq!(dev_files.len(), 2);
+        let [(_, test_bytes)] = test_files.as_slice() else {
+            panic!("one test file, not {}", test_files.len());
+        };
+        let test_lines = record_lines(test_bytes);
+        fs::remove_file(&test_files[0].0).expect("the test file is removable");
+        let again = fixture
+            .run(
+                &weights,
+                0.4,
+                true,
+                Models::CharLm(&lm),
+                Some(&fixture.progress(None, Some(&lm_dir))),
+            )
+            .expect("the run rebuilds only the test pass");
+        assert_eq!(again, baseline);
+        assert_eq!(
+            fixture.pass_files("dev"),
+            dev_files,
+            "the dev files were resumed, not rewritten"
+        );
+        let rebuilt = fixture.pass_files("test");
+        assert_eq!(rebuilt.len(), 1, "the test file was rebuilt");
+        assert_eq!(record_lines(&rebuilt[0].1), test_lines);
+    }
 
     #[test]
     fn a_negative_fusion_weight_is_refused() {
