@@ -737,5 +737,29 @@ def eval_rime(
         write_report(report, out)
 
 
+@eval_app.command("gui")
+def eval_gui(
+    engine: str = typer.Option(..., help="apple, sogou or baidu -- the engine ime-drive ran"),
+    results: Path = typer.Option(..., help="ime-drive's per-record JSONL output"),
+    eval_set: Path = typer.Option(..., help="The eval set the run typed"),
+    slice_: str = typer.Option(
+        "test", "--slice", help="test (default), dev or all -- the keyed split"
+    ),
+    dev_share: float = typer.Option(0.0905, help="Share of the set that is development data"),
+    out: Path = typer.Option(None, help="Where to write the report, with every sentence, as JSON"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Score an ime-drive run's committed sentences like `eval rime` scores RIME."""
+    configure(verbose)
+    from mlime.gui import measure, write_report
+
+    if slice_ not in ("dev", "test", "all"):
+        raise typer.BadParameter("--slice must be dev, test or all")
+    report = measure(results, eval_set, engine, slice_, dev_share)
+    typer.echo(report.render())
+    if out is not None:
+        write_report(report, out)
+
+
 if __name__ == "__main__":
     app()
