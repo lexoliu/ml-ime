@@ -1,6 +1,7 @@
 """The GUI harness's scoring: keyed slice selection and `evaluate` parity."""
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -42,6 +43,35 @@ def test_slice_indices_splits_on_the_share() -> None:
     test = slice_indices(rows, "test", DEV_SHARE)
     assert sorted(dev + test) == list(range(5))
     assert not set(dev) & set(test)
+
+
+def test_slice_boundary_matches_the_rust_formula() -> None:
+    # Golden digests: BLAKE2b-64 of pinyin \x00 text \x00 context, big-endian;
+    # dev iff float(digest) / float(u64::MAX) < share, as Rust's Slice::holds.
+    golden = [
+        ("zhongguo", "中国", None, 1483103352520586474, "dev"),
+        ("renmin", "人民", None, 5258366442535009459, "test"),
+        ("yinhang", "银行", "我要去", 9404986330596425458, "test"),
+        ("beijing", "北京", None, 8823118165217649467, "test"),
+        ("tianqi", "天气", "今天的", 17299626687068035301, "test"),
+    ]
+    rows = [{"pinyin": p, "text": t, "context": c} for p, t, c, _, _ in golden]
+    for index, (pinyin, text, context, expected, side) in enumerate(golden):
+        assert digest(pinyin, text, context) == expected
+        assert index in slice_indices(rows, side, DEV_SHARE)
+        assert index not in slice_indices(rows, "dev" if side == "test" else "test", DEV_SHARE)
+
+    # Within a few ulps of the threshold the strict `<` still decides, exactly
+    # as Rust's `f64 < f64` does.
+    ratio = float(golden[0][3]) / float(2**64 - 1)
+    assert slice_indices(rows, "dev", ratio) == []  # equal is not under the share
+    assert slice_indices(rows, "dev", math.nextafter(ratio, math.inf)) == [0]
+    assert slice_indices(rows, "dev", math.nextafter(ratio, -math.inf)) == []
+
+
+def test_slice_indices_rejects_an_unknown_slice() -> None:
+    with pytest.raises(ValueError, match="dev"):
+        slice_indices(_eval_rows(), "devs", DEV_SHARE)
 
 
 def test_measure_scores_like_eval_rime(tmp_path: Path) -> None:
@@ -111,6 +141,56 @@ def test_measure_rejects_a_slice_with_no_rows(tmp_path: Path) -> None:
     # dev_share 0 leaves no dev records, so scoring dev has nothing to say.
     with pytest.raises(ValueError, match="no records"):
         measure(results, eval_set, "apple", slice_="dev", dev_share=0.0)
+
+
+def test_read_results_raises_on_a_torn_line(tmp_path: Path) -> None:
+    path = tmp_path / "results.jsonl"
+    path.write_text(
+        '{"type": "meta", "engine": "apple"}\n'
+        '{"record": 0, "committed": "\u4e2d\u56fd", "first_page": [], "wall_ms": 1}\n'
+        '{"record": 1, "committed": "\u4eba'  # the torn tail a kill leaves behind
+    )
+    with pytest.raises(ValueError, match=r"results\.jsonl:3.*--out"):
+        read_results(path)
+
+
+def test_read_results_raises_on_duplicate_and_late_meta(tmp_path: Path) -> None:
+    dup = _write(
+        tmp_path,
+        "dup.jsonl",
+        [
+            {"record": 0, "committed": "x", "first_page": [], "wall_ms": 1},
+            {"record": 0, "committed": "y", "first_page": [], "wall_ms": 1},
+        ],
+    )
+    with pytest.raises(ValueError, match="twice"):
+        read_results(dup)
+    # The meta line is the first line; a second meta line is an error.
+    late = _write(
+        tmp_path,
+        "late.jsonl",
+        [
+            {"type": "meta", "engine": "apple"},
+            {"record": 0, "committed": "x", "first_page": [], "wall_ms": 1},
+            {"type": "meta", "engine": "apple"},
+        ],
+    )
+    with pytest.raises(ValueError, match="meta"):
+        read_results(late)
+
+
+def test_measure_refuses_a_mismatched_engine(tmp_path: Path) -> None:
+    eval_set = _write(tmp_path, "eval.jsonl", _eval_rows())
+    results = _write(
+        tmp_path,
+        "results.jsonl",
+        [
+            {"type": "meta", "engine": "apple", "slice": "all"},
+            {"record": 0, "committed": "\u4e2d\u56fd", "first_page": [], "wall_ms": 1},
+        ],
+    )
+    with pytest.raises(ValueError, match="sogou"):
+        measure(results, eval_set, "sogou", slice_="test", dev_share=0.0)
 
 
 def test_measure_refuses_a_mismatched_run_slice(tmp_path: Path) -> None:

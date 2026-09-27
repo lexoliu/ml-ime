@@ -753,6 +753,8 @@ def eval_gui(
     configure(verbose)
     from mlime.gui import measure, write_report
 
+    if slice_ not in ("dev", "test", "all"):
+        raise typer.BadParameter("--slice must be dev, test or all")
     report = measure(results, eval_set, engine, slice_, dev_share)
     typer.echo(report.render())
     if out is not None:
