@@ -69,14 +69,12 @@ trusted vendors.
 
 ## Run
 
-One engine, the three twins, sequentially — a GUI session has one keyboard
-focus, so never run two engines on one VM at once:
+One twin per run (see "One twin per fresh engine state" below — do NOT run
+all three twins against the same engine state):
 
-    for twin in eval3 eval3-abbreviated eval3-mixed; do
-      macos/ImeDrive/build/ImeDrive.app/Contents/MacOS/ime-drive \
-        --engine <ENGINE> --eval-set data/run3_pool/$twin.jsonl \
-        --out data/gui/<ENGINE>/$twin.jsonl --slice test
-    done
+    macos/ImeDrive/build/ImeDrive.app/Contents/MacOS/ime-drive \
+      --engine <ENGINE> --eval-set data/run3_pool/<TWIN>.jsonl \
+      --out data/gui/<ENGINE>/<TWIN>.jsonl --slice test
 
 `--slice test` types only the test share (dev share 0.0905, keyed on the
 record hash — identical to `mlime eval rime`). The `--out` file is the
@@ -84,6 +82,35 @@ journal: kill and restart at will, records already in it are skipped. A
 record over the 20 s budget is written as a failure line, never retried.
 ~1–2.3 s/record → each twin is well over an hour; the sweep runs
 unattended.
+
+## One twin per fresh engine state
+
+The three twins are the SAME sentences typed three ways. A committed
+sentence lands in the engine's learned dictionary, so on the abbreviated
+twin the first letters recall sentences the engine already saw — only the
+first twin typed on a fresh engine state is a measurement. Observed: after
+eval3 ran, abbreviated record 0 (`zxmlnd`) offered 最下面雷鸟的 — the eval3
+record 0 sentence — as its first candidate.
+
+So: one twin per fresh state. Fresh means a fresh VM, or the engine's
+learned-word stores deleted and learning off before the twin. Where each
+engine learns:
+
+- **apple** — `~/Library/Dictionaries/DynamicPhraseLexicon_zh_Hans.db`
+  (SQLite). Fresh = file absent or zero user rows; delete it and log
+  out/in (or restart SCIM) to reset.
+- **sogou** — `~/Library/Application Support/Sogou/InputMethod/SogouPY/`
+  (`sgim_gd_usr.bin` user dictionary, `sgim_gd_usr_a_bigram.bin` learned
+  bigrams) plus `SogouPY.users/` per-app cells. Fresh = files at their
+  install-time sizes; resetting means removing SogouPY's user files and
+  restarting the engine.
+- **baidu** — `~/Library/Application Support/BaiduInput/userdict/`
+  (`usr3user.bin` learned words, `usr3cell.bin*` cells). Fresh = files at
+  install-time sizes, `utrc.log` untouched.
+
+The journal's meta line records `engine_state`: the readable preference
+domains and each learned file's size/mtime at run start — that snapshot is
+what a report uses to say which state produced it.
 
 ## Score
 
