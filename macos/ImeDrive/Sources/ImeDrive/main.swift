@@ -74,20 +74,25 @@ struct EngineSpec {
     /// Substrings matched against the input source's bundle id and against
     /// running applications' bundle ids to find candidate-window owners.
     let bundleHints: [String]
+    /// Whether the engine's candidate panel exposes its candidates through
+    /// the accessibility tree. When false (Baidu, whose panel is custom
+    /// drawn) readiness is keyed on the panel's window-server presence and
+    /// the accessibility read is skipped outright.
+    let panelHasAxText: Bool
 }
 
 let engines: [String: EngineSpec] = [
     "apple": EngineSpec(
         sourceIdHints: ["com.apple.inputmethod.scim.itabc"],
-        bundleHints: ["com.apple.inputmethod"]
+        bundleHints: ["com.apple.inputmethod"], panelHasAxText: true
     ),
     "sogou": EngineSpec(
         sourceIdHints: ["com.sogou.inputmethod.sogou.pinyin", "sogou"],
-        bundleHints: ["sogou"]
+        bundleHints: ["sogou"], panelHasAxText: true
     ),
     "baidu": EngineSpec(
         sourceIdHints: ["com.baidu.inputmethod.baiduim.pinyin", "baidu"],
-        bundleHints: ["baidu"]
+        bundleHints: ["baidu"], panelHasAxText: false
     ),
 ]
 
@@ -237,7 +242,8 @@ do {
         engine: args.engine, evalSet: evalSet, out: out, textView: textView,
         watchPids: watchPids, bundleHints: hints, sourceID: source.id,
         clientBounds: clientBounds, keyWaitCapMs: args.keyWaitCapMs,
-        recordTimeoutMs: args.recordTimeoutMs, slice: args.slice)
+        recordTimeoutMs: args.recordTimeoutMs, slice: args.slice,
+        panelHasAxText: spec.panelHasAxText)
 } catch {
     err("setup failed: \(error.localizedDescription)")
 }
