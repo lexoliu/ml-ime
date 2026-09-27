@@ -76,12 +76,15 @@ impl Backend {
     ///
     /// If the backend's provider was not compiled into this build.
     fn providers(self) -> Result<Vec<ExecutionProviderDispatch>, LmError> {
+        // Every dispatch carries `error_on_failure`: a provider that cannot
+        // initialise is an error at session creation, never a silent CPU
+        // session.
         match self {
             Self::Cpu => Ok(Vec::new()),
             #[cfg(feature = "gpu-coreml")]
-            Self::CoreMl => Ok(vec![ort::ep::CoreML::default().build()]),
+            Self::CoreMl => Ok(vec![ort::ep::CoreML::default().build().error_on_failure()]),
             #[cfg(feature = "gpu-webgpu")]
-            Self::WebGpu => Ok(vec![ort::ep::WebGPU::default().build()]),
+            Self::WebGpu => Ok(vec![ort::ep::WebGPU::default().build().error_on_failure()]),
             #[allow(
                 unreachable_patterns,
                 reason = "the arm is reachable only when a gpu-* feature is off; with both on, every Backend variant already has an arm"
@@ -214,6 +217,17 @@ pub enum LmError {
     NotCompiled {
         /// The backend that was asked for.
         backend: Backend,
+    },
+    /// The backend's provider was compiled in but could not initialise --
+    /// CUDA asked for on a machine without the toolkit, the driver or the
+    /// device, say.
+    #[error("the {backend:?} backend's provider could not initialise")]
+    Provider {
+        /// The backend that was asked for.
+        backend: Backend,
+        /// The registration error.
+        #[source]
+        source: ort::Error,
     },
 }
 
@@ -765,7 +779,10 @@ fn open_session(
     if !providers.is_empty() {
         builder = builder
             .with_execution_providers(providers)
-            .map_err(ort::Error::from)?;
+            .map_err(|source| LmError::Provider {
+                backend: shape.backend,
+                source: ort::Error::from(source),
+            })?;
     }
     for (name, value) in initializers {
         builder = builder
