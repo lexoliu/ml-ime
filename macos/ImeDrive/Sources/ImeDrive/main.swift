@@ -18,6 +18,8 @@ import Foundation
 ///   --record-timeout-ms N
 ///                     per-record wall budget; exceeding it writes a
 ///                     failure line instead of hanging (default 20000)
+///   --slice S         dev|test|all — which keyed split to type (default all;
+///                     the split is the record hash, dev share 0.0905)
 ///   --watch-bundle S  extra bundle-id substring whose processes are read for
 ///                     the candidate window before any other app
 struct Args {
@@ -28,6 +30,7 @@ struct Args {
     var list = false
     var keyWaitCapMs = 300
     var recordTimeoutMs = 20_000
+    var slice = "all"
     var watchBundle: String?
 
     static func parse() -> Args {
@@ -44,6 +47,7 @@ struct Args {
                 args.keyWaitCapMs = iterator.next().flatMap(Int.init) ?? 300
             case "--record-timeout-ms":
                 args.recordTimeoutMs = iterator.next().flatMap(Int.init) ?? 20_000
+            case "--slice": args.slice = iterator.next() ?? "all"
             case "--watch-bundle": args.watchBundle = iterator.next()
             case "--help", "-h":
                 let usage =
@@ -108,6 +112,9 @@ guard let spec = engines[args.engine] else {
 }
 guard let evalSet = args.evalSet, let out = args.out else {
     err("--eval-set and --out are required")
+}
+guard ["dev", "test", "all"].contains(args.slice) else {
+    err("--slice must be dev, test or all, got \(args.slice)")
 }
 
 // Reading another process's candidate window needs Accessibility trust; ask
@@ -230,7 +237,7 @@ do {
         engine: args.engine, evalSet: evalSet, out: out, textView: textView,
         watchPids: watchPids, bundleHints: hints, sourceID: source.id,
         clientBounds: clientBounds, keyWaitCapMs: args.keyWaitCapMs,
-        recordTimeoutMs: args.recordTimeoutMs)
+        recordTimeoutMs: args.recordTimeoutMs, slice: args.slice)
 } catch {
     err("setup failed: \(error.localizedDescription)")
 }

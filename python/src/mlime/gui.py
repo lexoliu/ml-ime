@@ -169,11 +169,16 @@ def measure(
     """Score the committed sentences of *results* against *eval_set*'s *slice_*.
 
     Only result lines naming a record in the slice are scored; a record the
-    harness never typed contributes nothing.
+    harness never typed contributes nothing. The file must have been typed
+    with a --slice that covers what is scored ("all" covers any slice, and is
+    what files written before --slice existed count as).
     """
     rows = read_eval_set(eval_set)
     keep = set(slice_indices(rows, slice_, dev_share))
     meta, gui_rows = read_results(results)
+    ran = meta.get("slice", "all")
+    if ran not in ("all", slice_):
+        raise ValueError(f"{results} was typed with --slice {ran}; cannot score the {slice_} slice")
     kept = [row for row in gui_rows if row.index in keep]
     if not kept:
         raise ValueError(f"{results} holds no records of the {slice_} slice of {eval_set}")

@@ -44,11 +44,16 @@ final class Driver {
 
     private let out: FileHandle
     private let done: Set<Int>
+    /// "dev", "test" or "all" — which keyed split this run types.
+    private let slice: String
+    /// The dev share, matching ``mlime eval rime``'s --dev-share 0.0905.
+    private static let devShare = 0.0905
 
     init(
         engine: String, evalSet: URL, out outURL: URL, textView: NSTextView,
         watchPids: Set<pid_t>, bundleHints: [String], sourceID: String,
-        clientBounds: CGRect, keyWaitCapMs: Int, recordTimeoutMs: Int
+        clientBounds: CGRect, keyWaitCapMs: Int, recordTimeoutMs: Int,
+        slice: String
     ) throws {
         self.engine = engine
         self.textView = textView
@@ -58,7 +63,11 @@ final class Driver {
         self.clientBounds = clientBounds
         self.keyWaitCapMs = keyWaitCapMs
         self.recordTimeoutMs = recordTimeoutMs
+        self.slice = slice
 
+        // digest < dev_share * u64::MAX, compared as integers — identical
+        // to Python's `digest < limit` for a non-integral limit.
+        let devLimit = UInt64(Self.devShare * Double(UInt64.max))
         var rows: [EvalRow] = []
         var index = 0
         for line in try String(contentsOf: evalSet, encoding: .utf8).split(
@@ -67,13 +76,22 @@ final class Driver {
             guard !line.trimmingCharacters(in: .whitespaces).isEmpty,
                 let data = line.data(using: .utf8),
                 let row = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                let pinyin = row["pinyin"] as? String
+                let pinyin = row["pinyin"] as? String,
+                let text = row["text"] as? String
             else {
                 throw NSError(
                     domain: "ImeDrive", code: 1,
                     userInfo: [NSLocalizedDescriptionKey: "bad eval-set line \(index + 1)"])
             }
-            rows.append(EvalRow(index: index, pinyin: pinyin))
+            // Same split as Python's slice_indices: a record is development
+            // data when its digest is under dev_share * u64::MAX.
+            let isDev =
+                Blake2b.digest(
+                    pinyin: pinyin, text: text,
+                    context: row["context"] as? String) <= devLimit
+            if slice == "all" || (slice == "dev") == isDev {
+                rows.append(EvalRow(index: index, pinyin: pinyin))
+            }
             index += 1
         }
         self.rows = rows
@@ -107,6 +125,7 @@ final class Driver {
         let meta: [String: Any] = [
             "type": "meta",
             "engine": engine,
+            "slice": slice,
             "input_source_id": sourceID,
             "macos": ProcessInfo.processInfo.operatingSystemVersionString,
             "started": ISO8601DateFormatter().string(from: Date()),
