@@ -12,6 +12,7 @@ use ime_lm::{CharLm, LmState, SessionShape};
 use ime_pinyin::{CharId, Lexicon, SyllableTable};
 use serde::Deserialize;
 use std::fs;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 
 /// What `charlm_fixtures.py` recorded from the exported graphs.
@@ -38,6 +39,15 @@ fn lexicon(dir: &Path) -> Lexicon {
     Lexicon::parse(&source, &table).expect("the fixture table parses")
 }
 
+/// The fixture's beam width as the rectangle's, so a full batch is two live
+/// rows and no dead row is ever fed.
+fn shape() -> SessionShape {
+    SessionShape {
+        width: NonZeroUsize::new(2).expect("two is not zero"),
+        ..SessionShape::default()
+    }
+}
+
 fn assert_close(got: &[f32], want: &[f32], what: &str) {
     assert_eq!(got.len(), want.len(), "{what}: row length differs");
     for (index, (got, want)) in got.iter().zip(want).enumerate() {
@@ -53,8 +63,7 @@ fn assert_close(got: &[f32], want: &[f32], what: &str) {
 fn run(arch: &str) {
     let dir = fixture_dir();
     let lexicon = lexicon(&dir);
-    let model = CharLm::open(&dir.join(arch), &lexicon, SessionShape::default())
-        .expect("the fixture opens");
+    let model = CharLm::open(&dir.join(arch), &lexicon, shape()).expect("the fixture opens");
     let expected: Expected = serde_json::from_str(
         &fs::read_to_string(dir.join(arch).join("expected.json"))
             .expect("expected.json is committed with the fixture"),
@@ -114,14 +123,15 @@ fn run(arch: &str) {
 }
 
 /// Rows from different records in one `advance` keep their own prefixes: a
-/// batch alternating two preludes of different lengths -- so the shorter is
-/// padded -- scores each row as if it had run alone.
+/// batch alternating two preludes of different lengths -- four workers of one
+/// live row each, the shorter padded, a dead row under every worker -- scores
+/// each row as if it had run alone.
 #[test]
 fn transformer_rows_from_different_records_match_solo_runs() {
     let dir = fixture_dir();
     let lexicon = lexicon(&dir);
-    let model = CharLm::open(&dir.join("transformer"), &lexicon, SessionShape::default())
-        .expect("the fixture opens");
+    let model =
+        CharLm::open(&dir.join("transformer"), &lexicon, shape()).expect("the fixture opens");
     let expected: Expected = serde_json::from_str(
         &fs::read_to_string(dir.join("transformer").join("expected.json"))
             .expect("expected.json is committed with the fixture"),

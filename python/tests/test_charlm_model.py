@@ -99,7 +99,11 @@ def _pad_left(tensor: torch.Tensor, width: int) -> torch.Tensor:
 
 
 def test_a_padded_batch_step_equals_per_record_steps() -> None:
-    """Two records whose preludes differ step in one padded batch as they do alone."""
+    """Workers whose preludes differ step in one padded batch as they do alone.
+
+    The batch is laid out ``[workers, width]``: two workers of two rows each,
+    the narrower prelude's prefix row padded on the left.
+    """
     torch.manual_seed(3)
     model = build(len(VOCAB), CONFIGS["transformer"]).eval()
     restricted = Restricted(model, None)
@@ -107,30 +111,46 @@ def test_a_padded_batch_step_equals_per_record_steps() -> None:
         torch.tensor([[BOS, *_tokens("你", "好", "很"), SEP]]),
         torch.tensor([[BOS, *_tokens("再"), SEP]]),
     )
+    width = 2  # rows per worker
     with torch.no_grad():
         runs = [model.prefill(prelude) for prelude in preludes]
-        tokens = torch.tensor(_tokens("我", "吗"))
-        solo = [model.step(tokens[row : row + 1], run[1], run[2]) for row, run in enumerate(runs)]
-        # The batch's prefix stacks one row per record, the shorter one padded
+        tokens = torch.tensor(_tokens("我", "吗", "你", "好"))
+        solo = [
+            model.step(
+                tokens[row * width : (row + 1) * width],
+                run[1],
+                tuple(tensor.expand(width, *tensor.shape[1:]).contiguous() for tensor in run[2]),
+            )
+            for row, run in enumerate(runs)
+        ]
+        # The batch's prefix stacks one row per worker, the shorter one padded
         # on the left; the mask marks each row's real prelude positions.
-        width = max(prefix[0].shape[3] for _, prefix, _ in runs)
+        prelude_width = max(prefix[0].shape[3] for _, prefix, _ in runs)
         prefix = tuple(
-            torch.cat([_pad_left(run[1][i], width) for run in runs]) for i in range(len(runs[0][1]))
+            torch.cat([_pad_left(run[1][i], prelude_width) for run in runs])
+            for i in range(len(runs[0][1]))
         )
-        mask = torch.zeros(len(runs), width, dtype=torch.bool)
+        mask = torch.zeros(len(runs), prelude_width, dtype=torch.bool)
         for row, (_, row_prefix, _) in enumerate(runs):
-            mask[row, width - row_prefix[0].shape[3] :] = True
-        state = tuple(torch.cat([run[2][i] for run in runs]) for i in range(2))
+            mask[row, prelude_width - row_prefix[0].shape[3] :] = True
+        state = tuple(
+            torch.cat([run[2][i].expand(width, *run[2][i].shape[1:]) for run in runs])
+            for i in range(2)
+        )
         features, next_state = model.step(tokens, prefix, state, mask)
         got = restricted(features)
         diffs = [
-            (got[row] - restricted(solo[row][0])[0]).abs().max().item() for row in range(len(runs))
+            (got[row] - restricted(solo[row // width][0])[row % width]).abs().max().item()
+            for row in range(len(runs) * width)
         ]
         log.info("padded batch vs per-record step", max_abs_diff=max(diffs))
-        for row in range(len(runs)):
-            torch.testing.assert_close(got[row], restricted(solo[row][0])[0], atol=1e-5, rtol=1e-5)
-            for tensor, wanted in zip(next_state, solo[row][1], strict=True):
-                torch.testing.assert_close(tensor[row], wanted[0], atol=1e-5, rtol=1e-5)
+        for row in range(len(runs) * width):
+            worker, beam = divmod(row, width)
+            torch.testing.assert_close(
+                got[row], restricted(solo[worker][0])[beam], atol=1e-5, rtol=1e-5
+            )
+            for tensor, wanted in zip(next_state, solo[worker][1], strict=True):
+                torch.testing.assert_close(tensor[row], wanted[beam], atol=1e-5, rtol=1e-5)
 
 
 def _checkpoint(path: Path, arch: str) -> None:

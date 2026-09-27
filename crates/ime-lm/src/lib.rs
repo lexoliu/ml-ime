@@ -15,9 +15,11 @@
 //! produced -- the transformer's key/value cache over the context -- and every
 //! beam of a record shares them; the *state* tensors are per beam (the LSTM's
 //! `hidden`/`cell`, the transformer's cache over the sentence so far). Every
-//! tensor is batch-first: a step's batch is the rows of the surviving beams
-//! stacked, and a beam's share of an output is one row, without the crate ever
-//! interpreting what a row holds.
+//! tensor is batch-first, and a step's batch is the surviving beams' rows laid
+//! out as a rectangle: `width` consecutive rows per worker, so the prefix
+//! feeds once per worker and broadcasts over the rows under it instead of
+//! being packed per row. A beam's share of an output is one row, without the
+//! crate ever interpreting what a row holds.
 //!
 //! The alphabet is the lexicon's, so every [`CharId`] the lattice can propose
 //! has a row; the mapping is built once at load and a lexicon that disagrees
@@ -31,7 +33,7 @@
 //! pre-packs are shared too, so the model's memory is one copy of the
 //! weights plus per-thread working space no matter how many threads decode.
 
-use ime_decode::{MAX_HISTORY, Transition};
+use ime_decode::{BeamOptions, MAX_HISTORY, Transition};
 use ime_pinyin::{CharId, Lexicon};
 use memmap2::Mmap;
 use ort::AsPointer;
@@ -39,7 +41,7 @@ use ort::ep::ExecutionProviderDispatch;
 use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::builder::{GraphOptimizationLevel, PrepackedWeights};
 use ort::session::{Session, SessionInputValue};
-use ort::value::{DynValue, Shape, Tensor, TensorRef, TensorRefMut};
+use ort::value::{DynValue, Shape, Tensor, TensorRefMut};
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -100,7 +102,8 @@ impl Backend {
 }
 
 /// How a model's sessions are built: the provider they register, the threads
-/// one step spreads over, and whether the runtime logs verbosely.
+/// one step spreads over, the width a step's batch is laid out at, and
+/// whether the runtime logs verbosely.
 ///
 /// The caller states the shape the decode will run, because the decoder is
 /// the parallel layer and the session must not fight it: the per-record
@@ -114,6 +117,11 @@ pub struct SessionShape {
     /// The threads one session spreads a step over; the default is one, the
     /// rayon path's shape.
     pub intra_threads: NonZeroUsize,
+    /// The rows a worker owns in a step's `[workers, width]` batch -- the
+    /// beam width the caller decodes with, the decoder's own default -- so
+    /// a worker's surviving beams fill their block and a wider one would
+    /// have to be split over extra prefix rows.
+    pub width: NonZeroUsize,
     /// ONNX Runtime's verbose session logging: the provider each node lands
     /// on is the evidence for whether a backend actually runs the step.
     pub verbose_logging: bool,
@@ -124,6 +132,7 @@ impl Default for SessionShape {
         Self {
             backend: Backend::Cpu,
             intra_threads: NonZeroUsize::MIN,
+            width: BeamOptions::default().beam_width,
             verbose_logging: false,
         }
     }
@@ -510,64 +519,77 @@ impl CharLm {
     /// Advance a batch: `tokens[i]` applied to `states[i]`, whose rows may
     /// come from different records.
     ///
-    /// The step graph's prefix tensors are one row per batch row: when every
-    /// row shares a record's prelude the single row `prefill` produced goes
-    /// in as-is and broadcasts over the batch (the one-record path makes no
-    /// copies beyond what it always did); when the batch mixes records each
-    /// row's tensor stacks, padded on the left up to the widest prelude, and
-    /// the `prefix_mask` input marks which positions are real. A model
-    /// without prefix tensors (the LSTM) has no mask input and feeds none.
+    /// The batch is fed as a `[workers, width]` rectangle. Every maximal run
+    /// of consecutive rows sharing one prefix is one worker's -- the decoder
+    /// keeps a worker's survivors contiguous, per the contract on
+    /// [`Transition::advance`] -- cut into blocks of `SessionShape::width`
+    /// rows, and each block padded out to `width` with dead rows (a valid
+    /// state and its token, whose outputs are dropped on the way back). The
+    /// prefix tensors take one row per block, padded on the left up to the
+    /// widest prelude and masked by `prefix_mask`, and the graph broadcasts
+    /// each over the block's rows: the prefix is packed once per worker,
+    /// never per row. A model without prefix tensors (the LSTM) has no
+    /// rectangle to fill: the batch is one flat run of live rows.
     fn step(&self, states: &[&LmState], tokens: &[u32]) -> Result<Vec<LmState>, LmError> {
         let batch = tokens.len();
         debug_assert_eq!(states.len(), batch, "one state per token");
-        let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
-            Vec::with_capacity(2 + self.prefix.len() + self.state.len());
-        let tokens: Vec<i64> = tokens.iter().copied().map(i64::from).collect();
-        inputs.push((
-            Cow::Borrowed("token"),
-            Tensor::from_array((vec![dim(batch)], tokens))?.into(),
-        ));
-        if !self.prefix.is_empty() {
-            if states
-                .iter()
-                .all(|state| Arc::ptr_eq(&state.prefix, &states[0].prefix))
-            {
-                let prefix = &states[0].prefix;
-                for (name, tensor) in self.prefix.iter().zip(prefix.iter()) {
-                    let mut shape = Vec::with_capacity(tensor.shape.len() + 1);
-                    shape.push(1);
-                    shape.extend_from_slice(&tensor.shape);
-                    inputs.push((
-                        Cow::Owned(name.clone()),
-                        TensorRef::from_array_view((shape, tensor.data.as_slice()))?.into(),
-                    ));
+        let width = self.step_sessions.shape.width.get();
+        // `(first row, live rows, padded rows)` per block of the rectangle.
+        let mut blocks: Vec<(usize, usize, usize)> = Vec::new();
+        if self.prefix.is_empty() {
+            blocks.push((0, batch, batch));
+        } else {
+            let mut row = 0;
+            while row < batch {
+                let prefix = &states[row].prefix;
+                let mut end = row + 1;
+                while end < batch && Arc::ptr_eq(&states[end].prefix, prefix) {
+                    end += 1;
                 }
-                // One all-real row: every prelude position of the shared
-                // prefix is a real one.
-                let width = prefix_width(&prefix[0]);
-                inputs.push((
-                    Cow::Borrowed("prefix_mask"),
-                    Tensor::from_array(([1i64, dim(width)], vec![true; width]))?.into(),
-                ));
-            } else {
-                self.push_row_prefixes(&mut inputs, states)?;
+                for start in (row..end).step_by(width) {
+                    blocks.push((start, (end - start).min(width), width));
+                }
+                row = end;
             }
         }
-        // The per-beam tensors stack row by row; every row of one tensor has
-        // the same shape at the same step.
+        let rows: usize = blocks.iter().map(|block| block.2).sum();
+        // The input row feeding a block's padded row `j`: its own row while
+        // `j < live`, else the block's first row stands in as a dead row.
+        let fed = |(first, live, _): (usize, usize, usize), j: usize| {
+            first + if j < live { j } else { 0 }
+        };
+        let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
+            Vec::with_capacity(2 + self.prefix.len() + self.state.len());
+        let mut padded_tokens: Vec<i64> = Vec::with_capacity(rows);
+        for &block in &blocks {
+            for j in 0..block.2 {
+                padded_tokens.push(i64::from(tokens[fed(block, j)]));
+            }
+        }
+        inputs.push((
+            Cow::Borrowed("token"),
+            Tensor::from_array((vec![dim(rows)], padded_tokens))?.into(),
+        ));
+        if !self.prefix.is_empty() {
+            self.push_worker_prefixes(&mut inputs, states, &blocks)?;
+        }
+        // The per-beam tensors stack row by row, dead rows included; every
+        // row of one tensor has the same shape at the same step.
         for (index, name) in self.state.iter().enumerate() {
             let row_shape = &states[0].tensors[index].shape;
-            let mut data = Vec::with_capacity(batch * states[0].tensors[index].data.len());
-            for state in states {
-                let tensor = &state.tensors[index];
-                debug_assert_eq!(
-                    row_shape, &tensor.shape,
-                    "every row of {name} has the same shape at one step"
-                );
-                data.extend_from_slice(&tensor.data);
+            let mut data = Vec::with_capacity(rows * states[0].tensors[index].data.len());
+            for &block in &blocks {
+                for j in 0..block.2 {
+                    let tensor = &states[fed(block, j)].tensors[index];
+                    debug_assert_eq!(
+                        row_shape, &tensor.shape,
+                        "every row of {name} has the same shape at one step"
+                    );
+                    data.extend_from_slice(&tensor.data);
+                }
             }
             let mut shape = Vec::with_capacity(row_shape.len() + 1);
-            shape.push(dim(batch));
+            shape.push(dim(rows));
             shape.extend_from_slice(row_shape);
             inputs.push((
                 Cow::Owned(name.clone()),
@@ -577,7 +599,7 @@ impl CharLm {
         let mut session = self.step_sessions.session()?.borrow_mut();
         let outputs = session.run(inputs)?;
         let (_, log_probs) = outputs["log_probs"].try_extract_tensor::<f32>()?;
-        let vocabulary = log_probs.len() / batch;
+        let vocabulary = log_probs.len() / rows;
         // Each `next_*` output is split into rows by its own shape: a row's
         // shape is whatever the graph produced, which for the transformer
         // grows one position on the time axis per step.
@@ -587,12 +609,17 @@ impl CharLm {
             .map(|name| {
                 let (shape, data) =
                     outputs[format!("next_{name}").as_str()].try_extract_tensor::<f32>()?;
-                debug_assert_eq!(shape[0], dim(batch));
+                debug_assert_eq!(shape[0], dim(rows));
                 Ok((shape[1..].to_vec(), data.to_vec()))
             })
             .collect::<Result<_, ort::Error>>()?;
-        Ok((0..batch)
-            .map(|row| {
+        // Slice each block's live rows back out in input order, dropping the
+        // dead rows' outputs.
+        let mut advanced = Vec::with_capacity(batch);
+        let mut base = 0;
+        for &(first, live, block_rows) in &blocks {
+            for j in 0..live {
+                let row = base + j;
                 let tensors = next
                     .iter()
                     .map(|(row_shape, data)| {
@@ -603,41 +630,46 @@ impl CharLm {
                         }
                     })
                     .collect();
-                LmState {
-                    prefix: Arc::clone(&states[row].prefix),
+                advanced.push(LmState {
+                    prefix: Arc::clone(&states[first + j].prefix),
                     tensors: Arc::new(tensors),
                     log_probs: Arc::new(
                         log_probs[row * vocabulary..(row + 1) * vocabulary].to_vec(),
                     ),
-                }
-            })
-            .collect())
+                });
+            }
+            base += block_rows;
+        }
+        Ok(advanced)
     }
 
-    /// Feed the `prefix_*` tensors and `prefix_mask` of a batch whose rows
-    /// belong to different records.
+    /// Feed the `prefix_*` tensors and `prefix_mask` of a batch laid out as
+    /// `[workers, width]` blocks.
     ///
-    /// Each tensor stacks one row per batch row, every row's time axis (the
-    /// second-to-last) padded on the left up to the widest prelude; the mask
-    /// row is `false` under the padding and `true` under real positions.
-    fn push_row_prefixes<'a>(
+    /// Each tensor stacks one row per block -- one per worker -- every row's
+    /// time axis (the second-to-last) padded on the left up to the widest
+    /// prelude; the mask row is `false` under the padding and `true` under
+    /// real positions. A block's row is the prefix its rows share, packed
+    /// once, so a batch from one record is one row as it always was.
+    fn push_worker_prefixes<'a>(
         &'a self,
         inputs: &mut Vec<(Cow<'a, str>, SessionInputValue<'a>)>,
         states: &[&LmState],
+        blocks: &[(usize, usize, usize)],
     ) -> Result<(), LmError> {
-        let batch = states.len();
-        let reals: Vec<usize> = states
+        let workers = blocks.len();
+        let reals: Vec<usize> = blocks
             .iter()
-            .map(|state| prefix_width(&state.prefix[0]))
+            .map(|&(first, _, _)| prefix_width(&states[first].prefix[0]))
             .collect();
         let width = reals
             .iter()
             .copied()
             .max()
             .expect("advance never runs an empty batch");
-        let mut mask = vec![false; batch * width];
-        for (row, &real) in reals.iter().enumerate() {
-            mask[row * width + (width - real)..(row + 1) * width].fill(true);
+        let mut mask = vec![false; workers * width];
+        for (worker, &real) in reals.iter().enumerate() {
+            mask[worker * width + (width - real)..(worker + 1) * width].fill(true);
         }
         for (index, name) in self.prefix.iter().enumerate() {
             // A prefix tensor's row is [..., time, element]; the mask pads
@@ -647,29 +679,32 @@ impl CharLm {
             let unit = usize::try_from(row_shape[time_axis + 1]).expect("a shape axis is positive");
             let slab = elements(&row_shape[..time_axis]);
             let mut shape = Vec::with_capacity(row_shape.len() + 1);
-            shape.push(dim(batch));
+            shape.push(dim(workers));
             for (axis, &value) in row_shape.iter().enumerate() {
                 shape.push(if axis == time_axis { dim(width) } else { value });
             }
             let row_len = elements(&shape[1..]);
-            let mut data = vec![0.0; batch * row_len];
-            for (row, state) in states.iter().enumerate() {
-                let source = &state.prefix[index];
+            let mut data = vec![0.0; workers * row_len];
+            for (worker, &(first, _, _)) in blocks.iter().enumerate() {
+                let source = &states[first].prefix[index];
                 debug_assert_eq!(
                     &source.shape[..time_axis],
                     &row_shape[..time_axis],
-                    "every row of {name} agrees on the static axes"
+                    "every worker's {name} agrees on the static axes"
                 );
                 debug_assert_eq!(
                     &source.shape[time_axis + 1..],
                     &row_shape[time_axis + 1..],
-                    "every row of {name} agrees on the static axes"
+                    "every worker's {name} agrees on the static axes"
                 );
                 let real =
                     usize::try_from(source.shape[time_axis]).expect("a shape axis is positive");
-                debug_assert_eq!(real, reals[row], "a row's prefix tensors share one width");
+                debug_assert_eq!(
+                    real, reals[worker],
+                    "a worker's prefix tensors share one width"
+                );
                 let pad = width - real;
-                let mut dst = row * row_len + pad * unit;
+                let mut dst = worker * row_len + pad * unit;
                 let mut src = 0;
                 for _ in 0..slab {
                     data[dst..dst + real * unit]
@@ -685,7 +720,7 @@ impl CharLm {
         }
         inputs.push((
             Cow::Borrowed("prefix_mask"),
-            Tensor::from_array(([dim(batch), dim(width)], mask))?.into(),
+            Tensor::from_array(([dim(workers), dim(width)], mask))?.into(),
         ));
         Ok(())
     }
@@ -730,6 +765,10 @@ impl Transition for CharLm {
         state.log_probs[self.specials.eos as usize]
     }
 
+    /// Relies on the row-order guarantee of [`Transition::advance`]: a
+    /// worker's survivors arrive as one contiguous run, which `step` pads
+    /// to `SessionShape::width` blocks sharing the worker's prefix row.
+    ///
     /// # Panics
     ///
     /// If ONNX Runtime fails a run; see [`CharLm::start`].

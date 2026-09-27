@@ -427,7 +427,8 @@ impl FusedRun<'_> {
     /// path -- `--batch` above one, or any GPU backend -- keeps one session
     /// for the whole batch, so it gets the machine's intra-op parallelism;
     /// the per-record rayon path keeps one thread a session, the decoder
-    /// itself being the parallel layer.
+    /// itself being the parallel layer. `width` is the beam width the decode
+    /// runs: a worker's survivors fill a block of the rectangle.
     fn session_shape(&self) -> ime_lm::SessionShape {
         let lockstep = self.batch > 1 || self.backend != ime_lm::Backend::Cpu;
         ime_lm::SessionShape {
@@ -437,6 +438,7 @@ impl FusedRun<'_> {
             } else {
                 std::num::NonZeroUsize::MIN
             },
+            width: self.search.beam_width,
             verbose_logging: self.ort_verbose,
         }
     }

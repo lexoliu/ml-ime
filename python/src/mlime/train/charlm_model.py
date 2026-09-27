@@ -12,8 +12,11 @@ The state is split in two so the beams do not each carry the context. The
 *prefix* tensors are what the prelude produced and are shared by every beam
 of a record (the transformer's key/value cache over the context); the *state*
 tensors are per beam (the LSTM's hidden and cell, the transformer's cache over
-the sentence so far). Every tensor is batch-first, so the Rust side stacks
-beams by rows without knowing what the rows hold.
+the sentence so far). A step's batch is a rectangle: the rows are laid out
+``[workers, width]``, every worker owning exactly ``width`` consecutive rows
+under one prefix row, so the prefix is fed once per worker and broadcast over
+the width axis rather than packed per row. Every tensor is batch-first, so the
+Rust side stacks beams by rows without knowing what the rows hold.
 """
 
 from __future__ import annotations
@@ -114,14 +117,15 @@ class CharLm(nn.Module):
         state: tuple[torch.Tensor, ...],
         prefix_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
-        """Advance ``token [B]`` on ``state``: features ``[B, H]`` and the new state.
+        """Advance ``token [workers * width]`` on ``state``: features and the new state.
 
-        A prefix tensor is ``[P, ...]``: one row per record when the batch
-        mixes records, or a single row the batch broadcasts over when every
-        row shares one record's prelude. Rows of the first form are padded on
-        the left up to the widest prelude, and ``prefix_mask [P, T]`` marks
-        the real positions (``None`` reads as all true). A model without
-        prefix tensors ignores the mask.
+        The batch is rectangular: ``workers`` blocks of ``width`` consecutive
+        rows each, one block per record under its own prefix row. A prefix
+        tensor is ``[workers, ...]`` -- one row per block, padded on the left
+        up to the widest prelude, with ``prefix_mask [workers, T]`` marking
+        the real positions (``None`` reads as all true) -- and it broadcasts
+        over the ``width`` rows under it. A model without prefix tensors takes
+        a flat batch and ignores the mask.
         """
         raise NotImplementedError
 
@@ -227,41 +231,53 @@ class Block(nn.Module):
         keys: torch.Tensor,
         values: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """One new position ``x [B, 1, H]`` against the two caches and itself.
+        """One new position ``x [workers * width, 1, H]`` against the two caches and itself.
 
-        ``prefix_keys``/``prefix_values`` hold each row's context's positions
-        -- one row when the whole batch shares a record's prelude, one row per
-        batch row otherwise, the real positions right-aligned under
-        ``prefix_mask`` -- and ``keys``/``values`` the sentence's; scoring
-        them separately and concatenating only the scores keeps the prefix
-        cache out of the step's copies. Masked prefix positions take ``-inf``
-        before the softmax, which leaves them weightless however the padding
-        was filled. Written with plain matrix products so the step graph
-        exports as a handful of ONNX operators. Returns the output and the
-        new key/value.
+        ``prefix_keys``/``prefix_values`` hold each worker's context's
+        positions -- one row per ``width``-row block of the batch, the real
+        positions right-aligned under ``prefix_mask`` -- and
+        ``keys``/``values`` the sentence's; scoring them separately and
+        concatenating only the scores keeps the prefix cache out of the
+        step's copies. The queries fold the batch back into its
+        ``[workers, width]`` rectangle so the prefix row broadcasts over the
+        rows under it: ``MatMul`` does that on its own where an ``Expand``
+        would materialise the prefix per row. Masked prefix positions take
+        ``-inf`` before the softmax, which leaves them weightless however the
+        padding was filled. Written with plain matrix products so the step
+        graph exports as a handful of ONNX operators. Returns the output and
+        the new key/value.
         """
         q, k, v = self.split(x)
         keys = torch.cat([keys, k], dim=2)
         values = torch.cat([values, v], dim=2)
-        prefix_scores = (q @ prefix_keys.transpose(-1, -2)).masked_fill(
-            prefix_mask.logical_not().unsqueeze(1).unsqueeze(1), float("-inf")
+        workers = prefix_keys.shape[0]
+        queries = q.view(workers, -1, self.heads, 1, self.head_dim)
+        prefix_scores = (queries @ prefix_keys.unsqueeze(1).transpose(-1, -2)).masked_fill(
+            prefix_mask.logical_not().view(workers, 1, 1, 1, -1), float("-inf")
         )
-        scores = torch.cat([prefix_scores, q @ keys.transpose(-1, -2)], dim=-1) / math.sqrt(
-            self.head_dim
-        )
+        scores = torch.cat(
+            [
+                prefix_scores,
+                (q @ keys.transpose(-1, -2)).view(workers, -1, self.heads, 1, keys.shape[2]),
+            ],
+            dim=-1,
+        ) / math.sqrt(self.head_dim)
         probs = torch.softmax(scores, dim=-1)
         split = prefix_keys.shape[2]
-        attended = probs[..., :split] @ prefix_values + probs[..., split:] @ values
-        return self.merge(x, attended), k, v
+        attended = probs[..., :split] @ prefix_values.unsqueeze(1) + (
+            probs[..., split:] @ values.view(workers, -1, self.heads, keys.shape[2], self.head_dim)
+        )
+        return self.merge(x, attended.view(q.shape)), k, v
 
 
 class TransformerCharLm(CharLm):
     """Embedding plus learned positions, pre-norm blocks, tied output.
 
-    The cache is ``[B, layers, heads, T, head_dim]`` for keys and for values,
-    once over the prelude (the prefix, shared by the beams of a record) and
-    once over the sentence so far (per beam). A step's position is the sum of
-    the two lengths, read off the tensors so the graph needs no counter.
+    The cache is ``[batch, layers, heads, T, head_dim]`` for keys and for
+    values -- over the prelude the batch axis is the worker (the prefix,
+    shared by the ``width`` rows under it) and over the sentence so far it is
+    the row (per beam). A step's position is the sum of the two lengths, read
+    off the tensors so the graph needs no counter.
     """
 
     def __init__(self, vocab_size: int, config: CharLmConfig):
@@ -345,16 +361,17 @@ class TransformerCharLm(CharLm):
                 dtype=torch.bool,
                 device=token.device,
             )
-        # A row's next position is its prelude's real length plus the
-        # sentence's so far, so the mask's count is what ``embed_at`` counts
-        # from and padded prelude positions hold no position id either.
-        first = prefix_mask.sum(-1) + keys.shape[3]
+        # A row's next position is its worker's prelude's real length plus
+        # the sentence's so far, so the mask's count is what ``embed_at``
+        # counts from and padded prelude positions hold no position id either.
+        # The mask counts per worker; every row under it counts from the same
+        # position.
+        workers = prefix_mask.shape[0]
+        first = (prefix_mask.sum(-1) + keys.shape[3]).unsqueeze(-1)
+        first = first.expand(workers, token.shape[0] // workers).reshape(-1)
         x = self.embed_at(token.unsqueeze(1), first)
         new_keys, new_values = [], []
         for layer, block in enumerate(self.layers()):
-            # A one-row prefix is broadcast by ``MatMul`` where an ``Expand``
-            # would materialise a per-beam copy; per-record rows already hold
-            # the batch.
             x, k, v = block.attend(
                 x,
                 prefix_keys[:, layer],
@@ -416,9 +433,12 @@ class Restricted(nn.Module):
 class StepModule(nn.Module):
     """The step graph: ``(token, *prefix, mask?, *state) -> (log_probs, *next_state)``.
 
-    The mask input sits between the prefix and state tensors, and exists only
-    where the model has a prefix to mask (the transformer): a model without
-    prefix tensors takes ``(token, *state)`` as before.
+    ``token`` and the state tensors take one row per beam, laid out as
+    ``[workers, width]``; the prefix tensors take one row per worker and the
+    mask ``[workers, T]`` marks their real positions. The mask input sits
+    between the prefix and state tensors, and exists only where the model has
+    a prefix to mask (the transformer): a model without prefix tensors takes
+    ``(token, *state)`` over a flat batch as before.
     """
 
     def __init__(self, model: CharLm, keep: torch.Tensor | None = None):

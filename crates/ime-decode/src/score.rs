@@ -164,7 +164,10 @@ pub trait Transition {
     ///
     /// The decoder calls this once per position and reading with every surviving
     /// beam, so a model whose step is a matrix product can run them as one batch.
-    /// The result has one state per step.
+    /// `decode_many` guarantees the row order the batch is built on: each
+    /// live worker's survivors arrive as one contiguous run, in the same
+    /// worker order as the records, so a model can take the batch as
+    /// `workers` runs back to back. The result has one state per step.
     fn advance(&self, steps: &[(&Self::State, CharId)]) -> Vec<Self::State>;
 }
 

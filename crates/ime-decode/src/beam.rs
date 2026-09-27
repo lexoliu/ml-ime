@@ -278,7 +278,8 @@ where
         // Score: each live worker relaxes its candidates to the best way of
         // reaching each history and truncates to the beam width, the same
         // shape a single-record search has; then every survivor's step goes
-        // on the batch's one list.
+        // on the batch's one list, each worker's as a contiguous run in
+        // worker order -- the guarantee `Transition::advance` is built on.
         let mut steps: Vec<(&T::State, CharId)> = Vec::new();
         let mut chosen: Vec<Vec<Candidate>> = Vec::with_capacity(workers.len());
         for worker in workers.iter().filter(|worker| worker.pending()) {

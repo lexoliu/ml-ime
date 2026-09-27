@@ -87,6 +87,7 @@ fn args() -> (PathBuf, usize, SessionShape) {
         SessionShape {
             backend,
             intra_threads,
+            width: NonZeroUsize::new(BEAM).expect("BEAM is not zero"),
             verbose_logging,
         },
     )
