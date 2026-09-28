@@ -198,6 +198,14 @@ struct SearchArgs {
     /// default, so that an offline run cannot hide a wrong answer behind one.
     #[arg(long)]
     incomplete_tail: bool,
+    /// Guard a position when its runner-up character trails the winner by at
+    /// most this many nats; the beam then keeps the best lineage per covered
+    /// character alive instead of letting the winner's tails crowd it out.
+    #[arg(long, default_value = "1.5")]
+    diversity_gap: f32,
+    /// How many distinct characters a guarded position keeps lineages for.
+    #[arg(long, default_value = "3")]
+    diversity_chars: usize,
 }
 
 impl SearchArgs {
@@ -214,6 +222,8 @@ impl SearchArgs {
             beam_width: self.beam_width,
             top_k: self.top_k,
             segmentation_weight: self.segmentation_weight,
+            diversity_gap: self.diversity_gap,
+            diversity_chars: self.diversity_chars,
         }
     }
 }
