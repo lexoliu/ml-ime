@@ -13,11 +13,12 @@ first publish. What it last did -- step and time of the last publish, or the
 last error -- is written to `publish-state.json`, which `e2e.sh status` reads.
 """
 
+import csv
+import io
 import json
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import time
 from pathlib import Path
@@ -78,7 +79,7 @@ def candidates():
     reads it does, so a trio that vanishes mid-poll is skipped, not an error.
     """
     found = []
-    for directory in sorted(RUN.glob("interval-*")) + [WORKING]:
+    for directory in [*sorted(RUN.glob("interval-*")), WORKING]:
         if not all((directory / marker).is_file() for marker in RESUME_MARKERS):
             continue
         try:
@@ -90,20 +91,23 @@ def candidates():
 
 
 def dataset_exists():
-    """Whether the resume dataset is already there to version."""
+    """Whether the resume dataset is already there to version.
+
+    Kaggle answers a metadata or status request for a private dataset that
+    does not exist with 403, the same answer a credential problem gets, so the
+    question is put to the account's own dataset list instead: the dataset
+    exists exactly when that list holds its ref.
+    """
     probe = subprocess.run(
-        ["kaggle", "datasets", "status", DATASET],
+        ["kaggle", "datasets", "list", "--mine", "--search", DATASET.split("/")[1], "--csv"],
         check=False,
         capture_output=True,
         text=True,
     )
-    if probe.returncode == 0:
-        return True
-    output = (probe.stdout + probe.stderr).strip()
-    lowered = output.lower()
-    if "not found" in lowered or "404" in lowered or "does not exist" in lowered:
-        return False
-    raise RuntimeError(f"kaggle datasets status {DATASET} failed: {output}")
+    if probe.returncode != 0:
+        output = (probe.stdout + probe.stderr).strip()
+        raise RuntimeError(f"kaggle datasets list --mine failed: {output}")
+    return any(row.get("ref") == DATASET for row in csv.DictReader(io.StringIO(probe.stdout)))
 
 
 def publish(trio):

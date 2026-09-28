@@ -31,7 +31,7 @@ def load_publisher(monkeypatch: pytest.MonkeyPatch, working: Path) -> ModuleType
 
 @pytest.fixture
 def kaggle_stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A `kaggle` on PATH recording its argv; `datasets status` reads a flag."""
+    """A `kaggle` on PATH recording its argv; `datasets list` reads a flag."""
     log = tmp_path / "kaggle-calls.log"
     binary = tmp_path / "bin" / "kaggle"
     binary.parent.mkdir()
@@ -39,9 +39,11 @@ def kaggle_stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     binary.write_text(
         "#!/bin/bash\n"
         f'echo "$@" >> "{log}"\n'
-        'if [ "$1 $2" = "datasets status" ]; then\n'
-        f'  if [ -f "{exists_flag}" ]; then exit 0; '
-        'else echo "404 Not Found" >&2; exit 1; fi\n'
+        'if [ "$1 $2" = "datasets list" ]; then\n'
+        '  echo "ref,title,size,lastUpdated,downloadCount,voteCount,usabilityRating"\n'
+        '  echo "lexoliu/mlime-e2e-init,mlime-e2e-init,1,2026-09-28,0,0,0"\n'
+        f'  if [ -f "{exists_flag}" ]; then '
+        'echo "lexoliu/mlime-e2e-resume,mlime-e2e-resume,1,2026-09-28,0,0,0"; fi\n'
         "fi\n"
         "exit 0\n"
     )
@@ -69,7 +71,7 @@ def test_an_absent_dataset_is_created(
     monkeypatch.setenv("ONCE", "1")
     publisher.main()
     calls = kaggle_stub.read_text()
-    assert "datasets status" in calls and "datasets create" in calls
+    assert "datasets list" in calls and "datasets create" in calls
     assert "datasets version" not in calls
     state = json.loads((working / "publish-state.json").read_text())
     assert state["last_published_step"] == 30
