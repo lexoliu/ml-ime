@@ -705,28 +705,35 @@ def export_onnx(
     ``charlm.onnx`` takes ``token [rows]`` and ``source_row [rows]`` -- each
     beam's next character and the row of the resident state buffers
     (``keys``/``values``, or the LSTM's ``hidden``/``cell``) it continues
-    from -- then, where the model has a prefix, ``prefix_row [workers]`` and
-    the resident prefix buffers ``prefix_keys``/``prefix_values``
+    from -- then ``candidates [rows, K]`` (int64, padded with a column the
+    host ignores): the alphabet ids each produced state will be scored on
+    at its next position, ``<eos>`` included where its path can end there.
+    Where the model has a prefix, ``prefix_row [workers]`` and the
+    resident prefix buffers ``prefix_keys``/``prefix_values``
     ``[slots, layers, heads, T, head_dim]`` with ``prefix_mask
     ``[slots, T]`` marking real positions. The graph gathers the rows the
-    batch names and returns ``log_probs [rows, V]`` (float32, normalised
-    over the alphabet, or over the characters of *restrict* plus ``<eos>``
-    when given) and the ``next_*`` state tensors -- the rows the caller
-    binds over fresh buffers, so the beam reorder stays on the device and
-    only tokens, indices and log-probabilities ever cross the bus.
-    ``prefill.onnx`` takes ``tokens [1, T]`` and returns the same
-    ``log_probs``, the prefix tensors already left-padded to a resident
-    slot's width with the ``prefix_mask`` row that marks their real
-    positions, and the state tensors to start from -- its outputs are
-    bound over the slot's rows, so a ``start`` moves no bytes itself. The
-    manifest's ``rows`` record what one slot row of each prefix and state
-    buffer is shaped as, which is what the resident pool allocates.
+    batch names, gathers the log-softmax (float32, normalised over the
+    alphabet, or over the characters of *restrict* plus ``<eos>`` when
+    given) at the candidates each row named, and returns
+    ``candidate_log_probs [rows, K]`` -- the only tensor that crosses the
+    bus -- plus the ``next_*`` state tensors the caller binds over fresh
+    buffers, so the beam reorder stays on the device and only tokens,
+    indices and candidate log-probabilities ever cross.
+    ``prefill.onnx`` takes ``tokens [1, T]`` and the first position's
+    ``candidates [1, K]``, and returns the same ``candidate_log_probs``,
+    the prefix tensors already left-padded to a resident slot's width
+    with the ``prefix_mask`` row that marks their real positions, and the
+    state tensors to start from -- its outputs are bound over the slot's
+    rows, so a ``start`` moves no bytes itself. The manifest's ``rows``
+    record what one slot row of each prefix and state buffer is shaped
+    as, which is what the resident pool allocates.
     The prefix and index inputs exist only where the model has a prefix: the
-    LSTM's step graph is ``(token, source_row, hidden, cell)``.
+    LSTM's step graph is ``(token, source_row, candidates, hidden, cell)``.
     ``charlm.json`` names the tensors and holds the alphabet in id order;
-    its ``layout`` records the step graph's layout (``"resident"``), which
-    ``ime-lm`` refuses to open without, and its ``dtype`` the element type
-    the resident buffers and the states exchange.
+    its ``layout`` records the step graph's layout
+    (``"resident-candidates"``), which ``ime-lm`` refuses to open without,
+    and its ``dtype`` the element type the resident buffers and the states
+    exchange.
     The graphs' initializers live in an external weights file beside the
     graphs -- ``charlm.weights``, shared when the step and prefill
     initializers coincide, otherwise one file per graph -- which the manifest's
@@ -738,7 +745,7 @@ def export_onnx(
     manifest table then also carries ``int8`` tensors. With
     ``quantize="fp16"`` the model is halved before export, so the weights,
     the prefix buffers and the state tensors are all ``float16`` while
-    ``log_probs`` stays ``float32`` through the output cast.
+    ``candidate_log_probs`` stays ``float32`` through the output cast.
     """
     if quantize not in (None, "int8", "fp16"):
         raise ValueError(f"quantize must be 'int8', 'fp16' or None, got {quantize!r}")
@@ -763,6 +770,9 @@ def export_onnx(
     with torch.no_grad():
         four = torch.tensor([SEP] * 4)
         source_row = torch.arange(4, dtype=torch.long)
+        # The candidates the produced rows would be scored on; any in-range
+        # ids trace the same gather, so a fixed row of specials stands in.
+        candidates = torch.tensor([[BOS, SEP, EOS, UNK]] * 4)
         state_buffers = tuple(tensor.expand(4, *tensor.shape[1:]).contiguous() for tensor in state)
         prefix_buffers: tuple[torch.Tensor, ...] = ()
         index_args: tuple[torch.Tensor, ...] = ()
@@ -776,12 +786,20 @@ def export_onnx(
             )
         # Two passes grow the example's state buffers to a real time axis.
         for _ in range(2):
-            args = (four, source_row, *prefix_buffers, *index_args, *state_buffers)
+            args = (
+                four,
+                source_row,
+                candidates,
+                *prefix_buffers,
+                *index_args,
+                *state_buffers,
+            )
             _, *state_buffers = module(*args)
     axes: dict[str, dict[int, str]] = {
         "token": {0: "rows"},
         "source_row": {0: "rows"},
-        "log_probs": {0: "rows"},
+        "candidates": {0: "rows", 1: "candidates"},
+        "candidate_log_probs": {0: "rows", 1: "candidates"},
     }
     for name in (*state_names, *next_names):
         axes[name] = {0: "residents"}
@@ -801,16 +819,17 @@ def export_onnx(
     step_graph = out_dir / "charlm.onnx"
     torch.onnx.export(
         module,
-        (four, source_row, *prefix_buffers, *index_args, *state_buffers),
+        (four, source_row, candidates, *prefix_buffers, *index_args, *state_buffers),
         str(step_graph),
         input_names=[
             "token",
             "source_row",
+            "candidates",
             *prefix_names,
             *extra_names,
             *state_names,
         ],
-        output_names=["log_probs", *next_names],
+        output_names=["candidate_log_probs", *next_names],
         dynamic_axes=axes,
         opset_version=17,
         dynamo=False,
@@ -819,12 +838,14 @@ def export_onnx(
     mask_names = ["prefix_mask"] if prefix_names else []
     torch.onnx.export(
         PrefillModule(model, keep),
-        (prelude,),
+        (prelude, torch.tensor([[BOS, SEP, EOS, UNK]])),
         str(prefill_graph),
-        input_names=["tokens"],
-        output_names=["log_probs", *prefix_names, *mask_names, *state_names],
+        input_names=["tokens", "candidates"],
+        output_names=["candidate_log_probs", *prefix_names, *mask_names, *state_names],
         dynamic_axes={
             "tokens": {1: "length"},
+            "candidates": {1: "candidates"},
+            "candidate_log_probs": {1: "candidates"},
             **{
                 name: {**axes[name], 0: "batch"}
                 for name in (*prefix_names, *state_names)
@@ -848,7 +869,7 @@ def export_onnx(
                 "context_chars": model.config.context_chars,
                 "prefix": list(prefix_names),
                 "state": list(state_names),
-                "layout": "resident",
+                "layout": "resident-candidates",
                 "dtype": {None: "float32", "int8": "float32", "fp16": "float16"}[quantize],
                 "rows": {
                     "prefix": [
