@@ -216,6 +216,67 @@ weight; the test rows above are reported at the bold cell of their row.
   way to get that onto a GPU; per-record resume (#71) is what lets a grid be
   stopped for such a change and continued.
 
+## The int8 export, now batch-independent (2026-09-28, #93)
+
+The int8 rows above were measured from the binary at `33f7371`, where the
+beam advanced one reading at a time -- every step call carried at most 16
+rows of one record. Since #76 the decoder advances the whole lockstep
+batch in one call, ~128 rows of unrelated records, and the old export moved
+with it: `quantize_dynamic` scales each activation over the whole
+`[rows, dim]` tensor from the batch's min/max, so a row's int8 scores
+depended on its batchmates. The same record scored alone and inside a
+128-row batch differs by up to 0.115 nats, and near-ties in the beam break
+the other way -- the abbreviated row's 28.26 and the mixed row's 38.54 do
+not reproduce under a batched advance (28.24 and 38.42, 6 records of drift
+between binary eras on mixed; the int8 full row coincidentally did not
+move). ONNX Runtime has no per-row dynamic int8 kernel --
+`DynamicQuantizeMatMul` still batches -- so the activation quantization
+goes away.
+
+`--quantize int8` now writes weight-only int8: every MatMul weight folds
+into a per-output-channel int8 constant plus a `DequantizeLinear`, which
+ONNX Runtime runs as `MatMulNBits`. Activations stay float32, so a row's
+scores cannot move with its batchmates -- verified bit-exact, not to a
+tolerance: `int8_scores_do_not_depend_on_batchmates` in ime-lm scores a row
+alone and inside a 128-row batch of unrelated rows and asserts `to_bits()`
+equality over every score key, and its Python twin asserts the same on a
+fresh export. The old dynamic export fails the twin (5/13 fixture
+elements; 0.115 nats on the real model).
+
+Calibrated static QDQ -- int8 activations on scales from replaying a fixed
+sample of eval contexts through the fp32 export -- was the other
+batch-independent candidate. It loses abbreviated by 17 records and mixed
+by 19 against the weight-only rows below, and is 2x slower at the product's
+batch-8 shape, so it is not kept; its numbers stay here for the record.
+
+Re-measured test slices, same configuration as above (trigram + char-lm,
+lm-weight 1, abbreviated at neural weight 1.5):
+
+| export | full, top-1 / top-8 / char / MRR | abbreviated | mixed |
+|---|---|---|---|
+| int8 dynamic, old rows | 78.16 / 82.49 / 95.87 / 0.800 | 28.24 / 34.10 / 67.87 / 0.305 | 38.42 / 47.45 / 76.24 / 0.418 |
+| fp32 | 78.16 / 82.49 / 95.87 / 0.800 | 28.32 / 34.00 / 67.88 / 0.305 | 38.46 / 47.55 / 76.27 / 0.419 |
+| **int8 weight-only (new `int8`)** | 78.14 / 82.51 / 95.88 / 0.800 | **28.36 / 34.06 / 67.92 / 0.305** | **38.54 / 47.57 / 76.29 / 0.419** |
+| int8 static QDQ | 78.14 / 82.47 / 95.91 / 0.800 | 28.02 / 33.88 / 67.76 / 0.302 | 38.17 / 47.23 / 76.18 / 0.415 |
+
+The new default reproduces the published 38.54 on mixed exactly and is
+never worse than fp32 by more than a record.
+
+Step cost, 800 records at 8 beams each (records/s, ms/step); batch 1 is the
+evaluation shape, batch 8 the product's:
+
+| export | M4 Pro, batch 1 | M4 Pro, batch 8 | 8-thread VM, batch 1 | 8-thread VM, batch 8 |
+|---|---|---|---|---|
+| fp32 | 22.4, 2.23 | 12.1, 33.0 | 14.1, 3.54 | 16.1, 24.9 |
+| fp16 | 6.4, 7.82 | 5.1, 78.2 | 3.0, 16.8 | 5.9, 67.3 |
+| int8 dynamic (old) | 44.4, 1.13 | 13.2, 30.4 | 41.1, 1.22 | 21.0, 19.0 |
+| **int8 weight-only (new `int8`)** | **36.5, 1.37** | **13.1, 30.5** | **23.1, 2.17** | **16.3, 24.6** |
+| int8 static QDQ | 39.9, 1.25 | 6.8, 58.7 | 32.9, 1.52 | 10.4, 38.4 |
+
+The reproduce commands below are unchanged -- the flag was already
+`--quantize int8`; what it writes is what changed. `int8-weights` and
+`int8-static` exist no longer.
+
 ## Reproduce
 
 ```

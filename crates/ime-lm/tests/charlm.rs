@@ -375,3 +375,85 @@ fn transformer_fp16_export_scores_the_fixture_beams() {
 fn transformer_export_scores_the_fixture_beams() {
     run("transformer", 1e-4);
 }
+
+/// The int8 export's quantisation is row-independent: a row advanced alone
+/// and again inside a 128-row batch of unrelated rows gets bit-for-bit the
+/// same candidate scores. `quantize_dynamic`'s `DynamicQuantizeLinear` shares
+/// one activation scale across the whole batch, so the legacy export moved
+/// every row by up to ~0.13 nats here (issue #93).
+#[test]
+fn int8_scores_do_not_depend_on_batchmates() {
+    let dir = fixture_dir();
+    let lexicon = lexicon(&dir);
+    for arch in ["transformer-int8", "lstm-int8"] {
+        let model =
+            CharLm::open(&dir.join(arch), &lexicon, shape()).expect("the int8 fixture opens");
+        let expected = expected(&dir, arch);
+        let ids = expected.steps[0][0].ids(&lexicon);
+        let asked = Asked {
+            candidates: &ids,
+            eos: expected.steps[0][0].eos,
+        };
+        let alphabet: Vec<_> = "你好吗我很再见谢"
+            .chars()
+            .map(|ch| lexicon.id_of(ch).expect("fixture chars are in the lexicon"))
+            .collect();
+
+        // Unrelated states: a shorter context alternating with the fixture's,
+        // each row advanced alone on its own first character.
+        let short: String = expected
+            .context
+            .chars()
+            .take(expected.context.chars().count() / 2)
+            .collect();
+        let token = |beam: usize| alphabet[beam % alphabet.len()];
+        let mut fillers = Vec::new();
+        for row in 0..127 {
+            let context = if row % 2 == 0 {
+                &expected.context
+            } else {
+                &short
+            };
+            let start = model.start(Some(context), &asked);
+            fillers.push(model.advance(&[(&start, token(row), asked)]).remove(0));
+        }
+
+        // The target row: the fixture context's first beam advanced on its
+        // second character, alone and in the batch.
+        let start = model.start(Some(&expected.context), &asked);
+        let target = alphabet[1];
+        let solo = model.advance(&[(&start, target, asked)]).remove(0);
+        let batch: Vec<(&LmState, ime_pinyin::CharId, Asked<'_>)> = [(&start, target, asked)]
+            .into_iter()
+            .chain(
+                fillers
+                    .iter()
+                    .enumerate()
+                    .map(|(row, state)| (state, token(row + 1), asked)),
+            )
+            .collect();
+        let mixed = model.advance(&batch);
+        assert_eq!(mixed.len(), 128, "one state per row comes back");
+
+        let keys: Vec<&String> = expected.steps[0][0].scores.keys().collect();
+        for key in &keys {
+            assert_eq!(
+                read(&model, &lexicon, &mixed[0], key).to_bits(),
+                read(&model, &lexicon, &solo, key).to_bits(),
+                "{arch}: {key} for the target row moves with its batchmates"
+            );
+        }
+        // The fillers' rows are covered the same way: each repeats its own
+        // advance alone and the answers must be identical.
+        for (row, state) in fillers.iter().enumerate() {
+            let alone = model.advance(&[(state, token(row + 1), asked)]).remove(0);
+            for key in &keys {
+                assert_eq!(
+                    read(&model, &lexicon, &mixed[row + 1], key).to_bits(),
+                    read(&model, &lexicon, &alone, key).to_bits(),
+                    "{arch}: {key} for filler row {row} moves with its batchmates"
+                );
+            }
+        }
+    }
+}

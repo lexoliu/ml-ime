@@ -236,7 +236,10 @@ def main() -> None:
             # The fp16 variant exercises the loader's second dtype; its
             # expected.json is what the fp16 graphs themselves produce.
             export_onnx(checkpoint, out / f"{arch}-fp16", restrict, quantize="fp16")
-        for variant in (arch, f"{arch}-fp16"):
+            # The int8 variant is what the batch-independence test runs: its
+            # scores must not move when a row shares its batch with strangers.
+            export_onnx(checkpoint, out / f"{arch}-int8", restrict, quantize="int8")
+        for variant in (arch, f"{arch}-fp16", f"{arch}-int8"):
             (out / variant / "expected.json").write_text(
                 json.dumps(_expected(out / variant), ensure_ascii=False) + "\n",
                 encoding="utf-8",

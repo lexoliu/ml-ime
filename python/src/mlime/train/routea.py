@@ -34,7 +34,7 @@ from torch import nn
 from transformers.models.bert.modeling_bert import BertEmbeddings, BertLayer
 
 from mlime.logging import log
-from mlime.train.charlm import _externalize, _quantize_dynamic_int8, _weights_table
+from mlime.train.charlm import _externalize, _weights_table
 from mlime.train.lexicon import Lexicon
 from mlime.train.model import GatedCrossAttention, RouteAModel
 from mlime.train.samples import DEFAULT_CONTEXT_TOKENS, BaseTokenizer
@@ -173,6 +173,24 @@ class _FillGraph(nn.Module):
         )
         log_probs: torch.Tensor = logits.masked_fill(~masks, FLOOR).log_softmax(dim=-1)
         return log_probs
+
+
+def _quantize_dynamic_int8(graph: Path) -> None:
+    """Rewrite *graph* in place with every MatMul weight dynamic-quantized to int8."""
+    from onnxruntime.quantization import QuantType, quantize_dynamic
+
+    quantized = graph.with_suffix(".quantized.onnx")
+    quantize_dynamic(
+        graph,
+        quantized,
+        op_types_to_quantize=["MatMul"],
+        per_channel=True,
+        # Seven-bit weights: x86 kernels without VNNI multiply u8 x s8 into a
+        # saturating 16-bit lane and full-range int8 overflows it.
+        reduce_range=True,
+        weight_type=QuantType.QInt8,
+    )
+    quantized.replace(graph)
 
 
 def export_onnx(
