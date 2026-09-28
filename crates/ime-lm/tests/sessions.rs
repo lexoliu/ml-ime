@@ -14,7 +14,7 @@
 mod common;
 
 use common::{expected, fixture_dir, lexicon, shape};
-use ime_decode::Transition;
+use ime_decode::{Asked, Transition};
 use ime_lm::{CharLm, LmState};
 use std::fmt;
 use std::sync::Arc;
@@ -84,13 +84,20 @@ fn starts_and_steps_do_not_open_new_sessions() {
         .id_of(lexicon.characters()[0])
         .expect("the lexicon indexes itself");
     let context = expected(&dir, "transformer").context;
+    // Any request serves — the count is about sessions, not scores.
+    let asked = Asked {
+        candidates: std::slice::from_ref(&character),
+        eos: true,
+    };
 
     // Past the pool's starting capacity of 64, so `grow` runs its copiers.
-    let mut states: Vec<LmState> = (0..70).map(|_| model.start(Some(&context))).collect();
+    let mut states: Vec<LmState> = (0..70)
+        .map(|_| model.start(Some(&context), &asked))
+        .collect();
     drop(states.drain(..));
     for _ in 0..200 {
-        let state = model.start(Some(&context));
-        let next = model.advance(&[(&state, character)]);
+        let state = model.start(Some(&context), &asked);
+        let next = model.advance(&[(&state, character, asked)]);
         drop(next);
         drop(state);
     }

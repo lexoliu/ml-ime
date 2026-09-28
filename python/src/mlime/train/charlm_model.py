@@ -457,16 +457,21 @@ class ResidentStepModule(nn.Module):
     puts them -- the device for a GPU backend, the heap for the CPU -- and
     the host passes only which row each new beam continues from:
 
-    ``token [rows]`` is each beam's next character and ``source_row [rows]``
-    its index into the state buffers; ``keys``/``values`` (the transformer)
-    or ``hidden``/``cell`` (the LSTM) are the resident state tensors the
-    batch gathers, laid out ``[rows, layers, heads, time, head_dim]``; the
-    prefix buffers take one slot per worker, ``prefix_row [workers]`` naming
-    which slot feeds each ``width``-row block, and ``prefix_mask``
-    ``[slots, T]`` marks the real positions. The output ``next_*`` tensors
-    are the rows the caller binds over fresh buffers -- read through them,
-    the old buffers release when their last beam moves on, so nothing ever
-    writes into a row a live state still reads.
+    ``token [rows]`` is each beam's next character, ``source_row [rows]``
+    its index into the state buffers, and ``candidates [rows, K]`` the
+    alphabet ids the produced state will be scored on at its next position
+    (``<eos>`` included where the path can end there, a throwaway id as
+    padding). ``keys``/``values`` (the transformer) or ``hidden``/``cell``
+    (the LSTM) are the resident state tensors the batch gathers, laid out
+    ``[rows, layers, heads, time, head_dim]``; the prefix buffers take one
+    slot per worker, ``prefix_row [workers]`` naming which slot feeds each
+    ``width``-row block, and ``prefix_mask`` ``[slots, T]`` marks the real
+    positions. The output ``candidate_log_probs [rows, K]`` is the
+    log-softmax gathered at each row's candidates -- the only tensor that
+    crosses the bus -- and ``next_*`` are the rows the caller binds over
+    fresh buffers -- read through them, the old buffers release when their
+    last beam moves on, so nothing ever writes into a row a live state
+    still reads.
     """
 
     def __init__(self, model: CharLm, keep: torch.Tensor | None = None):
@@ -475,7 +480,11 @@ class ResidentStepModule(nn.Module):
         self.restricted = Restricted(model, keep)
 
     def forward(
-        self, token: torch.Tensor, source_row: torch.Tensor, *tensors: torch.Tensor
+        self,
+        token: torch.Tensor,
+        source_row: torch.Tensor,
+        candidates: torch.Tensor,
+        *tensors: torch.Tensor,
     ) -> tuple[torch.Tensor, ...]:
         split = len(self.model.prefix_names)
         prefix_buffers, rest = tensors[:split], tensors[split:]
@@ -488,20 +497,22 @@ class ResidentStepModule(nn.Module):
             prefix, mask, state_buffers = (), None, rest
         state = tuple(buffer.index_select(0, source_row) for buffer in state_buffers)
         features, state = self.model.step(token, prefix, state, mask)
-        return (self.restricted(features), *state)
+        return (self.restricted(features).gather(1, candidates), *state)
 
 
 class PrefillModule(nn.Module):
     """The prefill graph, emitted in the resident layout.
 
-    ``tokens [1, T] -> (log_probs, *prefix, prefix_mask, *state)``. A
-    prefix row lands directly in its resident slot, whose buffers are
-    shaped to the widest prelude -- ``<bos>`` + ``context_chars`` +
-    ``<sep>`` -- so each prefix tensor is left-padded to that width on its
-    time axis and the mask row the step graph reads is emitted with it;
-    the step binds the graph's outputs over the slot's rows without a
-    copy. A model without prefix tensors (the LSTM) emits
-    ``(log_probs, *state)``.
+    ``tokens [1, T], candidates [1, K] -> (candidate_log_probs, *prefix,
+    prefix_mask, *state)``. A prefix row lands directly in its resident
+    slot, whose buffers are shaped to the widest prelude -- ``<bos>`` +
+    ``context_chars`` + ``<sep>`` -- so each prefix tensor is left-padded
+    to that width on its time axis and the mask row the step graph reads
+    is emitted with it; the step binds the graph's outputs over the
+    slot's rows without a copy. ``candidates`` is the first position's
+    candidate ids and ``candidate_log_probs [1, K]`` the log-softmax
+    gathered at them. A model without prefix tensors (the LSTM) emits
+    ``(candidate_log_probs, *state)``.
     """
 
     def __init__(self, model: CharLm, keep: torch.Tensor | None = None):
@@ -509,10 +520,11 @@ class PrefillModule(nn.Module):
         self.model = model
         self.restricted = Restricted(model, keep)
 
-    def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def forward(self, tokens: torch.Tensor, candidates: torch.Tensor) -> tuple[torch.Tensor, ...]:
         features, prefix, state = self.model.prefill(tokens)
+        gathered = self.restricted(features).gather(1, candidates)
         if not prefix:
-            return (self.restricted(features), *state)
+            return (gathered, *state)
         width = self.model.config.context_chars + 2
         pad = width - tokens.shape[1]
         padded = tuple(
@@ -532,4 +544,4 @@ class PrefillModule(nn.Module):
             for tensor in prefix
         )
         mask = torch.arange(width, device=tokens.device).unsqueeze(0) >= pad
-        return (self.restricted(features), *padded, mask, *state)
+        return (gathered, *padded, mask, *state)

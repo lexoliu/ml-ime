@@ -20,7 +20,7 @@ pub use candidates::{CandidatePath, Candidates};
 pub use emissions::{
     EmissionError, Emittable, LatticePath, LatticeRecord, ScoreRecord, Scored, Weighted,
 };
-pub use score::{Both, Emission, History, MAX_HISTORY, NoTransition, Transition, Uniform};
+pub use score::{Asked, Both, Emission, History, MAX_HISTORY, NoTransition, Transition, Uniform};
 
 use thiserror::Error;
 
@@ -120,7 +120,7 @@ mod tests {
 
         type State = Option<CharId>;
 
-        fn start(&self, _context: Option<&str>) -> Self::State {
+        fn start(&self, _context: Option<&str>, _asked: &Asked<'_>) -> Self::State {
             None
         }
 
@@ -132,8 +132,8 @@ mod tests {
             0.0
         }
 
-        fn advance(&self, steps: &[(&Self::State, CharId)]) -> Vec<Self::State> {
-            steps.iter().map(|(_, ch)| Some(*ch)).collect()
+        fn advance(&self, steps: &[(&Self::State, CharId, Asked<'_>)]) -> Vec<Self::State> {
+            steps.iter().map(|(_, ch, _)| Some(*ch)).collect()
         }
     }
 

@@ -1,6 +1,8 @@
 //! Both exported architectures run end to end: `start` is one `prefill` call
-//! and `advance` stacks the surviving beams, against log probabilities the
-//! Python side recorded from onnxruntime for the same prelude and tokens.
+//! and `advance` stacks the surviving beams, against the gathered candidate
+//! scores the Python side recorded from onnxruntime for the same prelude,
+//! tokens and requests — and against the row the same step returns with the
+//! whole alphabet asked.
 //!
 //! The fixtures under `tests/fixtures/` are written by
 //! `python/scripts/charlm_fixtures.py`; regenerate them with
@@ -9,46 +11,107 @@
 
 mod common;
 
-use common::{expected, fixture_dir, lexicon, shape};
-use ime_decode::Transition;
+use common::{AskedRecord, alphabet, expected, fixture_dir, lexicon, shape};
+use ime_decode::{Asked, Transition};
 use ime_lm::{CharLm, LmState};
-use ime_pinyin::CharId;
+use ime_pinyin::Lexicon;
 use std::fs;
 
-fn assert_close(got: &[f32], want: &[f32], what: &str, atol: f32) {
-    assert_eq!(got.len(), want.len(), "{what}: row length differs");
-    for (index, (got, want)) in got.iter().zip(want).enumerate() {
-        assert!(
-            (got - want).abs() <= atol,
-            "{what}[{index}]: got {got}, want {want}"
-        );
+/// *key*'s score out of *state* — `finish` for `"<eos>"`, `score` else.
+fn read(model: &CharLm, lexicon: &Lexicon, state: &LmState, key: &str) -> f32 {
+    if key == "<eos>" {
+        model.finish(state)
+    } else {
+        let ch = key
+            .chars()
+            .next()
+            .expect("a score key is one char or <eos>");
+        model.score(
+            state,
+            lexicon
+                .id_of(ch)
+                .expect("fixture characters are in the lexicon"),
+        )
     }
 }
 
-/// `start(Some(context))`, then two `advance` calls of two beams each, every
-/// log-probability row checked against what onnxruntime produced. *atol* is
-/// the fp32 fixtures' near-exact bound, wider for fp16 whose half-precision
-/// arithmetic answers within a few hundredths of a nat.
+/// The column of a full row *key* names: the alphabet's index of the id.
+fn column(alphabet: &[String], key: &str) -> usize {
+    alphabet
+        .iter()
+        .position(|name| name == key)
+        .expect("a score key names an alphabet id")
+}
+
+/// `start(Some(context))` with the fixture's first-position request, then two
+/// `advance` calls of two beams each — every state's scores checked against
+/// what onnxruntime gathered for the same request, and against the same
+/// step's full-vocabulary row. *atol* is the fp32 fixtures' near-exact bound,
+/// wider for fp16 whose half-precision arithmetic answers within a few
+/// hundredths of a nat.
 fn run(arch: &str, atol: f32) {
     let dir = fixture_dir();
     let lexicon = lexicon(&dir);
+    let alphabet = alphabet(&dir, arch);
     let model = CharLm::open(&dir.join(arch), &lexicon, shape()).expect("the fixture opens");
     let expected = expected(&dir, arch);
     assert_eq!(expected.beams.len(), 2, "the fixture has two beams");
 
-    let start = model.start(Some(&expected.context));
-    assert_close(start.log_probs(), &expected.prefill, "prefill", atol);
+    let check = |state: &LmState, record: &AskedRecord, full: &[f32], what: &str| {
+        assert_eq!(
+            record.scores.len(),
+            record.candidates.chars().count() + usize::from(record.eos),
+            "{what}: the record's scores answer its request"
+        );
+        for (key, &want) in &record.scores {
+            let got = read(&model, &lexicon, state, key);
+            assert!(
+                (got - want).abs() <= atol,
+                "{what}: {key} got {got}, want {want}"
+            );
+            let column = column(&alphabet, key);
+            assert!(
+                (got - full[column]).abs() <= atol,
+                "{what}: {key} gathered {got}, the full row's column {column} has {}",
+                full[column]
+            );
+        }
+    };
+
+    let start_ids = expected.start.ids(&lexicon);
+    let start = model.start(
+        Some(&expected.context),
+        &Asked {
+            candidates: &start_ids,
+            eos: expected.start.eos,
+        },
+    );
+    check(&start, &expected.start, &expected.prefill_full, "prefill");
+
     // Every beam of a record starts from the same state; two clones of it are
     // the two beams the fixture recorded.
     let mut states = vec![start.clone(), start];
+    // A step asked for every character plus <eos>: its gather answers the
+    // whole row, and the narrow rows must match its columns exactly.
+    let all: Vec<_> = lexicon
+        .characters()
+        .iter()
+        .map(|&ch| lexicon.id_of(ch).expect("the lexicon indexes itself"))
+        .collect();
+    let wide = Asked {
+        candidates: &all,
+        eos: true,
+    };
 
     let steps = expected.beams[0].chars().count();
     assert_eq!(expected.steps.len(), steps, "one expected row set per step");
-    for position in 0..steps {
-        let batch: Vec<(&LmState, CharId)> = states
+    for (position, records) in expected.steps.iter().enumerate() {
+        let ids: Vec<Vec<_>> = records.iter().map(|record| record.ids(&lexicon)).collect();
+        let batch: Vec<(&LmState, ime_pinyin::CharId, Asked<'_>)> = states
             .iter()
             .zip(&expected.beams)
-            .map(|(state, beam)| {
+            .zip(records.iter().zip(&ids))
+            .map(|((state, beam), (record, ids))| {
                 let character = beam
                     .chars()
                     .nth(position)
@@ -58,6 +121,10 @@ fn run(arch: &str, atol: f32) {
                     lexicon
                         .id_of(character)
                         .expect("fixture characters are in the lexicon"),
+                    Asked {
+                        candidates: ids,
+                        eos: record.eos,
+                    },
                 )
             })
             .collect();
@@ -66,24 +133,31 @@ fn run(arch: &str, atol: f32) {
             expected.beams.len(),
             "every beam is fed a token"
         );
+        // The same inputs asked for the whole alphabet: the gathered columns
+        // are the full row's.
+        let whole: Vec<(&LmState, ime_pinyin::CharId, Asked<'_>)> = batch
+            .iter()
+            .map(|(state, ch, _)| (*state, *ch, wide))
+            .collect();
+        let whole = model.advance(&whole);
         states = model.advance(&batch);
         assert_eq!(
             states.len(),
             expected.beams.len(),
             "one state per beam comes back"
         );
-        assert_eq!(
-            expected.steps[position].len(),
-            states.len(),
-            "one row per beam"
-        );
         for (row, state) in states.iter().enumerate() {
-            assert_close(
-                state.log_probs(),
-                &expected.steps[position][row],
-                &format!("{arch} step {position} beam {row}"),
-                atol,
-            );
+            let record = &records[row];
+            let what = format!("{arch} step {position} beam {row}");
+            check(state, record, &expected.full[position][row], &what);
+            // The wide request's answers include every key the narrow one named.
+            for (key, &want) in &record.scores {
+                let got = read(&model, &lexicon, &whole[row], key);
+                assert!(
+                    (got - want).abs() <= atol,
+                    "{what}: the whole row's {key} got {got}, want {want}"
+                );
+            }
         }
     }
 }
@@ -115,14 +189,21 @@ fn transformer_rows_from_different_records_match_solo_runs() {
             .id_of(character)
             .expect("fixture characters are in the lexicon")
     };
+    // Every row asks for the fixture's first step candidates, so all rows
+    // answer the same keys.
+    let asked_ids: Vec<_> = expected.steps[0][0].ids(&lexicon);
+    let asked = Asked {
+        candidates: &asked_ids,
+        eos: expected.steps[0][0].eos,
+    };
     // What each record's two beams score run on their own.
     let solo = |context: &str| {
-        let start = model.start(Some(context));
+        let start = model.start(Some(context), &asked);
         let states = [start.clone(), start];
-        let batch: Vec<(&LmState, CharId)> = states
+        let batch: Vec<(&LmState, ime_pinyin::CharId, Asked<'_>)> = states
             .iter()
             .zip(0..2)
-            .map(|(state, beam)| (state, token(beam)))
+            .map(|(state, beam)| (state, token(beam), asked))
             .collect();
         model.advance(&batch)
     };
@@ -130,13 +211,14 @@ fn transformer_rows_from_different_records_match_solo_runs() {
     let alone_short = solo(&short);
 
     // One batch alternating the two records.
-    let long = model.start(Some(&expected.context));
-    let short_start = model.start(Some(&short));
-    let batch: Vec<(&LmState, CharId)> = [&long, &short_start, &long, &short_start]
-        .into_iter()
-        .enumerate()
-        .map(|(row, state)| (state, token(row / 2)))
-        .collect();
+    let long = model.start(Some(&expected.context), &asked);
+    let short_start = model.start(Some(&short), &asked);
+    let batch: Vec<(&LmState, ime_pinyin::CharId, Asked<'_>)> =
+        [&long, &short_start, &long, &short_start]
+            .into_iter()
+            .enumerate()
+            .map(|(row, state)| (state, token(row / 2), asked))
+            .collect();
     let mixed = model.advance(&batch);
     assert_eq!(mixed.len(), 4, "one state per row comes back");
     for (row, state) in mixed.iter().enumerate() {
@@ -145,20 +227,61 @@ fn transformer_rows_from_different_records_match_solo_runs() {
         } else {
             &alone_short[row / 2]
         };
-        assert_close(
-            state.log_probs(),
-            solo.log_probs(),
-            &format!("mixed batch row {row}"),
-            1e-4,
-        );
+        for key in expected.steps[0][0].scores.keys() {
+            let got = read(&model, &lexicon, state, key);
+            let want = read(&model, &lexicon, solo, key);
+            assert!(
+                (got - want).abs() <= 1e-4,
+                "mixed batch row {row}: {key} got {got}, solo {want}"
+            );
+        }
     }
 }
 
-/// A manifest whose `layout` is not `"resident"` is an export built for
-/// another batch layout: its graphs load and step until a broadcasting
-/// operator fails on the wrong shape, so `open` refuses it -- naming the
-/// directory and the re-export -- whether the field holds a foreign value or
-/// is absent, as every pre-resident manifest is.
+/// `score` of a candidate the produced state was never asked for is a panic,
+/// not a floor: the request rides with the row, and the model keeps no whole
+/// row to fall back on.
+#[test]
+#[should_panic(expected = "the step never asked for")]
+fn an_unasked_candidate_panics() {
+    let dir = fixture_dir();
+    let lexicon = lexicon(&dir);
+    let model = CharLm::open(&dir.join("lstm"), &lexicon, shape()).expect("the fixture opens");
+    let expected = expected(&dir, "lstm");
+    let ids = expected.start.ids(&lexicon);
+    let asked = Asked {
+        candidates: &ids,
+        eos: false,
+    };
+    let start = model.start(Some(&expected.context), &asked);
+    // 谢 is not among the first position's candidates.
+    let outside = lexicon.id_of('谢').expect("谢 is in the lexicon");
+    let _ = model.score(&start, outside);
+}
+
+/// `finish` of a state whose request carried no `<eos>` fails fast — the
+/// path cannot end there.
+#[test]
+#[should_panic(expected = "the step never asked for <eos>")]
+fn an_unasked_eos_panics() {
+    let dir = fixture_dir();
+    let lexicon = lexicon(&dir);
+    let model = CharLm::open(&dir.join("lstm"), &lexicon, shape()).expect("the fixture opens");
+    let expected = expected(&dir, "lstm");
+    let ids = expected.start.ids(&lexicon);
+    let asked = Asked {
+        candidates: &ids,
+        eos: false,
+    };
+    let start = model.start(Some(&expected.context), &asked);
+    let _ = model.finish(&start);
+}
+
+/// A manifest whose `layout` is not `"resident-candidates"` is an export
+/// built for another batch layout: its graphs load and step until a
+/// broadcasting operator fails on the wrong shape, so `open` refuses it --
+/// naming the directory and the re-export -- whether the field holds a
+/// foreign value or is absent, as every pre-candidates manifest is.
 #[test]
 fn a_manifest_of_another_layout_is_refused() {
     let dir = fixture_dir();

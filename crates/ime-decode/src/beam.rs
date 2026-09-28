@@ -1,7 +1,7 @@
 //! Beam Viterbi over the candidate lattice.
 
 use crate::candidates::{CandidatePath, Candidates};
-use crate::score::{Emission, History, MAX_HISTORY, Transition};
+use crate::score::{Asked, Emission, History, MAX_HISTORY, Transition};
 use ime_pinyin::{CharId, Lexicon};
 use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::num::NonZeroUsize;
@@ -274,7 +274,15 @@ where
                 record,
                 path,
                 reading,
-                start: transition.start(request.context),
+                // A reading always has a first position, and its start state
+                // is only ever scored there -- never finished, so no <eos>.
+                start: transition.start(
+                    request.context,
+                    &Asked {
+                        candidates: &reading.positions()[0],
+                        eos: false,
+                    },
+                ),
                 history: Vec::with_capacity(reading.len()),
                 latest: Vec::new(),
             });
@@ -287,7 +295,7 @@ where
         // shape a single-record search has; then every survivor's step goes
         // on the batch's one list, each worker's as a contiguous run in
         // worker order -- the guarantee `Transition::advance` is built on.
-        let mut steps: Vec<(&T::State, CharId)> = Vec::new();
+        let mut steps: Vec<(&T::State, CharId, Asked<'_>)> = Vec::new();
         let mut chosen: Vec<Vec<Candidate>> = Vec::with_capacity(workers.len());
         for worker in workers.iter().filter(|worker| worker.pending()) {
             let next = worker.survivors(
@@ -296,13 +304,23 @@ where
                 width,
                 &mut index,
             );
+            // The states this step produces stand one position ahead: they
+            // will be scored on that position's candidates, or finished when
+            // the reading ends there -- the worker's last step asks only for
+            // <eos>.
+            let after = worker.history.len() + 1;
+            let positions = worker.reading.positions().get(after);
+            let asked = Asked {
+                candidates: positions.map_or(&[][..], Vec::as_slice),
+                eos: positions.is_none(),
+            };
             for candidate in &next {
                 let state = if worker.history.is_empty() {
                     &worker.start
                 } else {
                     &worker.latest[candidate.parent].state
                 };
-                steps.push((state, candidate.ch));
+                steps.push((state, candidate.ch, asked));
             }
             chosen.push(next);
         }

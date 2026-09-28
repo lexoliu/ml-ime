@@ -174,7 +174,7 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
     export_onnx(checkpoint, tmp_path / "export", restrict)
     manifest = json.loads((tmp_path / "export" / "charlm.json").read_text())
     assert manifest["arch"] == arch
-    assert manifest["layout"] == "resident"
+    assert manifest["layout"] == "resident-candidates"
     assert manifest["dtype"] == "float32"
     assert manifest["restricted_to"] == 5  # four characters plus <eos>
     weights = manifest["weights"]
@@ -204,7 +204,13 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
     step = ort.InferenceSession(str(tmp_path / "export" / "charlm.onnx"))
     prelude = [BOS, *_tokens("你", "好"), SEP]
     beams = (_tokens("我", "吗"), _tokens("你", "好"))
-    outputs = prefill.run(None, {"tokens": np.array([prelude], dtype=np.int64)})
+    # Asking for the whole alphabet makes the gathered output the row a
+    # full-vocabulary export would have returned.
+    whole = np.arange(len(VOCAB), dtype=np.int64)
+    outputs = prefill.run(
+        None,
+        {"tokens": np.array([prelude], dtype=np.int64), "candidates": whole.reshape(1, -1)},
+    )
     by_name = dict(zip((o.name for o in prefill.get_outputs()), outputs, strict=True))
     prefix = {name: by_name[name] for name in manifest["prefix"]}
     mask = _prefix_mask(by_name)
@@ -215,7 +221,17 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
     state = {name: np.repeat(by_name[name], 2, axis=0) for name in manifest["state"]}
     for position in range(2):
         token = np.array([beam[position] for beam in beams], dtype=np.int64)
-        outputs = step.run(None, {"token": token, **prefix, **indices, **mask, **state})
+        outputs = step.run(
+            None,
+            {
+                "token": token,
+                "candidates": np.tile(whole, (2, 1)),
+                **prefix,
+                **indices,
+                **mask,
+                **state,
+            },
+        )
         log_probs = outputs[0]
         state = dict(zip(manifest["state"], outputs[1:], strict=True))
     from mlime.train.charlm import load_model
@@ -248,12 +264,17 @@ def _worker_index(prefix: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 
 
 def _run_export(dir: Path) -> list[np.ndarray]:
-    """The ``log_probs`` rows of an export over the fixture prelude and two beams."""
+    """The ``candidate_log_probs`` rows of an export over the fixture prelude
+    and two beams, the whole alphabet asked so they are full rows."""
     manifest = json.loads((dir / "charlm.json").read_text())
     prefill = ort.InferenceSession(str(dir / "prefill.onnx"))
     step = ort.InferenceSession(str(dir / "charlm.onnx"))
     prelude = [BOS, *_tokens("你", "好"), SEP]
-    outputs = prefill.run(None, {"tokens": np.array([prelude], dtype=np.int64)})
+    whole = np.arange(len(VOCAB), dtype=np.int64)
+    outputs = prefill.run(
+        None,
+        {"tokens": np.array([prelude], dtype=np.int64), "candidates": whole.reshape(1, -1)},
+    )
     by_name = dict(zip((o.name for o in prefill.get_outputs()), outputs, strict=True))
     prefix = {name: by_name[name] for name in manifest["prefix"]}
     mask = _prefix_mask(by_name)
@@ -262,11 +283,21 @@ def _run_export(dir: Path) -> list[np.ndarray]:
         **_worker_index(prefix),
     }
     state = {name: np.repeat(by_name[name], 2, axis=0) for name in manifest["state"]}
-    rows = [by_name["log_probs"]]
+    rows = [by_name["candidate_log_probs"]]
     beams = (_tokens("我", "吗"), _tokens("你", "好"))
     for position in range(len(beams[0])):
         token = np.array([beam[position] for beam in beams], dtype=np.int64)
-        outputs = step.run(None, {"token": token, **prefix, **indices, **mask, **state})
+        outputs = step.run(
+            None,
+            {
+                "token": token,
+                "candidates": np.tile(whole, (2, 1)),
+                **prefix,
+                **indices,
+                **mask,
+                **state,
+            },
+        )
         rows.append(outputs[0])
         state = dict(zip(manifest["state"], outputs[1:], strict=True))
     return rows

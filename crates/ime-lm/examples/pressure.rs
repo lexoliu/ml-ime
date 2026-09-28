@@ -17,7 +17,7 @@
 //! --batch` feeds a GPU backend. A GPU backend takes the serial path at any
 //! batch, its session holding the one device.
 
-use ime_decode::Transition;
+use ime_decode::{Asked, Transition};
 use ime_lm::{Backend, CharLm, LmState, SessionShape};
 use ime_pinyin::{CharId, Lexicon, SyllableTable};
 use rand::Rng;
@@ -33,10 +33,24 @@ const RECORDS: usize = 100;
 const BEAM: usize = 8;
 const STEPS: usize = 20;
 
-/// A record's prelude plus the random characters its `STEPS` steps feed.
+/// How many candidates a row's request carries — the median candidates a
+/// lattice position admits, computed as the median homophone count over the
+/// syllable inventory (eval3's own lattices aren't on this machine; a
+/// full-pinyin position is one syllable, so the inventory's median stands
+/// in for it).
+const CANDIDATES: usize = 94;
+
+/// A record's prelude, the random characters its `STEPS` steps feed, and
+/// the candidates each produced state is asked for.
 struct Work {
     context: String,
     tokens: Vec<CharId>,
+    /// The first position's candidates — what `start` is asked.
+    first: Vec<CharId>,
+    /// Per step, the produced rows' request — `CANDIDATES` ids; empty at
+    /// the last step, whose produced states are finished rather than
+    /// scored, so they ask for `<eos>` alone.
+    next: Vec<Vec<CharId>>,
 }
 
 /// The command line: the export directory, the lockstep batch width, and the
@@ -93,8 +107,10 @@ fn args() -> (PathBuf, usize, SessionShape) {
     )
 }
 
-/// One record's workload: a random-width context and the `STEPS * BEAM`
-/// characters its steps feed.
+/// One record's workload: a random-width context, the `STEPS * BEAM`
+/// characters its steps feed, and a `CANDIDATES`-wide request per step —
+/// shared by all of a record's beams, as a lattice position's candidate
+/// set is.
 fn work(rng: &mut impl Rng, lexicon: &Lexicon, ids: &[CharId]) -> Work {
     let width = rng.random_range(40..=62);
     let context: String = (0..width)
@@ -108,12 +124,59 @@ fn work(rng: &mut impl Rng, lexicon: &Lexicon, ids: &[CharId]) -> Work {
     let tokens = (0..STEPS * BEAM)
         .map(|_| *ids.choose(rng).expect("the lexicon is not empty"))
         .collect();
-    Work { context, tokens }
+    let count = CANDIDATES.min(ids.len());
+    let first = ids.choose_multiple(&mut *rng, count).copied().collect();
+    let next = (0..STEPS)
+        .map(|step| {
+            if step == STEPS - 1 {
+                Vec::new()
+            } else {
+                ids.choose_multiple(&mut *rng, count).copied().collect()
+            }
+        })
+        .collect();
+    Work {
+        context,
+        tokens,
+        first,
+        next,
+    }
 }
 
 /// A `Work` decoded to a running state: `start` over its context, `BEAM` deep.
 fn states(model: &CharLm, work: &Work) -> Vec<LmState> {
-    vec![model.start(Some(&work.context)); BEAM]
+    vec![
+        model.start(
+            Some(&work.context),
+            &Asked {
+                candidates: &work.first,
+                eos: false,
+            },
+        );
+        BEAM
+    ]
+}
+
+/// The `advance` batch one step of a lockstep run builds: every beam of
+/// every record, fed its token and asked the produced position's
+/// candidates — `<eos>` alone at the last step, whose produced states are
+/// finished rather than scored.
+fn rows<'a>(
+    chunk: &'a [Work],
+    beams: &'a [Vec<LmState>],
+    step: usize,
+) -> Vec<(&'a LmState, CharId, Asked<'a>)> {
+    let mut rows = Vec::with_capacity(chunk.len() * BEAM);
+    for (record, states) in beams.iter().enumerate() {
+        let asked = Asked {
+            candidates: &chunk[record].next[step],
+            eos: step == STEPS - 1,
+        };
+        for (beam, state) in states.iter().enumerate() {
+            rows.push((state, chunk[record].tokens[step * BEAM + beam], asked));
+        }
+    }
+    rows
 }
 
 /// The process's peak resident set so far, from `/proc/self/status` — `None`
@@ -182,14 +245,10 @@ fn main() {
                     let mut rng = rand::rng();
                     for _ in 0..RECORDS {
                         let work = work(&mut rng, lexicon, ids);
-                        let mut states = states(model, &work);
+                        let mut beams = vec![states(model, &work)];
                         for step in 0..STEPS {
-                            let rows: Vec<(&LmState, CharId)> = states
-                                .iter()
-                                .enumerate()
-                                .map(|(beam, state)| (state, work.tokens[step * BEAM + beam]))
-                                .collect();
-                            states = model.advance(&rows);
+                            let rows = rows(std::slice::from_ref(&work), &beams, step);
+                            beams = vec![model.advance(&rows)];
                         }
                     }
                 });
@@ -209,12 +268,7 @@ fn main() {
             let mut beams: Vec<Vec<LmState>> =
                 chunk.iter().map(|work| states(&model, work)).collect();
             for step in 0..STEPS {
-                let mut rows: Vec<(&LmState, CharId)> = Vec::with_capacity(chunk.len() * BEAM);
-                for (record, states) in beams.iter().enumerate() {
-                    for (beam, state) in states.iter().enumerate() {
-                        rows.push((state, chunk[record].tokens[step * BEAM + beam]));
-                    }
-                }
+                let rows = rows(&chunk, &beams, step);
                 let mut advanced = model.advance(&rows).into_iter();
                 beams = beams
                     .iter()
