@@ -2470,8 +2470,7 @@ dependencies = [
 [[package]]
 name = "ort-sys"
 version = "2.0.0-rc.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf211e3776eea6aec988552fa118dd746d70e1b1e5e244058d1c98015f3e5872"
+source = "git+https://github.com/pykeio/ort?rev=6d7c231c3430026bd5e8262fc8d74e2307512ab1#6d7c231c3430026bd5e8262fc8d74e2307512ab1"
 dependencies = [
  "glob",
  "hmac-sha256",
