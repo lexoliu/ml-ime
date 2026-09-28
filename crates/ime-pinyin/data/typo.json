@@ -1,0 +1,155 @@
+{
+  "edit_count": {
+    "1": 0.62,
+    "2": 0.25,
+    "3": 0.1,
+    "4": 0.03
+  },
+  "edit_type": {
+    "adjacent": 0.42,
+    "doubling": 0.08,
+    "fuzzy": 0.2,
+    "omission": 0.16,
+    "transposition": 0.14
+  },
+  "fuzzy_pairs": [
+    {
+      "from": "zh",
+      "to": "z",
+      "weight": 0.55,
+      "where": "initial"
+    },
+    {
+      "from": "z",
+      "to": "zh",
+      "weight": 0.45,
+      "where": "initial"
+    },
+    {
+      "from": "ch",
+      "to": "c",
+      "weight": 0.55,
+      "where": "initial"
+    },
+    {
+      "from": "c",
+      "to": "ch",
+      "weight": 0.45,
+      "where": "initial"
+    },
+    {
+      "from": "sh",
+      "to": "s",
+      "weight": 0.55,
+      "where": "initial"
+    },
+    {
+      "from": "s",
+      "to": "sh",
+      "weight": 0.45,
+      "where": "initial"
+    },
+    {
+      "from": "n",
+      "to": "l",
+      "weight": 0.5,
+      "where": "initial"
+    },
+    {
+      "from": "l",
+      "to": "n",
+      "weight": 0.5,
+      "where": "initial"
+    },
+    {
+      "from": "an",
+      "to": "ang",
+      "weight": 0.45,
+      "where": "final"
+    },
+    {
+      "from": "ang",
+      "to": "an",
+      "weight": 0.55,
+      "where": "final"
+    },
+    {
+      "from": "en",
+      "to": "eng",
+      "weight": 0.45,
+      "where": "final"
+    },
+    {
+      "from": "eng",
+      "to": "en",
+      "weight": 0.55,
+      "where": "final"
+    },
+    {
+      "from": "in",
+      "to": "ing",
+      "weight": 0.45,
+      "where": "final"
+    },
+    {
+      "from": "ing",
+      "to": "in",
+      "weight": 0.55,
+      "where": "final"
+    }
+  ],
+  "initials": [
+    "b",
+    "p",
+    "m",
+    "f",
+    "d",
+    "t",
+    "n",
+    "l",
+    "g",
+    "k",
+    "h",
+    "j",
+    "q",
+    "x",
+    "zh",
+    "ch",
+    "sh",
+    "r",
+    "z",
+    "c",
+    "s",
+    "y",
+    "w"
+  ],
+  "neighbours": {
+    "a": "qwsz",
+    "b": "vgnh",
+    "c": "xdfv",
+    "d": "serfcx",
+    "e": "wsdr",
+    "f": "drtgvc",
+    "g": "ftyhbv",
+    "h": "gyujnb",
+    "i": "ujko",
+    "j": "huikmn",
+    "k": "jiolm",
+    "l": "kop",
+    "m": "njk",
+    "n": "bhjm",
+    "o": "iklp",
+    "p": "ol",
+    "q": "wa",
+    "r": "edft",
+    "s": "awedxz",
+    "t": "rfgy",
+    "u": "yhji",
+    "v": "cfgb",
+    "w": "qase",
+    "x": "zsdc",
+    "y": "tghu",
+    "z": "asx"
+  },
+  "per_sentence": 0.35
+}

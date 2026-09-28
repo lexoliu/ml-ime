@@ -1005,6 +1005,50 @@ def _e2e_base_model(checkpoint: Path) -> str:
     return str(record["base_model"])
 
 
+@eval_app.command("typo-twin")
+def eval_typo_twin(
+    eval_set: Path = typer.Option(
+        ...,
+        "--eval-set",
+        help="The JSON Lines eval set to corrupt, e.g. data/run3_pool/eval3.jsonl",
+    ),
+    out: Path = typer.Option(..., "--out", help="Where the twin's JSON Lines go"),
+    seed: int = typer.Option(0, "--seed", help="The set's seed; each record's draw is keyed on it"),
+    typo_table: Path = typer.Option(
+        None, "--typo-table", help="ime-pinyin's typo.json; found upwards when omitted"
+    ),
+    syllables: Path = typer.Option(
+        None, "--syllables", help="ime-pinyin's syllables.txt; found upwards when omitted"
+    ),
+    lattice: Path = typer.Option(
+        ...,
+        "--lattice",
+        help="The set's emit-lattice output; its character-aligned path is the true spelling",
+    ),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Write the typo twin of an evaluation set: same records, corrupted keystrokes.
+
+    Every record is corrupted at least once and keeps its identity through the
+    `clean` field, so the twin's dev and test slices are the parent's.
+    """
+    configure(verbose)
+    from mlime.locate import find_upwards
+    from mlime.typo import SYLLABLES_RELATIVE, default_typo_table, typo_twin
+
+    table = typo_table or default_typo_table()
+    if table is None:
+        raise typer.BadParameter(
+            "no typo.json found above the working directory; pass --typo-table"
+        )
+    syllable_path = syllables or find_upwards(SYLLABLES_RELATIVE)
+    if syllable_path is None:
+        raise typer.BadParameter(
+            "no syllables.txt found above the working directory; pass --syllables"
+        )
+    typer.echo(typo_twin(eval_set, out, seed, table, syllable_path, lattice))
+
+
 @eval_app.command("gui")
 def eval_gui(
     engine: str = typer.Option(..., help="apple, sogou or baidu -- the engine ime-drive ran"),

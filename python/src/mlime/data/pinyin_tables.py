@@ -12,6 +12,12 @@ so that the syllable inventory stays in sync with a maintained data source:
     ``<char>\t<py1>,<py2>,...`` for every character, readings deduplicated and
     ordered as ``pypinyin`` orders them (most common reading first).
 
+``typo.json``
+    The typo noise model -- the QWERTY neighbour table, the fuzzy-pinyin pairs
+    and the rates -- copied through from ``typo_model.json`` after
+    ``mlime.typo.NoiseModel`` has validated it, so the file both languages read
+    is the one that proved loadable.
+
 The input alphabet of a pinyin keyboard is exactly ``[a-z]``. Readings outside it
 (``ê``, on two rare characters) can never be produced by a keystroke sequence, so they
 are dropped -- loudly, with a logged count -- rather than carried into the Rust side
@@ -30,6 +36,7 @@ already lists is a row that has done its work and should go.
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter
 from collections.abc import Iterator
@@ -45,6 +52,9 @@ TYPEABLE = re.compile(r"\A[a-z]+\Z")
 #: Readings the mainland standard has and ``pypinyin`` does not, one
 #: ``<char>\t<reading>`` row each, applied after the dictionary's own.
 OVERRIDES_PATH = Path(__file__).parent / "pinyin_overrides.tsv"
+
+#: The authored typo noise model, validated and copied through to the crate.
+TYPO_MODEL_PATH = Path(__file__).parent / "typo_model.json"
 
 
 def read_overrides(path: Path = OVERRIDES_PATH) -> dict[str, tuple[str, ...]]:
@@ -81,8 +91,12 @@ def _readings(raw: str, untypeable: Counter[str]) -> Iterator[str]:
             yield normal
 
 
-def build(out_dir: Path, overrides_path: Path = OVERRIDES_PATH) -> None:
-    """Write ``syllables.txt`` and ``char_pinyin.tsv`` into *out_dir*."""
+def build(
+    out_dir: Path,
+    overrides_path: Path = OVERRIDES_PATH,
+    typo_path: Path = TYPO_MODEL_PATH,
+) -> None:
+    """Write ``syllables.txt``, ``char_pinyin.tsv`` and ``typo.json`` into *out_dir*."""
     out_dir.mkdir(parents=True, exist_ok=True)
 
     untypeable: Counter[str] = Counter()
@@ -121,10 +135,19 @@ def build(out_dir: Path, overrides_path: Path = OVERRIDES_PATH) -> None:
     (out_dir / "char_pinyin.tsv").write_text(
         "".join(f"{c}\t{p}\n" for c, p in rows), encoding="utf-8"
     )
+
+    from mlime.typo import NoiseModel
+
+    source = typo_path.read_text(encoding="utf-8")
+    NoiseModel.parse(source)
+    (out_dir / "typo.json").write_text(
+        json.dumps(json.loads(source), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     log.info(
         "pinyin tables written",
         syllables=len(syllables),
         chars=len(rows),
+        typo_table=str(typo_path),
         longest=max(len(s) for s in syllables),
         dropped_untypeable=dict(untypeable),
         overridden=sorted(overrides),

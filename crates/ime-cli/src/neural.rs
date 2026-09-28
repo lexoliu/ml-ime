@@ -409,10 +409,21 @@ struct Reader {
 }
 
 impl Reader {
-    /// Resolve one record's keystrokes.
-    fn read(&self, record: &EvalRecord) -> Result<(Vec<ime_pinyin::Segmentation>, Candidates)> {
-        read(&record.pinyin, &self.table, &self.segment, &self.lexicon)
-            .with_context(|| format!("could not read {:?}", record.pinyin))
+    /// Resolve one record's keystrokes, or `None` when they admit no reading.
+    ///
+    /// A record whose keystrokes cannot be segmented at all is not an error:
+    /// corrupted input is expected to leave the lattice sometimes, and a record
+    /// the engine could not even read is the extreme case of one it got wrong,
+    /// so callers score it as unanswered. Every other failure still raises.
+    fn read(&self, record: &EvalRecord) -> Result<Option<(Vec<Segmentation>, Candidates)>> {
+        match read(&record.pinyin, &self.table, &self.segment, &self.lexicon) {
+            Ok(resolved) => Ok(Some(resolved)),
+            Err(crate::engine::BaselineError::Segment {
+                source: ime_pinyin::SegmentError::NoSegmentation { .. },
+                ..
+            }) => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("could not read {:?}", record.pinyin)),
+        }
     }
 }
 
@@ -443,7 +454,9 @@ pub fn emit_lattice(
     let mut positions = 0usize;
     let mut slots = 0usize;
     for (index, record) in set.records().iter().enumerate() {
-        let (segmentations, candidates) = reader.read(record)?;
+        let (segmentations, candidates) = reader
+            .read(record)?
+            .with_context(|| format!("{:?} admits no reading", record.pinyin))?;
         let paths = lattice_paths(
             &record.pinyin,
             &segmentations,
@@ -876,23 +889,9 @@ where
         .enumerate()
         .filter(|(_, record)| slice.slice().holds(record, dev_share))
         .map(|(index, record)| -> Result<(Report, Vec<DumpRow>)> {
-            let (segmentations, candidates) = reader.read(record)?;
-            let emission = emissions.model(index, record, &segmentations, &candidates)?;
-            let hypotheses = decode_many(
-                &[Record {
-                    candidates: &candidates,
-                    emission,
-                    context: record.context.as_deref(),
-                }],
-                transition,
-                beam,
-            )
-            .map(|mut results| results.pop().expect("one record decodes to one result"))
-            .with_context(|| format!("could not decode record {index}"))?;
-            let texts: Vec<String> = hypotheses
-                .iter()
-                .map(|hypothesis| hypothesis.text(&reader.lexicon))
-                .collect();
+            let (hypotheses, texts) =
+                decode_record(index, record, reader, emissions, transition, beam)?
+                    .unwrap_or_default();
             let mut report = Report::new(beam.top_k);
             report.observe(&record.text, &texts);
             let row = dump.then(|| DumpRow {
@@ -920,6 +919,48 @@ where
     Ok((report, rows))
 }
 
+/// Decode one readable record down to its hypotheses and their strings.
+///
+/// `None` when the keystrokes admit no reading -- the caller then scores the
+/// record as unanswered rather than skipping it.
+///
+/// # Errors
+///
+/// If a record's scores do not describe its lattice or it cannot be decoded.
+fn decode_record<E, T>(
+    index: usize,
+    record: &EvalRecord,
+    reader: &Reader,
+    emissions: &E,
+    transition: &T,
+    beam: &BeamOptions,
+) -> Result<Option<(Vec<Hypothesis>, Vec<String>)>>
+where
+    E: Emissions,
+    T: Transition,
+{
+    let Some((segmentations, candidates)) = reader.read(record)? else {
+        return Ok(None);
+    };
+    let emission = emissions.model(index, record, &segmentations, &candidates)?;
+    let hypotheses = decode_many(
+        &[Record {
+            candidates: &candidates,
+            emission,
+            context: record.context.as_deref(),
+        }],
+        transition,
+        beam,
+    )
+    .map(|mut results| results.pop().expect("one record decodes to one result"))
+    .with_context(|| format!("could not decode record {index}"))?;
+    let texts: Vec<String> = hypotheses
+        .iter()
+        .map(|hypothesis| hypothesis.text(&reader.lexicon))
+        .collect();
+    Ok(Some((hypotheses, texts)))
+}
+
 /// Decode one batch of records in lockstep.
 ///
 /// Every record's lattice and emission model is built before the decode
@@ -927,8 +968,10 @@ where
 ///
 /// # Errors
 ///
-/// If a record cannot be read, its scores do not describe its lattice, or the
-/// batch cannot be decoded.
+/// If a record other than an unreadable one cannot be read, its scores do not
+/// describe its lattice, or the batch cannot be decoded. A record whose
+/// keystrokes admit no reading decodes to no hypotheses -- it is scored as
+/// unanswered, not skipped.
 fn decode_chunk<E, T>(
     chunk: &[(usize, &EvalRecord)],
     reader: &Reader,
@@ -941,25 +984,33 @@ where
     T: Transition,
 {
     let mut lattices = Vec::with_capacity(chunk.len());
-    for &(index, record) in chunk {
-        let (segmentations, candidates) = reader.read(record)?;
-        lattices.push((index, record, segmentations, candidates));
+    for (position, &(index, record)) in chunk.iter().enumerate() {
+        if let Some((segmentations, candidates)) = reader.read(record)? {
+            lattices.push((position, index, record, segmentations, candidates));
+        }
     }
     let mut requests = Vec::with_capacity(lattices.len());
-    for (index, record, segmentations, candidates) in &lattices {
+    for (_, index, record, segmentations, candidates) in &lattices {
         requests.push(Record {
             candidates,
             emission: emissions.model(*index, record, segmentations, candidates)?,
             context: record.context.as_deref(),
         });
     }
-    decode_many(&requests, transition, beam).with_context(|| {
-        format!(
-            "could not decode records {}..={}",
-            chunk[0].0,
-            chunk[chunk.len() - 1].0
-        )
-    })
+    let mut decoded = decode_many(&requests, transition, beam)
+        .with_context(|| {
+            format!(
+                "could not decode records {}..={}",
+                chunk[0].0,
+                chunk[chunk.len() - 1].0
+            )
+        })?
+        .into_iter();
+    let mut answers: Vec<Vec<Hypothesis>> = (0..chunk.len()).map(|_| Vec::new()).collect();
+    for &(position, ..) in &lattices {
+        answers[position] = decoded.next().expect("one request decodes to one result");
+    }
+    Ok(answers)
 }
 
 /// Decode the slice's records in lockstep batches of *batch* records each.
@@ -1463,23 +1514,9 @@ where
     pending
         .par_iter()
         .map(|&(index, record)| -> Result<()> {
-            let (segmentations, candidates) = reader.read(record)?;
-            let emission = emissions.model(index, record, &segmentations, &candidates)?;
-            let hypotheses = decode_many(
-                &[Record {
-                    candidates: &candidates,
-                    emission,
-                    context: record.context.as_deref(),
-                }],
-                transition,
-                beam,
-            )
-            .map(|mut results| results.pop().expect("one record decodes to one result"))
-            .with_context(|| format!("could not decode record {index}"))?;
-            let texts: Vec<String> = hypotheses
-                .iter()
-                .map(|hypothesis| hypothesis.text(&reader.lexicon))
-                .collect();
+            let (hypotheses, texts) =
+                decode_record(index, record, reader, emissions, transition, beam)?
+                    .unwrap_or_default();
             journal.send(ProgressLine {
                 record: index,
                 observation: Observation::new(&record.text, &texts, beam.top_k.get()),
@@ -1715,6 +1752,7 @@ mod tests {
                     pinyin: pinyin.to_owned(),
                     text: text.to_owned(),
                     context: None,
+                    clean: None,
                 };
                 source.push_str(&serde_json::to_string(&record).expect("a record serialises"));
                 source.push('\n');
@@ -2130,6 +2168,7 @@ mod tests {
             pinyin: "nihao".to_owned(),
             text: "你好".to_owned(),
             context: None,
+            clean: None,
         };
         assert!(SliceArg::All.slice().holds(&record, 0.5));
         assert_ne!(
