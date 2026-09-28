@@ -802,7 +802,7 @@ def export_char_lm(
     ),
     quantize: Literal["int8", "fp16"] | None = typer.Option(
         None,
-        help="Quantize the MatMul weights ('int8' dynamic, per channel) or halve them ('fp16')",
+        help="Quantize: 'int8' weight-only int8 (batch-independent), 'fp16' halved",
     ),
     verbose: bool = VERBOSE,
 ) -> None:

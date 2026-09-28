@@ -349,3 +349,80 @@ def test_batches_resume_from_a_saved_position(tmp_path: Path) -> None:
         assert torch.equal(got.tokens, expected.tokens)
         assert torch.equal(got.targets, expected.targets)
     assert len(seen) == 12
+
+
+def test_int8_scores_do_not_depend_on_batchmates(tmp_path: Path) -> None:
+    """A row scored alone equals the same row inside a 128-row batch.
+
+    The legacy dynamic export quantised each activation with a scale from the
+    batch's min/max, so a row's scores moved with its batchmates (issue #93).
+    The weight-only int8 export's activations stay float32, so its
+    ``candidate_log_probs`` must be bit-for-bit equal alone or batched.
+    """
+    checkpoint = tmp_path / "charlm-final.pt"
+    _checkpoint(checkpoint, "transformer")
+    restrict = tmp_path / "emittable.txt"
+    restrict.write_text("\n".join(CHARS[:4]) + "\n", encoding="utf-8")
+    out = tmp_path / "int8"
+    export_onnx(checkpoint, out, restrict, quantize="int8")
+    manifest = json.loads((out / "charlm.json").read_text())
+    prefill = ort.InferenceSession(str(out / "prefill.onnx"))
+    step = ort.InferenceSession(str(out / "charlm.onnx"))
+    whole = np.arange(len(VOCAB), dtype=np.int64)
+
+    def run(inputs: dict[str, np.ndarray]) -> list[np.ndarray]:
+        return step.run(None, inputs)
+
+    by_name = dict(
+        zip(
+            (o.name for o in prefill.get_outputs()),
+            prefill.run(
+                None,
+                {
+                    "tokens": np.array([[BOS, *_tokens("你", "好"), SEP]], dtype=np.int64),
+                    "candidates": whole.reshape(1, -1),
+                },
+            ),
+            strict=True,
+        )
+    )
+    prefix = {name: by_name[name] for name in manifest["prefix"]}
+    mask = _prefix_mask(by_name)
+
+    # 128 residents of equal time: each its own first character, advanced alone.
+    first = (_tokens(*CHARS) * 17)[:128]
+    residents: dict[str, list[np.ndarray]] = {name: [] for name in manifest["state"]}
+    for token in first:
+        outputs = run(
+            {
+                "token": np.array([token], dtype=np.int64),
+                "source_row": np.zeros(1, dtype=np.int64),
+                "candidates": np.tile(whole, (1, 1)),
+                **prefix,
+                **_worker_index(prefix),
+                **mask,
+                **{name: by_name[name] for name in manifest["state"]},
+            }
+        )
+        for name, tensor in zip(manifest["state"], outputs[1:], strict=True):
+            residents[name].append(tensor)
+    state128 = {name: np.concatenate(rows, axis=0) for name, rows in residents.items()}
+    target = _tokens("我")[0]
+
+    def advance(rows: int) -> np.ndarray:
+        outputs = run(
+            {
+                "token": np.array([target, *(_tokens(*CHARS) * 17)[: rows - 1]], dtype=np.int64),
+                "source_row": np.arange(rows, dtype=np.int64),
+                "candidates": np.tile(whole, (rows, 1)),
+                **prefix,
+                "prefix_row": np.zeros(rows, dtype=np.int64),
+                **mask,
+                **state128,
+            }
+        )
+        return outputs[0]
+
+    solo = advance(1)[0]
+    batched = advance(128)[0]
+    np.testing.assert_array_equal(solo, batched, err_msg="int8 scores move with the batch")

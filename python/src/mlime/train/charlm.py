@@ -675,23 +675,73 @@ def _external_weights(step_graph: Path, prefill_graph: Path) -> dict[str, Any]:
     return {"file": "charlm.weights", "tensors": list(step_table.values())}
 
 
-def _quantize_dynamic_int8(graph: Path) -> None:
-    """Rewrite *graph* in place with every MatMul weight dynamic-quantized to int8."""
-    from onnxruntime.quantization import QuantType, quantize_dynamic
+def _quantize_weights_int8(graph: Path) -> None:
+    """Rewrite *graph* in place keeping only the MatMul weights int8.
 
-    quantized = graph.with_suffix(".quantized.onnx")
-    quantize_dynamic(
-        graph,
-        quantized,
-        op_types_to_quantize=["MatMul"],
-        per_channel=True,
-        # Seven-bit weights: x86 kernels without VNNI multiply u8 x s8 into a
-        # saturating 16-bit lane and full-range int8 overflows it (0.12 nats
-        # off on the fixture), while arm64 loses nothing measurable (0.029).
-        reduce_range=True,
-        weight_type=QuantType.QInt8,
+    Each weight folds into a per-output-channel int8 constant plus a
+    ``DequantizeLinear`` that rebuilds it float32 ahead of the matmul, so
+    activations stay float32 end to end and no row's value depends on its
+    batchmates. Full int8 range applies: nothing here reaches a u8 x s8
+    kernel, so the seven-bit guard of the dynamic path is unneeded.
+    """
+    model = onnx.load(str(graph))
+    initializers = {tensor.name: tensor for tensor in model.graph.initializer}
+    added: list[onnx.TensorProto] = []
+    dropped: set[str] = set()
+    dequantized: dict[str, str] = {}  # weight name -> dequantized tensor name
+    nodes: list[onnx.NodeProto] = []
+    for node in model.graph.node:
+        weight_input = -1
+        if node.op_type == "MatMul":
+            for index in (0, 1):
+                if node.input[index] in initializers:
+                    weight_input = index
+                    break
+        if weight_input >= 0:
+            wname = node.input[weight_input]
+            if wname not in dequantized:
+                weight = onnx.numpy_helper.to_array(initializers[wname]).astype(np.float32)
+                # Channels are the matmul's output features: the last axis of
+                # a [K, N] weight, or the first of [N, K].
+                axis = weight.ndim - 1 if weight_input == 1 else 0
+                bound = np.abs(weight).max(axis=axis ^ 1)
+                scale = (bound / 127.0).astype(np.float32)
+                scale[scale == 0.0] = 1.0
+                shape = [1] * weight.ndim
+                shape[axis] = weight.shape[axis]
+                quantized_weight = np.clip(
+                    np.round(weight / scale.reshape(shape)), -127, 127
+                ).astype(np.int8)
+                added += [
+                    onnx.numpy_helper.from_array(quantized_weight, f"{wname}_int8"),
+                    onnx.numpy_helper.from_array(scale, f"{wname}_scale"),
+                ]
+                dequantized[wname] = f"{wname}_dequantized"
+                dropped.add(wname)
+                nodes.append(
+                    onnx.helper.make_node(
+                        "DequantizeLinear",
+                        [f"{wname}_int8", f"{wname}_scale"],
+                        [dequantized[wname]],
+                        axis=axis,
+                    )
+                )
+            inputs = list(node.input)
+            inputs[weight_input] = dequantized[wname]
+            nodes.append(onnx.helper.make_node("MatMul", inputs, list(node.output), name=node.name))
+        else:
+            nodes.append(node)
+    model.graph.ClearField("node")
+    model.graph.node.extend(nodes)
+    kept = {name for node in model.graph.node for name in node.input if name in initializers}
+    model.graph.ClearField("initializer")
+    model.graph.initializer.extend(
+        tensor for name, tensor in initializers.items() if name not in dropped or name in kept
     )
-    quantized.replace(graph)
+    model.graph.initializer.extend(added)
+    rewritten = graph.with_suffix(".rewritten.onnx")
+    onnx.save_model(model, str(rewritten))
+    rewritten.replace(graph)
 
 
 def export_onnx(
@@ -740,15 +790,17 @@ def export_onnx(
     ``weights`` table maps name-by-name so the Rust decoder can share one
     mapping across its sessions.
 
-    With ``quantize="int8"`` every MatMul's weight is dynamic-quantized to
-    int8 (per channel) between the torch export and externalisation; the
-    manifest table then also carries ``int8`` tensors. With
-    ``quantize="fp16"`` the model is halved before export, so the weights,
-    the prefix buffers and the state tensors are all ``float16`` while
-    ``candidate_log_probs`` stays ``float32`` through the output cast.
+    With ``quantize="int8"`` every MatMul's weight folds into a
+    per-channel int8 constant plus a ``DequantizeLinear`` -- activations
+    stay float32, so a row's scores cannot move with its batchmates
+    (issue #93). With ``quantize="fp16"`` the model is halved before
+    export, so the weights, the prefix buffers and the state tensors are
+    all ``float16`` while ``candidate_log_probs`` stays ``float32`` through
+    the output cast.
     """
-    if quantize not in (None, "int8", "fp16"):
-        raise ValueError(f"quantize must be 'int8', 'fp16' or None, got {quantize!r}")
+    choices = (None, "int8", "fp16")
+    if quantize not in choices:
+        raise ValueError(f"quantize must be one of {choices}, got {quantize!r}")
     device = torch.device("cpu")
     model, vocab, step = load_model(checkpoint, device)
     model.eval()
@@ -857,8 +909,8 @@ def export_onnx(
         dynamo=False,
     )
     if quantize == "int8":
-        _quantize_dynamic_int8(step_graph)
-        _quantize_dynamic_int8(prefill_graph)
+        _quantize_weights_int8(step_graph)
+        _quantize_weights_int8(prefill_graph)
     weights = _external_weights(step_graph, prefill_graph)
     manifest = out_dir / "charlm.json"
     manifest.write_text(
@@ -870,7 +922,7 @@ def export_onnx(
                 "prefix": list(prefix_names),
                 "state": list(state_names),
                 "layout": "resident-candidates",
-                "dtype": {None: "float32", "int8": "float32", "fp16": "float16"}[quantize],
+                "dtype": "float16" if quantize == "fp16" else "float32",
                 "rows": {
                     "prefix": [
                         [*tensor.shape[1:3], model.config.context_chars + 2, tensor.shape[4]]
