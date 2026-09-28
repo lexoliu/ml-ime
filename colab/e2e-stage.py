@@ -5,10 +5,10 @@ Runs on the VM as its own process, which `colab/e2e.sh start` launches
 credentials, the kernel script, its metadata and the checkpoint publisher. It recreates the mount layout the
 Kaggle kernel expects by downloading the same datasets, stages the resume
 point -- the newest `checkpoint-paused` trio by step among the latest
-COMPLETE Kaggle segment's output and the `mlime-e2e-resume` dataset -- stamps
+COMPLETE Kaggle segment's output and the two `mlime-e2e-resume-{a,b}` slots -- stamps
 the segment number and the interval checkpoint cadence into the kernel,
 launches it detached, and launches the publisher beside it: every interval
-trio lands in `mlime-e2e-resume`, so a VM that dies without warning loses
+trio lands in one of the `mlime-e2e-resume-{a,b}` slots, so a VM that dies without warning loses
 minutes of training, not the leg.
 """
 
@@ -25,7 +25,8 @@ WORKING = Path("/kaggle/working")
 KERNEL = Path("/kaggle/kernel.py")
 METADATA = Path("/kaggle/kernel-metadata.json")
 PUBLISHER = Path("/kaggle/e2e-publish.py")
-RESUME_DATASET = "lexoliu/mlime-e2e-resume"
+#: The two slots the publisher alternates between (see e2e-publish.py).
+RESUME_DATASETS = ("lexoliu/mlime-e2e-resume-a", "lexoliu/mlime-e2e-resume-b")
 SEGMENT_SLUG = "lexoliu/mlime-e2e-s"
 RESUME_MARKERS = ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
 #: The cadence a Colab leg checkpoints at: the VM can die without warning, so
@@ -178,7 +179,7 @@ def main():
         # The resume dataset holds the Colab leg's checkpoints; before the
         # first Colab segment it does not exist, and the kernel tolerates its
         # absence the way it would on Kaggle.
-        download(dataset, tolerate=(dataset == RESUME_DATASET))
+        download(dataset, tolerate=(dataset in RESUME_DATASETS))
     latest = latest_segment()
     if latest is not None:
         kernel_output(latest)
