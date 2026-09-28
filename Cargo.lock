@@ -1733,6 +1733,7 @@ dependencies = [
  "ime-eval",
  "ime-g2p",
  "ime-lm",
+ "ime-neural",
  "ime-ngram",
  "ime-pinyin",
  "ime-synth",
@@ -1831,6 +1832,19 @@ dependencies = [
 [[package]]
 name = "ime-neural"
 version = "0.1.0"
+dependencies = [
+ "ime-decode",
+ "ime-pinyin",
+ "memmap2",
+ "ort",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "thread_local",
+ "tokenizers",
+ "tracing",
+ "tracing-subscriber",
+]
 
 [[package]]
 name = "ime-ngram"

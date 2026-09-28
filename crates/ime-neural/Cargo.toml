@@ -7,7 +7,29 @@ repository.workspace = true
 authors.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+# Apple Core ML execution provider (ANE/GPU): `ort`'s `coreml` feature.
+gpu-coreml = ["ort/coreml"]
+# WebGPU execution provider over Dawn/Metal: `ort`'s `webgpu` feature.
+gpu-webgpu = ["ort/webgpu"]
+# NVIDIA CUDA execution provider: `ort`'s `cuda` feature (the Kaggle T4 leg).
+gpu-cuda = ["ort/cuda"]
+
 [dependencies]
+ime-decode.workspace = true
+memmap2.workspace = true
+ort.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+thread_local.workspace = true
+tokenizers.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+ime-pinyin.workspace = true
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

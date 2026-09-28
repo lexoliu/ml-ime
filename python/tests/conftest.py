@@ -20,6 +20,7 @@ from pathlib import Path
 import polars as pl
 import pytest
 import torch
+from tokenizers import Tokenizer, models
 
 from mlime.data.corpus import SAMPLE_SCHEMA, Sample
 from mlime.train.arbitration import ReadingArbitration
@@ -81,6 +82,21 @@ class StubTokenizer:
             ids[row, len(tokens)] = self.sep_token_id
             mask[row, : len(tokens) + 1] = 1
         return {"input_ids": ids, "attention_mask": mask}
+
+    def save(self, path: str) -> None:
+        """Write a minimal tokenizer.json: the sentinels and nothing else."""
+        inner = Tokenizer(
+            models.WordLevel(
+                {
+                    "[PAD]": self.pad_token_id,
+                    "[CLS]": self.cls_token_id,
+                    "[SEP]": self.sep_token_id,
+                    "[MASK]": self.mask_token_id,
+                },
+                unk_token="[UNK]",
+            )
+        )
+        inner.save(path)
 
 
 @pytest.fixture(name="spans")
