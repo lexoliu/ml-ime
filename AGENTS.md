@@ -54,7 +54,7 @@ table does not load, so an export and the decoder always move together.
 - The dev slice is a hash of the record (`--dev-share 0.0905`), so it survives reordering.
   Weights are chosen on dev (`--select-on-dev`) and reported on test; never tune on test.
 - Metrics: sentence top-1 and top-8 (or top-k at a wider beam, the oracle), character accuracy,
-  MRR. The current numbers to beat are in `notes/char-lm-v1.md`, `notes/route-a-v2.md` and
+  MRR. The current numbers to beat are in `notes/search-diversity.md`, `notes/char-lm-v2.md` and
   `notes/commercial-baselines.md`.
 - A change to the protocol (slices, weights, beam width, what counts as correct) is its own
   issue; it is never folded into a model comparison.

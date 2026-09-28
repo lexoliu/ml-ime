@@ -270,6 +270,148 @@ mod tests {
     }
 
     #[test]
+    fn the_list_keeps_the_runner_up_first_character() {
+        struct PerPosition {
+            scores: HashMap<(usize, CharId), f32>,
+        }
+        impl Emission for PerPosition {
+            fn score(&self, _path: usize, position: usize, candidate: CharId) -> f32 {
+                *self.scores.get(&(position, candidate)).unwrap_or(&-20.0)
+            }
+        }
+        /// Scores nothing and remembers two characters, so prefixes that
+        /// diverge at position 0 are not merged away before they can finish.
+        struct Flat;
+        impl Transition for Flat {
+            const HISTORY: usize = 2;
+            type State = ();
+            fn start(&self, _context: Option<&str>, _asked: &Asked<'_>) -> Self::State {}
+            fn score(&self, _state: &Self::State, _candidate: CharId) -> f32 {
+                0.0
+            }
+            fn finish(&self, _state: &Self::State) -> f32 {
+                0.0
+            }
+            fn advance(&self, steps: &[(&Self::State, CharId, Asked<'_>)]) -> Vec<Self::State> {
+                vec![(); steps.len()]
+            }
+        }
+        let (table, lexicon) = fixture();
+        let batch = candidates("tashi", &table, &lexicon);
+        let ta = lexicon.id_of('他').expect("他");
+        let ta2 = lexicon.id_of('她').expect("她");
+        // `tashi` reads as `ta` + `shi`; the second position admits enough
+        // characters for the stronger first character's tails to fill top-8.
+        let path = batch
+            .paths()
+            .iter()
+            .find(|path| path.len() == 2)
+            .expect("tashi reads as two syllables");
+        let second = &path.positions()[1];
+        assert!(second.len() >= 10, "the fixture needs a wide tail");
+        assert!(path.positions()[0].contains(&ta2));
+        let mut scores = HashMap::new();
+        // The runner-up is close behind, and at least eight of the winner's
+        // tails are closer -- so a score-ordered top-8 cannot reach it, while
+        // the 16-wide beam still carries it to the end.
+        scores.insert((0, ta), 0.0);
+        scores.insert((0, ta2), -0.2);
+        let mut tail = 0.0f32;
+        for &ch in second {
+            scores.insert((1, ch), tail);
+            tail -= 0.02;
+        }
+        let best = decode(
+            &batch,
+            PerPosition { scores },
+            &Flat,
+            None,
+            &BeamOptions::default(),
+        )
+        .expect("tashi decodes");
+        assert_eq!(best[0].chars()[0], ta, "top-1 stays the best hypothesis");
+        assert!(
+            best.iter().any(|h| h.chars()[0] == ta2),
+            "the runner-up reading of position 0 is listed: {:?}",
+            best.iter().map(|h| h.text(&lexicon)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn the_beam_keeps_a_runner_up_reading_alive() {
+        struct PerPosition {
+            scores: HashMap<(usize, CharId), f32>,
+        }
+        impl Emission for PerPosition {
+            fn score(&self, _path: usize, position: usize, candidate: CharId) -> f32 {
+                *self.scores.get(&(position, candidate)).unwrap_or(&-20.0)
+            }
+        }
+        let (table, lexicon) = fixture();
+        let batch = candidates("tashi", &table, &lexicon);
+        let ta = lexicon.id_of('他').expect("他");
+        let ta2 = lexicon.id_of('她').expect("她");
+        let path = batch
+            .paths()
+            .iter()
+            .find(|path| path.len() == 2)
+            .expect("tashi reads as two syllables");
+        let second = &path.positions()[1];
+        // `她` trails `他` by 0.2 at position 0, and every `他` tail beats
+        // every `她` tail, so under a one-character history each `她x`
+        // merges into `他x` -- without a guard no `她` state can reach
+        // position 1 at all.
+        assert!(second.len() >= 10, "the fixture needs a wide tail");
+        assert!(path.positions()[0].contains(&ta2));
+        let mut scores = HashMap::new();
+        scores.insert((0, ta), 0.0);
+        scores.insert((0, ta2), -0.2);
+        let mut tail = 0.0f32;
+        for &ch in second {
+            scores.insert((1, ch), tail);
+            tail -= 0.02;
+        }
+        let narrow = BeamOptions {
+            diversity_gap: 0.0,
+            ..BeamOptions::default()
+        };
+        let plain = decode(
+            &batch,
+            PerPosition {
+                scores: scores.clone(),
+            },
+            &NoTransition,
+            None,
+            &narrow,
+        )
+        .expect("tashi decodes");
+        assert!(
+            plain.iter().all(|h| h.chars()[0] == ta),
+            "without the guard every survivor reads the winner's character: {:?}",
+            plain.iter().map(|h| h.text(&lexicon)).collect::<Vec<_>>()
+        );
+        let guarded = BeamOptions {
+            diversity_gap: 0.5,
+            diversity_chars: 2,
+            ..BeamOptions::default()
+        };
+        let best = decode(
+            &batch,
+            PerPosition { scores },
+            &NoTransition,
+            None,
+            &guarded,
+        )
+        .expect("tashi decodes");
+        assert_eq!(best[0].chars()[0], ta, "top-1 stays the best hypothesis");
+        assert!(
+            best.iter().any(|h| h.chars()[0] == ta2),
+            "the guarded runner-up survives the beam and reaches the list: {:?}",
+            best.iter().map(|h| h.text(&lexicon)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn an_empty_batch_is_rejected() {
         let (_, lexicon) = fixture();
         assert_eq!(
