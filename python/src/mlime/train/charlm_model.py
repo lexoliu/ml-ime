@@ -253,7 +253,10 @@ class Block(nn.Module):
         workers = prefix_keys.shape[0]
         queries = q.view(workers, -1, self.heads, 1, self.head_dim)
         prefix_scores = (queries @ prefix_keys.unsqueeze(1).transpose(-1, -2)).masked_fill(
-            prefix_mask.logical_not().view(workers, 1, 1, 1, -1), float("-inf")
+            prefix_mask.logical_not().view(workers, 1, 1, 1, -1),
+            # A typed fill value: the python float would trace as fp32 and the
+            # legacy exporter would reconcile by casting the block to float.
+            torch.tensor(float("-inf"), dtype=q.dtype),
         )
         scores = torch.cat(
             [
@@ -261,7 +264,12 @@ class Block(nn.Module):
                 (q @ keys.transpose(-1, -2)).view(workers, -1, self.heads, 1, keys.shape[2]),
             ],
             dim=-1,
-        ) / math.sqrt(self.head_dim)
+        ) / torch.tensor(
+            math.sqrt(self.head_dim),
+            # A typed divisor: the python float would trace as fp32 and the
+            # legacy exporter would reconcile by casting the block to float.
+            dtype=q.dtype,
+        )
         probs = torch.softmax(scores, dim=-1)
         split = prefix_keys.shape[2]
         attended = probs[..., :split] @ prefix_values.unsqueeze(1) + (
@@ -327,7 +335,18 @@ class TransformerCharLm(CharLm):
         keys, values = [], []
         for block in self.layers():
             q, k, v = block.split(x)
-            attended = nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True)
+            # The same arithmetic as ``scaled_dot_product_attention`` spelled
+            # out: the fused operator's internals trace scalar constants as
+            # fp32, which spoils an fp16 export.
+            scores = (q @ k.transpose(-1, -2)) / torch.tensor(
+                math.sqrt(block.head_dim), dtype=q.dtype
+            )
+            length = q.shape[2]
+            causal = torch.triu(
+                torch.ones(length, length, dtype=torch.bool, device=q.device), diagonal=1
+            )
+            scores = scores.masked_fill(causal, torch.tensor(float("-inf"), dtype=q.dtype))
+            attended = torch.softmax(scores, dim=-1) @ v
             x = block.merge(x, attended)
             keys.append(k)
             values.append(v)
@@ -342,6 +361,7 @@ class TransformerCharLm(CharLm):
                 self.config.hidden // self.config.heads,
             ),
             device=tokens.device,
+            dtype=x.dtype,
         )
         last: torch.Tensor = self.norm(x)[:, -1]
         return last, prefix, (empty, empty.clone())
@@ -430,15 +450,23 @@ class Restricted(nn.Module):
         return full.scatter(1, index, kept)
 
 
-class StepModule(nn.Module):
-    """The step graph: ``(token, *prefix, mask?, *state) -> (log_probs, *next_state)``.
+class ResidentStepModule(nn.Module):
+    """The step graph with the beam state resident beside the session.
 
-    ``token`` and the state tensors take one row per beam, laid out as
-    ``[workers, width]``; the prefix tensors take one row per worker and the
-    mask ``[workers, T]`` marks their real positions. The mask input sits
-    between the prefix and state tensors, and exists only where the model has
-    a prefix to mask (the transformer): a model without prefix tensors takes
-    ``(token, *state)`` over a flat batch as before.
+    Between runs the state tensors live wherever the session's allocator
+    puts them -- the device for a GPU backend, the heap for the CPU -- and
+    the host passes only which row each new beam continues from:
+
+    ``token [rows]`` is each beam's next character and ``source_row [rows]``
+    its index into the state buffers; ``keys``/``values`` (the transformer)
+    or ``hidden``/``cell`` (the LSTM) are the resident state tensors the
+    batch gathers, laid out ``[rows, layers, heads, time, head_dim]``; the
+    prefix buffers take one slot per worker, ``prefix_row [workers]`` naming
+    which slot feeds each ``width``-row block, and ``prefix_mask``
+    ``[slots, T]`` marks the real positions. The output ``next_*`` tensors
+    are the rows the caller binds over fresh buffers -- read through them,
+    the old buffers release when their last beam moves on, so nothing ever
+    writes into a row a live state still reads.
     """
 
     def __init__(self, model: CharLm, keep: torch.Tensor | None = None):
@@ -446,16 +474,35 @@ class StepModule(nn.Module):
         self.model = model
         self.restricted = Restricted(model, keep)
 
-    def forward(self, token: torch.Tensor, *tensors: torch.Tensor) -> tuple[torch.Tensor, ...]:
+    def forward(
+        self, token: torch.Tensor, source_row: torch.Tensor, *tensors: torch.Tensor
+    ) -> tuple[torch.Tensor, ...]:
         split = len(self.model.prefix_names)
-        prefix, rest = tensors[:split], tensors[split:]
-        mask, state = (rest[0], rest[1:]) if split else (None, rest)
+        prefix_buffers, rest = tensors[:split], tensors[split:]
+        if split:
+            prefix_row, prefix_mask = rest[0], rest[1]
+            state_buffers = rest[2:]
+            prefix = tuple(buffer.index_select(0, prefix_row) for buffer in prefix_buffers)
+            mask = prefix_mask.index_select(0, prefix_row)
+        else:
+            prefix, mask, state_buffers = (), None, rest
+        state = tuple(buffer.index_select(0, source_row) for buffer in state_buffers)
         features, state = self.model.step(token, prefix, state, mask)
         return (self.restricted(features), *state)
 
 
 class PrefillModule(nn.Module):
-    """The prefill graph: ``tokens [1, T] -> (log_probs, *prefix, *state)``."""
+    """The prefill graph, emitted in the resident layout.
+
+    ``tokens [1, T] -> (log_probs, *prefix, prefix_mask, *state)``. A
+    prefix row lands directly in its resident slot, whose buffers are
+    shaped to the widest prelude -- ``<bos>`` + ``context_chars`` +
+    ``<sep>`` -- so each prefix tensor is left-padded to that width on its
+    time axis and the mask row the step graph reads is emitted with it;
+    the step binds the graph's outputs over the slot's rows without a
+    copy. A model without prefix tensors (the LSTM) emits
+    ``(log_probs, *state)``.
+    """
 
     def __init__(self, model: CharLm, keep: torch.Tensor | None = None):
         super().__init__()
@@ -464,4 +511,25 @@ class PrefillModule(nn.Module):
 
     def forward(self, tokens: torch.Tensor) -> tuple[torch.Tensor, ...]:
         features, prefix, state = self.model.prefill(tokens)
-        return (self.restricted(features), *prefix, *state)
+        if not prefix:
+            return (self.restricted(features), *state)
+        width = self.model.config.context_chars + 2
+        pad = width - tokens.shape[1]
+        padded = tuple(
+            torch.cat(
+                [
+                    tensor.new_zeros(
+                        tensor.shape[0],
+                        tensor.shape[1],
+                        tensor.shape[2],
+                        pad,
+                        tensor.shape[4],
+                    ),
+                    tensor,
+                ],
+                dim=3,
+            )
+            for tensor in prefix
+        )
+        mask = torch.arange(width, device=tokens.device).unsqueeze(0) >= pad
+        return (self.restricted(features), *padded, mask, *state)

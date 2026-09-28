@@ -3,6 +3,7 @@ agree with torch, and a stream of batches resumes from a saved position."""
 
 import json
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import onnx
@@ -173,6 +174,8 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
     export_onnx(checkpoint, tmp_path / "export", restrict)
     manifest = json.loads((tmp_path / "export" / "charlm.json").read_text())
     assert manifest["arch"] == arch
+    assert manifest["layout"] == "resident"
+    assert manifest["dtype"] == "float32"
     assert manifest["restricted_to"] == 5  # four characters plus <eos>
     weights = manifest["weights"]
     # One table shared by both graphs, or one per graph.
@@ -202,14 +205,17 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
     prelude = [BOS, *_tokens("你", "好"), SEP]
     beams = (_tokens("我", "吗"), _tokens("你", "好"))
     outputs = prefill.run(None, {"tokens": np.array([prelude], dtype=np.int64)})
-    names = ["log_probs", *manifest["prefix"], *manifest["state"]]
-    by_name = dict(zip(names, outputs, strict=True))
+    by_name = dict(zip((o.name for o in prefill.get_outputs()), outputs, strict=True))
     prefix = {name: by_name[name] for name in manifest["prefix"]}
-    mask = _prefix_mask(prefix)
+    mask = _prefix_mask(by_name)
+    indices = {
+        "source_row": np.arange(2, dtype=np.int64),
+        **_worker_index(prefix),
+    }
     state = {name: np.repeat(by_name[name], 2, axis=0) for name in manifest["state"]}
     for position in range(2):
         token = np.array([beam[position] for beam in beams], dtype=np.int64)
-        outputs = step.run(None, {"token": token, **prefix, **mask, **state})
+        outputs = step.run(None, {"token": token, **prefix, **indices, **mask, **state})
         log_probs = outputs[0]
         state = dict(zip(manifest["state"], outputs[1:], strict=True))
     from mlime.train.charlm import load_model
@@ -226,12 +232,19 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
     assert (log_probs[:, VOCAB.index["谢"]] == Restricted.UNREACHABLE).all()
 
 
-def _prefix_mask(prefix: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-    """The step's ``prefix_mask`` input: one all-real row, as wide as the prefix."""
+def _prefix_mask(outputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """The step's ``prefix_mask`` input: the row the prefill emitted, marked
+    where the padded prefix row's prelude positions are."""
+    if "prefix_mask" not in outputs:
+        return {}
+    return {"prefix_mask": outputs["prefix_mask"]}
+
+
+def _worker_index(prefix: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """The step's ``prefix_row`` input: both beams' rows share the worker's one slot."""
     if not prefix:
         return {}
-    width = next(iter(prefix.values())).shape[3]
-    return {"prefix_mask": np.ones((1, width), dtype=np.bool_)}
+    return {"prefix_row": np.zeros(1, dtype=np.int64)}
 
 
 def _run_export(dir: Path) -> list[np.ndarray]:
@@ -241,30 +254,36 @@ def _run_export(dir: Path) -> list[np.ndarray]:
     step = ort.InferenceSession(str(dir / "charlm.onnx"))
     prelude = [BOS, *_tokens("你", "好"), SEP]
     outputs = prefill.run(None, {"tokens": np.array([prelude], dtype=np.int64)})
-    names = ["log_probs", *manifest["prefix"], *manifest["state"]]
-    by_name = dict(zip(names, outputs, strict=True))
+    by_name = dict(zip((o.name for o in prefill.get_outputs()), outputs, strict=True))
     prefix = {name: by_name[name] for name in manifest["prefix"]}
-    mask = _prefix_mask(prefix)
+    mask = _prefix_mask(by_name)
+    indices = {
+        "source_row": np.arange(2, dtype=np.int64),
+        **_worker_index(prefix),
+    }
     state = {name: np.repeat(by_name[name], 2, axis=0) for name in manifest["state"]}
     rows = [by_name["log_probs"]]
     beams = (_tokens("我", "吗"), _tokens("你", "好"))
     for position in range(len(beams[0])):
         token = np.array([beam[position] for beam in beams], dtype=np.int64)
-        outputs = step.run(None, {"token": token, **prefix, **mask, **state})
+        outputs = step.run(None, {"token": token, **prefix, **indices, **mask, **state})
         rows.append(outputs[0])
         state = dict(zip(manifest["state"], outputs[1:], strict=True))
     return rows
 
 
-def test_int8_export_scores_within_005_nats_of_fp32(tmp_path: Path) -> None:
-    """The dynamic-quantized graphs load in onnxruntime and track the fp32 export."""
+@pytest.mark.parametrize("quantize", ["int8", "fp16"])
+def test_quantized_export_scores_within_005_nats_of_fp32(
+    quantize: Literal["int8", "fp16"], tmp_path: Path
+) -> None:
+    """The quantized graphs load in onnxruntime and track the fp32 export."""
     checkpoint = tmp_path / "charlm-final.pt"
     _checkpoint(checkpoint, "transformer")
     restrict = tmp_path / "emittable.txt"
     restrict.write_text("\n".join(CHARS[:4]) + "\n", encoding="utf-8")
     export_onnx(checkpoint, tmp_path / "fp32", restrict)
-    export_onnx(checkpoint, tmp_path / "int8", restrict, quantize="int8")
-    quantized = _run_export(tmp_path / "int8")
+    export_onnx(checkpoint, tmp_path / quantize, restrict, quantize=quantize)
+    quantized = _run_export(tmp_path / quantize)
     reference = _run_export(tmp_path / "fp32")
     for got, want in zip(quantized, reference, strict=True):
         np.testing.assert_allclose(got, want, atol=0.05)

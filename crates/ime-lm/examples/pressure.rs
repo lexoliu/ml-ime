@@ -116,13 +116,35 @@ fn states(model: &CharLm, work: &Work) -> Vec<LmState> {
     vec![model.start(Some(&work.context)); BEAM]
 }
 
+/// The process's peak resident set so far, from `/proc/self/status` — `None`
+/// off Linux — standing in for device memory while the arena is off.
+fn peak_rss_mb() -> Option<f64> {
+    let status = fs::read_to_string("/proc/self/status").ok()?;
+    let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
+    let kib = line.split_whitespace().nth(1)?.parse::<f64>().ok()?;
+    Some(kib / 1024.0)
+}
+
+/// The tracing subscriber: `ort` forwards the runtime's logging to
+/// `tracing` at TRACE, so `--ort-verbose` (`SessionShape::verbose_logging`)
+/// is `info,ort=trace`; `RUST_LOG` still wins when set.
+fn subscribe(verbose: bool) {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                tracing_subscriber::EnvFilter::new(if verbose { "info,ort=trace" } else { "info" })
+            }),
+        )
+        .init();
+}
+
 #[expect(
     clippy::cast_precision_loss,
     reason = "record and step counts are far under 2^53"
 )]
 fn main() {
-    tracing_subscriber::fmt::init();
     let (dir, batch, shape) = args();
+    subscribe(shape.verbose_logging);
     let table = SyllableTable::load();
     let source = fs::read_to_string(dir.join("char_pinyin.tsv"))
         .expect("char_pinyin.tsv is written beside the export");
@@ -208,12 +230,20 @@ fn main() {
         }
     }
     let elapsed = started.elapsed().as_secs_f64();
+    let bus = model.bus().totals();
     tracing::info!(
         records = total,
         seconds = elapsed,
         records_per_second = total as f64 / elapsed,
         step_calls,
         ms_per_step = elapsed * 1e3 / step_calls as f64,
+        step_bytes_up = bus.step_uploaded,
+        step_bytes_down = bus.step_downloaded,
+        bytes_per_step_up = bus.step_uploaded as f64 / step_calls as f64,
+        bytes_per_step_down = bus.step_downloaded as f64 / step_calls as f64,
+        start_bytes_up = bus.start_uploaded,
+        start_bytes_down = bus.start_downloaded,
+        peak_rss_mb = peak_rss_mb().unwrap_or(0.0),
         "pressure run done"
     );
 }
