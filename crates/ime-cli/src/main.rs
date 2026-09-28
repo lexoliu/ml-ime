@@ -15,6 +15,7 @@ use g2p::{ExportCommand, G2pCommand};
 use ime_decode::BeamOptions;
 use ime_eval::{EvalSet, evaluate};
 use ime_lm::CharLm;
+use ime_neural::RouteA;
 use ime_ngram::{Counter, NgramModel};
 use ime_pinyin::{Lexicon, SegmentOptions, SyllableTable};
 use neural::{Models, SliceArgs, parse_weight};
@@ -129,8 +130,24 @@ enum Command {
         eval_set: PathBuf,
         /// A gzipped score file written by `mlime train emit`. Omitted, the run
         /// is the n-gram baseline over the same slice.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "route_a")]
         scores: Option<PathBuf>,
+        /// A directory written by `mlime export route-a`: the emissions are
+        /// computed live by the towers instead of read from a score file.
+        #[arg(long)]
+        route_a: Option<PathBuf>,
+        /// Score the records without their contexts: every record's gate is
+        /// zeroed, the `context off` score file's live twin.
+        #[arg(long, requires = "route_a")]
+        no_context: bool,
+        /// Intra-op threads for the towers' sessions on the per-record path;
+        /// a lockstep run (a GPU backend or `--batch` above one) takes all of
+        /// them either way.
+        #[arg(long, default_value = "1", requires = "route_a")]
+        route_a_threads: NonZeroUsize,
+        /// Drop the n-gram and decode on the emissions alone.
+        #[arg(long)]
+        no_transition: bool,
         /// The same emittable set the lattice was written with.
         #[arg(long)]
         emittable: PathBuf,
@@ -142,9 +159,6 @@ enum Command {
         /// tuned on the dev slice in one pass.
         #[arg(long, value_parser = parse_weight, default_values_t = [1.0f32])]
         weight: Vec<f32>,
-        /// Drop the n-gram and decode on the emissions alone.
-        #[arg(long, requires = "scores")]
-        no_transition: bool,
         /// A directory the beam is dumped to: for every section the run
         /// evaluates, one JSON Lines file named for the section, one record's
         /// hypotheses and their scores per line. The report is unchanged.
@@ -163,14 +177,14 @@ enum Command {
         /// sized for.
         #[arg(long, default_value = "1")]
         batch: usize,
-        /// Which backend the character model's sessions run on. Asking for a
-        /// provider the binary was not compiled with is an error, never a
-        /// silent CPU session.
-        #[arg(long, value_enum, default_value = "cpu", requires = "lm")]
-        backend: neural::BackendArg,
+        /// Which backend the ONNX Runtime sessions run on -- the character
+        /// model's and the towers' alike. Asking for a provider the binary
+        /// was not compiled with is an error, never a silent CPU session.
+        #[arg(long, value_enum)]
+        backend: Option<neural::BackendArg>,
         /// ONNX Runtime's verbose session logging: the provider each graph
         /// node lands on, the evidence for whether a backend runs the step.
-        #[arg(long, requires = "lm")]
+        #[arg(long)]
         ort_verbose: bool,
         #[command(flatten)]
         slice: SliceArgs,
@@ -286,10 +300,13 @@ async fn main() -> Result<()> {
             lm_weight,
             eval_set,
             scores,
+            route_a,
+            no_context,
+            route_a_threads,
             emittable,
             unscored,
             weight,
-            no_transition: _,
+            no_transition,
             dump,
             progress,
             batch,
@@ -297,23 +314,32 @@ async fn main() -> Result<()> {
             ort_verbose,
             slice,
             search,
-        } => fused_eval(&FusedRun {
-            model: model.as_deref(),
-            lm: lm.as_deref(),
-            lm_weight,
-            eval_set: &eval_set,
-            scores: scores.as_deref(),
-            emittable: &emittable,
-            unscored,
-            weights: &weight,
-            dump: dump.as_deref(),
-            progress: progress.as_deref(),
-            batch,
-            backend: backend.backend(),
-            ort_verbose,
-            slice: &slice,
-            search: &search,
-        }),
+        } => {
+            if backend.is_some() && lm.is_none() && route_a.is_none() {
+                anyhow::bail!("--backend applies to a neural model, and this run has none");
+            }
+            fused_eval(&FusedRun {
+                model: model.as_deref(),
+                lm: lm.as_deref(),
+                lm_weight,
+                eval_set: &eval_set,
+                scores: scores.as_deref(),
+                route_a: route_a.as_deref(),
+                with_context: !no_context,
+                route_a_threads,
+                emittable: &emittable,
+                unscored,
+                weights: &weight,
+                no_transition,
+                dump: dump.as_deref(),
+                progress: progress.as_deref(),
+                batch,
+                backend: backend.unwrap_or_default(),
+                ort_verbose,
+                slice: &slice,
+                search: &search,
+            })
+        }
         Command::Corpus { command } => corpus::run(command).await,
         Command::G2p { command } => g2p::run(command).await,
         Command::Synth { command } => synth::run(command).await,
@@ -416,9 +442,17 @@ struct FusedRun<'a> {
     lm_weight: f32,
     eval_set: &'a Path,
     scores: Option<&'a Path>,
+    /// The towers' export directory, when emissions are computed live.
+    route_a: Option<&'a Path>,
+    /// Whether live emissions read the record's context.
+    with_context: bool,
+    /// Intra-op threads per towers session on the per-record path.
+    route_a_threads: NonZeroUsize,
     emittable: &'a Path,
     unscored: f32,
     weights: &'a [f32],
+    /// Whether the run drops the transition, emissions alone.
+    no_transition: bool,
     /// Where every evaluated section's beam lands, or `None` to report only.
     dump: Option<&'a Path>,
     /// Where every configuration's per-record progress lands, or `None` to
@@ -426,8 +460,8 @@ struct FusedRun<'a> {
     progress: Option<&'a Path>,
     /// Records per lockstep batch; one is the per-record rayon path.
     batch: usize,
-    /// Which backend the character model's sessions run on.
-    backend: ime_lm::Backend,
+    /// Which backend the ONNX Runtime sessions run on.
+    backend: neural::BackendArg,
     /// ONNX Runtime's verbose session logging.
     ort_verbose: bool,
     slice: &'a SliceArgs,
@@ -441,22 +475,50 @@ impl FusedRun<'_> {
     /// the per-record rayon path keeps one thread a session, the decoder
     /// itself being the parallel layer. `width` is the beam width the decode
     /// runs: a worker's survivors fill a block of the rectangle.
-    fn session_shape(&self) -> ime_lm::SessionShape {
-        let lockstep = self.batch > 1 || self.backend != ime_lm::Backend::Cpu;
-        ime_lm::SessionShape {
-            backend: self.backend,
-            intra_threads: if lockstep {
-                std::thread::available_parallelism().unwrap_or(std::num::NonZeroUsize::MIN)
-            } else {
-                std::num::NonZeroUsize::MIN
-            },
+    fn session_shape(&self) -> Result<ime_lm::SessionShape> {
+        let lockstep = self.batch > 1 || self.backend.backend() != ime_lm::Backend::Cpu;
+        let intra_threads = if lockstep {
+            std::thread::available_parallelism()
+                .context("could not ask the platform for its thread count")?
+        } else {
+            NonZeroUsize::MIN
+        };
+        Ok(ime_lm::SessionShape {
+            backend: self.backend.backend(),
+            intra_threads,
             width: self.search.beam_width,
             verbose_logging: self.ort_verbose,
-        }
+        })
+    }
+
+    /// The shape the towers' sessions are built to: one intra-op thread per
+    /// session on the per-record path unless `--route-a-threads` asks for
+    /// more, all of them on the lockstep path.
+    fn neural_shape(&self) -> Result<ime_neural::SessionShape> {
+        let lockstep = self.batch > 1 || self.backend.neural_backend() != ime_neural::Backend::Cpu;
+        let intra_threads = if lockstep {
+            std::thread::available_parallelism()
+                .context("could not ask the platform for its thread count")?
+        } else {
+            self.route_a_threads
+        };
+        Ok(ime_neural::SessionShape {
+            backend: self.backend.neural_backend(),
+            intra_threads,
+            verbose_logging: self.ort_verbose,
+        })
     }
 }
 
 fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
+    if run.no_transition && run.scores.is_none() && run.route_a.is_none() {
+        anyhow::bail!(
+            "--no-transition decodes on emissions that --scores or --route-a must supply"
+        );
+    }
+    if run.slice.select_on_dev && run.scores.is_none() && run.route_a.is_none() {
+        anyhow::bail!("--select-on-dev sweeps emissions that --scores or --route-a must supply");
+    }
     let (table, lexicon) = tables()?;
     let ngram = run
         .model
@@ -465,8 +527,15 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
     let lm = run
         .lm
         .map(|dir| {
-            CharLm::open(dir, &lexicon, run.session_shape())
+            CharLm::open(dir, &lexicon, run.session_shape()?)
                 .with_context(|| format!("could not open the character model in {}", dir.display()))
+        })
+        .transpose()?;
+    let towers = run
+        .route_a
+        .map(|dir| {
+            RouteA::open(dir, run.neural_shape()?)
+                .with_context(|| format!("could not open the route A export in {}", dir.display()))
         })
         .transpose()?;
     let transition = match (ngram.as_ref(), lm.as_ref()) {
@@ -488,6 +557,9 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
     let rendered = neural::fused_eval(
         run.eval_set,
         run.scores,
+        run.route_a
+            .zip(towers.as_ref())
+            .map(|(path, towers)| (path, towers, run.with_context)),
         run.emittable,
         run.unscored,
         run.weights,
