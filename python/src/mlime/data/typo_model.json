@@ -1,0 +1,69 @@
+{
+  "per_sentence": 0.35,
+  "edit_count": {
+    "1": 0.62,
+    "2": 0.25,
+    "3": 0.10,
+    "4": 0.03
+  },
+  "edit_type": {
+    "adjacent": 0.42,
+    "transposition": 0.14,
+    "omission": 0.16,
+    "doubling": 0.08,
+    "fuzzy": 0.20
+  },
+  "initials": [
+    "b", "p", "m", "f",
+    "d", "t", "n", "l",
+    "g", "k", "h",
+    "j", "q", "x",
+    "zh", "ch", "sh", "r",
+    "z", "c", "s",
+    "y", "w"
+  ],
+  "neighbours": {
+    "a": "qwsz",
+    "b": "vgnh",
+    "c": "xdfv",
+    "d": "serfcx",
+    "e": "wsdr",
+    "f": "drtgvc",
+    "g": "ftyhbv",
+    "h": "gyujnb",
+    "i": "ujko",
+    "j": "huikmn",
+    "k": "jiolm",
+    "l": "kop",
+    "m": "njk",
+    "n": "bhjm",
+    "o": "iklp",
+    "p": "ol",
+    "q": "wa",
+    "r": "edft",
+    "s": "awedxz",
+    "t": "rfgy",
+    "u": "yhji",
+    "v": "cfgb",
+    "w": "qase",
+    "x": "zsdc",
+    "y": "tghu",
+    "z": "asx"
+  },
+  "fuzzy_pairs": [
+    { "from": "zh", "to": "z", "where": "initial", "weight": 0.55 },
+    { "from": "z", "to": "zh", "where": "initial", "weight": 0.45 },
+    { "from": "ch", "to": "c", "where": "initial", "weight": 0.55 },
+    { "from": "c", "to": "ch", "where": "initial", "weight": 0.45 },
+    { "from": "sh", "to": "s", "where": "initial", "weight": 0.55 },
+    { "from": "s", "to": "sh", "where": "initial", "weight": 0.45 },
+    { "from": "n", "to": "l", "where": "initial", "weight": 0.5 },
+    { "from": "l", "to": "n", "where": "initial", "weight": 0.5 },
+    { "from": "an", "to": "ang", "where": "final", "weight": 0.45 },
+    { "from": "ang", "to": "an", "where": "final", "weight": 0.55 },
+    { "from": "en", "to": "eng", "where": "final", "weight": 0.45 },
+    { "from": "eng", "to": "en", "where": "final", "weight": 0.55 },
+    { "from": "in", "to": "ing", "where": "final", "weight": 0.45 },
+    { "from": "ing", "to": "in", "where": "final", "weight": 0.55 }
+  ]
+}

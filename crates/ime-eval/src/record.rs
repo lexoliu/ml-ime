@@ -22,6 +22,14 @@ pub struct EvalRecord {
     /// record deliberately measures the engine without it.
     #[serde(default)]
     pub context: Option<String>,
+    /// The keystrokes this record corrupts, when it is a typo twin's.
+    ///
+    /// A typo twin retypes another set's records with errors: `pinyin` is what
+    /// was pressed and `clean` what should have been. The corrupted record
+    /// keeps the clean record's identity -- its digest is the clean
+    /// keystrokes' -- so the twin's dev and test slices are the parent set's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clean: Option<String>,
 }
 
 impl EvalRecord {
@@ -34,7 +42,7 @@ impl EvalRecord {
     #[must_use]
     pub fn digest(&self) -> u64 {
         let mut hasher = Blake2b::<U8>::new();
-        hasher.update(self.pinyin.as_bytes());
+        hasher.update(self.clean.as_deref().unwrap_or(&self.pinyin).as_bytes());
         hasher.update([0]);
         hasher.update(self.text.as_bytes());
         hasher.update([0]);
@@ -125,6 +133,12 @@ impl EvalSet {
                 return Err(EvalError::EmptyField {
                     line,
                     field: "text",
+                });
+            }
+            if record.clean.as_deref().is_some_and(str::is_empty) {
+                return Err(EvalError::EmptyField {
+                    line,
+                    field: "clean",
                 });
             }
             records.push(record);
