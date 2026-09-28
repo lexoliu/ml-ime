@@ -91,19 +91,24 @@ def _expected(export: Path) -> dict:
     index = VOCAB.index
     prelude = [BOS, *[index[ch] for ch in CONTEXT], SEP]
     outputs = prefill.run(None, {"tokens": np.array([prelude], dtype=np.int64)})
-    names = ["log_probs", *manifest["prefix"], *manifest["state"]]
-    by_name = dict(zip(names, outputs, strict=True))
+    by_name = dict(zip((o.name for o in prefill.get_outputs()), outputs, strict=True))
     prefix = {name: by_name[name] for name in manifest["prefix"]}
-    mask = (
-        {"prefix_mask": np.ones((1, prefix["prefix_keys"].shape[3]), dtype=np.bool_)}
-        if prefix
-        else {}
-    )
+    # The prefill emits the mask row with the padded prefix rows; the step
+    # reads it as the resident slot's mask.
+    mask = {"prefix_mask": by_name["prefix_mask"]} if prefix else {}
+    # The resident state buffer holds one row per beam, each beam's row its
+    # index; the resident prefix and mask are the single worker's slot.
     state = {name: np.repeat(by_name[name], len(BEAMS), axis=0) for name in manifest["state"]}
+    rows = np.arange(len(BEAMS), dtype=np.int64)
+    indices = (
+        {"source_row": rows, "prefix_row": np.zeros(1, dtype=np.int64)}
+        if prefix
+        else {"source_row": rows}
+    )
     steps = []
     for position in range(len(BEAMS[0])):
         token = np.array([index[beam[position]] for beam in BEAMS], dtype=np.int64)
-        outputs = step.run(None, {"token": token, **prefix, **mask, **state})
+        outputs = step.run(None, {"token": token, **prefix, **indices, **mask, **state})
         steps.append(outputs[0].tolist())
         state = dict(zip(manifest["state"], outputs[1:], strict=True))
     return {
@@ -127,10 +132,15 @@ def main() -> None:
             restrict = tmp_path / "emittable.txt"
             restrict.write_text("\n".join(RESTRICTED) + "\n", encoding="utf-8")
             export_onnx(checkpoint, out / arch, restrict)
-        (out / arch / "expected.json").write_text(
-            json.dumps(_expected(out / arch), ensure_ascii=False) + "\n", encoding="utf-8"
-        )
-        log.info("wrote fixture", dir=str(out / arch))
+            # The fp16 variant exercises the loader's second dtype; its
+            # expected.json is what the fp16 graphs themselves produce.
+            export_onnx(checkpoint, out / f"{arch}-fp16", restrict, quantize="fp16")
+        for variant in (arch, f"{arch}-fp16"):
+            (out / variant / "expected.json").write_text(
+                json.dumps(_expected(out / variant), ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            log.info("wrote fixture", dir=str(out / variant))
 
 
 if __name__ == "__main__":

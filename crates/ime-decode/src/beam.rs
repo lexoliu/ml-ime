@@ -121,14 +121,20 @@ struct Worker<'a, S> {
     /// The state position zero advances from: `start` over the record's
     /// context.
     start: S,
-    /// The beam levels filled so far, one per position decoded.
-    beams: Vec<Vec<Beam<S>>>,
+    /// The candidates surviving at each finished position — the backpointer
+    /// chain `reconstruct` walks. Keeping them without their states releases
+    /// a level's states the moment the next level lands, so a dead beam's
+    /// resident row is freed then rather than at `finish`.
+    history: Vec<Vec<Candidate>>,
+    /// The beams surviving at the current position; pushing a level's
+    /// `advance` replaces it wholesale.
+    latest: Vec<Beam<S>>,
 }
 
 impl<S> Worker<'_, S> {
     /// Whether the worker still has a position to decode.
     fn pending(&self) -> bool {
-        self.beams.len() < self.reading.len()
+        self.history.len() < self.reading.len()
     }
 
     /// Score this worker's candidates at its current position down to the
@@ -150,7 +156,7 @@ impl<S> Worker<'_, S> {
         E: Emission,
         T: Transition<State = S>,
     {
-        let position = self.beams.len();
+        let position = self.history.len();
         let allowed = &self.reading.positions()[position];
         let mut next: Vec<Candidate> = Vec::with_capacity(allowed.len());
         index.clear();
@@ -169,7 +175,7 @@ impl<S> Worker<'_, S> {
                 );
             }
         } else {
-            for (parent, beam) in self.beams[position - 1].iter().enumerate() {
+            for (parent, beam) in self.latest.iter().enumerate() {
                 for &ch in allowed {
                     let score = beam.candidate.score
                         + emission.score(self.path, position, ch)
@@ -195,10 +201,10 @@ impl<S> Worker<'_, S> {
     /// Follow the backpointers from a finished beam to the start of the
     /// sequence.
     fn reconstruct(&self, slot: usize) -> Vec<CharId> {
-        let mut chars = Vec::with_capacity(self.beams.len());
+        let mut chars = Vec::with_capacity(self.history.len());
         let mut current = slot;
-        for level in self.beams.iter().rev() {
-            let candidate = level[current].candidate;
+        for level in self.history.iter().rev() {
+            let candidate = level[current];
             chars.push(candidate.ch);
             current = candidate.parent;
         }
@@ -269,7 +275,8 @@ where
                 path,
                 reading,
                 start: transition.start(request.context),
-                beams: Vec::with_capacity(reading.len()),
+                history: Vec::with_capacity(reading.len()),
+                latest: Vec::new(),
             });
         }
     }
@@ -289,12 +296,11 @@ where
                 width,
                 &mut index,
             );
-            let position = worker.beams.len();
             for candidate in &next {
-                let state = if position == 0 {
+                let state = if worker.history.is_empty() {
                     &worker.start
                 } else {
-                    &worker.beams[position - 1][candidate.parent].state
+                    &worker.latest[candidate.parent].state
                 };
                 steps.push((state, candidate.ch));
             }
@@ -312,12 +318,15 @@ where
             .filter(|worker| worker.pending())
             .zip(chosen)
         {
-            worker.beams.push(
-                next.into_iter()
-                    .zip(&mut states)
-                    .map(|(candidate, state)| Beam { candidate, state })
-                    .collect(),
-            );
+            let beams: Vec<Beam<T::State>> = next
+                .into_iter()
+                .zip(&mut states)
+                .map(|(candidate, state)| Beam { candidate, state })
+                .collect();
+            worker
+                .history
+                .push(beams.iter().map(|beam| beam.candidate).collect());
+            worker.latest = beams;
         }
         debug_assert!(states.next().is_none(), "every advanced state lands");
     }
@@ -334,9 +343,10 @@ fn finish<T: Transition>(
 ) -> Vec<Vec<Hypothesis>> {
     let mut merged: Vec<Vec<Hypothesis>> = (0..records).map(|_| Vec::new()).collect();
     for worker in workers {
-        let Some(last) = worker.beams.last() else {
+        if worker.latest.is_empty() {
             continue;
-        };
+        }
+        let last = &worker.latest;
         let penalty = options.segmentation_weight * worker.reading.cost();
         let mut finished: Vec<(usize, f32)> = last
             .iter()

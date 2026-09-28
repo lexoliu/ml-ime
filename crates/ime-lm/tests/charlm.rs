@@ -7,72 +7,37 @@
 //! `cd python && uv run python scripts/charlm_fixtures.py
 //! ../crates/ime-lm/tests/fixtures`.
 
+mod common;
+
+use common::{expected, fixture_dir, lexicon, shape};
 use ime_decode::Transition;
-use ime_lm::{CharLm, LmState, SessionShape};
-use ime_pinyin::{CharId, Lexicon, SyllableTable};
-use serde::Deserialize;
+use ime_lm::{CharLm, LmState};
+use ime_pinyin::CharId;
 use std::fs;
-use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
 
-/// What `charlm_fixtures.py` recorded from the exported graphs.
-#[derive(Deserialize)]
-struct Expected {
-    /// The context `start` is called with (the prelude's middle).
-    context: String,
-    /// Two beams of two tokens each, as characters.
-    beams: Vec<String>,
-    /// `log_probs` after prefill: one row of the alphabet.
-    prefill: Vec<f32>,
-    /// `log_probs` after each step: two rows of the alphabet, per step.
-    steps: Vec<Vec<Vec<f32>>>,
-}
-
-fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
-
-fn lexicon(dir: &Path) -> Lexicon {
-    let table = SyllableTable::load();
-    let source = fs::read_to_string(dir.join("char_pinyin.tsv"))
-        .expect("char_pinyin.tsv is committed with the fixtures");
-    Lexicon::parse(&source, &table).expect("the fixture table parses")
-}
-
-/// The fixture's beam width as the rectangle's, so a full batch is two live
-/// rows and no dead row is ever fed.
-fn shape() -> SessionShape {
-    SessionShape {
-        width: NonZeroUsize::new(2).expect("two is not zero"),
-        ..SessionShape::default()
-    }
-}
-
-fn assert_close(got: &[f32], want: &[f32], what: &str) {
+fn assert_close(got: &[f32], want: &[f32], what: &str, atol: f32) {
     assert_eq!(got.len(), want.len(), "{what}: row length differs");
     for (index, (got, want)) in got.iter().zip(want).enumerate() {
         assert!(
-            (got - want).abs() <= 1e-4,
+            (got - want).abs() <= atol,
             "{what}[{index}]: got {got}, want {want}"
         );
     }
 }
 
 /// `start(Some(context))`, then two `advance` calls of two beams each, every
-/// log-probability row checked against what onnxruntime produced.
-fn run(arch: &str) {
+/// log-probability row checked against what onnxruntime produced. *atol* is
+/// the fp32 fixtures' near-exact bound, wider for fp16 whose half-precision
+/// arithmetic answers within a few hundredths of a nat.
+fn run(arch: &str, atol: f32) {
     let dir = fixture_dir();
     let lexicon = lexicon(&dir);
     let model = CharLm::open(&dir.join(arch), &lexicon, shape()).expect("the fixture opens");
-    let expected: Expected = serde_json::from_str(
-        &fs::read_to_string(dir.join(arch).join("expected.json"))
-            .expect("expected.json is committed with the fixture"),
-    )
-    .expect("expected.json parses");
+    let expected = expected(&dir, arch);
     assert_eq!(expected.beams.len(), 2, "the fixture has two beams");
 
     let start = model.start(Some(&expected.context));
-    assert_close(start.log_probs(), &expected.prefill, "prefill");
+    assert_close(start.log_probs(), &expected.prefill, "prefill", atol);
     // Every beam of a record starts from the same state; two clones of it are
     // the two beams the fixture recorded.
     let mut states = vec![start.clone(), start];
@@ -117,6 +82,7 @@ fn run(arch: &str) {
                 state.log_probs(),
                 &expected.steps[position][row],
                 &format!("{arch} step {position} beam {row}"),
+                atol,
             );
         }
     }
@@ -132,11 +98,7 @@ fn transformer_rows_from_different_records_match_solo_runs() {
     let lexicon = lexicon(&dir);
     let model =
         CharLm::open(&dir.join("transformer"), &lexicon, shape()).expect("the fixture opens");
-    let expected: Expected = serde_json::from_str(
-        &fs::read_to_string(dir.join("transformer").join("expected.json"))
-            .expect("expected.json is committed with the fixture"),
-    )
-    .expect("expected.json parses");
+    let expected = expected(&dir, "transformer");
 
     // A second prelude half as long, so its row of the batch is padded.
     let short: String = expected
@@ -187,15 +149,16 @@ fn transformer_rows_from_different_records_match_solo_runs() {
             state.log_probs(),
             solo.log_probs(),
             &format!("mixed batch row {row}"),
+            1e-4,
         );
     }
 }
 
-/// A manifest whose `layout` is not `"rectangular"` is an export built for
+/// A manifest whose `layout` is not `"resident"` is an export built for
 /// another batch layout: its graphs load and step until a broadcasting
 /// operator fails on the wrong shape, so `open` refuses it -- naming the
 /// directory and the re-export -- whether the field holds a foreign value or
-/// is absent, as every pre-rectangle manifest is.
+/// is absent, as every pre-resident manifest is.
 #[test]
 fn a_manifest_of_another_layout_is_refused() {
     let dir = fixture_dir();
@@ -254,9 +217,9 @@ fn a_manifest_of_another_layout_is_refused() {
 fn cuda_backend_fails_where_cuda_cannot_initialise() {
     let dir = fixture_dir();
     let lexicon = lexicon(&dir);
-    let shape = SessionShape {
+    let shape = ime_lm::SessionShape {
         backend: ime_lm::Backend::Cuda,
-        ..SessionShape::default()
+        ..ime_lm::SessionShape::default()
     };
     match CharLm::open(&dir.join("lstm"), &lexicon, shape) {
         Err(ime_lm::LmError::Provider { backend, .. }) => {
@@ -267,12 +230,25 @@ fn cuda_backend_fails_where_cuda_cannot_initialise() {
     }
 }
 
+/// The fp16 exports open on the CPU backend -- an fp16 kernel's private
+/// prepack must not trip the shared container -- and score the fixture beams
+/// within 0.05 nats of what onnxruntime recorded of the same graphs.
+#[test]
+fn lstm_fp16_export_scores_the_fixture_beams() {
+    run("lstm-fp16", 5e-2);
+}
+
 #[test]
 fn lstm_export_scores_the_fixture_beams() {
-    run("lstm");
+    run("lstm", 1e-4);
+}
+
+#[test]
+fn transformer_fp16_export_scores_the_fixture_beams() {
+    run("transformer-fp16", 5e-2);
 }
 
 #[test]
 fn transformer_export_scores_the_fixture_beams() {
-    run("transformer");
+    run("transformer", 1e-4);
 }

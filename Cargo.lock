@@ -1814,6 +1814,7 @@ dependencies = [
 name = "ime-lm"
 version = "0.1.0"
 dependencies = [
+ "half",
  "ime-decode",
  "ime-pinyin",
  "memmap2",
@@ -2444,6 +2445,7 @@ version = "2.0.0-rc.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4336a1e2b38848325241c72889086886004e589b7c74f335e60a8e8db5138a0b"
 dependencies = [
+ "half",
  "ndarray",
  "ort-sys",
  "smallvec",

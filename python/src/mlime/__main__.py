@@ -650,8 +650,9 @@ def export_char_lm(
     restrict: Path = typer.Option(
         None, help="Normalise over these characters (one per line, e.g. emittable.txt) plus <eos>"
     ),
-    quantize: Literal["int8"] | None = typer.Option(
-        None, help="Quantize the MatMul weights ('int8' dynamic, per channel)"
+    quantize: Literal["int8", "fp16"] | None = typer.Option(
+        None,
+        help="Quantize the MatMul weights ('int8' dynamic, per channel) or halve them ('fp16')",
     ),
     verbose: bool = VERBOSE,
 ) -> None:
