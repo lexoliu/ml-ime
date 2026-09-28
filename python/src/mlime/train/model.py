@@ -20,10 +20,12 @@ pass runs with the term scaled to zero.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import ClassVar
 
 import torch
+import torch.utils.checkpoint
 from torch import nn
 from transformers import BertConfig, BertForMaskedLM, BertModel
 
@@ -121,10 +123,18 @@ class RestrictedMlmHead(nn.Module):
 
 @dataclass(frozen=True)
 class RouteAOutput:
-    """What a forward pass produced."""
+    """What a forward pass produced for the training loop.
 
-    logits: torch.Tensor
+    The score frame is deliberately not a field: the loop reads ``loss`` and
+    ``extras`` only, and a logits field that meant nothing at training time
+    would be a value read by mistake later. Evaluation and emission call
+    ``scores()`` for the frame instead.
+    """
+
     loss: torch.Tensor | None = None
+    #: Extra scalars for the metrics record (the end-to-end model reports its
+    #: decoder and auxiliary losses apart). Tensors, floated at write time.
+    extras: Mapping[str, torch.Tensor] = field(default_factory=dict)
 
 
 def restricted_cross_entropy(
@@ -132,6 +142,8 @@ def restricted_cross_entropy(
     targets: torch.Tensor,
     candidates: torch.Tensor,
     label_smoothing: float,
+    *,
+    check: bool = True,
 ) -> torch.Tensor:
     """Cross-entropy over each position's candidate set alone.
 
@@ -142,11 +154,15 @@ def restricted_cross_entropy(
     rather than over the vocabulary -- torch's own ``label_smoothing`` would put
     mass on the ruled-out characters, whose log-probability is minus infinity,
     and the loss would stop being a number.
+
+    ``check`` verifies the mask admits a character at every position -- reading
+    that verdict back synchronises the device, so a caller whose batch a
+    validating collator built passes ``False`` and keeps the step asynchronous.
     """
     if targets.numel() == 0:
         raise ValueError("no positions to take a loss at")
     counts = candidates.sum(dim=-1)
-    if bool((counts == 0).any()):
+    if check and bool((counts == 0).any()):
         raise ValueError("a position admits no character at all; the mask and the target disagree")
     floor = torch.finfo(logits.dtype).min
     log_probabilities = logits.masked_fill(~candidates, floor).log_softmax(dim=-1)
@@ -158,6 +174,30 @@ def restricted_cross_entropy(
     return -((1.0 - label_smoothing) * gold + label_smoothing * spread).mean()
 
 
+def mark_dynamic(batch: Batch) -> None:
+    """Tell dynamo which dimensions of the batch vary between calls.
+
+    ``torch.compile(dynamic=True)`` still compiles its first call static and
+    only recompiles a dynamic graph on the second shape -- marking the batch
+    and sequence dimensions at the call site makes the first compile the
+    dynamic one. The marks live outside the compiled callables because dynamo
+    refuses to trace the marker itself. ``maybe_`` rather than
+    ``mark_dynamic``: a size-1 dimension is not markable and a tiny batch must
+    still run. Unmarked fields -- ``targets``, ``scored`` -- are read only by
+    the uncompiled loss path, so they need no mark.
+    """
+    for tensor in (
+        batch.input_ids,
+        batch.attention_mask,
+        batch.span_ids,
+        batch.span_positions,
+        batch.context_ids,
+        batch.context_mask,
+    ):
+        torch._dynamo.maybe_mark_dynamic(tensor, (0, 1))
+    torch._dynamo.maybe_mark_dynamic(batch.has_context, 0)
+
+
 class RouteAModel(nn.Module):
     """The fill tower, the context tower, and the gates between them.
 
@@ -166,6 +206,10 @@ class RouteAModel(nn.Module):
     call through one of them is a call on a possible tensor.
     """
 
+    #: The checkpoint record a run of this model stores its config under, and
+    #: refuses a resume against any other.
+    config_key: ClassVar[str] = "route_a"
+
     fill: BertModel
     context: BertModel
     head: RestrictedMlmHead
@@ -173,6 +217,9 @@ class RouteAModel(nn.Module):
     cross_attention: nn.ModuleList
     candidate_mask: torch.Tensor
     emittable_token_ids: torch.Tensor
+    #: When set, each fill-tower layer is recomputed in backward rather than
+    #: stored -- the knob a memory-tight run turns, off by default.
+    checkpoint_encoder: bool
 
     def __init__(
         self,
@@ -199,6 +246,13 @@ class RouteAModel(nn.Module):
                 "fill tower's layer-by-layer pass needs it to build the same masks the "
                 "model's own forward would"
             )
+        for tower in (fill.bert, context):
+            implementation = getattr(tower.config, "_attn_implementation", None)
+            if implementation != "sdpa":
+                raise RuntimeError(
+                    f"the towers are fed 4D boolean masks, which only sdpa reads as "
+                    f"'True attends'; this tower's attention is {implementation!r}"
+                )
         self.config = config
         self.fill = fill.bert
         self.context = context
@@ -216,6 +270,7 @@ class RouteAModel(nn.Module):
         )
         self.register_buffer("candidate_mask", lexicon.candidate_mask, persistent=True)
         self.register_buffer("emittable_token_ids", lexicon.token_ids, persistent=True)
+        self.checkpoint_encoder = False
 
     @classmethod
     def from_pretrained(
@@ -293,10 +348,23 @@ class RouteAModel(nn.Module):
         """The current gate value of each cross-attention layer."""
         return [float(layer.gate.detach()) for layer in self.gated_layers()]
 
+    def enable_encoder_checkpointing(self) -> None:
+        """Recompute each encoder layer in backward instead of storing it.
+
+        The fill tower's layers run one at a time from :meth:`encode`, so the
+        checkpoint wraps each call there; the context tower's own forward reads
+        the same switch through transformers' gradient checkpointing.
+        """
+        self.checkpoint_encoder = True
+        self.context.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+
     def _encode_context(self, batch: Batch) -> torch.Tensor:
-        """Run the context tower."""
+        """Run the context tower, on the same host-check-free mask as the fill one."""
         encoded: torch.Tensor = self.context(
-            input_ids=batch.context_ids, attention_mask=batch.context_mask
+            input_ids=batch.context_ids,
+            attention_mask=batch.context_mask[:, None, None, :].bool(),
         ).last_hidden_state
         return encoded
 
@@ -306,11 +374,21 @@ class RouteAModel(nn.Module):
         spans: torch.Tensor = self.span_embeddings(batch.span_ids)
         return words + spans * batch.span_positions[..., None]
 
-    def forward(self, batch: Batch) -> RouteAOutput:
-        """Emission-space logits for every position, and the loss where targets are."""
+    def encode(self, batch: Batch) -> torch.Tensor:
+        """The fill tower's last hidden states, context-attended (``[B, W, H]``).
+
+        Split out of :meth:`forward` because the end-to-end model's decoder
+        attends to the per-span hidden states rather than to their logits.
+        """
         embeddings: torch.Tensor = self.fill.embeddings(inputs_embeds=self._fill_inputs(batch))
+        # A 4D mask early-exits ``_create_attention_masks`` before its padding
+        # check -- ``padding_mask.all()`` is a device-to-host sync the step
+        # cannot afford. The ``[B, 1, 1, W]`` boolean is what the built mask
+        # becomes anyway under sdpa (True attends), so the towers see the same
+        # values; eager attention would add it to the scores instead, which is
+        # why the constructor refuses anything but sdpa.
         attention_mask, _ = self.fill._create_attention_masks(
-            attention_mask=batch.attention_mask,
+            attention_mask=batch.attention_mask[:, None, None, :].bool(),
             encoder_attention_mask=None,
             embedding_output=embeddings,
             encoder_hidden_states=None,
@@ -321,25 +399,48 @@ class RouteAModel(nn.Module):
         gated_from = len(self.fill.encoder.layer) - len(gated)
         hidden = embeddings
         for depth, layer in enumerate(self.fill.encoder.layer):
-            hidden = torch.as_tensor(layer(hidden, attention_mask=attention_mask))
+            if self.checkpoint_encoder:
+                hidden = torch.as_tensor(
+                    torch.utils.checkpoint.checkpoint(
+                        layer, hidden, attention_mask=attention_mask, use_reentrant=False
+                    )
+                )
+            else:
+                hidden = torch.as_tensor(layer(hidden, attention_mask=attention_mask))
             if context is not None and depth >= gated_from:
                 hidden = gated[depth - gated_from](
                     hidden, context, batch.context_mask, batch.has_context
                 )
-        logits = self.head(hidden)
-        return RouteAOutput(logits=logits, loss=self.loss(logits, batch))
+        return hidden
+
+    def forward(self, batch: Batch) -> RouteAOutput:
+        """The loss at the scored positions; the frame belongs to ``scores``."""
+        mark_dynamic(batch)
+        return RouteAOutput(loss=self.loss(self.head(self.encode(batch)), batch))
+
+    def scores(self, batch: Batch) -> torch.Tensor:
+        """The ``[B, W, E]`` emission frame, for the eval-side callers."""
+        mark_dynamic(batch)
+        logits: torch.Tensor = self.head(self.encode(batch))
+        return logits
 
     def loss(self, logits: torch.Tensor, batch: Batch) -> torch.Tensor | None:
-        """Restricted, smoothed cross-entropy at the positions a span was typed."""
-        positions = batch.targets != IGNORE_INDEX
-        if not bool(positions.any()):
+        """Restricted, smoothed cross-entropy at the positions a span was typed.
+
+        The positions come from the batch's own ``scored`` index, found by the
+        collator on the host -- mask-indexing ``logits`` here would synchronise
+        the device for the same answer the caller already computed.
+        """
+        scored = batch.scored
+        if not scored.numel():
             return None
-        span_ids = batch.span_ids[positions]
+        span_ids = batch.span_ids.reshape(-1).index_select(0, scored)
         return restricted_cross_entropy(
-            logits[positions],
-            batch.targets[positions],
+            logits.reshape(-1, logits.shape[-1]).index_select(0, scored),
+            batch.targets.reshape(-1).index_select(0, scored),
             self.candidate_mask.index_select(0, span_ids),
             self.config.label_smoothing,
+            check=False,
         )
 
     def predictions(self, logits: torch.Tensor, batch: Batch) -> torch.Tensor:

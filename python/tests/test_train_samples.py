@@ -210,7 +210,7 @@ def test_context_is_dropped_at_the_stated_rate(
     builder = SampleBuilder(lexicon, spans, arbitration)
     example = builder.build(_sample("我爱北京", context="北京"), ["wo3", "ai4", "bei3", "jing1"], 0)
     assert example is not None
-    collator = Collator(tokenizer, context_dropout=0.3, seed=42)
+    collator = Collator(tokenizer, lexicon.candidate_mask, context_dropout=0.3, seed=42)
     kept = sum(float(collator([example]).has_context[0]) for _ in range(4_000))
     assert kept / 4_000 == pytest.approx(0.7, abs=0.02)
 
@@ -221,7 +221,7 @@ def test_a_sample_with_no_context_never_claims_one(
     builder = SampleBuilder(lexicon, spans, arbitration)
     example = builder.build(_sample("我爱北京"), ["wo3", "ai4", "bei3", "jing1"], 0)
     assert example is not None
-    batch = Collator(tokenizer, context_dropout=0.0)([example])
+    batch = Collator(tokenizer, lexicon.candidate_mask, context_dropout=0.0)([example])
     assert float(batch.has_context[0]) == 0.0
 
 
@@ -234,7 +234,8 @@ def test_the_collated_batch_masks_and_targets_line_up(
         builder.build(_sample("中重"), ["zhong1", "chong2"], 0),
     ]
     assert all(example is not None for example in examples)
-    batch = Collator(tokenizer)([example for example in examples if example is not None])
+    collator = Collator(tokenizer, lexicon.candidate_mask)
+    batch = collator([example for example in examples if example is not None])
     assert batch.input_ids.shape == (2, 6)
     assert int(batch.span_positions.sum()) == 6
     assert int((batch.targets != IGNORE_INDEX).sum()) == 6
@@ -387,7 +388,7 @@ def test_a_batch_moves_wholesale(
     builder = SampleBuilder(lexicon, spans, arbitration)
     example = builder.build(_sample("我爱北京"), ["wo3", "ai4", "bei3", "jing1"], 0)
     assert example is not None
-    batch = Collator(tokenizer)([example])
+    batch = Collator(tokenizer, lexicon.candidate_mask)([example])
     moved = batch.to(torch.device("cpu"))
     assert isinstance(moved, Batch)
     assert moved.ids == batch.ids

@@ -29,6 +29,7 @@ Kaggle runs two kernels at once per account and allows 30 GPU-hours a week, so
 push two, and the next two when those finish.
 | `route-a-v2` | two epochs over all of run3 as a chain of segments; segment 0 counts the steps, every segment trains on a wall budget and pauses resumably |
 | `char-lm` | a character language model over the same 41M lines (`mlime train char-lm`, 2×T4 DDP, wall budget; the kernel's `MODEL` picks the architecture, a 12-layer transformer since `notes/generate-ceiling.md`, the LSTM of `notes/char-lm-v1.md` before it), exported to ONNX (`charlm.onnx`, `prefill.onnx`, the `charlm.weights` shared weights file, `charlm.json`) for `ime-cli fused-eval --lm`. A run longer than one session resumes: push the next session with the previous output added as a kernel source and it continues from that output's `run/charlm.pt` |
+| `e2e` | the end-to-end model of issue #88 (`mlime train e2e`, 2×T4 DDP, wall budget, same segment chain as `route-a-v2`): route A's towers and the transformer reader initialised from `lexoliu/mlime-e2e-init`, decoded by its own beam search with `mlime eval e2e` on the finishing segment. `SMOKE_STEPS = 300` instead probes each `SMOKE_BUDGETS` budget for peak memory and steps/s, then times 300 steps at the largest that fit; `ACTIVATION_CHECKPOINTING` recomputes the encoder towers when nothing fits |
 
 ## Chaining a training run
 
@@ -62,6 +63,18 @@ segment that finished the run with `kaggle/finish.sh` (six fused evals, results
 in `s<n>/results.md`), and otherwise pushes the next segment; a refused push
 (quota, an expired token) is retried an hour later. Only the notes stay manual.
 `notes/HANDOFF.md` is the operator's manual.
+
+The chain is the same for `e2e`, parameterised rather than copied:
+
+```
+kaggle/chain.sh --slug lexoliu/mlime-e2e-s --kernel-dir kaggle/e2e \
+                --data-dir data/e2e --finish none
+```
+
+`--finish none` is because the e2e kernel evaluates in-kernel (the trigram
+fusion `finish.sh` performs does not apply): the chain only gathers the
+segment's `e2e-*-report.txt` files into `s<n>/results.md`. Bare
+`kaggle/chain.sh` is route A v2, unchanged.
 
 A segment that would reach `max_steps` but could not also fit the scoring pauses
 early (`SCORING_RESERVE_SECONDS`), so the run always finishes in a segment with
