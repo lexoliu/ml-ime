@@ -27,6 +27,7 @@ import math
 import os
 import queue
 import random
+import shutil
 import sys
 import threading
 import time
@@ -99,6 +100,17 @@ class TrainingConfig:
     #: The mode torch.compile runs at: "default" first,
     #: "max-autotune-no-cudagraphs" when the default leaves the card underfed.
     compile_mode: str = "default"
+    #: Ranks one process runs as, when the run's world outnumbers its devices.
+    #: A Kaggle segment is two real ranks and a Colab segment is one process of
+    #: two virtual ones; each virtual rank owns the stream deal, the collator
+    #: and the generator state of the rank it stands for, so the checkpoints
+    #: the two legs write are interchangeable.
+    virtual_ranks: int = 1
+    #: Minutes between out-of-band checkpoints, beside the step cadence: each
+    #: one is a full ``checkpoint-paused.pt`` trio written atomically, for a
+    #: leg whose VM can die without warning (Colab) to publish. ``None`` leaves
+    #: only the cadence checkpoints and the wall-budget pause.
+    checkpoint_minutes: float | None = None
 
     COMPILE_MODES = ("default", "max-autotune-no-cudagraphs")
 
@@ -123,6 +135,10 @@ class TrainingConfig:
             raise ValueError(
                 f"wall_budget_seconds must be positive, got {self.wall_budget_seconds}"
             )
+        if self.virtual_ranks < 1:
+            raise ValueError(f"virtual_ranks must be at least 1, got {self.virtual_ranks}")
+        if self.checkpoint_minutes is not None and self.checkpoint_minutes <= 0:
+            raise ValueError(f"checkpoint_minutes must be positive, got {self.checkpoint_minutes}")
 
     @property
     def warmup_steps(self) -> int:
@@ -615,6 +631,36 @@ class Profiler:
 
 
 @dataclass(frozen=True)
+class Generators:
+    """The generators a rank's *process* draws from: Python's, torch's, CUDA's.
+
+    One process running several virtual ranks keeps a snapshot per rank and
+    swaps it in for that rank's accumulation window: from the model's point of
+    view the draws then match a world that gave each rank its own process.
+    """
+
+    python: tuple[Any, ...]
+    torch_cpu: torch.Tensor
+    torch_cuda: list[torch.Tensor]
+
+    @classmethod
+    def capture(cls) -> Generators:
+        """The state of the process-level generators as of now."""
+        return cls(
+            python=random.getstate(),
+            torch_cpu=torch.get_rng_state(),
+            torch_cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+        )
+
+    def restore(self) -> None:
+        """Put the process-level generators back where this snapshot found them."""
+        random.setstate(self.python)
+        torch.set_rng_state(self.torch_cpu)
+        if self.torch_cuda:
+            torch.cuda.set_rng_state_all(self.torch_cuda)
+
+
+@dataclass(frozen=True)
 class RandomState:
     """Where each generator one rank draws from had got to.
 
@@ -628,29 +674,6 @@ class RandomState:
     torch_cpu: torch.Tensor
     torch_cuda: list[torch.Tensor]
     collator: tuple[Any, ...]
-
-    @classmethod
-    def capture(cls, collator_rng: tuple[Any, ...]) -> RandomState:
-        """The state of this rank's generators as of now.
-
-        The collator's state is carried in from the last *consumed* batch
-        rather than read live: a prefetching producer may have moved the real
-        generator ahead of what training has seen.
-        """
-        return cls(
-            python=random.getstate(),
-            torch_cpu=torch.get_rng_state(),
-            torch_cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
-            collator=collator_rng,
-        )
-
-    def restore(self, collator: Collator) -> None:
-        """Put this rank's generators back where the checkpoint found them."""
-        random.setstate(self.python)
-        torch.set_rng_state(self.torch_cpu)
-        if self.torch_cuda:
-            torch.cuda.set_rng_state_all(self.torch_cuda)
-        collator.rng.setstate(self.collator)
 
     def as_record(self) -> dict[str, Any]:
         """The plain form that goes in the checkpoint."""
@@ -676,12 +699,24 @@ class RankState:
     random: RandomState
 
     @classmethod
-    def capture(cls, consumed: Produced) -> RankState:
-        """Where this rank is, ready to be gathered onto rank 0."""
+    def capture(cls, consumed: Produced, generators: Generators) -> RankState:
+        """Where this rank is, ready to be gathered onto rank 0.
+
+        The collator's state is carried in from the last *consumed* batch
+        rather than read live -- a prefetching producer may have moved the real
+        generator ahead of what training has seen -- and the process-level
+        generators come from the lane's own snapshot, not whatever rank ran
+        most recently in this process.
+        """
         return cls(
             epoch=consumed.epoch,
             index=consumed.index,
-            random=RandomState.capture(consumed.collator_rng),
+            random=RandomState(
+                python=generators.python,
+                torch_cpu=generators.torch_cpu,
+                torch_cuda=generators.torch_cuda,
+                collator=consumed.collator_rng,
+            ),
         )
 
     def as_record(self) -> dict[str, Any]:
@@ -696,6 +731,29 @@ class RankState:
             index=int(record["index"]),
             random=RandomState.from_record(record["random"]),
         )
+
+
+@dataclass
+class RankLane:
+    """One virtual rank's lane inside a process.
+
+    A lane owns everything a real rank owns: the stream its shard deal comes
+    from (built by the caller as rank ``global_rank`` of the whole world), the
+    producer feeding it batches, the snapshot of the process-level generators
+    restored before its accumulation window and captured after it, and the
+    last batch an optimiser step *consumed* -- the position a checkpoint
+    writes for it.
+    """
+
+    source: Iterator[Produced]
+    prefetcher: Prefetcher | None
+    generators: Generators
+    consumed: Produced | None = None
+
+    def close(self) -> None:
+        """Stop the lane's producer, if it has one."""
+        if self.prefetcher is not None:
+            self.prefetcher.close()
 
 
 def unwrap(model: nn.Module) -> RouteAModel:
@@ -744,14 +802,20 @@ def evaluate(
 
 def train(
     model: RouteAModel,
-    stream: CorpusStream,
-    collator: Collator,
+    lanes: Sequence[tuple[CorpusStream, Collator]],
     config: TrainingConfig,
     out_dir: Path,
     distributed: Distributed | None = None,
     resume: Path | None = None,
+    run_config: Path | None = None,
 ) -> Segment:
     """Run towards *config.max_steps* optimiser steps and say what this segment did.
+
+    *lanes* holds one ``(stream, collator)`` pair per virtual rank this process
+    runs as -- ``config.virtual_ranks`` of them, built by the caller as
+    consecutive ranks of the whole world. An optimiser step runs each lane's
+    accumulation window in turn under that lane's own generator state, so a
+    one-process Colab segment computes what a two-process Kaggle segment would.
 
     Writes every step's loss to the metrics file rather than printing it, because
     "the loss went down" is a claim that has to be checkable after the kernel has
@@ -765,11 +829,21 @@ def train(
     With *config.wall_budget_seconds*, the segment stops itself when the budget
     is spent and writes ``checkpoint-paused``. It writes no ``checkpoint-final``:
     the final checkpoint means the run reached ``max_steps``, and a segment that
-    ran out of clock has not.
+    ran out of clock has not. *config.checkpoint_minutes* adds the same trio on
+    a wall-clock cadence, atomically, for a leg that can die without warning.
+    The trio's run-config is the kernel's own file copied verbatim from
+    *run_config*, so the leg that picks it up reads the run's real fields.
     """
     world = distributed or Distributed()
+    virtual = config.virtual_ranks
+    if len(lanes) != virtual:
+        raise ValueError(
+            f"train got {len(lanes)} (stream, collator) lanes but virtual_ranks is {virtual}"
+        )
+    if config.checkpoint_minutes is not None and run_config is None:
+        raise ValueError("checkpoint_minutes copies the run's own config; pass run_config")
     world.start()
-    seed_everything(config.seed, world.rank)
+    total_world = world.world_size * virtual
     device = world.device
     model.to(device)
     resumed = (
@@ -805,27 +879,50 @@ def train(
         metrics.write(
             event="config",
             world_size=world.world_size,
+            ranks=total_world,
             amp=amp,
             device=str(device),
             **asdict(config),
         )
 
-    batches = EpochBatches(stream, collator, config.token_budget)
+    rank_lanes: list[RankLane] = []
+    for index, (stream, collator) in enumerate(lanes):
+        global_rank = world.rank * virtual + index
+        batches = EpochBatches(stream, collator, config.token_budget)
+        if resumed is not None:
+            position = resumed.positions[index]
+            batches.skip(position.epoch, position.index)
+            collator.rng.setstate(position.random.collator)
+            generators = Generators(
+                python=position.random.python,
+                torch_cpu=position.random.torch_cpu,
+                torch_cuda=position.random.torch_cuda,
+            )
+        else:
+            seed_everything(config.seed, global_rank)
+            generators = Generators.capture()
+        prefetcher = Prefetcher(batches) if config.prefetch else None
+        rank_lanes.append(
+            RankLane(
+                source=prefetcher if prefetcher is not None else batches.produced_forever(),
+                prefetcher=prefetcher,
+                generators=generators,
+            )
+        )
+
     step = 0
     if resumed is not None:
         optimiser.load_state_dict(resumed.optimiser)
         scheduler.load_state_dict(resumed.scheduler)
         scaler.load_state_dict(resumed.scaler)
         step = resumed.step
-        batches.skip(resumed.position.epoch, resumed.position.index)
-        resumed.position.random.restore(collator)
         if world.is_main:
             metrics.write(
                 event="resume",
                 checkpoint=str(resumed.path),
                 step=step,
-                epoch=resumed.position.epoch,
-                index=resumed.position.index,
+                epoch=resumed.positions[0].epoch,
+                index=resumed.positions[0].index,
             )
     checkpoints = Checkpointer(
         model=model,
@@ -835,12 +932,9 @@ def train(
         config=config,
         out_dir=out_dir,
         world=world,
+        run_config=run_config,
     )
 
-    prefetcher = Prefetcher(batches) if config.prefetch else None
-    source: Iterator[Produced] = (
-        prefetcher if prefetcher is not None else batches.produced_forever()
-    )
     profiler = Profiler(
         device,
         config.profile_steps,
@@ -854,52 +948,101 @@ def train(
     # in a metrics file is always the first step that file's segment ran.
     first_step = step + 1
     finished = False
-    consumed: Produced | None = None
+    consumed_any = False
+    interval_seconds = (
+        config.checkpoint_minutes * 60 if config.checkpoint_minutes is not None else None
+    )
+    next_interval = interval_seconds if interval_seconds is not None else 0.0
+    first_logged_loss: float | None = None
+    last_logged_loss: float | None = None
+
+    def states() -> list[RankState]:
+        """Each lane's position, in world order, for a checkpoint to write."""
+        written = []
+        for lane in rank_lanes:
+            if lane.consumed is None:
+                raise RuntimeError("a lane consumed nothing; it has no position to write")
+            written.append(RankState.capture(lane.consumed, lane.generators))
+        return written
+
+    def interval_summary(step: int, elapsed: float) -> dict[str, Any]:
+        """The run-summary half of an interval trio, shaped like the kernel's own."""
+        return {
+            "max_steps": config.max_steps,
+            "resumed_from": None if resume is None else str(resume),
+            "first_step": first_step,
+            "last_step": step,
+            "checkpoint_step": step,
+            "first_loss": first_logged_loss,
+            "last_loss": last_logged_loss,
+            "train_seconds": round(elapsed, 1),
+            "finished": False,
+            "world_size": total_world,
+            "processes": world.world_size,
+            "virtual_ranks": virtual,
+        }
+
     try:
         while True:
             profiler.begin(step - first_step + 2)
-            items = [next(source) for _ in range(config.accumulate)]
+            windows = [[next(lane.source) for _ in range(config.accumulate)] for lane in rank_lanes]
             profiler.mark("batch_wait")
-            # One step's gradient is the mean over every scored position across
-            # its micro-batches, so each micro-batch's loss -- already its own
-            # mean -- is weighted by its share of the positions, not by 1/N.
-            counts = [item.batch.scored.numel() for item in items]
-            scored_total = sum(counts)
-            if scored_total == 0 or 0 in counts:
-                raise RuntimeError("a batch reached the loop with no scored position")
             step_loss: torch.Tensor | None = None
             step_extras: dict[str, torch.Tensor] = {}
-            for micro, (item, count) in enumerate(zip(items, counts, strict=True)):
-                batch = item.batch.to(device)
-                profiler.mark("h2d")
-                # Under DDP only the last micro-batch's backward allreduces; the
-                # others accumulate locally under no_sync, so a step pays one
-                # gradient exchange no matter how many micro-batches it held.
-                synchronising = micro == len(items) - 1
-                sync_context = (
-                    contextlib.nullcontext()
-                    if synchronising or not isinstance(trained, DistributedDataParallel)
-                    else trained.no_sync()
-                )
-                with sync_context:
-                    with (
-                        profiler.guarded(),
-                        torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp),
-                    ):
-                        output = trained(batch)
-                    profiler.mark("forward")
-                    if output.loss is None:
-                        raise RuntimeError("a batch reached the loop with no scored position")
-                    weight = count / scored_total
-                    with profiler.guarded():
-                        scaler.scale(output.loss * weight).backward()
-                profiler.mark("backward")
-                contribution = output.loss.detach() * weight
-                step_loss = contribution if step_loss is None else step_loss + contribution
-                for name, extra in output.extras.items():
-                    part = extra.detach() * weight
-                    step_extras[name] = step_extras.get(name, 0.0) + part
-            consumed = items[-1]
+            for lane_index, (lane, items) in enumerate(zip(rank_lanes, windows, strict=True)):
+                lane.generators.restore()
+                # One step's gradient is the mean over every scored position
+                # across its micro-batches, so each micro-batch's loss --
+                # already its own mean -- is weighted by its share of the
+                # positions, not by 1/N.
+                counts = [item.batch.scored.numel() for item in items]
+                scored_total = sum(counts)
+                if scored_total == 0 or 0 in counts:
+                    raise RuntimeError("a batch reached the loop with no scored position")
+                for micro, (item, count) in enumerate(zip(items, counts, strict=True)):
+                    batch = item.batch.to(device)
+                    profiler.mark("h2d")
+                    # Under DDP only the very last micro-batch's backward
+                    # allreduces; every earlier one -- of this rank's window
+                    # and of every earlier virtual rank's -- accumulates
+                    # locally under no_sync, so a step pays one exchange.
+                    synchronising = lane_index == len(rank_lanes) - 1 and micro == len(items) - 1
+                    sync_context = (
+                        contextlib.nullcontext()
+                        if synchronising or not isinstance(trained, DistributedDataParallel)
+                        else trained.no_sync()
+                    )
+                    with sync_context:
+                        with (
+                            profiler.guarded(),
+                            torch.autocast(
+                                device_type=device.type, dtype=torch.float16, enabled=amp
+                            ),
+                        ):
+                            output = trained(batch)
+                        profiler.mark("forward")
+                        if output.loss is None:
+                            raise RuntimeError("a batch reached the loop with no scored position")
+                        weight = count / scored_total
+                        # The world's gradient is the mean of the per-rank
+                        # accumulations -- what DDP's all-reduce computes when
+                        # each rank has its own process. Dividing by the ranks
+                        # this process runs makes the same mean come out of one
+                        # process.
+                        with profiler.guarded():
+                            scaler.scale(output.loss * weight / virtual).backward()
+                    profiler.mark("backward")
+                    # The logged step is lane 0's view: the same numbers a real
+                    # rank 0 writes, which is what the segment summaries read.
+                    if lane_index == 0:
+                        contribution = output.loss.detach() * weight
+                        step_loss = contribution if step_loss is None else step_loss + contribution
+                        for name, extra in output.extras.items():
+                            part = extra.detach() * weight
+                            step_extras[name] = step_extras.get(name, 0.0) + part
+                lane.generators = Generators.capture()
+                lane.consumed = items[-1]
+            consumed_any = True
             scaler.unscale_(optimiser)
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
             profiler.mark("unscale_clip")
@@ -912,19 +1055,22 @@ def train(
             if world.is_main and (step % config.log_every == 0 or step == first_step):
                 if step_loss is None:  # unreachable: every micro-batch raises or contributes
                     raise RuntimeError("a step held no scored position")
+                loss_now = float(step_loss)
                 record = {
                     "event": "step",
                     "step": step,
-                    "loss": float(step_loss),
+                    "loss": loss_now,
                     **{name: float(extra) for name, extra in step_extras.items()},
                     "lr": scheduler.get_last_lr()[0],
                     "new_lr": scheduler.get_last_lr()[1],
-                    "examples": sum(item.batch.size for item in items),
-                    "tokens": sum(item.batch.tokens for item in items),
-                    "context_tokens": sum(item.batch.context_tokens for item in items),
+                    "examples": sum(item.batch.size for item in windows[0]),
+                    "tokens": sum(item.batch.tokens for item in windows[0]),
+                    "context_tokens": sum(item.batch.context_tokens for item in windows[0]),
                     "seconds": round(time.monotonic() - started, 1),
                     "gates": model.gates(),
                 }
+                first_logged_loss = loss_now if first_logged_loss is None else first_logged_loss
+                last_logged_loss = loss_now
                 if config.compile:
                     # Compiles belong to the step that caused them: all of a
                     # step's dynamo work sits in its forward/backward, ahead
@@ -936,24 +1082,25 @@ def train(
                 metrics.write(**record)
                 log.info("step", **{k: v for k, v in record.items() if k != "event"})
             if step % config.checkpoint_every == 0:
-                checkpoints.numbered(step, consumed)
+                checkpoints.numbered(step, states())
             # Ranks cannot leave a collective on different steps, so with more
             # than one the verdict is broadcast on a fixed cadence; a world of
             # one checks every step -- the check costs it no collective.
             elapsed = time.monotonic() - started
-            pause = False
-            if config.wall_budget_seconds is not None:
-                if world.world_size == 1:
-                    pause = elapsed >= config.wall_budget_seconds
-                elif step % config.agree_every == 0:
-                    pause = agreed(world, elapsed >= config.wall_budget_seconds, device)
+            verdict = 0  # 1 = an interval checkpoint is due; 2 = the budget is spent
+            if config.wall_budget_seconds is not None and elapsed >= config.wall_budget_seconds:
+                verdict = 2
+            elif interval_seconds is not None and elapsed >= next_interval:
+                verdict = 1
+            if world.world_size > 1:
+                verdict = agreed(world, verdict, device) if step % config.agree_every == 0 else 0
             profiler.mark("agree_log")
             profiler.end()
             if step >= config.max_steps:
                 finished = True
                 break
-            if pause:
-                checkpoints.paused(step, consumed)
+            if verdict == 2:
+                checkpoints.paused(step, states())
                 if world.is_main:
                     metrics.write(event="paused", step=step, seconds=round(elapsed, 1))
                 log.info(
@@ -962,17 +1109,24 @@ def train(
                     seconds=round(elapsed, 1),
                 )
                 break
+            if verdict == 1:
+                checkpoints.interval(step, states(), interval_summary(step, elapsed))
+                if interval_seconds is None:
+                    raise RuntimeError("an interval verdict was reached without a cadence")
+                next_interval += interval_seconds
+                if world.is_main:
+                    metrics.write(event="interval", step=step, seconds=round(elapsed, 1))
             # A measurement run ends when its window fills -- a compiled one
             # may warm up late, so its max_steps is a cap, not the target.
             if profiler.done():
                 break
     finally:
-        if prefetcher is not None:
-            prefetcher.close()
-    if consumed is None:
+        for lane in rank_lanes:
+            lane.close()
+    if not consumed_any:
         raise RuntimeError("the loop ran no step; nothing was consumed")
     if finished:
-        checkpoints.final(step, consumed)
+        checkpoints.final(step, states())
     if profiler.records:
         profile = profiler.report()
         # The kernel reads the phase table out of the log stream, like
@@ -1051,40 +1205,46 @@ def rotate_checkpoints(out_dir: Path, keep: int) -> None:
         log.info("checkpoint rotated out", path=str(path))
 
 
-def agreed(world: Distributed, decision: bool, device: torch.device) -> bool:
-    """Rank 0's *decision*, made every rank's.
+def agreed(world: Distributed, verdict: int, device: torch.device) -> int:
+    """Rank 0's *verdict*, made every rank's.
 
-    Whether the wall clock has run out is measured per rank, and ranks do not
-    reach a step at the same instant, so two of them can measure it differently
-    on the same step. Ranks that disagreed would not disagree politely: the ones
-    that stopped would leave the ones that did not waiting in the next gradient
-    all-reduce, and a hang is worse than either answer. So one rank decides and
-    the rest are told.
+    What a step owes the clock is measured per rank, and ranks do not reach a
+    step at the same instant, so two of them can measure it differently on the
+    same step. Ranks that disagreed would not disagree politely: the ones that
+    stopped would leave the ones that did not waiting in the next gradient
+    all-reduce, and a hang is worse than either answer. So one rank decides
+    and the rest are told.
+
+    The verdicts: 0 carry on, 1 an interval checkpoint is due, 2 the wall
+    budget is spent.
     """
     if world.world_size == 1:
-        return decision
-    verdict = torch.tensor([int(decision)], dtype=torch.int64, device=device)
-    torch.distributed.broadcast(verdict, src=0)
-    return bool(verdict.item())
+        return verdict
+    sent = torch.tensor([verdict], dtype=torch.int64, device=device)
+    torch.distributed.broadcast(sent, src=0)
+    return int(sent.item())
 
 
-def gather_positions(world: Distributed, consumed: Produced) -> list[dict[str, Any]]:
+def gather_positions(world: Distributed, states: Sequence[RankState]) -> list[dict[str, Any]]:
     """Every rank's place in its own stream, gathered so rank 0 can write them all.
 
-    The position written is the last batch an optimiser step *consumed* -- with
-    a prefetcher running, the stream itself is already ahead on batches the run
-    never trained on. Collective: every rank calls it, including the ones that
-    write nothing, which is why it is not inside an ``is_main`` guard.
+    A checkpoint is resumable only if it can put every rank back where it was,
+    so it writes a position per rank of the whole world -- real and virtual
+    alike, one record per lane in rank order. Collective: every rank calls it,
+    including the ones that write nothing, which is why it is not inside an
+    ``is_main`` guard.
     """
-    mine = RankState.capture(consumed).as_record()
+    mine = [state.as_record() for state in states]
     if world.world_size == 1:
-        return [mine]
+        return mine
     gathered: list[Any] = [None] * world.world_size
     torch.distributed.all_gather_object(gathered, mine)
-    missing = [rank for rank, record in enumerate(gathered) if record is None]
-    if missing:
-        raise RuntimeError(f"these ranks did not report a stream position: {missing}")
-    return [dict(record) for record in gathered]
+    positions: list[dict[str, Any]] = []
+    for rank, block in enumerate(gathered):
+        if not isinstance(block, list):
+            raise RuntimeError(f"rank {rank} did not report a stream position")
+        positions.extend(dict(record) for record in block)
+    return positions
 
 
 @dataclass(frozen=True)
@@ -1104,29 +1264,70 @@ class Checkpointer:
     config: TrainingConfig
     out_dir: Path
     world: Distributed
+    #: The run's own config file, copied verbatim into each interval trio.
+    run_config: Path | None
 
-    def numbered(self, step: int, consumed: Produced) -> None:
+    def numbered(self, step: int, states: Sequence[RankState]) -> None:
         """Write ``checkpoint-<step>`` and rotate the older ones out."""
-        self._write(self.out_dir / f"checkpoint-{step:06d}.pt", step, consumed)
+        self._write(self.out_dir / f"checkpoint-{step:06d}.pt", step, states)
         if self.world.is_main:
             rotate_checkpoints(self.out_dir, self.config.keep_checkpoints)
 
-    def final(self, step: int, consumed: Produced) -> None:
+    def final(self, step: int, states: Sequence[RankState]) -> None:
         """Write ``checkpoint-final``, which is never rotated out."""
-        self._write(self.out_dir / "checkpoint-final.pt", step, consumed)
+        self._write(self.out_dir / "checkpoint-final.pt", step, states)
 
-    def paused(self, step: int, consumed: Produced) -> None:
+    def paused(self, step: int, states: Sequence[RankState]) -> None:
         """Write ``checkpoint-paused``, the one the next kernel resumes from.
 
         Named rather than numbered so the next kernel knows what to mount without
         being told a step number, and so rotation cannot take it: a segment that
         stopped on the clock has no other copy of where it got to.
         """
-        self._write(self.out_dir / "checkpoint-paused.pt", step, consumed)
+        self._write(self.out_dir / "checkpoint-paused.pt", step, states)
 
-    def _write(self, path: Path, step: int, consumed: Produced) -> None:
+    def interval(
+        self, step: int, states: Sequence[RankState], summary: Mapping[str, Any]
+    ) -> Path | None:
+        """Write the paused trio under ``interval-<step>``, atomically, and keep the newest.
+
+        A leg that can die without warning cannot wait for the wall-budget
+        pause to learn where it got to: this writes the same resume point --
+        the checkpoint, the run's config, and a summary in the shape the
+        kernel writes -- every so many minutes instead. The directory is
+        staged under a hidden name and renamed whole, so a reader never sees
+        half of a trio; resuming from one is resuming from a pause.
+        """
+        positions = gather_positions(self.world, states)
+        if not self.world.is_main:
+            return None
+        target = self.out_dir / f"interval-{step:06d}"
+        staging = self.out_dir / f".interval-{step:06d}.tmp"
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True)
+        save_checkpoint(
+            self.model,
+            staging / "checkpoint-paused.pt",
+            step,
+            self.config,
+            self.optimiser,
+            self.scheduler,
+            self.scaler,
+            positions,
+        )
+        if self.run_config is None:
+            raise RuntimeError("an interval trio needs the run's own config file")
+        shutil.copyfile(self.run_config, staging / "run-config.json")
+        (staging / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        staging.replace(target)
+        for stale in self.out_dir.glob("interval-*"):
+            if stale != target:
+                shutil.rmtree(stale)
+        return target
+
+    def _write(self, path: Path, step: int, states: Sequence[RankState]) -> None:
         """Gather the positions -- all ranks -- and write the file on rank 0."""
-        positions = gather_positions(self.world, consumed)
+        positions = gather_positions(self.world, states)
         if not self.world.is_main:
             return
         save_checkpoint(
@@ -1145,10 +1346,20 @@ class Checkpointer:
 #: describes the run, so changing it makes the next segment a different
 #: experiment; these describe the *kernel* the segment runs in -- a longer
 #: session, a profiling pass, prefetching, how often ranks agree on the clock,
-#: whether the towers were compiled -- not the result it produces.
+#: whether the towers were compiled, how many ranks a process stands for, how
+#: often an interval checkpoint lands -- not the result it produces.
 #: ``accumulate`` changes the gradient, so it is deliberately not here.
 SEGMENT_FIELDS = frozenset(
-    {"wall_budget_seconds", "prefetch", "profile_steps", "agree_every", "compile", "compile_mode"}
+    {
+        "wall_budget_seconds",
+        "prefetch",
+        "profile_steps",
+        "agree_every",
+        "compile",
+        "compile_mode",
+        "virtual_ranks",
+        "checkpoint_minutes",
+    }
 )
 
 
@@ -1185,7 +1396,10 @@ class Resumption:
     optimiser: dict[str, Any]
     scheduler: dict[str, Any]
     scaler: dict[str, Any]
-    position: RankState
+    #: This process's lanes' positions, in lane order: the checkpoint's full
+    #: list is indexed by rank of the whole world, and a process that stands
+    #: for several virtual ranks takes the contiguous block that is its own.
+    positions: list[RankState]
 
     @classmethod
     def read(
@@ -1211,10 +1425,11 @@ class Resumption:
         refuse_mismatch(path, "training", state["training"], asdict(config), SEGMENT_FIELDS)
         refuse_mismatch(path, record, state[record], asdict(model_config))
         positions = state["positions"]
-        if len(positions) != world.world_size:
+        expected = world.world_size * config.virtual_ranks
+        if len(positions) != expected:
             raise ValueError(
                 f"{path} was written by a world of {len(positions)} ranks and this one has "
-                f"{world.world_size}; a rank would read shards it has no position for"
+                f"{expected}; a rank would read shards it has no position for"
             )
         step = int(state["step"])
         if step >= config.max_steps:
@@ -1222,6 +1437,7 @@ class Resumption:
                 f"{path} is already at step {step} of {config.max_steps}; "
                 "raise max_steps to run further, or this resume would do nothing"
             )
+        first = world.rank * config.virtual_ranks
         return cls(
             path=path,
             step=step,
@@ -1229,5 +1445,8 @@ class Resumption:
             optimiser=state["optimiser"],
             scheduler=state["scheduler"],
             scaler=state["scaler"],
-            position=RankState.from_record(positions[world.rank]),
+            positions=[
+                RankState.from_record(record)
+                for record in positions[first : first + config.virtual_ranks]
+            ],
         )

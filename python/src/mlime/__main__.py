@@ -509,6 +509,21 @@ def train_e2e(
     agree_every: int = typer.Option(
         64, "--agree-every", help="Steps between the ranks' wall-budget verdicts"
     ),
+    virtual_ranks: int = typer.Option(
+        1,
+        "--virtual-ranks",
+        help="Ranks this process runs as, when the run's world outnumbers its devices",
+    ),
+    checkpoint_minutes: float = typer.Option(
+        None,
+        "--checkpoint-minutes",
+        help="Also write the paused trio atomically every this many minutes",
+    ),
+    run_config: Path = typer.Option(
+        None,
+        "--run-config",
+        help="The run's own config file, copied verbatim into each interval trio",
+    ),
     log_every: int = typer.Option(10, "--log-every", help="Steps between metric records"),
     verbose: bool = VERBOSE,
 ) -> None:
@@ -543,6 +558,8 @@ def train_e2e(
                 compile=compile,
                 compile_mode=compile_mode,
                 agree_every=agree_every,
+                virtual_ranks=virtual_ranks,
+                checkpoint_minutes=checkpoint_minutes,
                 log_every=log_every,
             ),
             init_encoder=init_encoder,
@@ -550,6 +567,7 @@ def train_e2e(
             aux_weight=aux_weight,
             resume=resume,
             activation_checkpointing=activation_checkpointing,
+            run_config=run_config,
         )
     except torch.cuda.OutOfMemoryError as error:
         # The sweep that drives this wants the peak recorded even at the crash,

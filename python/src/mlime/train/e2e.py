@@ -11,6 +11,7 @@ itself.
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -199,6 +200,7 @@ def e2e(
     max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
     resume: Path | None = None,
     activation_checkpointing: bool = False,
+    run_config: Path | None = None,
 ) -> RunResult:
     """Train the end-to-end model over *slices.train*; score held-out both ways.
 
@@ -207,6 +209,8 @@ def e2e(
     restricted loss. What differs is the model under them and where its weights
     start. With *resume* this continues the run that wrote the checkpoint --
     ``--init-*`` belongs only to the first segment and passing both is an error.
+    *run_config* is the kernel's own run-config file, copied into each
+    interval trio verbatim; the loop refuses ``checkpoint_minutes`` without it.
     """
     world = Distributed.from_environment()
     if resume is None:
@@ -243,9 +247,26 @@ def e2e(
         compile_modules(model, training.compile_mode)
     lexicon, tokenizer = vocabularies.lexicon, vocabularies.tokenizer
 
-    builder = vocabularies.builder(augmentation, training.seed)
-    stream = vocabularies.stream(paths, slices.train, builder, world.rank, world.world_size)
-    collator = vocabularies.collator(context_dropout, max_context_tokens, training.seed)
+    # One (stream, collator) lane per rank this process stands for: lane j of
+    # a process takes the shard deal of world rank `rank * virtual + j`, and
+    # every lane's collator starts from the same seed -- exactly the objects a
+    # real world of `world_size * virtual` ranks would have built.
+    virtual = training.virtual_ranks
+    total_world = world.world_size * virtual
+    builders = [vocabularies.builder(augmentation, training.seed) for _ in range(virtual)]
+    lanes = [
+        (
+            vocabularies.stream(
+                paths,
+                slices.train,
+                builders[index],
+                world.rank * virtual + index,
+                total_world,
+            ),
+            vocabularies.collator(context_dropout, max_context_tokens, training.seed),
+        )
+        for index in range(virtual)
+    ]
 
     paths.out.mkdir(parents=True, exist_ok=True)
     with MetricLog(paths.out / "metrics.jsonl") as provenance:
@@ -268,10 +289,13 @@ def e2e(
                 resume=str(resume) if resume is not None else None,
             )
 
-    segment = train(model, stream, collator, training, paths.out, world, resume)
+    segment = train(model, lanes, training, paths.out, world, resume, run_config=run_config)
     losses = step_losses(segment.metrics)
     if not segment.finished:
-        return paused_run(segment, losses, model.gates(), builder.counts.as_dict(), world)
+        build_counts: Counter[str] = Counter()
+        for builder in builders:
+            build_counts.update(builder.counts.as_dict())
+        return paused_run(segment, losses, model.gates(), dict(build_counts), world)
     evaluation = held_out_examples(
         paths, vocabularies.builder(augmentation, training.seed + 1), slices
     )

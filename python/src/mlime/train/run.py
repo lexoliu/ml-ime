@@ -352,7 +352,7 @@ def route_a(
                 resume=str(resume) if resume is not None else None,
             )
 
-    segment = train(model, stream, collator, training, paths.out, world, resume)
+    segment = train(model, [(stream, collator)], training, paths.out, world, resume)
     losses = step_losses(segment.metrics)
     if not segment.finished:
         return paused_run(segment, losses, model.gates(), builder.counts.as_dict(), world)
