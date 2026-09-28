@@ -58,3 +58,12 @@ unsafe_op_in_unsafe_fn = "deny"
 pedantic = { level = "warn", priority = -1 }
 unwrap_used = "deny"
 panic_in_result_fn = "deny"
+
+[patch.crates-io]
+# rc.13's prebuilt ONNX Runtime 1.28.0 compiles the avx2 MLAS translation
+# units with -mavxvnni, so SQ8BitGemmKernel_*_avx2 emits AVX-VNNI
+# instructions (vpdpwssd) and SIGILLs on x86-64 CPUs without AVX-VNNI
+# (#98). The next commit on ort's main line only swaps the binaries to
+# ONNX Runtime 1.30.0, whose upstream build puts the VNNI kernels in their
+# own translation unit. Patching ort-sys alone keeps ort's rc.13 API.
+ort-sys = { git = "https://github.com/pykeio/ort", rev = "6d7c231c3430026bd5e8262fc8d74e2307512ab1" }
