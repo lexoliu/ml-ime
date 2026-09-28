@@ -84,6 +84,18 @@ neural weight 1, and abbreviated uses its dev weight of 1.5 from
 | mixed (5041) old | .3842 | .4745 | .7624 | .4182 | 413 |
 | mixed new | **.3870** | **.4936** | .7631 | **.4267** | **366** |
 
+The "old" rows are the search on the current decoder, and they sit below
+`notes/char-lm-v2.md`: .2824 against 28.26% abbreviated and .3842 against
+38.54% mixed. The note's rows came from the binary at 33f7371, which advanced
+the character LM one reading at a time. Since #76 the LM advances every
+reading of a position in one batch. The int8 export's dynamic quantisation
+takes one activation scale per batch, so a beam's score depends on its
+batchmates by 0.002 to 0.13 nats. That redistributes near-ties: on the mixed
+slice, 33f7371 gives .3854, 160a3ee .3846, and a380edc and current dev .3842.
+Current dev and a380edc agree record for record. Issue #93 makes the int8
+export batch-independent. The comparison here holds the decoder fixed, so the
+old and new rows differ only by the guard.
+
 These records changed top-1:
 
 | slice | changed | gained | lost | wrong both ways |
