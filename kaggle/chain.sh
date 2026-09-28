@@ -145,6 +145,19 @@ left=$(quota_left)
 if [ -z "$left" ] || ! python3 -c "import sys; sys.exit(0 if float('$left') >= $SESSION_HOURS else 1)"; then
   say "segment $last complete; ${left:-?}h of quota left, waiting for $SESSION_HOURS before pushing segment $next"; exit 0
 fi
+# A push while a Colab leg is training forks the lineage: the two legs then
+# diverge from the same checkpoint and the pick by step throws one away.
+COLAB=${COLAB:-/Users/lexoliu/.local/bin/colab}
+if [ -x "$COLAB" ]; then
+  case "$SLUG" in
+    *e2e*)
+      if sessions=$("$COLAB" sessions 2>&1); then
+        if printf '%s' "$sessions" | grep -qw e2e; then say "colab leg running; not pushing segment $next"; exit 0; fi
+      else
+        say "colab sessions failed; not pushing segment $next"; exit 0
+      fi ;;
+  esac
+fi
 dir=$(mktemp -d)
 sed "s/^SEGMENT = 0$/SEGMENT = $next/" "$KERNEL_DIR/kernel.py" > "$dir/kernel.py"
 python3 - "$next" "$dir/kernel-metadata.json" "$KERNEL_DIR/kernel-metadata.json" "$SLUG" <<'PY'

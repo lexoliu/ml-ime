@@ -103,7 +103,7 @@ def test_the_loss_falls_and_the_run_leaves_its_evidence(
     )
     out_dir = tmp_path / "run"
     collator = Collator(tokenizer, lexicon.candidate_mask)
-    metrics_path = train(model, stream, collator, config, out_dir).metrics
+    metrics_path = train(model, [(stream, collator)], config, out_dir).metrics
 
     records = [json.loads(line) for line in metrics_path.read_text().splitlines()]
     steps = [record for record in records if record["event"] == "step"]
@@ -130,7 +130,7 @@ def test_the_schedule_reaches_both_learning_rates(
     stream = CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, arbitration))
     config = TrainingConfig(max_steps=25, token_budget=64, log_every=1, fp16=False)
     collator = Collator(tokenizer, lexicon.candidate_mask)
-    metrics_path = train(model, stream, collator, config, tmp_path / "run").metrics
+    metrics_path = train(model, [(stream, collator)], config, tmp_path / "run").metrics
     steps = [
         json.loads(line)
         for line in metrics_path.read_text().splitlines()
@@ -228,15 +228,14 @@ def test_a_resumed_run_is_the_run_that_was_not_interrupted(
     whole_dir = tmp_path / "whole"
     uninterrupted = tiny_model(lexicon)
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
-    whole = train(uninterrupted, stream, collator, RESUMABLE, whole_dir).metrics
+    whole = train(uninterrupted, [(stream, collator)], RESUMABLE, whole_dir).metrics
     assert len(step_losses(whole)) == RESUMABLE.max_steps
 
     resumed_model = tiny_model(lexicon)
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     resumed = train(
         resumed_model,
-        stream,
-        collator,
+        [(stream, collator)],
         RESUMABLE,
         tmp_path / "resumed",
         resume=whole_dir / "checkpoint-000003.pt",
@@ -299,15 +298,14 @@ def test_a_resume_under_a_different_schedule_is_refused(
 ) -> None:
     out_dir = tmp_path / "whole"
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
-    train(tiny_model(lexicon), stream, collator, RESUMABLE, out_dir)
+    train(tiny_model(lexicon), [(stream, collator)], RESUMABLE, out_dir)
 
     elsewhere = replace(RESUMABLE, base_lr=RESUMABLE.base_lr * 2, weight_decay=0.5)
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     with pytest.raises(ValueError, match=r"base_lr .* weight_decay "):
         train(
             tiny_model(lexicon),
-            stream,
-            collator,
+            [(stream, collator)],
             elsewhere,
             tmp_path / "elsewhere",
             resume=out_dir / "checkpoint-000003.pt",
@@ -324,14 +322,13 @@ def test_resuming_a_run_that_is_already_finished_is_refused(
 ) -> None:
     out_dir = tmp_path / "whole"
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
-    train(tiny_model(lexicon), stream, collator, RESUMABLE, out_dir)
+    train(tiny_model(lexicon), [(stream, collator)], RESUMABLE, out_dir)
 
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     with pytest.raises(ValueError, match="already at step 6 of 6"):
         train(
             tiny_model(lexicon),
-            stream,
-            collator,
+            [(stream, collator)],
             RESUMABLE,
             tmp_path / "again",
             resume=out_dir / "checkpoint-final.pt",
@@ -349,7 +346,7 @@ def test_only_the_newest_checkpoints_are_kept(
     out_dir = tmp_path / "rotated"
     config = replace(RESUMABLE, checkpoint_every=1, keep_checkpoints=2)
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
-    train(tiny_model(lexicon), stream, collator, config, out_dir)
+    train(tiny_model(lexicon), [(stream, collator)], config, out_dir)
 
     numbered = sorted(path.name for path in out_dir.glob("checkpoint-[0-9]*.pt"))
     assert numbered == ["checkpoint-000005.pt", "checkpoint-000006.pt"]
@@ -377,12 +374,12 @@ def test_a_segment_out_of_clock_pauses_and_the_next_one_finishes_the_run(
     whole_dir = tmp_path / "whole"
     uninterrupted = tiny_model(lexicon)
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
-    whole = train(uninterrupted, stream, collator, RESUMABLE, whole_dir)
+    whole = train(uninterrupted, [(stream, collator)], RESUMABLE, whole_dir)
     assert whole.finished and whole.step == RESUMABLE.max_steps
 
     paused_dir = tmp_path / "paused"
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
-    paused = train(tiny_model(lexicon), stream, collator, SPENT, paused_dir)
+    paused = train(tiny_model(lexicon), [(stream, collator)], SPENT, paused_dir)
     assert (paused.step, paused.finished) == (1, False)
     assert (paused_dir / "checkpoint-paused.pt").is_file()
     # No final checkpoint: that file means the run reached max_steps, and a
@@ -396,8 +393,7 @@ def test_a_segment_out_of_clock_pauses_and_the_next_one_finishes_the_run(
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     resumed = train(
         resumed_model,
-        stream,
-        collator,
+        [(stream, collator)],
         RESUMABLE,
         tmp_path / "resumed",
         resume=paused_dir / "checkpoint-paused.pt",
@@ -421,7 +417,7 @@ def test_rotation_leaves_the_paused_checkpoint_alone(
     every_step = replace(RESUMABLE, checkpoint_every=1, keep_checkpoints=1)
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     spent = replace(every_step, wall_budget_seconds=SPENT.wall_budget_seconds)
-    train(tiny_model(lexicon), stream, collator, spent, out_dir)
+    train(tiny_model(lexicon), [(stream, collator)], spent, out_dir)
     assert (out_dir / "checkpoint-paused.pt").is_file()
 
     # The next segment writes into the same directory and rotates hard, and the
@@ -429,8 +425,7 @@ def test_rotation_leaves_the_paused_checkpoint_alone(
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     train(
         tiny_model(lexicon),
-        stream,
-        collator,
+        [(stream, collator)],
         every_step,
         out_dir,
         resume=out_dir / "checkpoint-paused.pt",
@@ -452,15 +447,14 @@ def test_a_budget_may_change_between_segments_but_nothing_else_may(
 ) -> None:
     out_dir = tmp_path / "paused"
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
-    train(tiny_model(lexicon), stream, collator, SPENT, out_dir)
+    train(tiny_model(lexicon), [(stream, collator)], SPENT, out_dir)
 
     longer = replace(SPENT, wall_budget_seconds=3600.0, new_lr=SPENT.new_lr / 2)
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     with pytest.raises(ValueError, match="new_lr") as refusal:
         train(
             tiny_model(lexicon),
-            stream,
-            collator,
+            [(stream, collator)],
             longer,
             tmp_path / "elsewhere",
             resume=out_dir / "checkpoint-paused.pt",
@@ -514,13 +508,12 @@ def test_a_prefetched_segment_pauses_and_resumes_on_the_consumed_batch(
     whole_dir = tmp_path / "whole"
     uninterrupted = tiny_model(lexicon)
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
-    whole = train(uninterrupted, stream, collator, RESUMABLE, whole_dir)
+    whole = train(uninterrupted, [(stream, collator)], RESUMABLE, whole_dir)
 
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     paused = train(
         tiny_model(lexicon),
-        stream,
-        collator,
+        [(stream, collator)],
         replace(SPENT, prefetch=True),
         tmp_path / "paused",
     )
@@ -530,8 +523,7 @@ def test_a_prefetched_segment_pauses_and_resumes_on_the_consumed_batch(
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     resumed = train(
         resumed_model,
-        stream,
-        collator,
+        [(stream, collator)],
         replace(RESUMABLE, prefetch=True),
         tmp_path / "resumed",
         resume=tmp_path / "paused" / "checkpoint-paused.pt",
@@ -609,7 +601,9 @@ def test_an_accumulated_step_is_the_mean_over_every_scored_position(
 
     doubled = replace(RESUMABLE, max_steps=1, accumulate=2)
     stream, collator = stream_and_collator(corpus, lexicon, spans, arbitration, tokenizer)
-    segment = train(tiny_model(lexicon), stream, UnevenTargets(collator), doubled, tmp_path / "run")
+    segment = train(
+        tiny_model(lexicon), [(stream, UnevenTargets(collator))], doubled, tmp_path / "run"
+    )
     assert step_losses(segment.metrics) == [pytest.approx(expected, rel=1e-5)]
 
 
@@ -628,13 +622,12 @@ def test_an_accumulating_run_pauses_and_resumes_in_micro_batches(
     whole_dir = tmp_path / "whole"
     uninterrupted = tiny_model(lexicon)
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
-    whole = train(uninterrupted, stream, collator, doubled, whole_dir)
+    whole = train(uninterrupted, [(stream, collator)], doubled, whole_dir)
 
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     paused = train(
         tiny_model(lexicon),
-        stream,
-        collator,
+        [(stream, collator)],
         replace(doubled, wall_budget_seconds=SPENT.wall_budget_seconds),
         tmp_path / "paused",
     )
@@ -644,8 +637,7 @@ def test_an_accumulating_run_pauses_and_resumes_in_micro_batches(
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     resumed = train(
         resumed_model,
-        stream,
-        collator,
+        [(stream, collator)],
         doubled,
         tmp_path / "resumed",
         resume=tmp_path / "paused" / "checkpoint-paused.pt",
@@ -669,10 +661,308 @@ def test_a_profiled_run_writes_the_phase_table(
     """A run asked to profile writes its timed steps' phases to the metrics."""
     config = replace(RESUMABLE, max_steps=12, profile_steps=2)
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
-    segment = train(tiny_model(lexicon), stream, collator, config, tmp_path / "run")
+    segment = train(tiny_model(lexicon), [(stream, collator)], config, tmp_path / "run")
     profiled = records(segment.metrics, "profile")
     assert len(profiled) == 1
     assert profiled[0]["steps"] == 2
     assert set(profiled[0]["phases"]) == set(PHASES)
     for phase in profiled[0]["phases"].values():
         assert phase["p95"] >= phase["mean"] >= 0.0
+
+
+# ---------------------------------------------------------------------------
+# One process running as a world: the virtual-rank path. A Kaggle segment is
+# two real ranks; a Colab segment is one process standing for both, and the
+# checkpoints the two legs write must be interchangeable.
+# ---------------------------------------------------------------------------
+
+
+def _rank_lanes(
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    first_rank: int,
+    count: int,
+) -> list[tuple[CorpusStream, Collator]]:
+    """The ``(stream, collator)`` lanes of *count* consecutive ranks of a world of two."""
+    samples_dir, labels_dir = corpus
+    return [
+        (
+            CorpusStream(
+                samples_dir,
+                labels_dir,
+                SampleBuilder(lexicon, spans, arbitration, seed=1),
+                rank=first_rank + index,
+                world_size=2,
+            ),
+            Collator(tokenizer, lexicon.candidate_mask),
+        )
+        for index in range(count)
+    ]
+
+
+def _gloo_rank(
+    rank: int,
+    corpus: tuple[str, str],
+    resume: str | None,
+    out_dir: str,
+    port: int,
+    config: TrainingConfig,
+) -> None:
+    """One process of the two-rank gloo world the virtual-rank tests compare against.
+
+    Runs under ``torch.multiprocessing``'s spawn, which starts a fresh
+    interpreter: the fixtures are rebuilt inside it rather than pickled over.
+    """
+    import os
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = str(port)
+    os.environ["RANK"] = str(rank)
+    os.environ["WORLD_SIZE"] = "2"
+
+    from conftest import READINGS, StubTokenizer
+
+    from mlime.train.lexicon import build_lexicon
+    from mlime.train.spans import SpanVocab
+
+    spans = SpanVocab.load()
+    vocabulary = {character: index + 100 for index, character in enumerate(sorted(READINGS))}
+    lexicon = build_lexicon(READINGS, vocabulary, spans)
+    arbitration = ReadingArbitration.load(spans)
+    lanes = _rank_lanes(
+        (Path(corpus[0]), Path(corpus[1])), lexicon, spans, arbitration, StubTokenizer(), rank, 1
+    )
+    train(
+        tiny_model(lexicon),
+        lanes,
+        config,
+        Path(out_dir),
+        Distributed(rank=rank, world_size=2, local_rank=0),
+        resume=None if resume is None else Path(resume),
+    )
+
+
+def _spawn_world(
+    corpus: tuple[Path, Path],
+    tmp_path: Path,
+    config: TrainingConfig,
+    out_dir: str,
+    resume: Path | None = None,
+) -> Path:
+    """Run *config*'s segment as a two-process gloo world under *out_dir*."""
+    import socket
+
+    import torch.multiprocessing as mp
+
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    port = listener.getsockname()[1]
+    listener.close()
+    paths = (str(corpus[0]), str(corpus[1]))
+    target = tmp_path / out_dir
+    mp.spawn(
+        _gloo_rank,
+        args=(paths, None if resume is None else str(resume), str(target), port, config),
+        nprocs=2,
+        join=True,
+    )
+    return target
+
+
+def _positions(path: Path) -> list[dict[str, object]]:
+    """Every rank's (epoch, index) in a checkpoint, in rank order."""
+    state = torch.load(path, weights_only=False)
+    return [{"epoch": p["epoch"], "index": p["index"]} for p in state["positions"]]
+
+
+def test_two_virtual_ranks_match_a_two_process_world(
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """A single process as two ranks computes what two gloo processes compute.
+
+    Same data, same steps: the virtual run's losses, its final weights and the
+    positions it checkpoints all equal the real world's -- within the small
+    float difference a different summation order can leave behind.
+    """
+    config = replace(RESUMABLE, accumulate=2, prefetch=True)
+    ddp_dir = _spawn_world(corpus, tmp_path, config, "ddp")
+
+    lanes = _rank_lanes(corpus, lexicon, spans, arbitration, tokenizer, 0, 2)
+    model = tiny_model(lexicon)
+    virtual = train(
+        model,
+        lanes,
+        replace(config, virtual_ranks=2),
+        tmp_path / "virtual",
+    )
+    assert virtual.finished and virtual.step == config.max_steps
+    assert step_losses(virtual.metrics) == step_losses(ddp_dir / "metrics.jsonl")
+    assert _positions(ddp_dir / "checkpoint-final.pt") == _positions(
+        tmp_path / "virtual" / "checkpoint-final.pt"
+    )
+    reference = torch.load(ddp_dir / "checkpoint-final.pt", weights_only=False)["model"]
+    for name, tensor in model.state_dict().items():
+        assert torch.allclose(tensor, reference[name], atol=1e-5), name
+
+
+def test_the_two_worlds_resume_each_other(
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """A gloo world's checkpoint resumes in a virtual process, and back again."""
+    config = replace(RESUMABLE, accumulate=2, prefetch=True)
+    ddp_dir = _spawn_world(corpus, tmp_path, config, "ddp")
+
+    lanes = _rank_lanes(corpus, lexicon, spans, arbitration, tokenizer, 0, 2)
+    virtual_model = tiny_model(lexicon)
+    virtual = train(
+        virtual_model,
+        lanes,
+        replace(config, virtual_ranks=2),
+        tmp_path / "virtual",
+    )
+
+    # Direction one: the real world's mid-run checkpoint resumes in a process
+    # standing for both ranks, and the same three steps come out.
+    lanes = _rank_lanes(corpus, lexicon, spans, arbitration, tokenizer, 0, 2)
+    resumed_model = tiny_model(lexicon)
+    resumed = train(
+        resumed_model,
+        lanes,
+        replace(config, virtual_ranks=2),
+        tmp_path / "from-ddp",
+        resume=ddp_dir / "checkpoint-000003.pt",
+    )
+    assert resumed.finished
+    assert step_losses(resumed.metrics) == step_losses(ddp_dir / "metrics.jsonl")[3:]
+    reference = torch.load(ddp_dir / "checkpoint-final.pt", weights_only=False)["model"]
+    for name, tensor in resumed_model.state_dict().items():
+        assert torch.allclose(tensor, reference[name], atol=1e-5), name
+
+    # Direction two: the virtual world's mid-run checkpoint resumes in the
+    # gloo world, each process taking its own rank's position.
+    ddp_resumed = _spawn_world(
+        corpus,
+        tmp_path,
+        config,
+        "from-virtual",
+        resume=tmp_path / "virtual" / "checkpoint-000003.pt",
+    )
+    assert step_losses(ddp_resumed / "metrics.jsonl") == step_losses(virtual.metrics)[3:]
+    assert _positions(ddp_resumed / "checkpoint-final.pt") == _positions(
+        tmp_path / "virtual" / "checkpoint-final.pt"
+    )
+
+
+def test_an_interval_checkpoint_resumes_like_a_pause(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """The trio an interval checkpoint writes continues the run at its step.
+
+    A leg that can die without warning publishes these; resuming from one has
+    to be resuming from a pause, so the steps after it equal an uninterrupted
+    run's.
+    """
+    longer = replace(RESUMABLE, max_steps=20, checkpoint_every=1000)
+    whole_dir = tmp_path / "whole"
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    whole = train(tiny_model(lexicon), [(stream, collator)], longer, whole_dir)
+
+    # A leg that dies mid-run: the measurement window fills at step 12 and
+    # the loop stops there, leaving the interval trios it wrote along the way
+    # -- the cadence here is fast enough to fire every step, and only the
+    # newest is kept. The trio's run-config is the kernel's own file, verbatim.
+    died_dir = tmp_path / "died"
+    run_config = tmp_path / "kernel-run-config.json"
+    run_config.write_text(json.dumps({"max_steps": 20, "epochs": 1, "segment": 3}) + "\n")
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    died = train(
+        tiny_model(lexicon),
+        [(stream, collator)],
+        replace(longer, checkpoint_minutes=1e-9, profile_steps=2),
+        died_dir,
+        run_config=run_config,
+    )
+    assert not died.finished and died.step == 12
+    intervals = sorted(died_dir.glob("interval-*"))
+    assert [directory.name for directory in intervals] == ["interval-000012"]
+    trio = intervals[0]
+    for marker in ("checkpoint-paused.pt", "run-config.json", "run-summary.json"):
+        assert (trio / marker).is_file(), marker
+    summary = json.loads((trio / "run-summary.json").read_text())
+    assert summary["checkpoint_step"] == 12 and not summary["finished"]
+    assert summary["processes"] == 1 and summary["virtual_ranks"] == 1
+    # Verbatim bytes, so the next leg reads segment and epochs too.
+    assert (trio / "run-config.json").read_bytes() == run_config.read_bytes()
+
+    resumed_model = tiny_model(lexicon)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    resumed = train(
+        resumed_model,
+        [(stream, collator)],
+        longer,
+        tmp_path / "resumed",
+        resume=trio / "checkpoint-paused.pt",
+    )
+    assert resumed.finished and resumed.step == longer.max_steps
+    assert step_losses(resumed.metrics) == step_losses(whole.metrics)[12:]
+    uninterrupted = torch.load(whole_dir / "checkpoint-final.pt", weights_only=False)["model"]
+    for name, tensor in resumed_model.state_dict().items():
+        assert torch.equal(tensor, uninterrupted[name]), name
+
+
+def test_an_interval_cadence_needs_the_run_config(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """--checkpoint-minutes without --run-config refuses before any step."""
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    with pytest.raises(ValueError, match="run_config"):
+        train(
+            tiny_model(lexicon),
+            [(stream, collator)],
+            replace(RESUMABLE, checkpoint_minutes=1),
+            tmp_path / "refused",
+        )
+
+
+def test_a_lane_count_mismatch_refuses(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """A process told to stand for two ranks but handed one lane raises."""
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    with pytest.raises(ValueError, match="virtual_ranks"):
+        train(
+            tiny_model(lexicon),
+            [(stream, collator)],
+            replace(RESUMABLE, virtual_ranks=2),
+            tmp_path,
+        )

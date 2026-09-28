@@ -19,7 +19,8 @@
     "lexoliu/mlime-run3-rest-samples",
     "lexoliu/mlime-run3-rest-labels",
     "lexoliu/mlime-e2e-init",
-    "lexoliu/mlime-e2e-census"
+    "lexoliu/mlime-e2e-census",
+    "lexoliu/mlime-e2e-resume"
   ],
   "kernel_sources": [],
   "competition_sources": [],

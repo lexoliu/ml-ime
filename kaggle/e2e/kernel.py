@@ -140,6 +140,24 @@ SCORING_RESERVE_SECONDS = 3 * 60 * 60
 KEEP_CHECKPOINTS = 1
 CHECKPOINT_EVERY = 5000
 
+#: The world this run trains in: Kaggle segments run it as two processes and a
+#: Colab leg as one process of two virtual ranks, and the checkpoints the two
+#: legs write carry every rank's position either way, so they resume each
+#: other. A fresh run trains in this world; a resumed one keeps the world's
+#: size the checkpoint's positions record.
+WORLD = 2
+
+#: Minutes between out-of-band checkpoint trios inside the segment, in
+#: addition to the step cadence and the wall-budget pause. A Kaggle leg is
+#: never surprised -- its pause lands before the session dies -- so the
+#: default is none; the Colab driver stamps 20 into the copy it uploads,
+#: because a Colab VM can die without warning and the interval trio is what
+#: its publisher ships.
+CHECKPOINT_MINUTES = 0
+
+#: The three files a leg hands the next one.
+RESUME_MARKERS = ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
+
 REQUIREMENTS = (
     "polars",
     "structlog",
@@ -173,14 +191,29 @@ def describe():
     }
 
 
-def locate(*markers):
-    """The mounted directory holding every one of *markers*."""
+def locate_all(*markers):
+    """Every mounted directory holding every one of *markers*."""
     if not INPUTS.is_dir():
         raise FileNotFoundError(f"{INPUTS} does not exist; the kernel has no inputs at all")
-    for directory in directories(INPUTS):
-        if all((directory / marker).exists() for marker in markers):
-            return directory
-    raise FileNotFoundError(f"no mounted directory holds {markers}; mounts hold {describe()}")
+    return [
+        directory
+        for directory in directories(INPUTS)
+        if all((directory / marker).exists() for marker in markers)
+    ]
+
+
+def locate(*markers):
+    """The first mounted directory holding every one of *markers*.
+
+    For callers whose markers name one thing -- a table, a shard, a package --
+    one match is the right one and the rest are the same files staged twice.
+    Checkpoint trios are different: two mounts can hold real and different
+    ones, and they go through `previous_segment`, which chooses by step.
+    """
+    found = locate_all(*markers)
+    if not found:
+        raise FileNotFoundError(f"no mounted directory holds {markers}; mounts hold {describe()}")
+    return found[0]
 
 
 def find_census():
@@ -334,15 +367,24 @@ def train_argv(
     profile_steps=0,
     compile=COMPILE,
     compile_mode=COMPILE_MODE,
+    nproc=WORLD,
+    virtual_ranks=1,
+    checkpoint_minutes=CHECKPOINT_MINUTES,
     log_every=10,
 ):
-    """The training command both ranks run."""
+    """The training command the ranks of this segment run.
+
+    *nproc* is how many processes the launcher's T4s host and
+    *virtual_ranks* how many ranks each one stands for: on Kaggle two
+    processes of one rank, on Colab one process of two, and the checkpoint
+    does not know the difference.
+    """
     argv = [
         sys.executable,
         "-m",
         "torch.distributed.run",
         "--standalone",
-        "--nproc_per_node=2",
+        f"--nproc_per_node={nproc}",
         "-m",
         "mlime",
         "train",
@@ -362,8 +404,13 @@ def train_argv(
         str(max_held_out),
         "--accumulate",
         str(accumulate),
+        "--virtual-ranks",
+        str(virtual_ranks),
         "--log-every",
         str(log_every),
+        # The kernel's own config file, copied verbatim into interval trios.
+        "--run-config",
+        str(WORKING / "run-config.json"),
     ]
     if prefetch:
         argv.append("--prefetch")
@@ -373,6 +420,8 @@ def train_argv(
         argv += ["--profile-steps", str(profile_steps)]
     if wall_budget is not None:
         argv += ["--wall-budget-seconds", str(wall_budget)]
+    if checkpoint_minutes:
+        argv += ["--checkpoint-minutes", str(checkpoint_minutes)]
     if initials is not None:
         argv += ["--init-encoder", str(initials[0]), "--init-decoder", str(initials[1])]
     if resume is not None:
@@ -814,24 +863,113 @@ def smoke(char_table, out, init_files, env):
     )
 
 
+def torch_load(path):
+    """torch.load with memory-mapping when this torch has it, for header reads."""
+    import inspect
+
+    import torch
+
+    options = {}
+    if "mmap" in inspect.signature(torch.load).parameters:
+        options["mmap"] = True
+    return torch.load(path, map_location="cpu", weights_only=False, **options)
+
+
+def resume_candidates():
+    """Every mounted trio that could resume this run, with the step and the
+    world read off the checkpoint itself, not off its summary.
+
+    A leg's checkpoint reaches the next segment two ways: inside the previous
+    kernel's own output (which the chain mounts) and inside the
+    `mlime-e2e-resume` dataset a Colab leg publishes to. A segment's own
+    interval checkpoints are found here too, inside the output's `run/`
+    directory -- same run, older steps, so the pick by step passes over them.
+    """
+    found = []
+    for mount in locate_all(*RESUME_MARKERS):
+        state = torch_load(mount / "checkpoint-paused.pt")
+        found.append(
+            {
+                "mount": mount,
+                "checkpoint": mount / "checkpoint-paused.pt",
+                "config": json.loads((mount / "run-config.json").read_text()),
+                "summary": json.loads((mount / "run-summary.json").read_text()),
+                "step": int(state["step"]),
+                "world": len(state["positions"]),
+            }
+        )
+    return found
+
+
 def previous_segment():
-    """The previous kernel's output: its paused checkpoint, run config and summary."""
-    if SEGMENT == 0:
-        return None
-    mount = locate("checkpoint-paused.pt", "run-config.json", "run-summary.json")
-    return (
-        mount / "checkpoint-paused.pt",
-        json.loads((mount / "run-config.json").read_text()),
-        json.loads((mount / "run-summary.json").read_text()),
+    """The newest resumable checkpoint mounted, or None for a run not started.
+
+    What is mounted decides fresh-or-resume, not SEGMENT: a re-pushed segment
+    0 resumes the trio a Colab leg published just as a later segment would,
+    and the stamp stays only a label on this leg's output. The pick is by the
+    step the checkpoint itself records, so a Colab leg's progress is never
+    silently discarded in favour of the Kaggle output that predates it. Trios
+    whose shared run-config fields disagree describe different runs -- the
+    refusal `refuse_mismatch` would make inside the checkpoint -- and are
+    refused the same way, by field name. The segment stamp is exempt: it
+    differs by construction.
+    """
+    candidates = resume_candidates()
+    if not candidates:
+        if SEGMENT == 0:
+            return None
+        raise FileNotFoundError(
+            f"segment {SEGMENT} found no resumable trio mounted; mounts hold {describe()}"
+        )
+    shared = set.intersection(*(set(c["config"]) for c in candidates)) - {"segment"}
+    differing = sorted(
+        key
+        for key in shared
+        if len({json.dumps(c["config"].get(key), sort_keys=True) for c in candidates}) > 1
     )
+    if differing:
+        raise ValueError(
+            "the mounted checkpoints disagree on the run: "
+            + ", ".join(differing)
+            + " differ between "
+            + ", ".join(str(c["mount"]) for c in candidates)
+        )
+    picked = max(candidates, key=lambda c: c["step"])
+    print(
+        "resumable checkpoints: "
+        + ", ".join(f"{c['mount']} at step {c['step']}" for c in candidates)
+        + f"; resuming {picked['mount']}",
+        flush=True,
+    )
+    return picked
 
 
-def training_budget(elapsed, max_steps, previous):
-    """How long this segment may train."""
+def gpu_count():
+    """How many accelerators this kernel can spawn a rank on; at least one."""
+    import torch
+
+    return max(1, torch.cuda.device_count())
+
+
+def training_budget(elapsed, max_steps, previous, processes):
+    """How long this segment may train.
+
+    The rate the previous leg measured holds only for a leg on the same
+    number of devices -- a Colab T4 runs at half the Kaggle pair's rate.
+    A summary without the field, or one from a different process count,
+    leaves the plain session budget in place with a line in the log.
+    """
     budget = SESSION_SECONDS - RESERVE_SECONDS - elapsed
     if previous is None:
         return budget
-    summary = previous[2]
+    summary = previous["summary"]
+    if summary.get("processes") != processes:
+        print(
+            f"the last leg trained on {summary.get('processes')} processes, this one has "
+            f"{processes}; its rate does not transfer, using the plain budget",
+            flush=True,
+        )
+        return budget
     steps = summary["last_step"] - summary["first_step"] + 1
     rate = steps / summary["train_seconds"]
     predicted = (max_steps - summary["last_step"]) / rate
@@ -890,17 +1028,33 @@ def main():
         config = {"max_steps": int(counts["steps_for_epochs"]), "epochs": EPOCHS}
         resume = None
     else:
-        resume, config, _ = previous
+        resume, config = previous["checkpoint"], previous["config"]
     config["segment"] = SEGMENT
     config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(config), flush=True)
+
+    # The world the run trains in is the checkpoint's when resuming and WORLD
+    # when starting; it splits into processes -- one per accelerator this
+    # kernel can see, but never more than it has ranks -- and each process
+    # stands for however many ranks are left over. On Kaggle that is two
+    # processes of one rank each; on Colab's single T4, one process of two.
+    world = WORLD if previous is None else previous["world"]
+    nproc = min(gpu_count(), world)
+    if world % nproc:
+        raise RuntimeError(
+            f"a world of {world} ranks does not split evenly over {nproc} processes"
+        )
+    virtual = world // nproc
+    print(f"world of {world}: {nproc} processes x {virtual} virtual ranks", flush=True)
 
     init_files = (
         (initials / INIT_ENCODER, initials / INIT_DECODER)
         if resume is None
         else None
     )
-    wall_budget = training_budget(time.monotonic() - started, config["max_steps"], previous)
+    wall_budget = training_budget(
+        time.monotonic() - started, config["max_steps"], previous, nproc
+    )
     if wall_budget <= 0:
         raise RuntimeError("the session was spent before training could start")
     code, seconds = run(
@@ -912,6 +1066,8 @@ def main():
             init_files,
             resume,
             TOKEN_BUDGET,
+            nproc=nproc,
+            virtual_ranks=virtual,
         ),
         env,
         str(WORKING / "train.log"),
@@ -927,10 +1083,16 @@ def main():
         "resumed_from": None if resume is None else str(resume),
         "first_step": steps[0]["step"],
         "last_step": steps[-1]["step"],
+        # A logged step is the last *recorded* one; the step the checkpoint
+        # holds is the pause event's own.
+        "checkpoint_step": paused[-1]["step"] if paused else steps[-1]["step"],
         "first_loss": steps[0]["loss"],
         "last_loss": steps[-1]["loss"],
         "train_seconds": round(seconds, 1),
         "finished": not paused,
+        "world_size": world,
+        "processes": nproc,
+        "virtual_ranks": virtual,
         "gates": steps[-1]["gates"],
     }
 
@@ -977,4 +1139,5 @@ def main():
     print(json.dumps(summary, indent=2), flush=True)
 
 
-main()
+if __name__ == "__main__":
+    main()
