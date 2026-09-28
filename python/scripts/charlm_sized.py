@@ -62,7 +62,7 @@ CHAR_PINYIN = "".join(f"{ch}\ta\n" for ch in VOCAB.chars[len(SPECIALS) : len(SPE
 
 def main() -> None:
     out = Path(sys.argv[1])
-    quantize = cast(Literal["int8"], sys.argv[2]) if len(sys.argv) > 2 else None
+    quantize = cast(Literal["int8", "fp16"], sys.argv[2]) if len(sys.argv) > 2 else None
     out.mkdir(parents=True, exist_ok=True)
     (out / "char_pinyin.tsv").write_text(CHAR_PINYIN, encoding="utf-8")
     torch.manual_seed(2)

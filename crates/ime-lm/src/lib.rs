@@ -18,12 +18,19 @@
 //! A state is two kinds of tensor. The *prefix* tensors are what the prelude
 //! produced -- the transformer's key/value cache over the context -- and every
 //! beam of a record shares them; the *state* tensors are per beam (the LSTM's
-//! `hidden`/`cell`, the transformer's cache over the sentence so far). Every
-//! tensor is batch-first, and a step's batch is the surviving beams' rows laid
-//! out as a rectangle: `width` consecutive rows per worker, so the prefix
-//! feeds once per worker and broadcasts over the rows under it instead of
-//! being packed per row. A beam's share of an output is one row, without the
-//! crate ever interpreting what a row holds.
+//! `hidden`/`cell`, the transformer's cache over the sentence so far). Both
+//! live on the session's device: `start` binds the prefill's outputs over
+//! one resident slot's rows -- the graph emits the prefix left-padded to
+//! the slot's width and the mask row beside it, so the run crosses nothing
+//! but the prelude's tokens up and `log_probs` down -- and a step is fed
+//! `token`, `source_row` (the resident row each new beam continues from)
+//! and `prefix_row` (each worker's slot) -- the
+//! graph gathers the caches by index on the device and produces the new
+//! rows' tensors there too, so the only tensors that ever cross the bus are
+//! the indices, the tokens and `log_probs`. A step's batch stays the
+//! `[workers, width]` rectangle: `width` consecutive rows per worker sharing
+//! the worker's slot, so the prefix gathers once per worker instead of once
+//! per row.
 //!
 //! The alphabet is the lexicon's, so every [`CharId`] the lattice can propose
 //! has a row; the mapping is built once at load and a lexicon that disagrees
@@ -37,24 +44,30 @@
 //! pre-packs are shared too, so the model's memory is one copy of the
 //! weights plus per-thread working space no matter how many threads decode.
 
+use half::f16;
 use ime_decode::{BeamOptions, MAX_HISTORY, Transition};
 use ime_pinyin::{CharId, Lexicon};
 use memmap2::Mmap;
 use ort::AsPointer;
 use ort::ep::ExecutionProviderDispatch;
-use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
+use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::builder::{GraphOptimizationLevel, PrepackedWeights};
-use ort::session::{Session, SessionInputValue};
-use ort::value::{DynValue, Shape, Tensor, TensorRefMut};
+use ort::session::{IoBinding, Session};
+use ort::value::{
+    DynTensor, DynValue, Outlet, PrimitiveTensorElementType, Shape, SymbolicDimensions, Tensor,
+    TensorElementType, TensorRefMut, ValueType,
+};
 use serde::Deserialize;
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fmt::Debug;
 use std::fs;
+use std::mem::size_of;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 use thiserror::Error;
 use thread_local::ThreadLocal;
 
@@ -105,6 +118,41 @@ impl Backend {
     }
 }
 
+/// Read *dir*'s `charlm.json` and refuse the manifest shapes this build
+/// cannot serve: a `layout` other than `resident`, or a `rows` table that
+/// does not parallel the `prefix` and `state` name lists it gives the row
+/// shapes of.
+fn read_manifest(dir: &Path) -> Result<Manifest, LmError> {
+    let manifest_path = dir.join("charlm.json");
+    let raw = fs::read_to_string(&manifest_path).map_err(|source| LmError::Io {
+        path: manifest_path.clone(),
+        source,
+    })?;
+    let manifest: Manifest = serde_json::from_str(&raw).map_err(|source| LmError::Manifest {
+        path: manifest_path,
+        source,
+    })?;
+    if manifest.layout.as_deref() != Some(STEP_LAYOUT) {
+        return Err(LmError::Layout {
+            path: dir.to_path_buf(),
+            layout: manifest.layout,
+        });
+    }
+    for (rows, names) in [
+        (&manifest.rows.prefix, &manifest.prefix),
+        (&manifest.rows.state, &manifest.state),
+    ] {
+        if rows.len() != names.len() {
+            return Err(LmError::Rows {
+                path: dir.join("charlm.json"),
+                rows: rows.len(),
+                names: names.len(),
+            });
+        }
+    }
+    Ok(manifest)
+}
+
 /// How a model's sessions are built: the provider they register, the threads
 /// one step spreads over, the width a step's batch is laid out at, and
 /// whether the runtime logs verbosely.
@@ -142,6 +190,18 @@ impl Default for SessionShape {
     }
 }
 
+/// A session plus the [`IoBinding`] every one of its runs is rebound
+/// through: creating a binding allocates an `OrtIoBinding`, so one is made
+/// with the session and `clear`ed per run rather than built per run.
+#[derive(Debug)]
+struct BoundSession {
+    /// The session.
+    session: Session,
+    /// Its persistent binding; a run clears it, binds the run's tensors and
+    /// calls `run_binding`.
+    binding: IoBinding,
+}
+
 /// The per-thread sessions of one graph, over one shared copy of its weights.
 ///
 /// *initializers* are the `OrtValue`s the export's weights table described,
@@ -152,11 +212,15 @@ impl Default for SessionShape {
 /// declared first so its sessions drop before the weights they point into.
 struct GraphSessions {
     /// One session per thread, opened on first use.
-    by_thread: ThreadLocal<RefCell<Session>>,
+    by_thread: ThreadLocal<RefCell<BoundSession>>,
     /// The graph's file.
     path: PathBuf,
-    /// The prepacked weights every session of this graph shares.
-    prepacked: PrepackedWeights,
+    /// The prepacked weights every session of this graph shares, `None`
+    /// when the export's dtype has kernels that cannot fill a shared
+    /// container -- fp16's `LayerNormalization` prepacks into a private one
+    /// instead, and a shared container present at session creation makes
+    /// `PrepackConstantInitializedTensors` fail the session's open.
+    prepacked: Option<PrepackedWeights>,
     /// The graph's initializers, one `OrtValue` each shared by every session.
     initializers: Vec<(String, Arc<DynValue>)>,
     /// How the sessions are built.
@@ -168,25 +232,33 @@ impl GraphSessions {
         graph: PathBuf,
         initializers: Vec<(String, Arc<DynValue>)>,
         shape: SessionShape,
+        dtype: ModelDtype,
     ) -> Self {
         Self {
             by_thread: ThreadLocal::new(),
             path: graph,
-            prepacked: PrepackedWeights::new(),
+            prepacked: (dtype == ModelDtype::Float32).then(PrepackedWeights::new),
             initializers,
             shape,
         }
     }
 
-    /// This thread's session, opened from the shared file on first use.
+    /// This thread's session and binding, opened from the shared file on
+    /// first use.
     ///
     /// Sessions may open concurrently: ONNX Runtime serializes the pre-packed
     /// weights lookups and writes itself -- `PrepackConstantInitializedTensors`
     /// holds `prepacked_weights_container_->mutex_` around them.
-    fn session(&self) -> Result<&RefCell<Session>, LmError> {
+    fn session(&self) -> Result<&RefCell<BoundSession>, LmError> {
         self.by_thread.get_or_try(|| {
-            open_session(&self.path, &self.prepacked, &self.initializers, self.shape)
-                .map(RefCell::new)
+            let session = open_session(
+                &self.path,
+                self.prepacked.as_ref(),
+                &self.initializers,
+                self.shape,
+            )?;
+            let binding = session.create_binding()?;
+            Ok(RefCell::new(BoundSession { session, binding }))
         })
     }
 }
@@ -216,7 +288,7 @@ pub enum LmError {
     /// a graph written for another would load and run until a broadcasting
     /// operator failed on it, so the check happens at open.
     #[error(
-        "the export at {path} has a step-graph batch layout of {layout:?}, not \"rectangular\": re-export it with `mlime export char-lm`"
+        "the export at {path} has a step-graph batch layout of {layout:?}, not \"resident\": re-export it with `mlime export char-lm`"
     )]
     Layout {
         /// The export's directory.
@@ -259,6 +331,17 @@ pub enum LmError {
         #[source]
         source: ort::Error,
     },
+    /// The manifest's `rows` does not parallel the tensor names it is a row
+    /// shape for.
+    #[error("the manifest at {path} lists {rows} rows for {names} tensors")]
+    Rows {
+        /// The manifest's file.
+        path: PathBuf,
+        /// How many rows the manifest declared.
+        rows: usize,
+        /// How many names the matching list holds.
+        names: usize,
+    },
 }
 
 /// The reserved ids, as the manifest names them.
@@ -272,7 +355,7 @@ struct Specials {
 
 /// The only step-graph batch layout this build reads; the manifest's
 /// `layout` must hold it exactly.
-const STEP_LAYOUT: &str = "rectangular";
+const STEP_LAYOUT: &str = "resident";
 
 /// `charlm.json`, the fields the run consults; the manifest also records the
 /// training step, the architecture and the restricted alphabet size, which
@@ -287,14 +370,34 @@ struct Manifest {
     /// Names of the per-beam tensors: `hidden`/`cell` for the LSTM, the
     /// key/value cache over the sentence so far for the transformer.
     state: Vec<String>,
+    /// The shape one resident slot's row takes in each buffer, in the name
+    /// order of `prefix` and `state`: the export emits its prefix rows
+    /// already left-padded to the prelude width, so these rows are exactly
+    /// what the pool allocates and the bound prefill writes into.
+    rows: RowShapes,
     /// The step graph's batch layout; absent on exports written before the
     /// field existed, which is exactly what [`CharLm::open`] refuses.
     layout: Option<String>,
+    /// The element type the graphs' prefix and state tensors hold; absent on
+    /// exports written before the field existed, all of which the `layout`
+    /// pin already refuses.
+    dtype: Option<ModelDtype>,
     /// Where the graphs' initializers live: one shared file's table, or one
     /// table per graph when the step and prefill tensors have different names.
     weights: WeightsTable,
     specials: Specials,
     chars: Vec<String>,
+}
+
+/// The manifest's `rows`: each resident buffer's per-slot row shape, in the
+/// order the `prefix` and `state` name lists give them.
+#[derive(Debug, Deserialize)]
+struct RowShapes {
+    /// The prefix buffers' row shapes -- for the transformer,
+    /// `[layers, heads, prelude width, head_dim]` per name.
+    prefix: Vec<Vec<i64>>,
+    /// The generation-zero buffers' row shapes.
+    state: Vec<Vec<i64>>,
 }
 
 /// The manifest's `weights`: either both graphs share one file's table, or
@@ -345,6 +448,9 @@ enum WeightDtype {
     /// IEEE-754 single precision, little-endian, four bytes per element.
     #[serde(rename = "float32")]
     Float32,
+    /// IEEE-754 half precision, little-endian, the fp16 export's element.
+    #[serde(rename = "float16")]
+    Float16,
     /// Signed 8-bit integer, the dynamic-quantized `MatMul` weights' element.
     #[serde(rename = "int8")]
     Int8,
@@ -353,32 +459,305 @@ enum WeightDtype {
     Int64,
 }
 
-/// One row of a named state or prefix tensor.
-///
-/// Every tensor the graphs exchange is batch-first, so a beam's share is the
-/// row behind the batch axis: its shape and its data, both read off the
-/// graph's outputs rather than assumed, because a row's shape can change from
-/// one step to the next (the transformer's time axis grows by one).
-#[derive(Debug)]
-struct StateTensor {
-    /// The row's shape: the tensor's axes after the batch axis.
-    shape: Vec<i64>,
-    data: Vec<f32>,
+/// The element type the graphs' prefix and state tensors hold: the
+/// manifest's `dtype`, which an fp16 export sets to halve the bytes a step
+/// moves and reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+enum ModelDtype {
+    /// IEEE-754 single precision.
+    #[default]
+    #[serde(rename = "float32")]
+    Float32,
+    /// IEEE-754 half precision.
+    #[serde(rename = "float16")]
+    Float16,
 }
 
-/// The model's state for one beam: the shared prefix, this beam's own tensors,
-/// and the log probabilities of whatever comes next.
+impl ModelDtype {
+    /// The ONNX Runtime element type it maps to.
+    const fn element(self) -> TensorElementType {
+        match self {
+            Self::Float32 => TensorElementType::Float32,
+            Self::Float16 => TensorElementType::Float16,
+        }
+    }
+}
+
+/// The tensor's shape, or an error when *value* is not a tensor.
+fn value_shape(value: &DynValue) -> Result<Shape, LmError> {
+    let ValueType::Tensor { shape, .. } = value.dtype() else {
+        return Err(ort::Error::new("a state or prefix value is not a tensor").into());
+    };
+    Ok(shape.clone())
+}
+
+/// The tensors one step produced — every `next_*` output — kept on the
+/// session's device.
 ///
-/// Shared rather than owned because the decoder clones a beam whenever it keeps
-/// it; cloning a beam is three reference-count bumps, and the prefix is the
-/// same [`Arc`] for every beam of a record.
+/// A generation is written once, by the step that produced it, and only read
+/// afterwards, so every beam it feeds shares the one allocation: each state's
+/// [`RowRef`] names its own row.
+#[derive(Debug)]
+struct Generation {
+    /// The step's `next_*` outputs in the manifest's `state` order, each
+    /// `[rows, *row shape]` on the session's device.
+    tensors: Vec<DynValue>,
+}
+
+/// A state's own row: which generation's tensors hold it and its index on
+/// their batch axis.
+///
+/// The handle is the typed form of what the step graph's `source_row` feeds
+/// `Gather` — a resident row, never a `usize` into memory the caller has to
+/// size — and keeping the generation's [`Arc`] is what makes the row a valid
+/// read.
+#[derive(Clone, Debug)]
+struct RowRef {
+    /// The buffers this state's row lives in.
+    generation: Arc<Generation>,
+    /// The row's index on the tensors' batch axis.
+    index: u32,
+}
+
+/// One worker's slot in a [`CharLm`]'s resident pool: the row whose prefix
+/// tensors, mask and generation-zero state belong to its record.
+///
+/// `start` takes a slot and uploads the record's prelude into it once; every
+/// beam of the record then reads the slot by index. Dropping the handle
+/// returns the slot to the pool — a cold path taken per record, never per
+/// step, so the pool's lock is never on the hot path's way.
+#[derive(Debug)]
+struct WorkerSlot {
+    /// The pool the slot is drawn from; the [`Arc`] also keeps the pool's
+    /// buffers alive for as long as any of the worker's states is.
+    pool: Arc<RwLock<Resident>>,
+    /// The worker's index into the pool's buffers.
+    index: u32,
+}
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.pool
+            .write()
+            .expect("the resident pool is not poisoned")
+            .free
+            .push(self.index);
+    }
+}
+
+/// A [`CharLm`]'s resident buffers: one tensor per prefix and per state name —
+/// `[slots, *row shape]` on the session's device — plus the per-slot
+/// `prefix_mask`, so slot *i* of every buffer is one worker's share.
+///
+/// The pool is shared across every thread the model runs on: a state's prefix
+/// resolves through the buffers the pool holds at the step that reads it, and
+/// growth copies the live slots into fresh buffers without changing their
+/// indices, so a stale handle can never point at wrong bytes.
+#[derive(Debug)]
+struct Resident {
+    /// How many slots the current buffers hold.
+    capacity: usize,
+    /// Slots nobody holds, free for the next `start`.
+    free: Vec<u32>,
+    /// The buffers; `None` until the first `start` establishes their shapes.
+    bufs: Option<WorkerBufs>,
+}
+
+/// The resident buffers themselves.
+#[derive(Debug)]
+struct WorkerBufs {
+    /// The `prefix_*` buffers, one per manifest name: `[slots, *row]` with
+    /// the row's time axis grown to the widest prelude.
+    prefix: Vec<DynValue>,
+    /// `prefix_mask`, `[slots, prelude width]`: `false` under the padding,
+    /// `true` under the positions a prelude filled. `None` on a model without
+    /// prefix tensors (the LSTM).
+    mask: Option<DynValue>,
+    /// Generation zero: the state rows every beam of a slot starts from.
+    /// `start` writes each state tensor's row of a slot once, and a beam's
+    /// first `advance` gathers it by `source_row`.
+    gen0: Arc<Generation>,
+}
+
+/// Where a session's resident buffers live and how the bound step reaches
+/// them, cached per thread because the allocator belongs to that thread's
+/// session.
+struct DeviceEnv {
+    /// The session's allocator for its device — every resident buffer is
+    /// allocated through it, so none ever moves.
+    allocator: Allocator,
+    /// The buffers' device: the GPU on a GPU backend, the heap for the CPU
+    /// and Core ML paths — "resident" is host memory there, which is what
+    /// lets one code path serve every backend.
+    device: MemoryInfo<'static>,
+    /// Host memory, where `log_probs` is bound: the one tensor that leaves
+    /// the device every step.
+    host: MemoryInfo<'static>,
+    /// How the thread's sessions are built — the copiers take the same
+    /// backend and thread shape.
+    shape: SessionShape,
+    /// The model's own identity sessions, one per element type a resident
+    /// buffer holds, opened lazily: a pool growth copies its buffers through
+    /// them instead of `ort`'s per-copy session cache, whose sessions
+    /// register a device provider each and were what ate the T4's VRAM a
+    /// copy at a time.
+    copiers: Vec<Copier>,
+}
+
+// Safety: `DeviceEnv` lives inside a `ThreadLocal` — it is created, read and
+// dropped on the one thread that owns it and is never moved across threads,
+// so the `NonNull` raw pointers in `Allocator`/`MemoryInfo` (and the copier
+// sessions' internals) stay thread-local.
+unsafe impl Send for DeviceEnv {}
+
+impl DeviceEnv {
+    /// The copier for *ty*, opened on first use.
+    fn copier(&mut self, ty: TensorElementType) -> Result<&mut Copier, LmError> {
+        if !self.copiers.iter().any(|copier| copier.ty == ty) {
+            self.copiers.push(Copier::open(ty, self.shape)?);
+        }
+        Ok(self
+            .copiers
+            .iter_mut()
+            .find(|copier| copier.ty == ty)
+            .expect("the copier was just opened"))
+    }
+}
+
+/// A one-node `Identity` session — `src` -> `dst` — the model owns, so a
+/// copy between resident buffers never consults `ort`'s per-copy session
+/// cache at all. It is built by the model editor at the backend's provider,
+/// so a CUDA buffer copies on the device without a host round-trip, and
+/// reused through its persistent binding.
+#[derive(Debug)]
+struct Copier {
+    /// The element type this session copies.
+    ty: TensorElementType,
+    /// The `Identity` graph's session.
+    session: Session,
+    /// Its binding, cleared and rebound per copy.
+    binding: IoBinding,
+}
+
+impl Copier {
+    /// Open the flat-tensor copy session for *ty*: `Identity` over a
+    /// one-dimensional input of any length, registered with *shape*'s
+    /// backend so it runs where the buffers live.
+    fn open(ty: TensorElementType, shape: SessionShape) -> Result<Self, LmError> {
+        let mut graph = ort::editor::Graph::new()?;
+        let flat = || ValueType::Tensor {
+            ty,
+            shape: Shape::new([-1]),
+            dimension_symbols: SymbolicDimensions::empty(1),
+        };
+        graph.set_inputs([Outlet::new("src", flat())])?;
+        graph.set_outputs([Outlet::new("dst", flat())])?;
+        graph.add_node(ort::editor::Node::new(
+            "Identity",
+            ort::editor::ONNX_DOMAIN,
+            "copy",
+            ["src"],
+            ["dst"],
+            [],
+        )?)?;
+        let mut model =
+            ort::editor::Model::new([ort::editor::Opset::new(ort::editor::ONNX_DOMAIN, 17)?])?;
+        model.add_graph(graph)?;
+        let providers = shape.backend.providers()?;
+        let mut builder = session_builder(shape)?;
+        if !providers.is_empty() {
+            builder = builder
+                .with_execution_providers(providers)
+                .map_err(|source| LmError::Provider {
+                    backend: shape.backend,
+                    source: ort::Error::from(source),
+                })?;
+        }
+        let session = model.into_session(&builder)?;
+        let binding = session.create_binding()?;
+        Ok(Self {
+            ty,
+            session,
+            binding,
+        })
+    }
+}
+
+/// Which side of the run a byte crossed on: a `start` (once per record — the
+/// prefill's tokens, the resident prefix/state writes, its log-probability
+/// row) or a `step` (per `advance` — tokens, indices, log-probability rows).
+/// The counters are attributed at the call site, so threads' `start`s can
+/// never bleed into another thread's `step` total.
+#[derive(Clone, Copy, Debug)]
+enum Phase {
+    /// The once-per-record `start` traffic.
+    Start,
+    /// The per-step `advance` traffic.
+    Step,
+}
+
+/// A snapshot of the model's bus counters.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BusTotals {
+    /// Host-input bytes at `start` (prefill tokens, resident writes).
+    pub start_uploaded: u64,
+    /// Host-input bytes at `step` (`token`, `source_row`, `prefix_row`).
+    pub step_uploaded: u64,
+    /// Downloaded bytes at `start` (the prefill's log-probability row).
+    pub start_downloaded: u64,
+    /// Downloaded bytes at `step` (`log_probs`).
+    pub step_downloaded: u64,
+}
+
+/// Byte counters of what a model's sessions move across the host↔device bus,
+/// so the pressure harness can prove a step crosses only `token`,
+/// `source_row`, `prefix_row` and `log_probs`.
+#[derive(Debug, Default)]
+pub struct Bus {
+    /// Host-side bytes per phase: start uploads, step uploads.
+    uploaded: [AtomicU64; 2],
+    /// Host-read bytes per phase: start download, step download.
+    downloaded: [AtomicU64; 2],
+}
+
+impl Bus {
+    /// The counters so far.
+    #[must_use]
+    pub fn totals(&self) -> BusTotals {
+        BusTotals {
+            start_uploaded: self.uploaded[Phase::Start as usize].load(Ordering::Relaxed),
+            step_uploaded: self.uploaded[Phase::Step as usize].load(Ordering::Relaxed),
+            start_downloaded: self.downloaded[Phase::Start as usize].load(Ordering::Relaxed),
+            step_downloaded: self.downloaded[Phase::Step as usize].load(Ordering::Relaxed),
+        }
+    }
+
+    /// Count *bytes* more host-side traffic for *phase*.
+    fn upload(&self, phase: Phase, bytes: usize) {
+        self.uploaded[phase as usize].fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    /// Count *bytes* more downloaded traffic for *phase*.
+    fn download(&self, phase: Phase, bytes: usize) {
+        self.downloaded[phase as usize].fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+/// The model's state for one beam: the worker slot whose resident buffers
+/// hold the record's prefix, the beam's own resident row, and the log
+/// probabilities of whatever comes next.
+///
+/// All three are handles — the tensors themselves never leave the session's
+/// device — so cloning a beam is reference-count bumps, and dropping the
+/// last beam of a record returns its slot to the pool.
 #[derive(Clone, Debug)]
 pub struct LmState {
-    /// The tensors `prefill` produced for the record's prelude.
-    prefix: Arc<Vec<StateTensor>>,
-    /// This beam's tensors, in the manifest's `state` order.
-    tensors: Arc<Vec<StateTensor>>,
-    /// One log probability per id of the alphabet.
+    /// The record's worker slot, shared by every beam the record keeps.
+    worker: Arc<WorkerSlot>,
+    /// This beam's own row in the step's resident buffers.
+    row: RowRef,
+    /// One log probability per id of the alphabet — the only tensor the host
+    /// ever holds.
     log_probs: Arc<Vec<f32>>,
 }
 
@@ -391,17 +770,263 @@ impl LmState {
     }
 }
 
+impl Resident {
+    /// The resident buffers, allocated on *env*'s device with *rows*'
+    /// shapes when this is the model's first `start`.
+    ///
+    /// *`prelude_width`* is the mask's axis — `<bos>` + `context_chars` +
+    /// `<sep>`, the width the graph already pads each prefix row to.
+    fn ensure(
+        &mut self,
+        env: &DeviceEnv,
+        dtype: ModelDtype,
+        rows: &RowShapes,
+        prelude_width: usize,
+    ) -> Result<(), LmError> {
+        if self.bufs.is_some() {
+            return Ok(());
+        }
+        let capacity = 64;
+        let resident = |row: &[i64]| -> Result<DynValue, LmError> {
+            let mut shape = Vec::with_capacity(row.len() + 1);
+            shape.push(dim(capacity));
+            shape.extend_from_slice(row);
+            Ok(DynTensor::new(&env.allocator, dtype.element(), shape)?.into_dyn())
+        };
+        let mut prefix = Vec::with_capacity(rows.prefix.len());
+        for row in &rows.prefix {
+            prefix.push(resident(row)?);
+        }
+        let mask = if rows.prefix.is_empty() {
+            None
+        } else {
+            Some(
+                DynTensor::new(
+                    &env.allocator,
+                    TensorElementType::Bool,
+                    [dim(capacity), dim(prelude_width)],
+                )?
+                .into_dyn(),
+            )
+        };
+        let mut gen0 = Vec::with_capacity(rows.state.len());
+        for row in &rows.state {
+            gen0.push(resident(row)?);
+        }
+        self.bufs = Some(WorkerBufs {
+            prefix,
+            mask,
+            gen0: Arc::new(Generation { tensors: gen0 }),
+        });
+        self.capacity = capacity;
+        self.free = (0..u32::try_from(capacity).expect("the capacity fits u32")).collect();
+        Ok(())
+    }
+
+    /// A free slot, growing the pool's buffers when none is.
+    fn take(&mut self, env: &mut DeviceEnv) -> Result<u32, LmError> {
+        if self.free.is_empty() {
+            self.grow(env)?;
+        }
+        self.free.pop().ok_or_else(|| {
+            ort::Error::new("the resident pool grew but handed no slot".to_owned()).into()
+        })
+    }
+
+    /// Double the buffers, copying every used row forward so every index
+    /// keeps meaning the same worker — one flat copy per buffer through the
+    /// model's own copier sessions. The free slots' stale bytes come along
+    /// and are simply overwritten when each next serves a worker.
+    fn grow(&mut self, env: &mut DeviceEnv) -> Result<(), LmError> {
+        let capacity = self.capacity * 2;
+        let used = self.capacity;
+        let bufs = self.bufs.as_mut().ok_or_else(|| {
+            ort::Error::new("the resident pool has no buffers to grow".to_owned())
+        })?;
+        let enlarge = |old: &DynValue| -> Result<DynValue, LmError> {
+            let mut shape = value_shape(old)?.to_vec();
+            shape[0] = dim(capacity);
+            let ValueType::Tensor { ty, .. } = old.dtype() else {
+                return Err(ort::Error::new("a resident buffer is not a tensor".to_owned()).into());
+            };
+            Ok(DynTensor::new(&env.allocator, *ty, shape)?.into_dyn())
+        };
+        let mut pairs: Vec<(&DynValue, DynValue)> = Vec::new();
+        for old in bufs.prefix.iter().chain(&bufs.gen0.tensors) {
+            pairs.push((old, enlarge(old)?));
+        }
+        if let Some(old) = &bufs.mask {
+            pairs.push((old, enlarge(old)?));
+        }
+        for (src, dst) in &pairs {
+            let ValueType::Tensor { ty, shape, .. } = src.dtype() else {
+                return Err(ort::Error::new("a resident buffer is not a tensor".to_owned()).into());
+            };
+            copy_flat(env, *ty, src, dst, used * elements(&shape[1..]))?;
+        }
+        let dsts: Vec<DynValue> = pairs.into_iter().map(|(_, dst)| dst).collect();
+        let mut dsts = dsts.into_iter();
+        bufs.prefix = dsts.by_ref().take(bufs.prefix.len()).collect();
+        bufs.gen0 = Arc::new(Generation {
+            tensors: dsts.by_ref().take(bufs.gen0.tensors.len()).collect(),
+        });
+        bufs.mask = dsts.next();
+        self.free.extend(
+            u32::try_from(self.capacity).expect("the capacity fits u32")
+                ..u32::try_from(capacity).expect("the capacity fits u32"),
+        );
+        self.capacity = capacity;
+        Ok(())
+    }
+}
+
+/// A `Tensor<T>` view over *slot*'s `[1, *row]` row inside the resident
+/// buffer *buf* — see [`tensor_view`], which this is a thin wrapper on.
+fn row_view<T: PrimitiveTensorElementType + Debug>(
+    buf: &DynValue,
+    slot: u32,
+    row: &[i64],
+) -> Result<Tensor<T>, LmError> {
+    let mut shape = Vec::with_capacity(row.len() + 1);
+    shape.push(1);
+    shape.extend_from_slice(row);
+    tensor_view::<T>(buf, slot as usize * elements(row), &shape)
+}
+
+/// A `Tensor<T>` view over *shape*-sized memory inside the resident buffer
+/// *buf*, starting *offset* elements in, labelled with the buffer's real
+/// [`MemoryInfo`].
+///
+/// `TensorRefMut::from_raw` cannot be used here: it calls
+/// `MemoryInfo::to_owned`, which in this `ort` release unconditionally
+/// rewrites the info to CPU — a device buffer labelled CPU is then written
+/// with a host `memcpy` into the device pointer, which faults. The view is
+/// built through `ort::api` instead, so the runtime and its bound outputs
+/// see the device the buffer really sits on.
+fn tensor_view<T: PrimitiveTensorElementType + Debug>(
+    buf: &DynValue,
+    offset: usize,
+    shape: &[i64],
+) -> Result<Tensor<T>, LmError> {
+    let bytes = elements(shape) * size_of::<T>();
+    // Safety: the view spans exactly `bytes` of `buf` at `offset`, which
+    // outlives it; the callers' aliasing guarantees are stated at each call
+    // site. A zero-length view gets a dangling-but-aligned pointer, since a
+    // buffer of zero elements has no `data_ptr` to offset.
+    let data = if bytes == 0 {
+        std::ptr::dangling_mut::<std::ffi::c_void>()
+    } else {
+        unsafe {
+            buf.data_ptr()
+                .cast::<u8>()
+                .add(offset * size_of::<T>())
+                .cast_mut()
+                .cast::<std::ffi::c_void>()
+        }
+    };
+    let mut value = std::ptr::null_mut();
+    // Safety: `data` is `bytes` of valid memory at `offset`, `shape`
+    // describes it, and `value` is an out-pointer the call fills.
+    unsafe {
+        ort::Error::result_from_status((ort::api().CreateTensorWithDataAsOrtValue)(
+            AsPointer::ptr(buf.memory_info()),
+            data,
+            bytes,
+            shape.as_ptr(),
+            shape.len(),
+            T::into_tensor_element_type().into(),
+            &raw mut value,
+        ))?;
+    }
+    let value = NonNull::new(value)
+        .ok_or_else(|| ort::Error::new("the view came back without a value".to_owned()))?;
+    // Safety: `value` is a valid OrtValue the call just created, and it is
+    // not a session output — dropping it releases the view, not the buffer.
+    Ok(unsafe { Tensor::from_ptr(value, None) })
+}
+
+/// A `[1, *row]` view of *slot*'s row inside *buf*, element-typed to the
+/// model's dtype — what a bound prefill output lands in.
+fn resident_view(buf: &DynValue, slot: u32, dtype: ModelDtype) -> Result<DynValue, LmError> {
+    let row = value_shape(buf)?[1..].to_vec();
+    Ok(match dtype {
+        ModelDtype::Float32 => row_view::<f32>(buf, slot, &row)?.into_dyn(),
+        ModelDtype::Float16 => row_view::<f16>(buf, slot, &row)?.into_dyn(),
+    })
+}
+
+/// Copy *count* elements from the start of *src* to the start of *dst* as
+/// one flat run — what `grow` uses per buffer — through the element type's
+/// copier session.
+fn copy_flat(
+    env: &mut DeviceEnv,
+    ty: TensorElementType,
+    src: &DynValue,
+    dst: &DynValue,
+    count: usize,
+) -> Result<(), LmError> {
+    match ty {
+        TensorElementType::Float32 => copy_flat_typed::<f32>(env, src, dst, count),
+        TensorElementType::Float16 => copy_flat_typed::<f16>(env, src, dst, count),
+        TensorElementType::Bool => copy_flat_typed::<bool>(env, src, dst, count),
+        other => {
+            Err(ort::Error::new(format!("a resident buffer of {other:?} has no copier")).into())
+        }
+    }
+}
+
+/// The element-typed form of [`copy_flat`].
+fn copy_flat_typed<T: PrimitiveTensorElementType + Debug>(
+    env: &mut DeviceEnv,
+    src: &DynValue,
+    dst: &DynValue,
+    count: usize,
+) -> Result<(), LmError> {
+    if count == 0 {
+        return Ok(());
+    }
+    // Safety: the views span the first `count` elements of each buffer,
+    // which `grow` owns for the copy's duration — the source rows may be
+    // aliased by live states, but the copier only ever reads them.
+    let src = tensor_view::<T>(src, 0, &[dim(count)])?;
+    let dst = tensor_view::<T>(dst, 0, &[dim(count)])?;
+    let copier = env.copier(T::into_tensor_element_type())?;
+    copier.binding.clear();
+    copier.binding.bind_input("src", &src)?;
+    copier.binding.bind_output("dst", dst)?;
+    let Copier {
+        session, binding, ..
+    } = copier;
+    session.run_binding(binding)?;
+    binding.synchronize_outputs()?;
+    binding.clear();
+    Ok(())
+}
+
 /// A trained character language model, ready to score.
 pub struct CharLm {
     /// `prefill.onnx`: the per-thread sessions over it.
     prefill_sessions: GraphSessions,
     /// `charlm.onnx`, the step graph: the per-thread sessions over it.
     step_sessions: GraphSessions,
+    /// The resident slot pool shared across every thread's sessions.
+    workers: Arc<RwLock<Resident>>,
+    /// The per-thread device environments: allocator, device and host memory
+    /// infos.
+    devices: ThreadLocal<RefCell<DeviceEnv>>,
     /// The manifest's `prefix`: names of the shared tensors.
     prefix: Vec<String>,
     /// The manifest's `state`: names of the per-beam tensors, whose outputs the
     /// step graph returns as `next_<name>`.
     state: Vec<String>,
+    /// The manifest's `rows`: each resident buffer's per-slot row shape, in
+    /// the name order of `prefix` and `state`.
+    rows: RowShapes,
+    /// The manifest's `dtype`: the element type the prefix and state tensors
+    /// hold.
+    dtype: ModelDtype,
+    /// The host↔device byte counters the pressure harness reports.
+    bus: Bus,
     context_chars: usize,
     specials: Specials,
     /// Alphabet id of every lexicon [`CharId`], by index.
@@ -428,34 +1053,25 @@ impl CharLm {
         self.step_sessions.shape.backend
     }
 
+    /// The model's bus counters — what the sessions have moved across the
+    /// host↔device boundary so far.
+    pub fn bus(&self) -> &Bus {
+        &self.bus
+    }
+
     /// Open the model in *dir* (`charlm.json`, `prefill.onnx`, `charlm.onnx`)
     /// for *lexicon*, its sessions built to *shape*.
     ///
     /// # Errors
     ///
     /// If the manifest cannot be read, declares a batch layout other than
-    /// `rectangular` (absent on exports written before the field existed),
+    /// `resident` (absent on exports written before the field existed),
     /// or names a field the export does not write, either graph cannot be
     /// loaded, a character of the lexicon has
     /// no row in the model's alphabet, or *shape*'s provider was not
     /// compiled into this build.
     pub fn open(dir: &Path, lexicon: &Lexicon, shape: SessionShape) -> Result<Self, LmError> {
-        let manifest_path = dir.join("charlm.json");
-        let raw = fs::read_to_string(&manifest_path).map_err(|source| LmError::Io {
-            path: manifest_path.clone(),
-            source,
-        })?;
-        let manifest: Manifest =
-            serde_json::from_str(&raw).map_err(|source| LmError::Manifest {
-                path: manifest_path,
-                source,
-            })?;
-        if manifest.layout.as_deref() != Some(STEP_LAYOUT) {
-            return Err(LmError::Layout {
-                path: dir.to_path_buf(),
-                layout: manifest.layout,
-            });
-        }
+        let manifest = read_manifest(dir)?;
         let alphabet: HashMap<char, u32> = (0u32..)
             .zip(&manifest.chars)
             .filter_map(|(id, entry)| {
@@ -497,15 +1113,31 @@ impl CharLm {
                 (table_values(prefill)?, table_values(step)?)
             }
         };
+        let dtype = manifest.dtype.unwrap_or_default();
         let model = Self {
             prefill_sessions: GraphSessions::new(
                 dir.join("prefill.onnx"),
                 prefill_initializers,
                 shape,
+                dtype,
             ),
-            step_sessions: GraphSessions::new(dir.join("charlm.onnx"), step_initializers, shape),
+            step_sessions: GraphSessions::new(
+                dir.join("charlm.onnx"),
+                step_initializers,
+                shape,
+                dtype,
+            ),
+            workers: Arc::new(RwLock::new(Resident {
+                capacity: 0,
+                free: Vec::new(),
+                bufs: None,
+            })),
+            devices: ThreadLocal::new(),
             prefix: manifest.prefix,
             state: manifest.state,
+            rows: manifest.rows,
+            dtype,
+            bus: Bus::default(),
             context_chars: manifest.context_chars,
             specials: manifest.specials,
             ids,
@@ -519,62 +1151,211 @@ impl CharLm {
         Ok(model)
     }
 
-    /// Read the prelude through `prefill.onnx`: the state every beam starts
-    /// from, prefix tensors included.
-    fn prefill(&self, context: Option<&str>) -> Result<LmState, LmError> {
-        let prelude = self.prelude(context);
-        let tokens: Vec<i64> = prelude.iter().copied().map(i64::from).collect();
-        let length = dim(prelude.len());
-        let mut session = self.prefill_sessions.session()?.borrow_mut();
-        let outputs = session.run(ort::inputs![
-            "tokens" => Tensor::from_array(([1i64, length], tokens))?,
-        ])?;
-        let (_, log_probs) = outputs["log_probs"].try_extract_tensor::<f32>()?;
-        // `prefill` ran a single prelude, so every tensor it produced is one
-        // row; the row shape is everything after the batch axis.
-        let row = |name: &String| -> Result<StateTensor, ort::Error> {
-            let (shape, data) = outputs[name.as_str()].try_extract_tensor::<f32>()?;
-            debug_assert_eq!(shape[0], 1);
-            Ok(StateTensor {
-                shape: shape[1..].to_vec(),
-                data: data.to_vec(),
-            })
-        };
-        Ok(LmState {
-            prefix: Arc::new(self.prefix.iter().map(&row).collect::<Result<_, _>>()?),
-            tensors: Arc::new(self.state.iter().map(&row).collect::<Result<_, _>>()?),
-            log_probs: Arc::new(log_probs.to_vec()),
+    /// This thread's device environment: the allocator the resident buffers
+    /// are allocated through, the memory infos the bound step needs, and the
+    /// copier sessions a pool growth uses.
+    fn device_env(&self) -> Result<&RefCell<DeviceEnv>, LmError> {
+        self.devices.get_or_try(|| {
+            let session = self.step_sessions.session()?;
+            let device = match self.step_sessions.shape.backend {
+                Backend::Cpu | Backend::CoreMl => AllocationDevice::CPU,
+                Backend::WebGpu => AllocationDevice::WEBGPU_BUFFER,
+                Backend::Cuda => AllocationDevice::CUDA,
+            };
+            let device = MemoryInfo::new(device, 0, AllocatorType::Device, MemoryType::Default)?;
+            let host = MemoryInfo::new(
+                AllocationDevice::CPU,
+                0,
+                AllocatorType::Device,
+                MemoryType::Default,
+            )?;
+            let allocator = Allocator::new(&session.borrow().session, device.clone())?;
+            Ok(RefCell::new(DeviceEnv {
+                allocator,
+                device,
+                host,
+                shape: self.step_sessions.shape,
+                copiers: Vec::new(),
+            }))
         })
     }
 
-    /// Advance a batch: `tokens[i]` applied to `states[i]`, whose rows may
-    /// come from different records.
+    /// Read the prelude through `prefill.onnx` into a resident slot: the
+    /// state every beam starts from — a handle, since the tensors themselves
+    /// stay on the session's device.
     ///
-    /// The batch is fed as a `[workers, width]` rectangle. Every maximal run
-    /// of consecutive rows sharing one prefix is one worker's -- the decoder
-    /// keeps a worker's survivors contiguous, per the contract on
-    /// [`Transition::advance`] -- cut into blocks of `SessionShape::width`
-    /// rows, and each block padded out to `width` with dead rows (a valid
-    /// state and its token, whose outputs are dropped on the way back). The
-    /// prefix tensors take one row per block, padded on the left up to the
-    /// widest prelude and masked by `prefix_mask`, and the graph broadcasts
-    /// each over the block's rows: the prefix is packed once per worker,
-    /// never per row. A model without prefix tensors (the LSTM) has no
+    /// The slot is taken before the run because the graph's outputs are
+    /// bound over its rows: `ensure`/`take` hold the pool's write lock, the
+    /// bound run then holds only the read lock, so a concurrent `take` that
+    /// has to grow the pool cannot move the buffers out from under the
+    /// bound row views.
+    fn prefill(&self, context: Option<&str>) -> Result<LmState, LmError> {
+        let prelude = self.prelude(context);
+        let tokens: Vec<i64> = prelude.iter().copied().map(i64::from).collect();
+        let tokens = Tensor::from_array(([1i64, dim(tokens.len())], tokens))?;
+        self.bus
+            .upload(Phase::Start, elements(tokens.shape()) * size_of::<i64>());
+        let slot = {
+            let env = self.device_env()?;
+            let mut pool = self
+                .workers
+                .write()
+                .expect("the resident pool is not poisoned");
+            pool.ensure(
+                &env.borrow(),
+                self.dtype,
+                &self.rows,
+                self.context_chars + 2,
+            )?;
+            pool.take(&mut env.borrow_mut())?
+        };
+        let (log_probs, generation) = match self.prefill_into(&tokens, slot) {
+            Ok(parts) => parts,
+            Err(error) => {
+                // The run may have half-written the slot's rows; handing it
+                // back is safe — the next `start` that takes it rewrites
+                // every row in full.
+                self.workers
+                    .write()
+                    .expect("the resident pool is not poisoned")
+                    .free
+                    .push(slot);
+                return Err(error);
+            }
+        };
+        Ok(LmState {
+            worker: Arc::new(WorkerSlot {
+                pool: Arc::clone(&self.workers),
+                index: slot,
+            }),
+            row: RowRef {
+                generation,
+                index: slot,
+            },
+            log_probs: Arc::new(log_probs),
+        })
+    }
+
+    /// Run the prefill into *slot*'s rows: every prefix, mask and state
+    /// output is bound over the slot's row of its resident buffer, so the
+    /// only tensors to cross the bus are `tokens` up and `log_probs` down.
+    fn prefill_into(
+        &self,
+        tokens: &Tensor<i64>,
+        slot: u32,
+    ) -> Result<(Vec<f32>, Arc<Generation>), LmError> {
+        let mut bound = self.prefill_sessions.session()?.borrow_mut();
+        let BoundSession { session, binding } = &mut *bound;
+        binding.clear();
+        binding.bind_input("tokens", tokens)?;
+        let pool = self
+            .workers
+            .read()
+            .expect("the resident pool is not poisoned");
+        let env = self.device_env()?.borrow();
+        let bufs = pool
+            .bufs
+            .as_ref()
+            .expect("the slot's buffers were ensured before it was taken");
+        for (index, name) in self.prefix.iter().enumerate() {
+            binding.bind_output(
+                name.as_str(),
+                resident_view(&bufs.prefix[index], slot, self.dtype)?,
+            )?;
+        }
+        if let Some(mask) = &bufs.mask {
+            let width = value_shape(mask)?[1];
+            binding.bind_output(
+                "prefix_mask",
+                row_view::<bool>(mask, slot, &[width])?.into_dyn(),
+            )?;
+        }
+        for (index, name) in self.state.iter().enumerate() {
+            binding.bind_output(
+                name.as_str(),
+                resident_view(&bufs.gen0.tensors[index], slot, self.dtype)?,
+            )?;
+        }
+        binding.bind_output_to_device("log_probs", &env.host)?;
+        let outputs = session.run_binding(binding)?;
+        binding.synchronize_outputs()?;
+        let log_probs = self.host_f32(&outputs["log_probs"], Phase::Start)?;
+        Ok((log_probs, Arc::clone(&bufs.gen0)))
+    }
+
+    /// The tensor's `f32` data on the host — the bound `log_probs` output,
+    /// the only thing the bus ever carries.
+    fn host_f32(&self, value: &DynValue, phase: Phase) -> Result<Vec<f32>, LmError> {
+        debug_assert!(
+            value.memory_info().is_cpu_accessible(),
+            "log_probs is bound to host memory"
+        );
+        let (shape, data) = value.try_extract_tensor::<f32>()?;
+        self.bus
+            .download(phase, shape.num_elements() * size_of::<f32>());
+        Ok(data.to_vec())
+    }
+
+    /// Advance the runs of one `advance` call, one `run_binding` per
+    /// generation the steps' rows live in.
+    ///
+    /// `decode_many`'s contract keeps every survivor of one position on the
+    /// same step's outputs, so a real decode lands here as a single run; a
+    /// caller that mixes states across steps (a test's interleave, say) gets
+    /// one bound step per contiguous run — slower, still correct, because
+    /// every run binds the buffers its own `RowRef`s name.
+    fn step(&self, steps: &[(&LmState, CharId)]) -> Result<Vec<LmState>, LmError> {
+        let mut advanced: Vec<Option<LmState>> = (0..steps.len()).map(|_| None).collect();
+        let mut begin = 0;
+        while begin < steps.len() {
+            let mut end = begin + 1;
+            while end < steps.len()
+                && Arc::ptr_eq(&steps[end].0.row.generation, &steps[begin].0.row.generation)
+            {
+                end += 1;
+            }
+            self.step_gen(&steps[begin..end], &mut advanced[begin..end])?;
+            begin = end;
+        }
+        Ok(advanced
+            .into_iter()
+            .map(|state| state.expect("every row is advanced by its run"))
+            .collect())
+    }
+
+    /// One bound step over rows all living in the same generation.
+    ///
+    /// The batch stays a `[workers, width]` rectangle: every maximal run of
+    /// consecutive rows sharing one worker slot is cut into blocks of
+    /// `SessionShape::width` rows, each padded out to `width` with dead rows
+    /// — a valid source row and token whose outputs are dropped on the way
+    /// back. The step binds the resident buffers by name: `token` and
+    /// `source_row` are the only host inputs, `prefix_row` gathers each
+    /// block's prefix slot on the device, and `log_probs` is bound to host
+    /// memory while the `next_*` outputs stay on the device as the next
+    /// generation. A model without prefix tensors (the LSTM) has no
     /// rectangle to fill: the batch is one flat run of live rows.
-    fn step(&self, states: &[&LmState], tokens: &[u32]) -> Result<Vec<LmState>, LmError> {
-        let batch = tokens.len();
-        debug_assert_eq!(states.len(), batch, "one state per token");
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one bound step is a straight-line sequence: block the rows, feed the dead ones, build the inputs, bind, run, scatter the states"
+    )]
+    fn step_gen(
+        &self,
+        steps: &[(&LmState, CharId)],
+        out: &mut [Option<LmState>],
+    ) -> Result<(), LmError> {
+        let generation = &steps[0].0.row.generation;
         let width = self.step_sessions.shape.width.get();
         // `(first row, live rows, padded rows)` per block of the rectangle.
         let mut blocks: Vec<(usize, usize, usize)> = Vec::new();
         if self.prefix.is_empty() {
-            blocks.push((0, batch, batch));
+            blocks.push((0, steps.len(), steps.len()));
         } else {
             let mut row = 0;
-            while row < batch {
-                let prefix = &states[row].prefix;
+            while row < steps.len() {
+                let worker = &steps[row].0.worker;
                 let mut end = row + 1;
-                while end < batch && Arc::ptr_eq(&states[end].prefix, prefix) {
+                while end < steps.len() && Arc::ptr_eq(&steps[end].0.worker, worker) {
                     end += 1;
                 }
                 for start in (row..end).step_by(width) {
@@ -589,81 +1370,90 @@ impl CharLm {
         let fed = |(first, live, _): (usize, usize, usize), j: usize| {
             first + if j < live { j } else { 0 }
         };
-        let mut inputs: Vec<(Cow<'_, str>, SessionInputValue<'_>)> =
-            Vec::with_capacity(2 + self.prefix.len() + self.state.len());
-        let mut padded_tokens: Vec<i64> = Vec::with_capacity(rows);
+        let mut token = Vec::with_capacity(rows);
+        let mut source_row = Vec::with_capacity(rows);
+        let mut prefix_row = Vec::with_capacity(blocks.len());
+        let mut uploaded = 0usize;
         for &block in &blocks {
             for j in 0..block.2 {
-                padded_tokens.push(i64::from(tokens[fed(block, j)]));
+                let row = fed(block, j);
+                token.push(i64::from(self.ids[steps[row].1.index()]));
+                source_row.push(i64::from(steps[row].0.row.index));
+            }
+            if !self.prefix.is_empty() {
+                prefix_row.push(i64::from(steps[block.0].0.worker.index));
             }
         }
-        inputs.push((
-            Cow::Borrowed("token"),
-            Tensor::from_array((vec![dim(rows)], padded_tokens))?.into(),
-        ));
-        if !self.prefix.is_empty() {
-            self.push_worker_prefixes(&mut inputs, states, &blocks)?;
-        }
-        // The per-beam tensors stack row by row, dead rows included; every
-        // row of one tensor has the same shape at the same step.
-        for (index, name) in self.state.iter().enumerate() {
-            let row_shape = &states[0].tensors[index].shape;
-            let mut data = Vec::with_capacity(rows * states[0].tensors[index].data.len());
-            for &block in &blocks {
-                for j in 0..block.2 {
-                    let tensor = &states[fed(block, j)].tensors[index];
-                    debug_assert_eq!(
-                        row_shape, &tensor.shape,
-                        "every row of {name} has the same shape at one step"
-                    );
-                    data.extend_from_slice(&tensor.data);
+        uploaded += (token.len() + source_row.len() + prefix_row.len()) * size_of::<i64>();
+        self.bus.upload(Phase::Step, uploaded);
+        let token = Tensor::from_array((vec![dim(rows)], token))?;
+        let source_row = Tensor::from_array((vec![dim(rows)], source_row))?;
+        let prefix_row = if self.prefix.is_empty() {
+            None
+        } else {
+            Some(Tensor::from_array((vec![dim(blocks.len())], prefix_row))?)
+        };
+        let env = self.device_env()?.borrow();
+        let mut bound = self.step_sessions.session()?.borrow_mut();
+        let BoundSession { session, binding } = &mut *bound;
+        binding.clear();
+        binding.bind_input("token", &token)?;
+        binding.bind_input("source_row", &source_row)?;
+        let pool = self
+            .workers
+            .read()
+            .expect("the resident pool is not poisoned");
+        {
+            let bufs = pool
+                .bufs
+                .as_ref()
+                .expect("a state exists only after a start allocated the buffers");
+            if let Some(prefix_row) = &prefix_row {
+                binding.bind_input("prefix_row", prefix_row)?;
+                binding.bind_input(
+                    "prefix_mask",
+                    bufs.mask.as_ref().expect("a prefix model owns the mask"),
+                )?;
+                for (index, name) in self.prefix.iter().enumerate() {
+                    binding.bind_input(name.as_str(), &bufs.prefix[index])?;
                 }
             }
-            let mut shape = Vec::with_capacity(row_shape.len() + 1);
-            shape.push(dim(rows));
-            shape.extend_from_slice(row_shape);
-            inputs.push((
-                Cow::Owned(name.clone()),
-                Tensor::from_array((shape, data))?.into(),
-            ));
+            for (index, name) in self.state.iter().enumerate() {
+                binding.bind_input(name.as_str(), &generation.tensors[index])?;
+            }
         }
-        let mut session = self.step_sessions.session()?.borrow_mut();
-        let outputs = session.run(inputs)?;
-        let (_, log_probs) = outputs["log_probs"].try_extract_tensor::<f32>()?;
+        drop(pool);
+        binding.bind_output_to_device("log_probs", &env.host)?;
+        for name in &self.state {
+            binding.bind_output_to_device(format!("next_{name}"), &env.device)?;
+        }
+        let mut outputs = session.run_binding(binding)?;
+        binding.synchronize_outputs()?;
+        // The next generation owns the `next_*` rows this step wrote; the
+        // states it feeds point back at them by index.
+        let mut tensors = Vec::with_capacity(self.state.len());
+        for name in &self.state {
+            tensors.push(
+                outputs
+                    .remove(format!("next_{name}").as_str())
+                    .expect("the step graph returns every next_ output"),
+            );
+        }
+        let next = Arc::new(Generation { tensors });
+        let log_probs = self.host_f32(&outputs["log_probs"], Phase::Step)?;
         let vocabulary = log_probs.len() / rows;
-        // Each `next_*` output is split into rows by its own shape: a row's
-        // shape is whatever the graph produced, which for the transformer
-        // grows one position on the time axis per step.
-        let next: Vec<(Vec<i64>, Vec<f32>)> = self
-            .state
-            .iter()
-            .map(|name| {
-                let (shape, data) =
-                    outputs[format!("next_{name}").as_str()].try_extract_tensor::<f32>()?;
-                debug_assert_eq!(shape[0], dim(rows));
-                Ok((shape[1..].to_vec(), data.to_vec()))
-            })
-            .collect::<Result<_, ort::Error>>()?;
         // Slice each block's live rows back out in input order, dropping the
         // dead rows' outputs.
-        let mut advanced = Vec::with_capacity(batch);
         let mut base = 0;
         for &(first, live, block_rows) in &blocks {
             for j in 0..live {
                 let row = base + j;
-                let tensors = next
-                    .iter()
-                    .map(|(row_shape, data)| {
-                        let row_len = elements(row_shape);
-                        StateTensor {
-                            shape: row_shape.clone(),
-                            data: data[row * row_len..(row + 1) * row_len].to_vec(),
-                        }
-                    })
-                    .collect();
-                advanced.push(LmState {
-                    prefix: Arc::clone(&states[first + j].prefix),
-                    tensors: Arc::new(tensors),
+                out[first + j] = Some(LmState {
+                    worker: Arc::clone(&steps[first + j].0.worker),
+                    row: RowRef {
+                        generation: Arc::clone(&next),
+                        index: u32::try_from(row).expect("a step's rows fit u32"),
+                    },
                     log_probs: Arc::new(
                         log_probs[row * vocabulary..(row + 1) * vocabulary].to_vec(),
                     ),
@@ -671,88 +1461,6 @@ impl CharLm {
             }
             base += block_rows;
         }
-        Ok(advanced)
-    }
-
-    /// Feed the `prefix_*` tensors and `prefix_mask` of a batch laid out as
-    /// `[workers, width]` blocks.
-    ///
-    /// Each tensor stacks one row per block -- one per worker -- every row's
-    /// time axis (the second-to-last) padded on the left up to the widest
-    /// prelude; the mask row is `false` under the padding and `true` under
-    /// real positions. A block's row is the prefix its rows share, packed
-    /// once, so a batch from one record is one row as it always was.
-    fn push_worker_prefixes<'a>(
-        &'a self,
-        inputs: &mut Vec<(Cow<'a, str>, SessionInputValue<'a>)>,
-        states: &[&LmState],
-        blocks: &[(usize, usize, usize)],
-    ) -> Result<(), LmError> {
-        let workers = blocks.len();
-        let reals: Vec<usize> = blocks
-            .iter()
-            .map(|&(first, _, _)| prefix_width(&states[first].prefix[0]))
-            .collect();
-        let width = reals
-            .iter()
-            .copied()
-            .max()
-            .expect("advance never runs an empty batch");
-        let mut mask = vec![false; workers * width];
-        for (worker, &real) in reals.iter().enumerate() {
-            mask[worker * width + (width - real)..(worker + 1) * width].fill(true);
-        }
-        for (index, name) in self.prefix.iter().enumerate() {
-            // A prefix tensor's row is [..., time, element]; the mask pads
-            // and marks the time axis, second-to-last.
-            let row_shape = &states[0].prefix[index].shape;
-            let time_axis = row_shape.len() - 2;
-            let unit = usize::try_from(row_shape[time_axis + 1]).expect("a shape axis is positive");
-            let slab = elements(&row_shape[..time_axis]);
-            let mut shape = Vec::with_capacity(row_shape.len() + 1);
-            shape.push(dim(workers));
-            for (axis, &value) in row_shape.iter().enumerate() {
-                shape.push(if axis == time_axis { dim(width) } else { value });
-            }
-            let row_len = elements(&shape[1..]);
-            let mut data = vec![0.0; workers * row_len];
-            for (worker, &(first, _, _)) in blocks.iter().enumerate() {
-                let source = &states[first].prefix[index];
-                debug_assert_eq!(
-                    &source.shape[..time_axis],
-                    &row_shape[..time_axis],
-                    "every worker's {name} agrees on the static axes"
-                );
-                debug_assert_eq!(
-                    &source.shape[time_axis + 1..],
-                    &row_shape[time_axis + 1..],
-                    "every worker's {name} agrees on the static axes"
-                );
-                let real =
-                    usize::try_from(source.shape[time_axis]).expect("a shape axis is positive");
-                debug_assert_eq!(
-                    real, reals[worker],
-                    "a worker's prefix tensors share one width"
-                );
-                let pad = width - real;
-                let mut dst = worker * row_len + pad * unit;
-                let mut src = 0;
-                for _ in 0..slab {
-                    data[dst..dst + real * unit]
-                        .copy_from_slice(&source.data[src..src + real * unit]);
-                    dst += width * unit;
-                    src += real * unit;
-                }
-            }
-            inputs.push((
-                Cow::Owned(name.clone()),
-                Tensor::from_array((shape, data))?.into(),
-            ));
-        }
-        inputs.push((
-            Cow::Borrowed("prefix_mask"),
-            Tensor::from_array(([dim(workers), dim(width)], mask))?.into(),
-        ));
         Ok(())
     }
 
@@ -797,8 +1505,8 @@ impl Transition for CharLm {
     }
 
     /// Relies on the row-order guarantee of [`Transition::advance`]: a
-    /// worker's survivors arrive as one contiguous run, which `step` pads
-    /// to `SessionShape::width` blocks sharing the worker's prefix row.
+    /// worker's survivors arrive as one contiguous run, which `step` groups
+    /// into `SessionShape::width` blocks sharing the worker's resident slot.
     ///
     /// # Panics
     ///
@@ -807,10 +1515,7 @@ impl Transition for CharLm {
         if steps.is_empty() {
             return Vec::new();
         }
-        let states: Vec<&LmState> = steps.iter().map(|(state, _)| *state).collect();
-        let tokens: Vec<u32> = steps.iter().map(|(_, ch)| self.ids[ch.index()]).collect();
-        self.step(&states, &tokens)
-            .expect("the graph runs on a batch")
+        self.step(steps).expect("the graph runs on a batch")
     }
 }
 
@@ -837,20 +1542,22 @@ fn session_builder(shape: SessionShape) -> ort::Result<ort::session::builder::Se
     Ok(builder)
 }
 
-/// Open a session for a shared graph. *weights* is the one container the
-/// matrices MLAS pre-packs go into, shared by every session of the graph so
-/// the packing happens once rather than per session.
+/// Open a session for a shared graph. *weights*, when present, is the one
+/// container the matrices MLAS pre-packs go into, shared by every session of
+/// the graph so the packing happens once rather than per session.
 fn open_session(
     graph: &Path,
-    weights: &PrepackedWeights,
+    weights: Option<&PrepackedWeights>,
     initializers: &[(String, Arc<DynValue>)],
     shape: SessionShape,
 ) -> Result<Session, LmError> {
     let providers = shape.backend.providers()?;
     let mut builder = session_builder(shape)?;
-    builder = builder
-        .with_prepacked_weights(weights)
-        .map_err(ort::Error::from)?;
+    if let Some(weights) = weights {
+        builder = builder
+            .with_prepacked_weights(weights)
+            .map_err(ort::Error::from)?;
+    }
     if !providers.is_empty() {
         builder = builder
             .with_execution_providers(providers)
@@ -920,6 +1627,9 @@ fn shared_values(map: &Mmap, table: &WeightsFile) -> Result<Vec<(String, Arc<Dyn
             WeightDtype::Float32 => {
                 shared_value::<f32>(map, &info, tensor, &mismatched, &mut values)?;
             }
+            WeightDtype::Float16 => {
+                shared_value::<f16>(map, &info, tensor, &mismatched, &mut values)?;
+            }
             WeightDtype::Int8 => {
                 shared_value::<i8>(map, &info, tensor, &mismatched, &mut values)?;
             }
@@ -988,11 +1698,6 @@ fn shared_value<T: ort::value::PrimitiveTensorElementType + std::fmt::Debug>(
 )]
 const fn dim(n: usize) -> i64 {
     n as i64
-}
-
-/// The width of a prefix tensor's time axis: its second-to-last.
-fn prefix_width(tensor: &StateTensor) -> usize {
-    usize::try_from(tensor.shape[tensor.shape.len() - 2]).expect("a shape axis is positive")
 }
 
 /// The element count of a tensor of *shape*: the product of its axes.

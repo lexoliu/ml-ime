@@ -233,14 +233,26 @@ struct CandidateList {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    // `ort` forwards the runtime's logging to `tracing` at TRACE, so
+    // `--ort-verbose` raises the `ort` target; RUST_LOG still wins when set.
+    let ort_trace = matches!(
+        &cli.command,
+        Command::FusedEval {
+            ort_verbose: true,
+            ..
+        }
+    );
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                EnvFilter::new(if ort_trace { "info,ort=trace" } else { "info" })
+            }),
         )
         .with_writer(std::io::stderr)
         .init();
 
-    match Cli::parse().command {
+    match cli.command {
         Command::TrainNgram { corpus, out } => train_ngram(&corpus, &out),
         Command::Decode {
             model,

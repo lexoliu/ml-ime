@@ -17,6 +17,7 @@ gpu-webgpu = ["ort/webgpu"]
 gpu-cuda = ["ort/cuda"]
 
 [dependencies]
+half = "2"
 ime-decode.workspace = true
 ime-pinyin.workspace = true
 memmap2.workspace = true

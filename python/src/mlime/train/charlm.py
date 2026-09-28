@@ -47,7 +47,7 @@ from mlime.train.charlm_model import (
     CharLm,
     CharLmConfig,
     PrefillModule,
-    StepModule,
+    ResidentStepModule,
     build,
 )
 from mlime.train.charlm_vocab import BOS, EOS, PAD, SEP, UNK, CharVocab
@@ -698,25 +698,35 @@ def export_onnx(
     checkpoint: Path,
     out_dir: Path,
     restrict: Path | None = None,
-    quantize: Literal["int8"] | None = None,
+    quantize: Literal["int8", "fp16"] | None = None,
 ) -> tuple[Path, Path]:
     """Write the step graph, the prefill graph and their manifest for the Rust decoder.
 
-    ``charlm.onnx`` takes ``token [workers * width]`` -- the batch laid out
-    ``[workers, width]``, each of the ``width``-row blocks one record's
-    beams -- the prefix tensors (one row per worker, left-padded up to the
-    widest prelude) and ``prefix_mask`` (which of each prefix row's
-    positions are real), then the state tensors (one row per beam), and
-    returns ``log_probs [workers * width, V]`` (float32, normalised over the
-    alphabet, or over the characters of *restrict* plus ``<eos>`` when
-    given) and the next state tensors. ``prefill.onnx`` takes ``tokens
-    [1, T]`` and returns the same ``log_probs``, the prefix tensors and the
-    state tensors to start from. The mask input exists only where the model
-    has a prefix: the LSTM's step graph is unchanged and takes no mask.
+    ``charlm.onnx`` takes ``token [rows]`` and ``source_row [rows]`` -- each
+    beam's next character and the row of the resident state buffers
+    (``keys``/``values``, or the LSTM's ``hidden``/``cell``) it continues
+    from -- then, where the model has a prefix, ``prefix_row [workers]`` and
+    the resident prefix buffers ``prefix_keys``/``prefix_values``
+    ``[slots, layers, heads, T, head_dim]`` with ``prefix_mask
+    ``[slots, T]`` marking real positions. The graph gathers the rows the
+    batch names and returns ``log_probs [rows, V]`` (float32, normalised
+    over the alphabet, or over the characters of *restrict* plus ``<eos>``
+    when given) and the ``next_*`` state tensors -- the rows the caller
+    binds over fresh buffers, so the beam reorder stays on the device and
+    only tokens, indices and log-probabilities ever cross the bus.
+    ``prefill.onnx`` takes ``tokens [1, T]`` and returns the same
+    ``log_probs``, the prefix tensors already left-padded to a resident
+    slot's width with the ``prefix_mask`` row that marks their real
+    positions, and the state tensors to start from -- its outputs are
+    bound over the slot's rows, so a ``start`` moves no bytes itself. The
+    manifest's ``rows`` record what one slot row of each prefix and state
+    buffer is shaped as, which is what the resident pool allocates.
+    The prefix and index inputs exist only where the model has a prefix: the
+    LSTM's step graph is ``(token, source_row, hidden, cell)``.
     ``charlm.json`` names the tensors and holds the alphabet in id order;
-    its ``layout`` records the step graph's batch layout (``"rectangular"``
-    -- ``[workers, width]``), which ``ime-lm`` refuses to open without, so a
-    stale per-row export fails at load rather than inside a MatMul.
+    its ``layout`` records the step graph's layout (``"resident"``), which
+    ``ime-lm`` refuses to open without, and its ``dtype`` the element type
+    the resident buffers and the states exchange.
     The graphs' initializers live in an external weights file beside the
     graphs -- ``charlm.weights``, shared when the step and prefill
     initializers coincide, otherwise one file per graph -- which the manifest's
@@ -725,13 +735,18 @@ def export_onnx(
 
     With ``quantize="int8"`` every MatMul's weight is dynamic-quantized to
     int8 (per channel) between the torch export and externalisation; the
-    manifest table then also carries ``int8`` tensors.
+    manifest table then also carries ``int8`` tensors. With
+    ``quantize="fp16"`` the model is halved before export, so the weights,
+    the prefix buffers and the state tensors are all ``float16`` while
+    ``log_probs`` stays ``float32`` through the output cast.
     """
-    if quantize not in (None, "int8"):
-        raise ValueError(f"quantize must be 'int8' or None, got {quantize!r}")
+    if quantize not in (None, "int8", "fp16"):
+        raise ValueError(f"quantize must be 'int8', 'fp16' or None, got {quantize!r}")
     device = torch.device("cpu")
     model, vocab, step = load_model(checkpoint, device)
     model.eval()
+    if quantize == "fp16":
+        model = model.half()
     out_dir.mkdir(parents=True, exist_ok=True)
     keep = None if restrict is None else kept_ids(vocab, restrict)
     prefix_names, state_names = model.prefix_names, model.state_names
@@ -740,58 +755,82 @@ def export_onnx(
     with torch.no_grad():
         _, prefix, state = model.prefill(prelude)
     # Example inputs of two workers at width two with two characters in the
-    # state, so every dynamic axis -- workers, rows under a worker, time --
-    # is exercised.
+    # state, so every dynamic axis -- slots, workers, rows, time -- is
+    # exercised. The resident buffers stand in for what the Rust side binds:
+    # two prefix slots holding one prelude each, four state rows, and the
+    # index tensors naming which of them each beam continues from.
+    module = ResidentStepModule(model, keep)
     with torch.no_grad():
         four = torch.tensor([SEP] * 4)
-        stacked = tuple(tensor.expand(4, *tensor.shape[1:]).contiguous() for tensor in state)
-        prefix_mask: torch.Tensor | None = None
+        source_row = torch.arange(4, dtype=torch.long)
+        state_buffers = tuple(tensor.expand(4, *tensor.shape[1:]).contiguous() for tensor in state)
+        prefix_buffers: tuple[torch.Tensor, ...] = ()
+        index_args: tuple[torch.Tensor, ...] = ()
         if model.config.arch == "transformer":
-            # The step's prefix is one row per worker; the example's two
-            # workers share the prelude, so its tensors repeat to two rows
-            # and the mask is real positions throughout (a padding-free
-            # batch).
-            prefix = tuple(tensor.expand(2, *tensor.shape[1:]).contiguous() for tensor in prefix)
-            prefix_mask = torch.ones(2, prefix[0].shape[3], dtype=torch.bool)
-        _, stacked = model.step(four, prefix, stacked, prefix_mask)
-        _, stacked = model.step(four, prefix, stacked, prefix_mask)
-    axes: dict[str, dict[int, str]] = {"token": {0: "batch"}, "log_probs": {0: "batch"}}
+            prefix_buffers = tuple(
+                tensor.expand(2, *tensor.shape[1:]).contiguous() for tensor in prefix
+            )
+            index_args = (
+                torch.arange(2, dtype=torch.long),
+                torch.ones(2, prefix[0].shape[3], dtype=torch.bool),
+            )
+        # Two passes grow the example's state buffers to a real time axis.
+        for _ in range(2):
+            args = (four, source_row, *prefix_buffers, *index_args, *state_buffers)
+            _, *state_buffers = module(*args)
+    axes: dict[str, dict[int, str]] = {
+        "token": {0: "rows"},
+        "source_row": {0: "rows"},
+        "log_probs": {0: "rows"},
+    }
     for name in (*state_names, *next_names):
-        axes[name] = {0: "batch"}
-    mask_names: list[str] = []
-    mask_args: tuple[torch.Tensor, ...] = ()
+        axes[name] = {0: "residents"}
+    extra_names: list[str] = []
     if model.config.arch == "transformer":
-        # Key/value caches are [workers, layers, heads, time, head_dim] and
-        # the mask [workers, time]; the workers axis is its own symbol, so
-        # one worker and a lockstep batch both feed the same graph.
+        # The resident prefix buffers are [slots, layers, heads, time,
+        # head_dim] and the mask [slots, time]; the workers axis is its own
+        # symbol, so one worker and a lockstep batch both feed the same
+        # graph.
         for name in prefix_names:
-            axes[name] = {0: "workers", 3: f"{name}_time"}
+            axes[name] = {0: "slots", 3: f"{name}_time"}
         for name in (*state_names, *next_names):
             axes.setdefault(name, {})[3] = f"{name}_time"
-        mask_names = ["prefix_mask"]
-        mask_args = (prefix_mask,) if prefix_mask is not None else ()
-        axes["prefix_mask"] = {0: "workers", 1: "prefix_mask_time"}
+        extra_names = ["prefix_row", "prefix_mask"]
+        axes["prefix_row"] = {0: "workers"}
+        axes["prefix_mask"] = {0: "slots", 1: "prefix_mask_time"}
     step_graph = out_dir / "charlm.onnx"
     torch.onnx.export(
-        StepModule(model, keep),
-        (four, *prefix, *mask_args, *stacked),
+        module,
+        (four, source_row, *prefix_buffers, *index_args, *state_buffers),
         str(step_graph),
-        input_names=["token", *prefix_names, *mask_names, *state_names],
+        input_names=[
+            "token",
+            "source_row",
+            *prefix_names,
+            *extra_names,
+            *state_names,
+        ],
         output_names=["log_probs", *next_names],
         dynamic_axes=axes,
         opset_version=17,
         dynamo=False,
     )
     prefill_graph = out_dir / "prefill.onnx"
+    mask_names = ["prefix_mask"] if prefix_names else []
     torch.onnx.export(
         PrefillModule(model, keep),
         (prelude,),
         str(prefill_graph),
         input_names=["tokens"],
-        output_names=["log_probs", *prefix_names, *state_names],
+        output_names=["log_probs", *prefix_names, *mask_names, *state_names],
         dynamic_axes={
             "tokens": {1: "length"},
-            **{name: axes[name] for name in (*prefix_names, *state_names) if name in axes},
+            **{
+                name: {**axes[name], 0: "batch"}
+                for name in (*prefix_names, *state_names)
+                if name in axes
+            },
+            **{name: {0: "batch"} for name in mask_names},
         },
         opset_version=17,
         dynamo=False,
@@ -809,7 +848,15 @@ def export_onnx(
                 "context_chars": model.config.context_chars,
                 "prefix": list(prefix_names),
                 "state": list(state_names),
-                "layout": "rectangular",
+                "layout": "resident",
+                "dtype": {None: "float32", "int8": "float32", "fp16": "float16"}[quantize],
+                "rows": {
+                    "prefix": [
+                        [*tensor.shape[1:3], model.config.context_chars + 2, tensor.shape[4]]
+                        for tensor in prefix
+                    ],
+                    "state": [list(tensor.shape[1:]) for tensor in state],
+                },
                 "specials": {"pad": PAD, "bos": BOS, "eos": EOS, "sep": SEP, "unk": UNK},
                 "restricted_to": None if keep is None else int(keep.numel()),
                 "weights": weights,
