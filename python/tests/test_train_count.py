@@ -9,14 +9,22 @@ tests hold it to that by counting the same corpus both ways.
 from __future__ import annotations
 
 import json
+from dataclasses import asdict, replace
 from pathlib import Path
 
 from mlime.train.arbitration import ReadingArbitration
-from mlime.train.count import count_batches
+from mlime.train.count import CENSUS_VERSION, CountSpec, count_batches, matching_census
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import EpochBatches
 from mlime.train.run import RunPaths, Slices, Vocabularies
-from mlime.train.samples import BaseTokenizer, Collator, CorpusStream, SampleBuilder
+from mlime.train.samples import (
+    DEFAULT_CONTEXT_TOKENS,
+    Augmentation,
+    BaseTokenizer,
+    Collator,
+    CorpusStream,
+    SampleBuilder,
+)
 from mlime.train.spans import SpanVocab
 
 #: Small enough that the two-shard fixture is many batches rather than one.
@@ -55,7 +63,7 @@ def batches_in_first_epoch(
             rank=rank,
             world_size=world_size,
         ),
-        Collator(tokenizer),
+        Collator(tokenizer, lexicon.candidate_mask),
         BUDGET,
     )
     taken = 0
@@ -144,3 +152,225 @@ def test_a_census_covers_every_epoch_and_is_read_back_from_its_file(
     assert written["token_budget"] == BUDGET
     assert written["shards"] == list(SHARDS)
     assert written["augmentation"]["full"] == 0.55
+
+
+def test_accumulation_divides_micro_batches_into_steps(
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """The rank totals count micro-batches; a step of N of them is a count/N."""
+    vocabularies = Vocabularies(
+        spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration
+    )
+    one = count_batches(
+        vocabularies,
+        census_paths(corpus, tmp_path),
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+    )
+    four = count_batches(
+        vocabularies,
+        census_paths(corpus, tmp_path / "four"),
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+        accumulate=4,
+    )
+    assert four.ranks == one.ranks
+    assert four.steps_for_epochs == -(-one.steps_for_epochs // 4)
+    assert four.accumulate == 4
+
+
+def spec_for(**overrides) -> CountSpec:
+    """The configuration the fixture counts use, with one field swapped out."""
+    spec = CountSpec(
+        world_size=1,
+        epochs=1,
+        token_budget=BUDGET,
+        max_context_tokens=DEFAULT_CONTEXT_TOKENS,
+        seed=SEED,
+        augmentation=asdict(Augmentation()),
+        shards=list(SHARDS),
+        accumulate=1,
+        census_version=CENSUS_VERSION,
+    )
+    return replace(spec, **overrides)
+
+
+def test_a_stored_census_is_used_when_the_configuration_matches(
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    vocabularies = Vocabularies(
+        spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration
+    )
+    counted = count_batches(
+        vocabularies,
+        census_paths(corpus, tmp_path),
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+    )
+    stored = tmp_path / "batch-counts.json"
+    counted.write(stored)
+    # A field the configuration match ignores is marked, so a recount where a
+    # reuse belonged shows up.
+    data = json.loads(stored.read_text(encoding="utf-8"))
+    data["build_counts"]["kept"] = -1
+    stored.write_text(json.dumps(data), encoding="utf-8")
+    census, differed = matching_census(stored, spec_for())
+    assert census is not None and differed == []
+    reused = count_batches(
+        vocabularies,
+        census_paths(corpus, tmp_path),
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+        reuse_census=stored,
+    )
+    assert reused.build_counts["kept"] == -1
+    assert reused.steps_for_epochs == counted.steps_for_epochs
+
+
+def test_a_stored_census_is_refused_when_one_field_differs(
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    vocabularies = Vocabularies(
+        spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration
+    )
+    counted = count_batches(
+        vocabularies,
+        census_paths(corpus, tmp_path),
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+    )
+    stored = tmp_path / "batch-counts.json"
+    counted.write(stored)
+    data = json.loads(stored.read_text(encoding="utf-8"))
+    data["build_counts"]["kept"] = -1
+    stored.write_text(json.dumps(data), encoding="utf-8")
+    for field, changed in (
+        ("seed", spec_for(seed=SEED + 1)),
+        ("token_budget", spec_for(token_budget=BUDGET * 2)),
+        ("accumulate", spec_for(accumulate=4)),
+        ("world_size", spec_for(world_size=2)),
+        ("shards", spec_for(shards=["other-00000.parquet"])),
+    ):
+        census, differed = matching_census(stored, changed)
+        assert census is None and differed == [field]
+    # A refused census is counted again, not used anyway.
+    recounted = count_batches(
+        vocabularies,
+        census_paths(corpus, tmp_path),
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+        accumulate=4,
+        reuse_census=stored,
+    )
+    assert recounted.build_counts["kept"] == 128
+    assert recounted.accumulate == 4
+
+
+def test_a_census_without_a_version_is_refused(
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """A file written before censuses were versioned is not reused.
+
+    The count's method itself is part of what makes it exact: a census whose
+    format predates the current counting is a wrong count even when every
+    configuration field matches.
+    """
+    vocabularies = Vocabularies(
+        spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration
+    )
+    counted = count_batches(
+        vocabularies,
+        census_paths(corpus, tmp_path),
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+    )
+    assert counted.census_version == CENSUS_VERSION
+    stored = tmp_path / "batch-counts.json"
+    counted.write(stored)
+    data = json.loads(stored.read_text(encoding="utf-8"))
+    del data["census_version"]
+    stored.write_text(json.dumps(data), encoding="utf-8")
+    census, differed = matching_census(stored, spec_for())
+    assert census is None and differed == ["census_version"]
+    recounted = count_batches(
+        vocabularies,
+        census_paths(corpus, tmp_path),
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+        reuse_census=stored,
+    )
+    assert recounted.steps_for_epochs == counted.steps_for_epochs
+
+
+def test_a_v1_shaped_census_is_refused_and_recounted(
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """A file shaped like an older census is refused, not trusted enough to raise on."""
+    vocabularies = Vocabularies(
+        spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration
+    )
+    counted = count_batches(
+        vocabularies,
+        census_paths(corpus, tmp_path),
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+    )
+    stored = tmp_path / "batch-counts.json"
+    counted.write(stored)
+    v1 = json.loads(stored.read_text(encoding="utf-8"))
+    del v1["accumulate"], v1["census_version"]
+    stored.write_text(json.dumps(v1), encoding="utf-8")
+    census, differed = matching_census(stored, spec_for())
+    assert census is None and differed == ["accumulate", "census_version"]
+    # A field this code does not know is also refused, by name.
+    data = json.loads(stored.read_text(encoding="utf-8"))
+    data["accumulate"] = 1
+    data["census_version"] = CENSUS_VERSION
+    data["extra_field"] = 1
+    stored.write_text(json.dumps(data), encoding="utf-8")
+    census, differed = matching_census(stored, spec_for())
+    assert census is None and differed == ["extra_field"]
+    # And the refusal counts again rather than exiting.
+    recounted = count_batches(
+        vocabularies,
+        census_paths(corpus, tmp_path),
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+        reuse_census=stored,
+    )
+    assert recounted.steps_for_epochs == counted.steps_for_epochs

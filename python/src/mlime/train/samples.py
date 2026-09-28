@@ -388,6 +388,9 @@ class Batch:
     ``span_ids`` carries the span at those same positions and is meaningless
     elsewhere, which ``span_positions`` marks. ``targets`` is in emission-index
     space, not vocabulary space, and is ``IGNORE_INDEX`` wherever no loss is due.
+    ``scored`` is ``targets != IGNORE_INDEX`` as flat indices into the ``[B, W]``
+    layout -- the ``nonzero`` a step would otherwise run on the device, done here
+    on the host where finding positions costs no synchronisation.
     """
 
     input_ids: torch.Tensor
@@ -395,6 +398,7 @@ class Batch:
     span_ids: torch.Tensor
     span_positions: torch.Tensor
     targets: torch.Tensor
+    scored: torch.Tensor
     context_ids: torch.Tensor
     context_mask: torch.Tensor
     has_context: torch.Tensor
@@ -429,6 +433,7 @@ class Batch:
             span_ids=self.span_ids.to(device, non_blocking=True),
             span_positions=self.span_positions.to(device, non_blocking=True),
             targets=self.targets.to(device, non_blocking=True),
+            scored=self.scored.to(device, non_blocking=True),
             context_ids=self.context_ids.to(device, non_blocking=True),
             context_mask=self.context_mask.to(device, non_blocking=True),
             has_context=self.has_context.to(device, non_blocking=True),
@@ -447,6 +452,7 @@ class Collator:
     def __init__(
         self,
         tokenizer: BaseTokenizer,
+        candidate_mask: torch.Tensor,
         context_dropout: float = 0.3,
         max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
         seed: int = 0,
@@ -454,6 +460,11 @@ class Collator:
         if not 0.0 <= context_dropout <= 1.0:
             raise ValueError(f"context_dropout must be a probability, got {context_dropout}")
         self.tokenizer = tokenizer
+        #: ``[spans, E]`` -- which characters each typed span admits. The batch
+        #: is where the examples become tensors, so it is also where an example
+        #: whose target its span does not admit (or a span admitting nothing)
+        #: fails, on the host, instead of inside a training step on the device.
+        self.candidate_mask = candidate_mask
         self.context_dropout = context_dropout
         self.max_context_tokens = max_context_tokens
         self.rng = random.Random(seed)
@@ -478,9 +489,14 @@ class Collator:
             input_ids[row, 1 : length + 1] = self.tokenizer.mask_token_id
             input_ids[row, length + 1] = self.tokenizer.sep_token_id
             attention_mask[row, : length + 2] = 1
-            span_ids[row, 1 : length + 1] = torch.tensor(example.span_ids, dtype=torch.long)
+            row_spans = torch.tensor(example.span_ids, dtype=torch.long)
+            row_targets = torch.tensor(example.targets, dtype=torch.long)
+            scored = row_targets != IGNORE_INDEX
+            if not bool(self.candidate_mask[row_spans[scored], row_targets[scored]].all()):
+                raise ValueError(f"example {example.id} has a target its span does not admit")
+            span_ids[row, 1 : length + 1] = row_spans
             span_positions[row, 1 : length + 1] = True
-            targets[row, 1 : length + 1] = torch.tensor(example.targets, dtype=torch.long)
+            targets[row, 1 : length + 1] = row_targets
             keep = example.context is not None and self.rng.random() >= self.context_dropout
             contexts.append(
                 context_tail(example.context, self.max_context_tokens)
@@ -496,12 +512,20 @@ class Collator:
             max_length=self.max_context_tokens,
             return_tensors="pt",
         )
+        # The device code indexes the scored positions rather than finding
+        # them: the nonzero and the check that they sit inside the span columns
+        # run here, on the host, so the training step stays asynchronous.
+        scored_positions = (targets != IGNORE_INDEX).reshape(-1).nonzero(as_tuple=True)[0]
+        columns = scored_positions % width
+        if bool(((columns == 0) | (columns == width - 1)).any()):
+            raise ValueError("a scored position sits outside the span columns")
         return Batch(
             input_ids=input_ids,
             attention_mask=attention_mask,
             span_ids=span_ids,
             span_positions=span_positions,
             targets=targets,
+            scored=scored_positions,
             context_ids=encoded["input_ids"],
             context_mask=encoded["attention_mask"],
             has_context=has_context,

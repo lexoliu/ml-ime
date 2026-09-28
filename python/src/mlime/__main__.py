@@ -445,6 +445,144 @@ def train_route_a(
     )
 
 
+@train_app.command("e2e")
+def train_e2e(
+    data_dir: Path = DATA_DIR,
+    labels: Path = LABELS,
+    out: Path = typer.Option(Path("runs/e2e"), help="Where checkpoints and metrics go"),
+    char_table: Path = CHAR_TABLE,
+    train_shard: list[str] = TRAIN_SHARD,
+    held_out_shard: list[str] = HELD_OUT_SHARD,
+    init_encoder: Path = typer.Option(
+        None,
+        help="A route A checkpoint (model weights and its route_a record); a new run starts here",
+    ),
+    init_decoder: Path = typer.Option(
+        None, help="The transformer reader's char-lm checkpoint; a new run starts here"
+    ),
+    aux_weight: float = typer.Option(
+        0.3, help="Weight of the encoder head's loss inside the total"
+    ),
+    max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
+    token_budget: int = TOKEN_BUDGET,
+    base_lr: float = typer.Option(3e-5, help="Learning rate for the pretrained weights"),
+    new_lr: float = typer.Option(1e-4, help="Learning rate for the tables e2e adds"),
+    seed: int = SEED,
+    fp16: bool = typer.Option(True, help="Train in fp16 with loss scaling"),
+    checkpoint_every: int = typer.Option(500, help="Steps between checkpoints"),
+    keep_checkpoints: int = typer.Option(2, help="Numbered checkpoints to keep on disk"),
+    wall_budget_seconds: float = typer.Option(
+        None,
+        help="Pause and checkpoint after this many seconds, for a session that gets killed",
+    ),
+    resume: Path = typer.Option(
+        None,
+        help="Continue the run that wrote this checkpoint; every other option must match it",
+    ),
+    max_held_out: int = typer.Option(4096, help="Held-out examples to score"),
+    activation_checkpointing: bool = typer.Option(
+        False,
+        "--activation-checkpointing",
+        help="Recompute encoder layers in backward; slower, much smaller footprint",
+    ),
+    accumulate: int = typer.Option(1, "--accumulate", help="Micro-batches per optimiser step"),
+    prefetch: bool = typer.Option(
+        False,
+        "--prefetch/--no-prefetch",
+        help="Collate the next batches on a producer thread while the step runs",
+    ),
+    profile_steps: int = typer.Option(
+        0,
+        "--profile-steps",
+        help="Steps after warm-up to time per phase; written to stdout and metrics",
+    ),
+    compile: bool = typer.Option(
+        False,
+        "--compile/--no-compile",
+        help="torch.compile the towers and the decoder stack (dynamic shapes)",
+    ),
+    compile_mode: str = typer.Option(
+        "default",
+        "--compile-mode",
+        help="torch.compile mode; try max-autotune-no-cudagraphs if default underfeeds the card",
+    ),
+    agree_every: int = typer.Option(
+        64, "--agree-every", help="Steps between the ranks' wall-budget verdicts"
+    ),
+    log_every: int = typer.Option(10, "--log-every", help="Steps between metric records"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Train the end-to-end model: route A's encoder, the reader's decoder."""
+    configure(verbose)
+    import os
+
+    import torch
+
+    from mlime.train.e2e import e2e
+    from mlime.train.loop import TrainingConfig
+    from mlime.train.run import describe_device
+
+    typer.echo(f"device: {describe_device()}")
+    try:
+        result = e2e(
+            route_a_paths(data_dir, labels, char_table, out),
+            route_a_slices(data_dir, train_shard, held_out_shard, max_held_out),
+            TrainingConfig(
+                max_steps=max_steps,
+                base_lr=base_lr,
+                new_lr=new_lr,
+                token_budget=token_budget,
+                seed=seed,
+                fp16=fp16,
+                checkpoint_every=checkpoint_every,
+                keep_checkpoints=keep_checkpoints,
+                wall_budget_seconds=wall_budget_seconds,
+                accumulate=accumulate,
+                prefetch=prefetch,
+                profile_steps=profile_steps,
+                compile=compile,
+                compile_mode=compile_mode,
+                agree_every=agree_every,
+                log_every=log_every,
+            ),
+            init_encoder=init_encoder,
+            init_decoder=init_decoder,
+            aux_weight=aux_weight,
+            resume=resume,
+            activation_checkpointing=activation_checkpointing,
+        )
+    except torch.cuda.OutOfMemoryError as error:
+        # The sweep that drives this wants the peak recorded even at the crash,
+        # and a freed cache before the process exits so a shared card is clean.
+        torch.cuda.empty_cache()
+        typer.echo(f"out of memory: {error}")
+        raise typer.Exit(3) from error
+    finally:
+        if torch.cuda.is_available():
+            typer.echo(
+                json.dumps(
+                    {
+                        "event": "peak-memory",
+                        "rank": int(os.environ.get("RANK", "0")),
+                        "bytes": torch.cuda.max_memory_allocated(),
+                    }
+                )
+            )
+    typer.echo(f"loss {result.first_loss:.4f} -> {result.last_loss:.4f} over {result.steps} steps")
+    if not result.finished:
+        typer.echo(
+            f"paused at step {result.step} of {max_steps}; the next kernel continues it with "
+            f"--resume {out / 'checkpoint-paused.pt'}"
+        )
+        return
+    with_context, without_context = result.scored
+    typer.echo(
+        f"held-out character accuracy: context on {with_context.rate:.4f}, "
+        f"off {without_context.rate:.4f} "
+        f"({with_context.scored} characters)"
+    )
+
+
 @train_app.command("count-batches")
 def train_count_batches(
     out: Path = typer.Option(..., "--out", help="Where the JSON census goes"),
@@ -458,6 +596,16 @@ def train_count_batches(
     base_model: str = typer.Option("hfl/chinese-macbert-base", help="The base checkpoint"),
     world_size: int = typer.Option(1, help="Ranks the run will be sharded across"),
     epochs: int = typer.Option(1, help="Epochs to count"),
+    accumulate: int = typer.Option(
+        1, "--accumulate", help="Micro-batches per optimiser step the run will use"
+    ),
+    reuse_census: Path | None = typer.Option(
+        None,
+        "--reuse-census",
+        help="A stored batch-counts.json to use when every configuration field "
+        "and the shard list equal this run's; refused with the differing "
+        "fields logged otherwise",
+    ),
     verbose: bool = VERBOSE,
 ) -> None:
     """Count the steps *epochs* of the training shards come to, for --max-steps.
@@ -480,6 +628,8 @@ def train_count_batches(
         seed=seed,
         world_size=world_size,
         epochs=epochs,
+        accumulate=accumulate,
+        reuse_census=reuse_census,
     )
     census.write(out)
     typer.echo(
@@ -769,6 +919,72 @@ def eval_rime(
     typer.echo(report.render())
     if out is not None:
         write_report(report, out)
+
+
+@eval_app.command("e2e")
+def eval_e2e(
+    checkpoint: Path = typer.Option(..., help="An e2e checkpoint written by `train e2e`"),
+    lattice: Path = typer.Option(..., help="A lattice written by `ime-cli emit-lattice`"),
+    eval_set: Path = typer.Option(..., help="The eval set the lattice was decoded from"),
+    char_table: Path = CHAR_TABLE,
+    slice_: str = typer.Option(
+        "test", "--slice", help="test (default), dev or all -- the keyed split"
+    ),
+    dev_share: float = typer.Option(0.0905, help="Share of the set that is development data"),
+    beam_width: int = typer.Option(16, help="Beams per lattice path"),
+    top_k: int = typer.Option(8, help="Hypotheses kept per record"),
+    context: bool = typer.Option(True, help="Let the encoder read each record's context"),
+    token_budget: int = typer.Option(8192, help="Padded positions per encoder forward"),
+    dump: Path = typer.Option(
+        None, help="Where each record's hypotheses go, as fused-eval --dump JSON Lines"
+    ),
+    out: Path = typer.Option(None, help="Where the report text goes"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Beam-search a lattice with an e2e checkpoint and report as `ime-eval` does."""
+    configure(verbose)
+    from mlime.data.corpus import default_char_table
+    from mlime.train.e2e_eval import evaluate
+    from mlime.train.run import build_lexicon_for, load_tokenizer
+    from mlime.train.spans import SpanVocab
+
+    table = char_table or default_char_table()
+    if table is None:
+        raise typer.BadParameter("no char_pinyin.tsv found above the working directory")
+    if slice_ not in ("dev", "test", "all"):
+        raise typer.BadParameter("--slice must be dev, test or all")
+    spans = SpanVocab.load()
+    tokenizer = load_tokenizer(_e2e_base_model(checkpoint))
+    reports = evaluate(
+        checkpoint=checkpoint,
+        lattice=lattice,
+        eval_set=eval_set,
+        tokenizer=tokenizer,
+        lexicon=build_lexicon_for(table, tokenizer, spans),
+        spans=spans,
+        slice_=slice_,
+        dev_share=dev_share,
+        beam_width=beam_width,
+        top_k=top_k,
+        with_context=context,
+        token_budget=token_budget,
+        dump=dump,
+    )
+    rendered = "\n\n".join(f"slice: {name}\n{report.render()}" for name, report in reports)
+    typer.echo(rendered)
+    if out is not None:
+        out.write_text(rendered + "\n", encoding="utf-8")
+
+
+def _e2e_base_model(checkpoint: Path) -> str:
+    """The base checkpoint an e2e model was built on, read out of its own file."""
+    import torch
+
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    record = state.get("e2e")
+    if not isinstance(record, dict):
+        raise typer.BadParameter(f"{checkpoint} holds no e2e record; it is not an e2e checkpoint")
+    return str(record["base_model"])
 
 
 @eval_app.command("gui")

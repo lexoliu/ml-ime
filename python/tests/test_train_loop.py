@@ -10,6 +10,7 @@ route A works.
 from __future__ import annotations
 
 import json
+import random
 from dataclasses import replace
 from pathlib import Path
 
@@ -20,17 +21,26 @@ from transformers import BertConfig
 from mlime.train.arbitration import ReadingArbitration
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import (
+    PHASES,
     Accuracy,
     Distributed,
     EpochBatches,
     MetricLog,
+    Prefetcher,
     TrainingConfig,
     cosine_with_warmup,
     evaluate,
     train,
 )
 from mlime.train.model import RouteAConfig, RouteAModel
-from mlime.train.samples import BaseTokenizer, Batch, Collator, CorpusStream, SampleBuilder
+from mlime.train.samples import (
+    IGNORE_INDEX,
+    BaseTokenizer,
+    Batch,
+    Collator,
+    CorpusStream,
+    SampleBuilder,
+)
 from mlime.train.spans import SpanVocab
 
 TINY = BertConfig(
@@ -92,7 +102,8 @@ def test_the_loss_falls_and_the_run_leaves_its_evidence(
         seed=3,
     )
     out_dir = tmp_path / "run"
-    metrics_path = train(model, stream, Collator(tokenizer), config, out_dir).metrics
+    collator = Collator(tokenizer, lexicon.candidate_mask)
+    metrics_path = train(model, stream, collator, config, out_dir).metrics
 
     records = [json.loads(line) for line in metrics_path.read_text().splitlines()]
     steps = [record for record in records if record["event"] == "step"]
@@ -118,7 +129,8 @@ def test_the_schedule_reaches_both_learning_rates(
     model = RouteAModel.from_config(TINY, lexicon, RouteAConfig(cross_attention_layers=1))
     stream = CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, arbitration))
     config = TrainingConfig(max_steps=25, token_budget=64, log_every=1, fp16=False)
-    metrics_path = train(model, stream, Collator(tokenizer), config, tmp_path / "run").metrics
+    collator = Collator(tokenizer, lexicon.candidate_mask)
+    metrics_path = train(model, stream, collator, config, tmp_path / "run").metrics
     steps = [
         json.loads(line)
         for line in metrics_path.read_text().splitlines()
@@ -185,7 +197,7 @@ def stream_and_collator(
     samples_dir, labels_dir = corpus
     return (
         CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, arbitration, seed=1)),
-        Collator(tokenizer),
+        Collator(tokenizer, lexicon.candidate_mask),
     )
 
 
@@ -459,3 +471,208 @@ def test_a_budget_may_change_between_segments_but_nothing_else_may(
 def test_a_wall_budget_that_is_not_time_is_refused() -> None:
     with pytest.raises(ValueError, match="wall_budget_seconds must be positive"):
         TrainingConfig(max_steps=1, wall_budget_seconds=0.0)
+
+
+def test_a_produced_item_carries_where_to_reopen_the_stream(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+) -> None:
+    """Each produced batch holds the position *after* it, so a checkpoint taken
+    on the last consumed item -- not the last one a prefetcher happened to
+    build -- resumes with exactly the batch that would have come next."""
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    source = Prefetcher(EpochBatches(stream, collator, RESUMABLE.token_budget))
+    try:
+        items = [next(source) for _ in range(3)]
+    finally:
+        source.close()
+    assert [(item.epoch, item.index) for item in items] == [(0, 1), (0, 2), (0, 3)]
+
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    replay = EpochBatches(stream, collator, RESUMABLE.token_budget)
+    replay.skip(items[0].epoch, items[0].index)
+    replay.collator.rng.setstate(items[0].collator_rng)
+    continued = replay.produce()
+    assert continued.batch.ids == items[1].batch.ids
+    assert typed(continued.batch, spans) == typed(items[1].batch, spans)
+
+
+def test_a_prefetched_segment_pauses_and_resumes_on_the_consumed_batch(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """With the producer thread running ahead, the paused checkpoint still
+    records the batch the optimiser last consumed, and the resumed segment
+    continues the uninterrupted run's sequence."""
+    whole_dir = tmp_path / "whole"
+    uninterrupted = tiny_model(lexicon)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    whole = train(uninterrupted, stream, collator, RESUMABLE, whole_dir)
+
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    paused = train(
+        tiny_model(lexicon),
+        stream,
+        collator,
+        replace(SPENT, prefetch=True),
+        tmp_path / "paused",
+    )
+    assert (paused.step, paused.finished) == (1, False)
+
+    resumed_model = tiny_model(lexicon)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    resumed = train(
+        resumed_model,
+        stream,
+        collator,
+        replace(RESUMABLE, prefetch=True),
+        tmp_path / "resumed",
+        resume=tmp_path / "paused" / "checkpoint-paused.pt",
+    )
+    # One consumed batch was recorded although the producer had run ahead.
+    assert records(resumed.metrics, "resume")[0]["index"] == 1
+    assert step_losses(resumed.metrics) == step_losses(whole.metrics)[1:]
+    weights = uninterrupted.state_dict()
+    for name, tensor in resumed_model.state_dict().items():
+        assert torch.equal(tensor, weights[name]), name
+
+
+class UnevenTargets:
+    """The real collator, blanking one example's targets in every other batch.
+
+    The fixture rows all carry four scored positions, so two consecutive
+    micro-batches would always hold the same count and could not tell a
+    position-weighted mean from a plain one; clearing a row makes the counts
+    differ while the stream, the grouping and the loss stay real.
+    """
+
+    def __init__(self, inner: Collator):
+        self.inner = inner
+        self.rng = inner.rng
+        self._calls = 0
+
+    @property
+    def max_context_tokens(self) -> int:
+        return self.inner.max_context_tokens
+
+    def __call__(self, group: list) -> Batch:
+        batch = self.inner(group)
+        self._calls += 1
+        if self._calls % 2 == 0:
+            batch.targets[0, :] = IGNORE_INDEX
+            # The collator ships `scored` over the targets it made; a wrapper
+            # that blanks them afterwards must rebuild it.
+            batch = replace(
+                batch,
+                scored=(batch.targets != IGNORE_INDEX).reshape(-1).nonzero(as_tuple=True)[0],
+            )
+        return batch
+
+
+def test_an_accumulated_step_is_the_mean_over_every_scored_position(
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """A step of two micro-batches weights each one's loss by its scored
+    positions -- the mean over positions, not the mean of the two means."""
+    stream, collator = stream_and_collator(corpus, lexicon, spans, arbitration, tokenizer)
+    batches = EpochBatches(stream, UnevenTargets(collator), RESUMABLE.token_budget)
+    items = [batches.produce() for _ in range(2)]
+    counts = [int((item.batch.targets != IGNORE_INDEX).sum()) for item in items]
+    # Same-width micro-batches could not tell the weighting from a plain mean.
+    assert counts[0] != counts[1]
+
+    # The loop's forwards sit right after seed_everything's manual_seed, so a
+    # replica seeded the same way draws the same dropout masks.
+    replica = tiny_model(lexicon)
+    random.seed(RESUMABLE.seed)
+    torch.manual_seed(RESUMABLE.seed)
+    replica.train()
+    losses = []
+    with torch.no_grad():
+        for item in items:
+            output = replica(item.batch)
+            assert output.loss is not None
+            losses.append(float(output.loss))
+    expected = sum(loss * count for loss, count in zip(losses, counts, strict=True)) / sum(counts)
+
+    doubled = replace(RESUMABLE, max_steps=1, accumulate=2)
+    stream, collator = stream_and_collator(corpus, lexicon, spans, arbitration, tokenizer)
+    segment = train(tiny_model(lexicon), stream, UnevenTargets(collator), doubled, tmp_path / "run")
+    assert step_losses(segment.metrics) == [pytest.approx(expected, rel=1e-5)]
+
+
+def test_an_accumulating_run_pauses_and_resumes_in_micro_batches(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """Positions count the micro-batches consumed: a pause after one optimiser
+    step of two is recorded as index 2, and the resumed segment goes on from
+    the third micro-batch exactly as the uninterrupted run did."""
+    doubled = replace(RESUMABLE, max_steps=3, accumulate=2)
+    whole_dir = tmp_path / "whole"
+    uninterrupted = tiny_model(lexicon)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    whole = train(uninterrupted, stream, collator, doubled, whole_dir)
+
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    paused = train(
+        tiny_model(lexicon),
+        stream,
+        collator,
+        replace(doubled, wall_budget_seconds=SPENT.wall_budget_seconds),
+        tmp_path / "paused",
+    )
+    assert (paused.step, paused.finished) == (1, False)
+
+    resumed_model = tiny_model(lexicon)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    resumed = train(
+        resumed_model,
+        stream,
+        collator,
+        doubled,
+        tmp_path / "resumed",
+        resume=tmp_path / "paused" / "checkpoint-paused.pt",
+    )
+    # Two micro-batches made the one step; the resume continues at the third.
+    assert records(resumed.metrics, "resume")[0]["index"] == 2
+    assert step_losses(resumed.metrics) == step_losses(whole.metrics)[1:]
+    weights = uninterrupted.state_dict()
+    for name, tensor in resumed_model.state_dict().items():
+        assert torch.equal(tensor, weights[name]), name
+
+
+def test_a_profiled_run_writes_the_phase_table(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """A run asked to profile writes its timed steps' phases to the metrics."""
+    config = replace(RESUMABLE, max_steps=12, profile_steps=2)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    segment = train(tiny_model(lexicon), stream, collator, config, tmp_path / "run")
+    profiled = records(segment.metrics, "profile")
+    assert len(profiled) == 1
+    assert profiled[0]["steps"] == 2
+    assert set(profiled[0]["phases"]) == set(PHASES)
+    for phase in profiled[0]["phases"].values():
+        assert phase["p95"] >= phase["mean"] >= 0.0

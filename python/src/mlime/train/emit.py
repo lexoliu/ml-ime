@@ -229,7 +229,7 @@ def score_chunk(
             iter(examples), token_budget, collator.max_context_tokens
         ):
             batch = collator(group).to(device)
-            logits = model(batch).logits.float()
+            logits = model.scores(batch).float()
             for row, example in enumerate(group):
                 record_id, path_index = owners[example.id]
                 candidates = admitted[record_id][path_index].candidates
@@ -320,6 +320,7 @@ def emit(
     model, route, step = load_model(checkpoint, lexicon, device)
     collator = Collator(
         tokenizer,
+        lexicon.candidate_mask,
         context_dropout=0.0 if with_context else 1.0,
         max_context_tokens=max_context_tokens,
     )

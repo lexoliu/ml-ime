@@ -21,10 +21,14 @@ the second half of a run a different experiment from the first.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
+import queue
 import random
+import sys
+import threading
 import time
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
@@ -75,6 +79,28 @@ class TrainingConfig:
     #: time to spare and writes a checkpoint the next kernel resumes from.
     wall_budget_seconds: float | None = None
     fp16: bool = True
+    #: Micro-batches whose gradients one optimiser step accumulates. The step's
+    #: loss is the mean over every scored position across them -- not the mean
+    #: of the per-batch means -- and a recorded stream position counts the
+    #: micro-batches consumed.
+    accumulate: int = 1
+    #: Build the next batches on a producer thread while the step runs.
+    prefetch: bool = False
+    #: Steps after warm-up to split into per-phase timings. Zero leaves the
+    #: loop untouched by the profiler's synchronising marks.
+    profile_steps: int = 0
+    #: Optimiser steps between the ranks agreeing whether the wall budget is
+    #: spent. A world of one checks every step: it pays no collective either way.
+    agree_every: int = 64
+    #: torch.compile the towers and the decoder stack, per module, before DDP
+    #: wraps them. A kernel-side choice: the checkpoint neither records it nor
+    #: needs it, and a resumed segment simply compiles again.
+    compile: bool = False
+    #: The mode torch.compile runs at: "default" first,
+    #: "max-autotune-no-cudagraphs" when the default leaves the card underfed.
+    compile_mode: str = "default"
+
+    COMPILE_MODES = ("default", "max-autotune-no-cudagraphs")
 
     def __post_init__(self) -> None:
         if self.max_steps <= 0:
@@ -83,6 +109,16 @@ class TrainingConfig:
             raise ValueError(f"warmup_fraction must be in [0, 1), got {self.warmup_fraction}")
         if self.keep_checkpoints < 1:
             raise ValueError(f"keep_checkpoints must be at least 1, got {self.keep_checkpoints}")
+        if self.accumulate < 1:
+            raise ValueError(f"accumulate must be at least 1, got {self.accumulate}")
+        if self.profile_steps < 0:
+            raise ValueError(f"profile_steps must not be negative, got {self.profile_steps}")
+        if self.agree_every < 1:
+            raise ValueError(f"agree_every must be at least 1, got {self.agree_every}")
+        if self.compile_mode not in self.COMPILE_MODES:
+            raise ValueError(
+                f"compile_mode must be one of {self.COMPILE_MODES}, got {self.compile_mode!r}"
+            )
         if self.wall_budget_seconds is not None and self.wall_budget_seconds <= 0:
             raise ValueError(
                 f"wall_budget_seconds must be positive, got {self.wall_budget_seconds}"
@@ -235,6 +271,25 @@ def epoch_groups(
     return token_budget_batches(iter(stream), budget, collator.max_context_tokens)
 
 
+@dataclass(frozen=True)
+class Produced:
+    """A collated batch, and where the stream stood when it was made.
+
+    ``epoch``/``index`` count the batches produced so far and ``collator_rng``
+    is the collator's generator state just after this batch was collated. A
+    checkpoint taken on this item resumes exactly after it: the batch a
+    re-opened stream produces next is the one an uninterrupted run would have
+    consumed. A prefetching producer carries this per item because the queue
+    may already hold batches a pause never reaches -- the position a checkpoint
+    writes is the last batch *consumed*, not the last one produced.
+    """
+
+    batch: Batch
+    epoch: int
+    index: int
+    collator_rng: tuple[Any, ...]
+
+
 class EpochBatches(Iterator[Batch]):
     """The stream as collated batches, epoch after epoch, and where in it we are.
 
@@ -256,7 +311,22 @@ class EpochBatches(Iterator[Batch]):
         self._groups = self._open_epoch()
 
     def __next__(self) -> Batch:
-        return self.collator(self._next_group())
+        return self.produce().batch
+
+    def produce(self) -> Produced:
+        """Collate the next group, and record the position it leaves behind."""
+        batch = self.collator(self._next_group())
+        return Produced(
+            batch=batch,
+            epoch=self.epoch,
+            index=self.index,
+            collator_rng=self.collator.rng.getstate(),
+        )
+
+    def produced_forever(self) -> Iterator[Produced]:
+        """This stream as produced items, endlessly -- the no-prefetch path."""
+        while True:
+            yield self.produce()
 
     def _open_epoch(self) -> Iterator[list[TrainingExample]]:
         """Start reading :attr:`epoch`, grouped to the budget but not collated."""
@@ -305,6 +375,245 @@ class EpochBatches(Iterator[Batch]):
         )
 
 
+#: Batches the producer thread keeps ready ahead of the consumer. Two is
+#: enough to hide a collation under a step; deeper would only hold batches a
+#: pause never reaches.
+PREFETCH_DEPTH = 2
+
+
+class Prefetcher(Iterator[Produced]):
+    """Runs an :class:`EpochBatches` on a daemon thread into a bounded queue.
+
+    Collation is host work -- parquet reads, the tokenizer, the padding -- and
+    the tokenizer releases the GIL inside its call, so the producer's batches
+    overlap the consumer's device-bound step rather than serialising behind it.
+    Exceptions from the producer are ferried to the consumer and raised there,
+    so a broken stream fails at the step that needed the batch, not silently on
+    a thread nobody joins. Call :meth:`close` when the loop is done; a paused
+    run's leftover queue entries are dropped, never trained on.
+    """
+
+    def __init__(self, batches: EpochBatches, depth: int = PREFETCH_DEPTH):
+        self._queue: queue.Queue[Produced | BaseException] = queue.Queue(maxsize=depth)
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(
+            target=self._fill, args=(batches,), daemon=True, name="batch-prefetch"
+        )
+        self._thread.start()
+
+    def _fill(self, batches: EpochBatches) -> None:
+        """Produce until told to stop; a producer failure is queued, not raised here."""
+        while not self._stopped.is_set():
+            try:
+                item: Produced | BaseException = batches.produce()
+            except BaseException as error:  # ferried to the consumer thread
+                item = error
+            while not self._stopped.is_set():
+                try:
+                    self._queue.put(item, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+            if isinstance(item, BaseException):
+                return
+
+    def __iter__(self) -> Prefetcher:
+        return self
+
+    def __next__(self) -> Produced:
+        item = self._queue.get()
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    def close(self) -> None:
+        """Stop the producer and wait briefly for it to notice."""
+        self._stopped.set()
+        self._thread.join(timeout=10)
+
+
+#: Steps a profiling run leaves unmeasured first, so the phase table describes
+#: the loop at cruising speed rather than at cold caches and lazy imports.
+PROFILE_WARMUP_STEPS = 10
+
+#: A compiled run's warm-up ends once dynamo has emitted no new graph for this
+#: many consecutive steps, and never runs past ``COMPILE_WARMUP_CAP``: a shape
+#: that still specialises then keeps doing so, and the profile says which.
+COMPILE_STABLE_STEPS = 5
+COMPILE_WARMUP_CAP = 30
+
+
+def _dynamo_graphs() -> int:
+    """How many graphs dynamo has compiled in this process so far."""
+    from torch._dynamo.utils import counters
+
+    return int(counters["stats"].get("unique_graphs") or 0)
+
+
+def _dynamo_breaks() -> int:
+    """How many graph breaks dynamo has taken in this process so far."""
+    from torch._dynamo.utils import counters
+
+    return int(sum(counters["graph_breaks"].values()))
+
+
+#: The phases one optimiser step is split into, in the order they run.
+PHASES = (
+    "batch_wait",
+    "h2d",
+    "forward",
+    "backward",
+    "unscale_clip",
+    "optimizer",
+    "agree_log",
+)
+
+
+class Profiler:
+    """Per-phase wall timing, collected only while a run asks for it.
+
+    Timing a phase means synchronising the device at its boundary, so a
+    profiled step is deliberately serial: the table says where the time went
+    and is not itself a faster total. Outside the collected window every mark
+    is one branch, so the option costs nothing when it is off. A phase can be
+    marked several times in a step -- accumulation's micro-batches each mark
+    ``h2d``/``forward``/``backward`` -- and the marks add.
+
+    ``dynamic`` is for a compiled run: its warm-up ends once dynamo has added
+    no graph for ``COMPILE_STABLE_STEPS`` steps running (capped at
+    ``COMPILE_WARMUP_CAP``), each collected step carries how many graphs and
+    breaks happened inside it, and ``done`` lets the loop leave as soon as the
+    window is full. ``sync_check`` arms the sync guard -- off for compiled
+    runs, whose proof is zero breaks and recompiles, since a legitimate
+    mid-window compile would trip a guard written for eager code.
+    """
+
+    def __init__(
+        self, device: torch.device, steps: int, *, dynamic: bool = False, sync_check: bool = True
+    ):
+        self.device = device
+        self.steps = steps
+        self.dynamic = dynamic
+        self.sync_check = sync_check
+        self.records: list[dict[str, float]] = []
+        self._current: dict[str, float] | None = None
+        self._t0 = 0.0
+        self.warmup_steps = 0
+        self._stable = 0
+        self._warmed = not dynamic
+        self._window: list[float] = []
+        self._graphs_at_begin = _dynamo_graphs() if dynamic else 0
+        self._breaks_at_begin = _dynamo_breaks() if dynamic else 0
+
+    def counters(self) -> tuple[int, int]:
+        """(new graphs, graph breaks) since this step began -- the compile cost."""
+        if not self.dynamic:
+            return (0, 0)
+        return (
+            _dynamo_graphs() - self._graphs_at_begin,
+            _dynamo_breaks() - self._breaks_at_begin,
+        )
+
+    def begin(self, local_step: int) -> None:
+        """Start a step: collect it when it lands inside the profiled window."""
+        warmed = self._warmed if self.dynamic else local_step > PROFILE_WARMUP_STEPS
+        collect = self.steps > 0 and warmed and len(self.records) < self.steps
+        if not collect:
+            self.warmup_steps += 1
+        self._current = {} if collect else None
+        if collect and not self._window:
+            self._window.append(time.time())
+        if self.dynamic:
+            self._graphs_at_begin = _dynamo_graphs()
+            self._breaks_at_begin = _dynamo_breaks()
+        self._t0 = time.perf_counter()
+
+    def mark(self, phase: str) -> None:
+        """Attribute everything since the last mark to *phase* and move on."""
+        if self._current is None:
+            return
+        if phase not in PHASES:
+            raise ValueError(f"unknown phase {phase!r}; known: {PHASES}")
+        if self.device.type == "cuda":
+            torch.cuda.synchronize()
+        now = time.perf_counter()
+        self._current[phase] = self._current.get(phase, 0.0) + (now - self._t0)
+        self._t0 = now
+
+    @contextlib.contextmanager
+    def guarded(self) -> Iterator[None]:
+        """A region a collected step proves needs no device synchronisation.
+
+        Forward and backward are wrapped in it: with ``sync_debug_mode`` at
+        ``error``, an ``.item()``, a ``nonzero``, a masked index or a
+        ``bool(tensor)`` inside either fails the run loudly instead of stalling
+        it quietly. Off CUDA, and off the profiled window, it is a no-op.
+        """
+        checking = self.sync_check and self._current is not None and self.device.type == "cuda"
+        if checking:
+            torch.cuda.set_sync_debug_mode("error")
+        try:
+            yield
+        finally:
+            if checking:
+                torch.cuda.set_sync_debug_mode("default")
+
+    def end(self) -> None:
+        """Close the step; keep it if it was being collected.
+
+        In a compiled run the step's compile cost is settled here too: new
+        graphs feed the stability counter that ends the warm-up, and both
+        deltas are stamped onto a collected record so the report can total
+        what happened inside the window.
+        """
+        recompiles = 0
+        graph_breaks = 0
+        if self.dynamic:
+            recompiles, graph_breaks = self.counters()
+            if not self._warmed:
+                self._stable = self._stable + 1 if recompiles == 0 else 0
+                if self._stable >= COMPILE_STABLE_STEPS or self.warmup_steps >= COMPILE_WARMUP_CAP:
+                    self._warmed = True
+        if self._current is not None:
+            if self.dynamic:
+                self._current["recompiles"] = float(recompiles)
+                self._current["graph_breaks"] = float(graph_breaks)
+            self.records.append(self._current)
+            self._current = None
+            if len(self.records) == self.steps:
+                self._window.append(time.time())
+
+    def done(self) -> bool:
+        """The window is full -- a measurement run has nothing left to measure."""
+        return self.steps > 0 and len(self.records) >= self.steps
+
+    def report(self) -> dict[str, Any]:
+        """Mean and p95 of each phase over the collected steps, as a record.
+
+        ``window`` brackets the collected steps in wall-clock epochs, so the
+        kernel can cut its GPU samples to the same stretch. ``recompiles`` and
+        ``graph_breaks`` total what dynamo did inside the window; a steady
+        compiled run reads zero on both.
+        """
+
+        def stats(values: list[float]) -> dict[str, float]:
+            ordered = sorted(values)
+            p95 = ordered[min(len(ordered) - 1, math.ceil(len(ordered) * 0.95) - 1)]
+            return {"mean": sum(ordered) / len(ordered), "p95": p95}
+
+        return {
+            "steps": len(self.records),
+            "warmup_steps": self.warmup_steps,
+            "window": self._window,
+            "recompiles": int(sum(record.get("recompiles", 0.0) for record in self.records)),
+            "graph_breaks": int(sum(record.get("graph_breaks", 0.0) for record in self.records)),
+            "phases": {
+                phase: stats([record.get(phase, 0.0) for record in self.records])
+                for phase in PHASES
+            },
+        }
+
+
 @dataclass(frozen=True)
 class RandomState:
     """Where each generator one rank draws from had got to.
@@ -321,13 +630,18 @@ class RandomState:
     collator: tuple[Any, ...]
 
     @classmethod
-    def capture(cls, collator: Collator) -> RandomState:
-        """The state of this rank's generators as of now."""
+    def capture(cls, collator_rng: tuple[Any, ...]) -> RandomState:
+        """The state of this rank's generators as of now.
+
+        The collator's state is carried in from the last *consumed* batch
+        rather than read live: a prefetching producer may have moved the real
+        generator ahead of what training has seen.
+        """
         return cls(
             python=random.getstate(),
             torch_cpu=torch.get_rng_state(),
             torch_cuda=torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
-            collator=collator.rng.getstate(),
+            collator=collator_rng,
         )
 
     def restore(self, collator: Collator) -> None:
@@ -362,12 +676,12 @@ class RankState:
     random: RandomState
 
     @classmethod
-    def capture(cls, batches: EpochBatches) -> RankState:
+    def capture(cls, consumed: Produced) -> RankState:
         """Where this rank is, ready to be gathered onto rank 0."""
         return cls(
-            epoch=batches.epoch,
-            index=batches.index,
-            random=RandomState.capture(batches.collator),
+            epoch=consumed.epoch,
+            index=consumed.index,
+            random=RandomState.capture(consumed.collator_rng),
         )
 
     def as_record(self) -> dict[str, Any]:
@@ -406,7 +720,11 @@ def evaluate(
     second code path, so the two numbers differ in exactly one thing.
     """
     route = unwrap(model)
-    collator = Collator(tokenizer, context_dropout=0.0 if with_context else 1.0)
+    collator = Collator(
+        tokenizer,
+        route.candidate_mask,
+        context_dropout=0.0 if with_context else 1.0,
+    )
     correct = scored = 0
     was_training = model.training
     model.eval()
@@ -415,7 +733,7 @@ def evaluate(
             iter(examples), token_budget, collator.max_context_tokens
         ):
             batch = collator(group).to(device)
-            logits = route(batch).logits
+            logits = route.scores(batch)
             hit, total = count_correct(route.predictions(logits, batch), batch.targets)
             correct += hit
             scored += total
@@ -454,7 +772,11 @@ def train(
     seed_everything(config.seed, world.rank)
     device = world.device
     model.to(device)
-    resumed = Resumption.read(resume, config, model.config, world) if resume is not None else None
+    resumed = (
+        Resumption.read(resume, config, model.config, world, record=model.config_key)
+        if resume is not None
+        else None
+    )
     if resumed is not None:
         model.load_state_dict(resumed.model)
     trained: nn.Module = model
@@ -467,6 +789,9 @@ def train(
     optimiser = torch.optim.AdamW(
         model.parameter_groups(config.base_lr, config.new_lr),
         weight_decay=config.weight_decay,
+        # The fused CUDA kernels run the whole step without leaving the device;
+        # the flag does not exist on CPU, where the plain implementation stands.
+        fused=device.type == "cuda",
     )
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimiser,
@@ -512,57 +837,162 @@ def train(
         world=world,
     )
 
+    prefetcher = Prefetcher(batches) if config.prefetch else None
+    source: Iterator[Produced] = (
+        prefetcher if prefetcher is not None else batches.produced_forever()
+    )
+    profiler = Profiler(
+        device,
+        config.profile_steps,
+        dynamic=config.compile,
+        sync_check=not config.compile,
+    )
+
     trained.train()
     started = time.monotonic()
     # A segment logs its own first step whatever the interval, so the first loss
     # in a metrics file is always the first step that file's segment ran.
     first_step = step + 1
     finished = False
-    for batch in batches:
-        batch = batch.to(device)
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp):
-            output = trained(batch)
-        if output.loss is None:
-            raise RuntimeError("a batch reached the loop with no scored position")
-        scaler.scale(output.loss).backward()
-        scaler.unscale_(optimiser)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
-        scaler.step(optimiser)
-        scaler.update()
-        optimiser.zero_grad(set_to_none=True)
-        scheduler.step()
-        step += 1
-        if world.is_main and (step % config.log_every == 0 or step == first_step):
-            record = {
-                "event": "step",
-                "step": step,
-                "loss": float(output.loss.detach()),
-                "lr": scheduler.get_last_lr()[0],
-                "new_lr": scheduler.get_last_lr()[1],
-                "examples": batch.size,
-                "tokens": batch.tokens,
-                "context_tokens": batch.context_tokens,
-                "seconds": round(time.monotonic() - started, 1),
-                "gates": model.gates(),
-            }
-            metrics.write(**record)
-            log.info("step", **{k: v for k, v in record.items() if k != "event"})
-        if step % config.checkpoint_every == 0:
-            checkpoints.numbered(step, batches)
-        if step >= config.max_steps:
-            finished = True
-            break
-        elapsed = time.monotonic() - started
-        if config.wall_budget_seconds is not None and agreed(
-            world, elapsed >= config.wall_budget_seconds, device
-        ):
-            checkpoints.paused(step, batches)
-            if world.is_main:
-                metrics.write(event="paused", step=step, seconds=round(elapsed, 1))
-            log.info("wall budget spent, segment paused", step=step, seconds=round(elapsed, 1))
-            break
+    consumed: Produced | None = None
+    try:
+        while True:
+            profiler.begin(step - first_step + 2)
+            items = [next(source) for _ in range(config.accumulate)]
+            profiler.mark("batch_wait")
+            # One step's gradient is the mean over every scored position across
+            # its micro-batches, so each micro-batch's loss -- already its own
+            # mean -- is weighted by its share of the positions, not by 1/N.
+            counts = [item.batch.scored.numel() for item in items]
+            scored_total = sum(counts)
+            if scored_total == 0 or 0 in counts:
+                raise RuntimeError("a batch reached the loop with no scored position")
+            step_loss: torch.Tensor | None = None
+            step_extras: dict[str, torch.Tensor] = {}
+            for micro, (item, count) in enumerate(zip(items, counts, strict=True)):
+                batch = item.batch.to(device)
+                profiler.mark("h2d")
+                # Under DDP only the last micro-batch's backward allreduces; the
+                # others accumulate locally under no_sync, so a step pays one
+                # gradient exchange no matter how many micro-batches it held.
+                synchronising = micro == len(items) - 1
+                sync_context = (
+                    contextlib.nullcontext()
+                    if synchronising or not isinstance(trained, DistributedDataParallel)
+                    else trained.no_sync()
+                )
+                with sync_context:
+                    with (
+                        profiler.guarded(),
+                        torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp),
+                    ):
+                        output = trained(batch)
+                    profiler.mark("forward")
+                    if output.loss is None:
+                        raise RuntimeError("a batch reached the loop with no scored position")
+                    weight = count / scored_total
+                    with profiler.guarded():
+                        scaler.scale(output.loss * weight).backward()
+                profiler.mark("backward")
+                contribution = output.loss.detach() * weight
+                step_loss = contribution if step_loss is None else step_loss + contribution
+                for name, extra in output.extras.items():
+                    part = extra.detach() * weight
+                    step_extras[name] = step_extras.get(name, 0.0) + part
+            consumed = items[-1]
+            scaler.unscale_(optimiser)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+            profiler.mark("unscale_clip")
+            scaler.step(optimiser)
+            scaler.update()
+            optimiser.zero_grad(set_to_none=True)
+            scheduler.step()
+            profiler.mark("optimizer")
+            step += 1
+            if world.is_main and (step % config.log_every == 0 or step == first_step):
+                if step_loss is None:  # unreachable: every micro-batch raises or contributes
+                    raise RuntimeError("a step held no scored position")
+                record = {
+                    "event": "step",
+                    "step": step,
+                    "loss": float(step_loss),
+                    **{name: float(extra) for name, extra in step_extras.items()},
+                    "lr": scheduler.get_last_lr()[0],
+                    "new_lr": scheduler.get_last_lr()[1],
+                    "examples": sum(item.batch.size for item in items),
+                    "tokens": sum(item.batch.tokens for item in items),
+                    "context_tokens": sum(item.batch.context_tokens for item in items),
+                    "seconds": round(time.monotonic() - started, 1),
+                    "gates": model.gates(),
+                }
+                if config.compile:
+                    # Compiles belong to the step that caused them: all of a
+                    # step's dynamo work sits in its forward/backward, ahead
+                    # of where this record is written, so the counter delta
+                    # since the step began is the step's own compile cost.
+                    recompiles, graph_breaks = profiler.counters()
+                    record["recompiles"] = recompiles
+                    record["graph_breaks"] = graph_breaks
+                metrics.write(**record)
+                log.info("step", **{k: v for k, v in record.items() if k != "event"})
+            if step % config.checkpoint_every == 0:
+                checkpoints.numbered(step, consumed)
+            # Ranks cannot leave a collective on different steps, so with more
+            # than one the verdict is broadcast on a fixed cadence; a world of
+            # one checks every step -- the check costs it no collective.
+            elapsed = time.monotonic() - started
+            pause = False
+            if config.wall_budget_seconds is not None:
+                if world.world_size == 1:
+                    pause = elapsed >= config.wall_budget_seconds
+                elif step % config.agree_every == 0:
+                    pause = agreed(world, elapsed >= config.wall_budget_seconds, device)
+            profiler.mark("agree_log")
+            profiler.end()
+            if step >= config.max_steps:
+                finished = True
+                break
+            if pause:
+                checkpoints.paused(step, consumed)
+                if world.is_main:
+                    metrics.write(event="paused", step=step, seconds=round(elapsed, 1))
+                log.info(
+                    "wall budget spent, segment paused",
+                    step=step,
+                    seconds=round(elapsed, 1),
+                )
+                break
+            # A measurement run ends when its window fills -- a compiled one
+            # may warm up late, so its max_steps is a cap, not the target.
+            if profiler.done():
+                break
+    finally:
+        if prefetcher is not None:
+            prefetcher.close()
+    if consumed is None:
+        raise RuntimeError("the loop ran no step; nothing was consumed")
     if finished:
-        checkpoints.final(step, batches)
+        checkpoints.final(step, consumed)
+    if profiler.records:
+        profile = profiler.report()
+        # The kernel reads the phase table out of the log stream, like
+        # `peak-memory`; rank 0 also writes it to the metrics file.
+        sys.stdout.write(json.dumps({"event": "profile", "rank": world.rank, **profile}) + "\n")
+        sys.stdout.flush()
+        if world.is_main:
+            metrics.write(event="profile", **profile)
+    if config.compile and world.is_main:
+        # How dynamo did: graphs compiled, breaks taken, and each recompile --
+        # the record a compiled run owes the reader of its numbers. The import
+        # lives here because torch only loads _dynamo on a compile.
+        from torch._dynamo.utils import counters as dynamo_counters
+
+        dynamo = {name: dict(counter) for name, counter in dynamo_counters.items() if counter}
+        sys.stdout.write(
+            json.dumps({"event": "dynamo", "rank": world.rank, "counters": dynamo}) + "\n"
+        )
+        sys.stdout.flush()
+        metrics.write(event="dynamo", counters=dynamo)
     metrics.close()
     world.stop()
     return Segment(metrics=metrics.path, step=step, finished=finished)
@@ -589,7 +1019,7 @@ def save_checkpoint(
         {
             "step": step,
             "model": model.state_dict(),
-            "route_a": asdict(model.config),
+            model.config_key: asdict(model.config),
             "training": asdict(config),
             "optimiser": optimiser.state_dict(),
             "scheduler": scheduler.state_dict(),
@@ -638,13 +1068,15 @@ def agreed(world: Distributed, decision: bool, device: torch.device) -> bool:
     return bool(verdict.item())
 
 
-def gather_positions(world: Distributed, batches: EpochBatches) -> list[dict[str, Any]]:
+def gather_positions(world: Distributed, consumed: Produced) -> list[dict[str, Any]]:
     """Every rank's place in its own stream, gathered so rank 0 can write them all.
 
-    Collective: every rank calls it, including the ones that write nothing, which
-    is why it is not inside an ``is_main`` guard.
+    The position written is the last batch an optimiser step *consumed* -- with
+    a prefetcher running, the stream itself is already ahead on batches the run
+    never trained on. Collective: every rank calls it, including the ones that
+    write nothing, which is why it is not inside an ``is_main`` guard.
     """
-    mine = RankState.capture(batches).as_record()
+    mine = RankState.capture(consumed).as_record()
     if world.world_size == 1:
         return [mine]
     gathered: list[Any] = [None] * world.world_size
@@ -673,28 +1105,28 @@ class Checkpointer:
     out_dir: Path
     world: Distributed
 
-    def numbered(self, step: int, batches: EpochBatches) -> None:
+    def numbered(self, step: int, consumed: Produced) -> None:
         """Write ``checkpoint-<step>`` and rotate the older ones out."""
-        self._write(self.out_dir / f"checkpoint-{step:06d}.pt", step, batches)
+        self._write(self.out_dir / f"checkpoint-{step:06d}.pt", step, consumed)
         if self.world.is_main:
             rotate_checkpoints(self.out_dir, self.config.keep_checkpoints)
 
-    def final(self, step: int, batches: EpochBatches) -> None:
+    def final(self, step: int, consumed: Produced) -> None:
         """Write ``checkpoint-final``, which is never rotated out."""
-        self._write(self.out_dir / "checkpoint-final.pt", step, batches)
+        self._write(self.out_dir / "checkpoint-final.pt", step, consumed)
 
-    def paused(self, step: int, batches: EpochBatches) -> None:
+    def paused(self, step: int, consumed: Produced) -> None:
         """Write ``checkpoint-paused``, the one the next kernel resumes from.
 
         Named rather than numbered so the next kernel knows what to mount without
         being told a step number, and so rotation cannot take it: a segment that
         stopped on the clock has no other copy of where it got to.
         """
-        self._write(self.out_dir / "checkpoint-paused.pt", step, batches)
+        self._write(self.out_dir / "checkpoint-paused.pt", step, consumed)
 
-    def _write(self, path: Path, step: int, batches: EpochBatches) -> None:
+    def _write(self, path: Path, step: int, consumed: Produced) -> None:
         """Gather the positions -- all ranks -- and write the file on rank 0."""
-        positions = gather_positions(self.world, batches)
+        positions = gather_positions(self.world, consumed)
         if not self.world.is_main:
             return
         save_checkpoint(
@@ -709,13 +1141,15 @@ class Checkpointer:
         )
 
 
-#: The one field of :class:`TrainingConfig` a resume may change. Everything else
+#: The fields of :class:`TrainingConfig` a resume may change. Everything else
 #: describes the run, so changing it makes the next segment a different
-#: experiment; the wall budget describes the *kernel* the segment runs in, and
-#: the next kernel is a different one -- a longer session, or a last segment that
-#: means to run to the end -- so holding a chain to one budget would be holding
-#: it to an accident of where the first segment happened to start.
-SEGMENT_FIELDS = frozenset({"wall_budget_seconds"})
+#: experiment; these describe the *kernel* the segment runs in -- a longer
+#: session, a profiling pass, prefetching, how often ranks agree on the clock,
+#: whether the towers were compiled -- not the result it produces.
+#: ``accumulate`` changes the gradient, so it is deliberately not here.
+SEGMENT_FIELDS = frozenset(
+    {"wall_budget_seconds", "prefetch", "profile_steps", "agree_every", "compile", "compile_mode"}
+)
 
 
 def refuse_mismatch(
@@ -755,7 +1189,12 @@ class Resumption:
 
     @classmethod
     def read(
-        cls, path: Path, config: TrainingConfig, route: RouteAConfig, world: Distributed
+        cls,
+        path: Path,
+        config: TrainingConfig,
+        model_config: RouteAConfig,
+        world: Distributed,
+        record: str = "route_a",
     ) -> Resumption:
         """Load *path* and refuse it unless it is this run, one segment earlier."""
         state = torch.load(path, map_location="cpu", weights_only=False)
@@ -765,8 +1204,12 @@ class Resumption:
                 f"{path} predates resumable training and has no {absent}; "
                 "it can be trained from, but not resumed"
             )
+        if record not in state:
+            raise ValueError(
+                f"{path} holds no {record} config; it is a checkpoint of a different model"
+            )
         refuse_mismatch(path, "training", state["training"], asdict(config), SEGMENT_FIELDS)
-        refuse_mismatch(path, "route_a", state["route_a"], asdict(route))
+        refuse_mismatch(path, record, state[record], asdict(model_config))
         positions = state["positions"]
         if len(positions) != world.world_size:
             raise ValueError(
