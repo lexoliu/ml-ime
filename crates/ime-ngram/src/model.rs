@@ -2,7 +2,7 @@
 
 use crate::NgramError;
 use crate::table::ProbTable;
-use ime_decode::Transition;
+use ime_decode::{Asked, Transition};
 use ime_pinyin::{CharId, Lexicon};
 use serde::{Deserialize, Serialize};
 
@@ -296,7 +296,7 @@ impl Transition for NgramModel {
 
     type State = Context;
 
-    fn start(&self, _context: Option<&str>) -> Context {
+    fn start(&self, _context: Option<&str>, _asked: &Asked<'_>) -> Context {
         self.context_at(Token::BOS, Token::BOS)
     }
 
@@ -308,10 +308,10 @@ impl Transition for NgramModel {
         self.probability_at(state, Token::EOS).ln()
     }
 
-    fn advance(&self, steps: &[(&Context, CharId)]) -> Vec<Context> {
+    fn advance(&self, steps: &[(&Context, CharId, Asked<'_>)]) -> Vec<Context> {
         steps
             .iter()
-            .map(|(state, ch)| self.context_at(state.previous, Token::of(*ch)))
+            .map(|(state, ch, _)| self.context_at(state.previous, Token::of(*ch)))
             .collect()
     }
 }

@@ -12,8 +12,8 @@
 //! would load and step until a broadcasting operator failed on it.
 //! `prefill.onnx` reads the prelude (`<bos> context <sep>`) once and
 //! produces the state every beam starts from; `charlm.onnx` advances a
-//! batch of beams by one character and
-//! returns the log probabilities of the next.
+//! batch of beams by one character and returns the log probabilities of
+//! the candidates the next position admits.
 //!
 //! A state is two kinds of tensor. The *prefix* tensors are what the prelude
 //! produced -- the transformer's key/value cache over the context -- and every
@@ -22,12 +22,16 @@
 //! live on the session's device: `start` binds the prefill's outputs over
 //! one resident slot's rows -- the graph emits the prefix left-padded to
 //! the slot's width and the mask row beside it, so the run crosses nothing
-//! but the prelude's tokens up and `log_probs` down -- and a step is fed
-//! `token`, `source_row` (the resident row each new beam continues from)
-//! and `prefix_row` (each worker's slot) -- the
-//! graph gathers the caches by index on the device and produces the new
-//! rows' tensors there too, so the only tensors that ever cross the bus are
-//! the indices, the tokens and `log_probs`. A step's batch stays the
+//! but the prelude's tokens and the first position's `candidates` up and
+//! `candidate_log_probs` down -- and a step is fed `token`, `source_row`
+//! (the resident row each new beam continues from), `candidates` (the
+//! alphabet ids each produced row will be scored on, `<eos>` among them
+//! where the path can end) and `prefix_row` (each worker's slot) -- the
+//! graph gathers the caches by index on the device, gathers the
+//! log-softmax at each row's candidates there too, and produces the new
+//! rows' tensors there as well, so the only tensors that ever cross the
+//! bus are the indices, the tokens, the candidate ids and their gathered
+//! scores. A step's batch stays the
 //! `[workers, width]` rectangle: `width` consecutive rows per worker sharing
 //! the worker's slot, so the prefix gathers once per worker instead of once
 //! per row.
@@ -45,7 +49,7 @@
 //! weights plus per-thread working space no matter how many threads decode.
 
 use half::f16;
-use ime_decode::{BeamOptions, MAX_HISTORY, Transition};
+use ime_decode::{Asked, BeamOptions, MAX_HISTORY, Transition};
 use ime_pinyin::{CharId, Lexicon};
 use memmap2::Mmap;
 use ort::AsPointer;
@@ -119,7 +123,7 @@ impl Backend {
 }
 
 /// Read *dir*'s `charlm.json` and refuse the manifest shapes this build
-/// cannot serve: a `layout` other than `resident`, or a `rows` table that
+/// cannot serve: a `layout` other than `resident-candidates`, or a `rows` table that
 /// does not parallel the `prefix` and `state` name lists it gives the row
 /// shapes of.
 fn read_manifest(dir: &Path) -> Result<Manifest, LmError> {
@@ -288,7 +292,7 @@ pub enum LmError {
     /// a graph written for another would load and run until a broadcasting
     /// operator failed on it, so the check happens at open.
     #[error(
-        "the export at {path} has a step-graph batch layout of {layout:?}, not \"resident\": re-export it with `mlime export char-lm`"
+        "the export at {path} has a step-graph batch layout of {layout:?}, not \"resident-candidates\": re-export it with `mlime export char-lm`"
     )]
     Layout {
         /// The export's directory.
@@ -347,6 +351,9 @@ pub enum LmError {
 /// The reserved ids, as the manifest names them.
 #[derive(Debug, Clone, Copy, Deserialize)]
 struct Specials {
+    /// The padding id — also the filler for `candidates` rows shorter than
+    /// the batch's widest request, a real column the host never reads back.
+    pad: u32,
     bos: u32,
     eos: u32,
     sep: u32,
@@ -355,7 +362,7 @@ struct Specials {
 
 /// The only step-graph batch layout this build reads; the manifest's
 /// `layout` must hold it exactly.
-const STEP_LAYOUT: &str = "resident";
+const STEP_LAYOUT: &str = "resident-candidates";
 
 /// `charlm.json`, the fields the run consults; the manifest also records the
 /// training step, the architecture and the restricted alphabet size, which
@@ -684,8 +691,9 @@ impl Copier {
 }
 
 /// Which side of the run a byte crossed on: a `start` (once per record — the
-/// prefill's tokens, the resident prefix/state writes, its log-probability
-/// row) or a `step` (per `advance` — tokens, indices, log-probability rows).
+/// prefill's tokens and candidates, the resident prefix/state writes, its
+/// gathered score row) or a `step` (per `advance` — tokens, indices,
+/// candidate ids, gathered score rows).
 /// The counters are attributed at the call site, so threads' `start`s can
 /// never bleed into another thread's `step` total.
 #[derive(Clone, Copy, Debug)]
@@ -701,17 +709,18 @@ enum Phase {
 pub struct BusTotals {
     /// Host-input bytes at `start` (prefill tokens, resident writes).
     pub start_uploaded: u64,
-    /// Host-input bytes at `step` (`token`, `source_row`, `prefix_row`).
+    /// Host-input bytes at `step` (`token`, `source_row`, `candidates`,
+    /// `prefix_row`).
     pub step_uploaded: u64,
-    /// Downloaded bytes at `start` (the prefill's log-probability row).
+    /// Downloaded bytes at `start` (the prefill's gathered score row).
     pub start_downloaded: u64,
-    /// Downloaded bytes at `step` (`log_probs`).
+    /// Downloaded bytes at `step` (`candidate_log_probs`).
     pub step_downloaded: u64,
 }
 
 /// Byte counters of what a model's sessions move across the host↔device bus,
 /// so the pressure harness can prove a step crosses only `token`,
-/// `source_row`, `prefix_row` and `log_probs`.
+/// `source_row`, `candidates`, `prefix_row` and `candidate_log_probs`.
 #[derive(Debug, Default)]
 pub struct Bus {
     /// Host-side bytes per phase: start uploads, step uploads.
@@ -743,9 +752,24 @@ impl Bus {
     }
 }
 
+/// The gathered scores a produced state answers: the alphabet ids the call
+/// that made it asked for — the next position's candidates, `<eos>` among
+/// them where the path can end — sorted ascending, each with its log
+/// probability. A score of anything else is a bug in the caller, so the
+/// lookup fails fast instead of falling back to a row the model never
+/// sent.
+#[derive(Clone, Debug)]
+struct Scores {
+    /// The request's alphabet ids, sorted — also the order the row of the
+    /// `candidates` tensor listed them in.
+    ids: Vec<u32>,
+    /// `ids`' gathered log probabilities, aligned.
+    probs: Vec<f32>,
+}
+
 /// The model's state for one beam: the worker slot whose resident buffers
-/// hold the record's prefix, the beam's own resident row, and the log
-/// probabilities of whatever comes next.
+/// hold the record's prefix, the beam's own resident row, and the gathered
+/// scores of whatever comes next.
 ///
 /// All three are handles — the tensors themselves never leave the session's
 /// device — so cloning a beam is reference-count bumps, and dropping the
@@ -756,18 +780,9 @@ pub struct LmState {
     worker: Arc<WorkerSlot>,
     /// This beam's own row in the step's resident buffers.
     row: RowRef,
-    /// One log probability per id of the alphabet — the only tensor the host
-    /// ever holds.
-    log_probs: Arc<Vec<f32>>,
-}
-
-impl LmState {
-    /// The beam's distribution over the next character, one log probability
-    /// per alphabet id.
-    #[must_use]
-    pub fn log_probs(&self) -> &[f32] {
-        &self.log_probs
-    }
+    /// The scores of the candidates this state was asked for — the only
+    /// tensor the host ever holds.
+    scores: Arc<Scores>,
 }
 
 impl Resident {
@@ -1180,6 +1195,27 @@ impl CharLm {
         })
     }
 
+    /// The alphabet ids *asked* names — the request's candidates mapped
+    /// through the lexicon's rows, `<eos>` appended where the path can end —
+    /// sorted, which is both the order a `candidates` tensor row lists them
+    /// in and the order the stored [`Scores`] are keyed by.
+    fn asked_ids(&self, asked: &Asked<'_>) -> Vec<u32> {
+        let mut ids: Vec<u32> = asked
+            .candidates
+            .iter()
+            .map(|ch| self.ids[ch.index()])
+            .collect();
+        if asked.eos {
+            ids.push(self.specials.eos);
+        }
+        ids.sort_unstable();
+        assert!(
+            !ids.is_empty(),
+            "a request with no candidates and no <eos> asks for a state that answers nothing"
+        );
+        ids
+    }
+
     /// Read the prelude through `prefill.onnx` into a resident slot: the
     /// state every beam starts from — a handle, since the tensors themselves
     /// stay on the session's device.
@@ -1189,7 +1225,7 @@ impl CharLm {
     /// bound run then holds only the read lock, so a concurrent `take` that
     /// has to grow the pool cannot move the buffers out from under the
     /// bound row views.
-    fn prefill(&self, context: Option<&str>) -> Result<LmState, LmError> {
+    fn prefill(&self, context: Option<&str>, asked: &Asked<'_>) -> Result<LmState, LmError> {
         let prelude = self.prelude(context);
         let tokens: Vec<i64> = prelude.iter().copied().map(i64::from).collect();
         let tokens = Tensor::from_array(([1i64, dim(tokens.len())], tokens))?;
@@ -1209,7 +1245,7 @@ impl CharLm {
             )?;
             pool.take(&mut env.borrow_mut())?
         };
-        let (log_probs, generation) = match self.prefill_into(&tokens, slot) {
+        let (scores, generation) = match self.prefill_into(&tokens, slot, asked) {
             Ok(parts) => parts,
             Err(error) => {
                 // The run may have half-written the slot's rows; handing it
@@ -1232,22 +1268,31 @@ impl CharLm {
                 generation,
                 index: slot,
             },
-            log_probs: Arc::new(log_probs),
+            scores: Arc::new(scores),
         })
     }
 
     /// Run the prefill into *slot*'s rows: every prefix, mask and state
     /// output is bound over the slot's row of its resident buffer, so the
-    /// only tensors to cross the bus are `tokens` up and `log_probs` down.
+    /// only tensors to cross the bus are `tokens` and `candidates` up and
+    /// `candidate_log_probs` down.
     fn prefill_into(
         &self,
         tokens: &Tensor<i64>,
         slot: u32,
-    ) -> Result<(Vec<f32>, Arc<Generation>), LmError> {
+        asked: &Asked<'_>,
+    ) -> Result<(Scores, Arc<Generation>), LmError> {
+        let ids = self.asked_ids(asked);
+        let candidates = Tensor::from_array((
+            [1i64, dim(ids.len())],
+            ids.iter().map(|&id| i64::from(id)).collect::<Vec<_>>(),
+        ))?;
+        self.bus.upload(Phase::Start, ids.len() * size_of::<i64>());
         let mut bound = self.prefill_sessions.session()?.borrow_mut();
         let BoundSession { session, binding } = &mut *bound;
         binding.clear();
         binding.bind_input("tokens", tokens)?;
+        binding.bind_input("candidates", &candidates)?;
         let pool = self
             .workers
             .read()
@@ -1276,15 +1321,15 @@ impl CharLm {
                 resident_view(&bufs.gen0.tensors[index], slot, self.dtype)?,
             )?;
         }
-        binding.bind_output_to_device("log_probs", &env.host)?;
+        binding.bind_output_to_device("candidate_log_probs", &env.host)?;
         let outputs = session.run_binding(binding)?;
         binding.synchronize_outputs()?;
-        let log_probs = self.host_f32(&outputs["log_probs"], Phase::Start)?;
-        Ok((log_probs, Arc::clone(&bufs.gen0)))
+        let probs = self.host_f32(&outputs["candidate_log_probs"], Phase::Start)?;
+        Ok((Scores { ids, probs }, Arc::clone(&bufs.gen0)))
     }
 
-    /// The tensor's `f32` data on the host — the bound `log_probs` output,
-    /// the only thing the bus ever carries.
+    /// The tensor's `f32` data on the host — the bound `candidate_log_probs`
+    /// output, the only thing the bus ever carries.
     fn host_f32(&self, value: &DynValue, phase: Phase) -> Result<Vec<f32>, LmError> {
         debug_assert!(
             value.memory_info().is_cpu_accessible(),
@@ -1304,7 +1349,7 @@ impl CharLm {
     /// caller that mixes states across steps (a test's interleave, say) gets
     /// one bound step per contiguous run — slower, still correct, because
     /// every run binds the buffers its own `RowRef`s name.
-    fn step(&self, steps: &[(&LmState, CharId)]) -> Result<Vec<LmState>, LmError> {
+    fn step(&self, steps: &[(&LmState, CharId, Asked<'_>)]) -> Result<Vec<LmState>, LmError> {
         let mut advanced: Vec<Option<LmState>> = (0..steps.len()).map(|_| None).collect();
         let mut begin = 0;
         while begin < steps.len() {
@@ -1329,10 +1374,12 @@ impl CharLm {
     /// consecutive rows sharing one worker slot is cut into blocks of
     /// `SessionShape::width` rows, each padded out to `width` with dead rows
     /// — a valid source row and token whose outputs are dropped on the way
-    /// back. The step binds the resident buffers by name: `token` and
-    /// `source_row` are the only host inputs, `prefix_row` gathers each
-    /// block's prefix slot on the device, and `log_probs` is bound to host
-    /// memory while the `next_*` outputs stay on the device as the next
+    /// back. The step binds the resident buffers by name: `token`,
+    /// `source_row` and `candidates` — the per-row requests padded to the
+    /// batch's widest with the `<pad>` id, whose column the host never reads
+    /// — are the host inputs, `prefix_row` gathers each block's prefix slot
+    /// on the device, and `candidate_log_probs` is bound to host memory
+    /// while the `next_*` outputs stay on the device as the next
     /// generation. A model without prefix tensors (the LSTM) has no
     /// rectangle to fill: the batch is one flat run of live rows.
     #[expect(
@@ -1341,7 +1388,7 @@ impl CharLm {
     )]
     fn step_gen(
         &self,
-        steps: &[(&LmState, CharId)],
+        steps: &[(&LmState, CharId, Asked<'_>)],
         out: &mut [Option<LmState>],
     ) -> Result<(), LmError> {
         let generation = &steps[0].0.row.generation;
@@ -1373,21 +1420,36 @@ impl CharLm {
         let mut token = Vec::with_capacity(rows);
         let mut source_row = Vec::with_capacity(rows);
         let mut prefix_row = Vec::with_capacity(blocks.len());
-        let mut uploaded = 0usize;
+        // The request of each padded row — the dead rows borrow the block's
+        // first — as the sorted alphabet ids the row's `candidate_log_probs`
+        // columns answer.
+        let mut asked: Vec<Vec<u32>> = Vec::with_capacity(rows);
         for &block in &blocks {
             for j in 0..block.2 {
                 let row = fed(block, j);
                 token.push(i64::from(self.ids[steps[row].1.index()]));
                 source_row.push(i64::from(steps[row].0.row.index));
+                asked.push(self.asked_ids(&steps[row].2));
             }
             if !self.prefix.is_empty() {
                 prefix_row.push(i64::from(steps[block.0].0.worker.index));
             }
         }
-        uploaded += (token.len() + source_row.len() + prefix_row.len()) * size_of::<i64>();
+        // The widest request sets K; shorter rows pad with `<pad>`, whose
+        // gathered column is real but never read.
+        let count = asked.iter().map(Vec::len).max().unwrap_or(0);
+        let mut candidates = vec![i64::from(self.specials.pad); rows * count];
+        for (row, ids) in asked.iter().enumerate() {
+            for (column, &id) in ids.iter().enumerate() {
+                candidates[row * count + column] = i64::from(id);
+            }
+        }
+        let uploaded = (token.len() + source_row.len() + prefix_row.len() + candidates.len())
+            * size_of::<i64>();
         self.bus.upload(Phase::Step, uploaded);
         let token = Tensor::from_array((vec![dim(rows)], token))?;
         let source_row = Tensor::from_array((vec![dim(rows)], source_row))?;
+        let candidates = Tensor::from_array(([dim(rows), dim(count)], candidates))?;
         let prefix_row = if self.prefix.is_empty() {
             None
         } else {
@@ -1399,6 +1461,7 @@ impl CharLm {
         binding.clear();
         binding.bind_input("token", &token)?;
         binding.bind_input("source_row", &source_row)?;
+        binding.bind_input("candidates", &candidates)?;
         let pool = self
             .workers
             .read()
@@ -1423,7 +1486,7 @@ impl CharLm {
             }
         }
         drop(pool);
-        binding.bind_output_to_device("log_probs", &env.host)?;
+        binding.bind_output_to_device("candidate_log_probs", &env.host)?;
         for name in &self.state {
             binding.bind_output_to_device(format!("next_{name}"), &env.device)?;
         }
@@ -1440,23 +1503,24 @@ impl CharLm {
             );
         }
         let next = Arc::new(Generation { tensors });
-        let log_probs = self.host_f32(&outputs["log_probs"], Phase::Step)?;
-        let vocabulary = log_probs.len() / rows;
+        let gathered = self.host_f32(&outputs["candidate_log_probs"], Phase::Step)?;
         // Slice each block's live rows back out in input order, dropping the
-        // dead rows' outputs.
+        // dead rows' outputs; a row keeps only the columns its request named.
         let mut base = 0;
         for &(first, live, block_rows) in &blocks {
             for j in 0..live {
                 let row = base + j;
+                let ids = std::mem::take(&mut asked[row]);
                 out[first + j] = Some(LmState {
                     worker: Arc::clone(&steps[first + j].0.worker),
                     row: RowRef {
                         generation: Arc::clone(&next),
                         index: u32::try_from(row).expect("a step's rows fit u32"),
                     },
-                    log_probs: Arc::new(
-                        log_probs[row * vocabulary..(row + 1) * vocabulary].to_vec(),
-                    ),
+                    scores: Arc::new(Scores {
+                        probs: gathered[row * count..row * count + ids.len()].to_vec(),
+                        ids,
+                    }),
                 });
             }
             base += block_rows;
@@ -1491,17 +1555,43 @@ impl Transition for CharLm {
     ///
     /// If ONNX Runtime fails a run, which the session that [`CharLm::open`]
     /// verified does not do for well-formed inputs.
-    fn start(&self, context: Option<&str>) -> LmState {
-        self.prefill(context)
+    fn start(&self, context: Option<&str>, asked: &Asked<'_>) -> LmState {
+        self.prefill(context, asked)
             .expect("the prefill graph runs on the prelude")
     }
 
+    /// # Panics
+    ///
+    /// If the state was never asked to score *candidate* — the request that
+    /// produced it did not name it, and the model keeps no row to fall back
+    /// on.
     fn score(&self, state: &LmState, candidate: CharId) -> f32 {
-        state.log_probs[self.ids[candidate.index()] as usize]
+        let id = self.ids[candidate.index()];
+        state.scores.probs[state
+            .scores
+            .ids
+            .binary_search(&id)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the step never asked for {candidate:?} — a score the search did not request is a bug, not a fallback"
+                )
+            })]
     }
 
+    /// # Panics
+    ///
+    /// If the state was never asked for `<eos>` — its request said the path
+    /// cannot end there.
     fn finish(&self, state: &LmState) -> f32 {
-        state.log_probs[self.specials.eos as usize]
+        state.scores.probs[state
+            .scores
+            .ids
+            .binary_search(&self.specials.eos)
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the step never asked for <eos> — a finish on a path that cannot end is a bug, not a fallback"
+                )
+            })]
     }
 
     /// Relies on the row-order guarantee of [`Transition::advance`]: a
@@ -1511,7 +1601,7 @@ impl Transition for CharLm {
     /// # Panics
     ///
     /// If ONNX Runtime fails a run; see [`CharLm::start`].
-    fn advance(&self, steps: &[(&LmState, CharId)]) -> Vec<LmState> {
+    fn advance(&self, steps: &[(&LmState, CharId, Asked<'_>)]) -> Vec<LmState> {
         if steps.is_empty() {
             return Vec::new();
         }

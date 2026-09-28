@@ -8,6 +8,24 @@
 
 use ime_pinyin::CharId;
 
+/// What a produced state will be asked to score.
+///
+/// A step returns only what the search can still read: the candidate ids the
+/// row's *next* position admits, plus `<eos>` when the row's path could end
+/// there. A score of anything else — a candidate the request never named, or
+/// `<eos>` on a path that cannot finish — is a bug in the caller, which is why
+/// the request rides along with the row instead of the model keeping the whole
+/// row around to check against.
+#[derive(Clone, Copy, Debug)]
+pub struct Asked<'a> {
+    /// The candidate ids of the position the produced state stands at, in the
+    /// order the lattice holds them. Empty when the path ends there.
+    pub candidates: &'a [CharId],
+    /// Whether the path can finish at this position: `<eos>` joins the
+    /// request so `finish` has a column to read.
+    pub eos: bool,
+}
+
 /// How many preceding characters a beam state can remember.
 ///
 /// Two, which is what an interpolated trigram needs. Raising it widens every beam
@@ -107,7 +125,7 @@ impl Transition for NoTransition {
 
     type State = ();
 
-    fn start(&self, _context: Option<&str>) -> Self::State {}
+    fn start(&self, _context: Option<&str>, _asked: &Asked<'_>) -> Self::State {}
 
     fn score(&self, _state: &Self::State, _candidate: CharId) -> f32 {
         0.0
@@ -117,7 +135,7 @@ impl Transition for NoTransition {
         0.0
     }
 
-    fn advance(&self, steps: &[(&Self::State, CharId)]) -> Vec<Self::State> {
+    fn advance(&self, steps: &[(&Self::State, CharId, Asked<'_>)]) -> Vec<Self::State> {
         vec![(); steps.len()]
     }
 }
@@ -148,7 +166,10 @@ pub trait Transition {
     /// The state before the first character, given whatever was on screen ahead
     /// of the sentence -- a model that reads context starts from it, one that
     /// does not ignores it.
-    fn start(&self, context: Option<&str>) -> Self::State;
+    ///
+    /// *asked* names the first position's candidates, so a model that gathers
+    /// only what the search will read knows which columns to return.
+    fn start(&self, context: Option<&str>, asked: &Asked<'_>) -> Self::State;
 
     /// Score of *candidate* following the characters *state* stands for, as a
     /// log probability or any other quantity where larger is better.
@@ -160,7 +181,7 @@ pub trait Transition {
     /// off mid-word costs no more than one that closes.
     fn finish(&self, state: &Self::State) -> f32;
 
-    /// The state after each `(state, ch)` step, in the order given.
+    /// The state after each `(state, ch, asked)` step, in the order given.
     ///
     /// The decoder calls this once per position and reading with every surviving
     /// beam, so a model whose step is a matrix product can run them as one batch.
@@ -168,7 +189,13 @@ pub trait Transition {
     /// live worker's survivors arrive as one contiguous run, in the same
     /// worker order as the records, so a model can take the batch as
     /// `workers` runs back to back. The result has one state per step.
-    fn advance(&self, steps: &[(&Self::State, CharId)]) -> Vec<Self::State>;
+    ///
+    /// Each row's `asked` names the candidates the produced state will be
+    /// scored on at the row's next position, plus `<eos>` when the row's path
+    /// can end there. A model that computes a full row may ignore it; a model
+    /// that gathers per candidate may return only what was asked, and then
+    /// `score`/`finish` of anything else is a bug in the caller.
+    fn advance(&self, steps: &[(&Self::State, CharId, Asked<'_>)]) -> Vec<Self::State>;
 }
 
 /// A shared reference to a model is the model: every method borrows it, so a
@@ -178,8 +205,8 @@ impl<T: Transition + ?Sized> Transition for &T {
 
     type State = T::State;
 
-    fn start(&self, context: Option<&str>) -> Self::State {
-        (**self).start(context)
+    fn start(&self, context: Option<&str>, asked: &Asked<'_>) -> Self::State {
+        (**self).start(context, asked)
     }
 
     fn score(&self, state: &Self::State, candidate: CharId) -> f32 {
@@ -190,7 +217,7 @@ impl<T: Transition + ?Sized> Transition for &T {
         (**self).finish(state)
     }
 
-    fn advance(&self, steps: &[(&Self::State, CharId)]) -> Vec<Self::State> {
+    fn advance(&self, steps: &[(&Self::State, CharId, Asked<'_>)]) -> Vec<Self::State> {
         (**self).advance(steps)
     }
 }
@@ -222,8 +249,11 @@ impl<A: Transition, B: Transition> Transition for Both<A, B> {
 
     type State = (A::State, B::State);
 
-    fn start(&self, context: Option<&str>) -> Self::State {
-        (self.first.start(context), self.second.start(context))
+    fn start(&self, context: Option<&str>, asked: &Asked<'_>) -> Self::State {
+        (
+            self.first.start(context, asked),
+            self.second.start(context, asked),
+        )
     }
 
     fn score(&self, state: &Self::State, candidate: CharId) -> f32 {
@@ -236,11 +266,15 @@ impl<A: Transition, B: Transition> Transition for Both<A, B> {
             + self.second_weight * self.second.finish(&state.1)
     }
 
-    fn advance(&self, steps: &[(&Self::State, CharId)]) -> Vec<Self::State> {
-        let first: Vec<(&A::State, CharId)> =
-            steps.iter().map(|(state, ch)| (&state.0, *ch)).collect();
-        let second: Vec<(&B::State, CharId)> =
-            steps.iter().map(|(state, ch)| (&state.1, *ch)).collect();
+    fn advance(&self, steps: &[(&Self::State, CharId, Asked<'_>)]) -> Vec<Self::State> {
+        let first: Vec<(&A::State, CharId, Asked<'_>)> = steps
+            .iter()
+            .map(|(state, ch, asked)| (&state.0, *ch, *asked))
+            .collect();
+        let second: Vec<(&B::State, CharId, Asked<'_>)> = steps
+            .iter()
+            .map(|(state, ch, asked)| (&state.1, *ch, *asked))
+            .collect();
         self.first
             .advance(&first)
             .into_iter()

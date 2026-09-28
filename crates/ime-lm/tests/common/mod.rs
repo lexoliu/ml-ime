@@ -3,11 +3,41 @@
 //! what `charlm_fixtures.py` recorded from the exported graphs.
 
 use ime_lm::SessionShape;
-use ime_pinyin::{Lexicon, SyllableTable};
+use ime_pinyin::{CharId, Lexicon, SyllableTable};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+
+/// One request `charlm_fixtures.py` drove a `start` or `advance` row with,
+/// and the gathered scores it answered.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+pub struct AskedRecord {
+    /// The request's candidate characters.
+    pub candidates: String,
+    /// Whether `<eos>` was among the request.
+    pub eos: bool,
+    /// The gathered log probabilities, keyed by candidate — `"<eos>"` when
+    /// the request named it.
+    pub scores: HashMap<String, f32>,
+}
+
+#[allow(dead_code)]
+impl AskedRecord {
+    /// The request's candidates as `CharId`s.
+    pub fn ids(&self, lexicon: &Lexicon) -> Vec<CharId> {
+        self.candidates
+            .chars()
+            .map(|ch| {
+                lexicon
+                    .id_of(ch)
+                    .expect("fixture characters are in the lexicon")
+            })
+            .collect()
+    }
+}
 
 /// What `charlm_fixtures.py` recorded from the exported graphs. Which fields
 /// a test binary reads depends on the test, so unused fields are fine.
@@ -18,10 +48,15 @@ pub struct Expected {
     pub context: String,
     /// Two beams of two tokens each, as characters.
     pub beams: Vec<String>,
-    /// `log_probs` after prefill: one row of the alphabet.
-    pub prefill: Vec<f32>,
-    /// `log_probs` after each step: two rows of the alphabet, per step.
-    pub steps: Vec<Vec<Vec<f32>>>,
+    /// What `start` was asked and the gathered scores it answered.
+    pub start: AskedRecord,
+    /// Per step, each row's request and the gathered scores it answered.
+    pub steps: Vec<Vec<AskedRecord>>,
+    /// The prefill's row with the whole alphabet asked — the full row the
+    /// gathered scores are checked against.
+    pub prefill_full: Vec<f32>,
+    /// Per step, each row's full-vocabulary row, the whole alphabet asked.
+    pub full: Vec<Vec<Vec<f32>>>,
 }
 
 /// `tests/fixtures/` beside this crate.
@@ -54,4 +89,20 @@ pub fn expected(dir: &Path, arch: &str) -> Expected {
             .expect("expected.json is committed with the fixture"),
     )
     .expect("expected.json parses")
+}
+
+/// The `chars` of the `arch` fixture's manifest: the alphabet in id order —
+/// `"<pad>"`, `"<bos>"`, `"<eos>"` and friends name their own columns.
+#[allow(dead_code)]
+pub fn alphabet(dir: &Path, arch: &str) -> Vec<String> {
+    #[derive(Deserialize)]
+    struct Chars {
+        chars: Vec<String>,
+    }
+    serde_json::from_str::<Chars>(
+        &fs::read_to_string(dir.join(arch).join("charlm.json"))
+            .expect("the fixture manifest is committed"),
+    )
+    .expect("the fixture manifest parses")
+    .chars
 }
