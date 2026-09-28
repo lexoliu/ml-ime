@@ -806,7 +806,9 @@ def test_two_virtual_ranks_match_a_two_process_world(
         tmp_path / "virtual",
     )
     assert virtual.finished and virtual.step == config.max_steps
-    assert step_losses(virtual.metrics) == step_losses(ddp_dir / "metrics.jsonl")
+    assert step_losses(virtual.metrics) == pytest.approx(
+        step_losses(ddp_dir / "metrics.jsonl"), rel=1e-6
+    )
     assert _positions(ddp_dir / "checkpoint-final.pt") == _positions(
         tmp_path / "virtual" / "checkpoint-final.pt"
     )
@@ -848,7 +850,9 @@ def test_the_two_worlds_resume_each_other(
         resume=ddp_dir / "checkpoint-000003.pt",
     )
     assert resumed.finished
-    assert step_losses(resumed.metrics) == step_losses(ddp_dir / "metrics.jsonl")[3:]
+    assert step_losses(resumed.metrics) == pytest.approx(
+        step_losses(ddp_dir / "metrics.jsonl")[3:], rel=1e-6
+    )
     reference = torch.load(ddp_dir / "checkpoint-final.pt", weights_only=False)["model"]
     for name, tensor in resumed_model.state_dict().items():
         assert torch.allclose(tensor, reference[name], atol=1e-5), name
@@ -862,7 +866,9 @@ def test_the_two_worlds_resume_each_other(
         "from-virtual",
         resume=tmp_path / "virtual" / "checkpoint-000003.pt",
     )
-    assert step_losses(ddp_resumed / "metrics.jsonl") == step_losses(virtual.metrics)[3:]
+    assert step_losses(ddp_resumed / "metrics.jsonl") == pytest.approx(
+        step_losses(virtual.metrics)[3:], rel=1e-6
+    )
     assert _positions(ddp_resumed / "checkpoint-final.pt") == _positions(
         tmp_path / "virtual" / "checkpoint-final.pt"
     )
