@@ -664,6 +664,39 @@ def export_char_lm(
     typer.echo(f"{graph}\n{manifest}")
 
 
+@export_app.command("route-a")
+def export_route_a(
+    checkpoint: Path = typer.Argument(..., help="A route A checkpoint (checkpoint-final.pt)"),
+    out: Path = typer.Option(
+        Path("data/route-a"), help="Where context.onnx, fill.onnx and route-a.json go"
+    ),
+    char_table: Path = typer.Option(None, help="ime-pinyin's char_pinyin.tsv"),
+    quantize: Literal["int8"] | None = typer.Option(
+        None, help="Quantize the MatMul weights to int8 (dynamic, per channel)"
+    ),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Export the context and fill towers as the ONNX graphs `ime-neural` loads."""
+    configure(verbose)
+    import torch
+
+    from mlime.data.corpus import default_char_table
+    from mlime.train.emit import load_model
+    from mlime.train.routea import export_onnx
+    from mlime.train.run import build_lexicon_for, load_tokenizer
+    from mlime.train.spans import SpanVocab
+
+    table = char_table or default_char_table()
+    if table is None:
+        raise typer.BadParameter("no char_pinyin.tsv found above the working directory")
+    spans = SpanVocab.load()
+    tokenizer = load_tokenizer(_base_model(checkpoint))
+    lexicon = build_lexicon_for(table, tokenizer, spans)
+    model, _, step = load_model(checkpoint, lexicon, torch.device("cpu"))
+    graph, manifest = export_onnx(model, step, lexicon, spans, tokenizer, out, quantize)
+    typer.echo(f"{graph}\n{manifest}")
+
+
 @eval_app.command("rescore")
 def eval_rescore(
     dump: Path = typer.Option(..., help="fused-eval --dump file of the slice to rerank"),

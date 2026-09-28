@@ -34,8 +34,9 @@ use ime_decode::{
 };
 use ime_eval::{EvalRecord, EvalSet, Observation, Report, Slice};
 use ime_lm::CharLm;
+use ime_neural::RouteA;
 use ime_ngram::NgramModel;
-use ime_pinyin::{Lexicon, SegmentOptions, SyllableTable};
+use ime_pinyin::{Lexicon, SegmentOptions, Segmentation, SyllableTable};
 use rayon::iter::{
     IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
 };
@@ -44,6 +45,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead as _, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::sync::mpsc::{self, Sender};
 use std::thread::{self, JoinHandle};
 use tracing::info;
@@ -94,8 +96,8 @@ pub struct SliceArgs {
     pub dev_share: f64,
     /// Sweep every `--weight` on the dev slice, then report the test slice at
     /// the weight whose sentence top-1 was highest; ties go to the weight given
-    /// first. Replaces `--slice`, and meaningless without a score file to fuse.
-    #[arg(long, requires = "scores", conflicts_with = "slice")]
+    /// first. Replaces `--slice`, and meaningless without emissions to fuse.
+    #[arg(long, conflicts_with = "slice")]
     pub select_on_dev: bool,
 }
 
@@ -126,6 +128,16 @@ impl BackendArg {
             Self::Cuda => ime_lm::Backend::Cuda,
         }
     }
+
+    /// The towers crate's name for this backend.
+    pub const fn neural_backend(self) -> ime_neural::Backend {
+        match self {
+            Self::Cpu => ime_neural::Backend::Cpu,
+            Self::Coreml => ime_neural::Backend::CoreMl,
+            Self::Webgpu => ime_neural::Backend::WebGpu,
+            Self::Cuda => ime_neural::Backend::Cuda,
+        }
+    }
 }
 
 /// Supplies the emission model for one record's lattice.
@@ -140,12 +152,18 @@ trait Emissions {
     where
         Self: 'a;
 
-    /// The model for *record*, over *candidates*.
+    /// The model for *record*, over *segmentations* and *candidates*.
     ///
     /// # Errors
     ///
     /// If nothing scored this record, or the scores do not describe this lattice.
-    fn model<'a>(&'a self, record: usize, candidates: &'a Candidates) -> Result<Self::Model<'a>>;
+    fn model<'a>(
+        &'a self,
+        record: usize,
+        eval: &EvalRecord,
+        segmentations: &[Segmentation],
+        candidates: &'a Candidates,
+    ) -> Result<Self::Model<'a>>;
 }
 
 /// No emissions at all: the n-gram baseline.
@@ -154,8 +172,153 @@ struct NoEmissions;
 impl Emissions for NoEmissions {
     type Model<'a> = Uniform;
 
-    fn model<'a>(&'a self, _record: usize, _candidates: &'a Candidates) -> Result<Uniform> {
+    fn model<'a>(
+        &'a self,
+        _record: usize,
+        _eval: &EvalRecord,
+        _segmentations: &[Segmentation],
+        _candidates: &'a Candidates,
+    ) -> Result<Uniform> {
         Ok(Uniform)
+    }
+}
+
+/// The paths one lattice record holds: which span each position is and which
+/// emittable characters it asks about, in lattice order. This is what
+/// `emit-lattice` writes and what the live emission consumes, so both names
+/// come from the same derivation.
+fn lattice_paths(
+    pinyin: &str,
+    segmentations: &[Segmentation],
+    candidates: &Candidates,
+    emittable: &Emittable,
+    lexicon: &Lexicon,
+) -> Vec<LatticePath> {
+    segmentations
+        .iter()
+        .zip(candidates.paths())
+        .map(|(segmentation, reading)| LatticePath {
+            spans: segmentation
+                .segments()
+                .iter()
+                .map(|segment| pinyin[segment.start()..segment.end()].to_owned())
+                .collect(),
+            candidates: reading
+                .positions()
+                .iter()
+                .map(|allowed| {
+                    emittable
+                        .restrict(allowed)
+                        .iter()
+                        .map(|id| lexicon.character(*id))
+                        .collect()
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// The model's log probabilities, computed live by the exported towers.
+///
+/// A record's table depends only on the record, so it is computed once and
+/// shared through `cache` across every weight the sweep decodes at and the
+/// dev/test passes alike -- the towers run once per record per run, not once
+/// per section.
+struct LiveEmissions<'a> {
+    /// The towers the export directory loaded into.
+    towers: &'a RouteA,
+    /// The emittable set the lattice's candidates are restricted to.
+    emittable: &'a Emittable,
+    /// The lexicon `restrict`'s ids name characters through.
+    lexicon: &'a Lexicon,
+    /// Every table this run has already computed, by record index.
+    cache: &'a Mutex<HashMap<usize, Vec<Vec<Vec<f32>>>>>,
+    weight: f32,
+    floor: f32,
+    /// Whether the context tower feeds the gate: off runs every record with
+    /// the gate zeroed, the `context off` score file's counterpart.
+    with_context: bool,
+}
+
+impl Emissions for LiveEmissions<'_> {
+    type Model<'a>
+        = Weighted<Scored<'a>>
+    where
+        Self: 'a;
+
+    fn model<'a>(
+        &'a self,
+        record: usize,
+        eval: &EvalRecord,
+        segmentations: &[Segmentation],
+        candidates: &'a Candidates,
+    ) -> Result<Weighted<Scored<'a>>> {
+        let hit = self
+            .cache
+            .lock()
+            .expect("the emissions cache is not poisoned")
+            .get(&record)
+            .cloned();
+        let scores = if let Some(scores) = hit {
+            scores
+        } else {
+            let lattice = LatticeRecord {
+                record,
+                pinyin: eval.pinyin.clone(),
+                context: eval.context.clone(),
+                paths: lattice_paths(
+                    &eval.pinyin,
+                    segmentations,
+                    candidates,
+                    self.emittable,
+                    self.lexicon,
+                ),
+            };
+            let computed = self
+                .towers
+                .emission(&lattice, self.with_context)
+                .with_context(|| format!("could not score record {record} with the towers"))?;
+            self.cache
+                .lock()
+                .expect("the emissions cache is not poisoned")
+                .entry(record)
+                .or_insert(computed)
+                .clone()
+        };
+        Ok(Weighted {
+            inner: Scored::attach(record, candidates, self.emittable, scores, self.floor)
+                .with_context(|| format!("the towers' answer does not fit record {record}"))?,
+            weight: self.weight,
+        })
+    }
+}
+
+/// Where the emissions come from: the score file, or the towers it was
+/// written from. Both answer the same table, so the decoder sees one type.
+enum Sources<'a> {
+    /// `NeuralEmissions`: the score file read once up front.
+    File(NeuralEmissions<'a>),
+    /// `LiveEmissions`: the towers, run per record.
+    Live(LiveEmissions<'a>),
+}
+
+impl Emissions for Sources<'_> {
+    type Model<'a>
+        = Weighted<Scored<'a>>
+    where
+        Self: 'a;
+
+    fn model<'a>(
+        &'a self,
+        record: usize,
+        eval: &EvalRecord,
+        segmentations: &[Segmentation],
+        candidates: &'a Candidates,
+    ) -> Result<Weighted<Scored<'a>>> {
+        match self {
+            Self::File(emissions) => emissions.model(record, eval, segmentations, candidates),
+            Self::Live(emissions) => emissions.model(record, eval, segmentations, candidates),
+        }
     }
 }
 
@@ -176,6 +339,8 @@ impl Emissions for NeuralEmissions<'_> {
     fn model<'a>(
         &'a self,
         record: usize,
+        _eval: &EvalRecord,
+        _segmentations: &[Segmentation],
         candidates: &'a Candidates,
     ) -> Result<Weighted<Scored<'a>>> {
         let scores = self
@@ -279,34 +444,19 @@ pub fn emit_lattice(
     let mut slots = 0usize;
     for (index, record) in set.records().iter().enumerate() {
         let (segmentations, candidates) = reader.read(record)?;
-        let mut paths = Vec::with_capacity(candidates.len());
-        for (segmentation, reading) in segmentations.iter().zip(candidates.paths()) {
-            let spans: Vec<String> = segmentation
-                .segments()
-                .iter()
-                .map(|segment| record.pinyin[segment.start()..segment.end()].to_owned())
-                .collect();
-            let admitted: Vec<String> = reading
-                .positions()
-                .iter()
-                .map(|allowed| {
-                    emittable
-                        .restrict(allowed)
-                        .iter()
-                        .map(|id| reader.lexicon.character(*id))
-                        .collect()
-                })
-                .collect();
-            positions += admitted.len();
-            slots += admitted
-                .iter()
-                .map(|set| set.chars().count())
-                .sum::<usize>();
-            paths.push(LatticePath {
-                spans,
-                candidates: admitted,
-            });
-        }
+        let paths = lattice_paths(
+            &record.pinyin,
+            &segmentations,
+            &candidates,
+            &emittable,
+            &reader.lexicon,
+        );
+        positions += paths.iter().map(|path| path.spans.len()).sum::<usize>();
+        slots += paths
+            .iter()
+            .flat_map(|path| &path.candidates)
+            .map(|set| set.chars().count())
+            .sum::<usize>();
         let line = LatticeRecord {
             record: index,
             pinyin: record.pinyin.clone(),
@@ -374,6 +524,15 @@ pub struct Progress<'a> {
     pub stop_after: Option<usize>,
 }
 
+/// An emission source before a weight is applied to it: the data a
+/// `Sources` variant is built from inside `measure_at`.
+enum SourceInput<'a> {
+    /// A loaded score file.
+    File(&'a HashMap<usize, Vec<Vec<Vec<f32>>>>),
+    /// The opened towers.
+    Live(&'a RouteA),
+}
+
 /// Everything a run needs to score one transition model over its sections.
 struct Run<'a> {
     set: &'a EvalSet,
@@ -383,6 +542,13 @@ struct Run<'a> {
     scores: Option<&'a HashMap<usize, Vec<Vec<Vec<f32>>>>>,
     /// Where the score file was read from; part of the progress key.
     scores_path: Option<&'a Path>,
+    /// The towers a live run emits through; exclusive with *scores*.
+    route_a: Option<&'a RouteA>,
+    /// Where the export directory lives; part of the progress key.
+    route_a_path: Option<&'a Path>,
+    /// Whether live emissions read the record's context. Score files come as
+    /// written; the flag does not reach them.
+    with_context: bool,
     emittable: &'a Emittable,
     /// Where the emittable set was read from; part of the progress key.
     emittable_path: &'a Path,
@@ -397,7 +563,57 @@ struct Run<'a> {
     progress: Option<&'a Progress<'a>>,
 }
 
-impl Run<'_> {
+impl<'a> Run<'a> {
+    /// The progress file this run's decode would keep, when one is asked for.
+    fn request(
+        &self,
+        label: &'static str,
+        lm_weight: f32,
+        weight: f32,
+    ) -> Option<ProgressRequest<'_>> {
+        self.progress.map(|progress| ProgressRequest {
+            dir: progress.dir,
+            stop_after: progress.stop_after,
+            eval_set: self.eval_set,
+            scores: self.scores_path,
+            route_a: self.route_a_path,
+            with_context: self.route_a.map(|_| self.with_context),
+            emittable: self.emittable_path,
+            model: progress.model,
+            lm: progress.lm,
+            lm_weight,
+            floor: self.floor,
+            weight,
+            transition: label,
+        })
+    }
+
+    /// What emits for this run's sections, and the label the report gives it:
+    /// the score file, the towers live, or nothing at all.
+    ///
+    /// # Errors
+    ///
+    /// If both the score file and the towers were given: the argument parser
+    /// refuses the pair, but a caller that is not the command line could still
+    /// hand both in.
+    fn source(&self) -> Result<Option<(SourceInput<'a>, &'static str)>> {
+        match (self.scores, self.route_a) {
+            (Some(_), Some(_)) => {
+                bail!("--scores and --route-a are two answers to the same question")
+            }
+            (Some(scores), None) => Ok(Some((SourceInput::File(scores), "neural"))),
+            (None, Some(towers)) => Ok(Some((
+                SourceInput::Live(towers),
+                if self.with_context {
+                    "route-a"
+                } else {
+                    "route-a-no-context"
+                },
+            ))),
+            (None, None) => Ok(None),
+        }
+    }
+
     /// The sections one transition model produces: without a score file the
     /// transition alone over the requested slice; with one, every weight over
     /// the slice, or the dev sweep and the test section at its winner.
@@ -412,23 +628,8 @@ impl Run<'_> {
         lm_weight: f32,
         lockstep: bool,
     ) -> Result<Vec<Section>> {
-        let request = |weight: f32| {
-            self.progress.map(|progress| ProgressRequest {
-                dir: progress.dir,
-                stop_after: progress.stop_after,
-                eval_set: self.eval_set,
-                scores: self.scores_path,
-                emittable: self.emittable_path,
-                model: progress.model,
-                lm: progress.lm,
-                lm_weight,
-                floor: self.floor,
-                weight,
-                transition: label,
-            })
-        };
-        let Some(scores) = self.scores else {
-            let request = request(0.0);
+        let Some((input, emission_label)) = self.source()? else {
+            let request = self.request(label, lm_weight, 0.0);
             let (report, rows) = measure(
                 self.set,
                 self.slice.slice,
@@ -452,14 +653,26 @@ impl Run<'_> {
                 rows,
             }]);
         };
+        let emission_cache = Mutex::new(HashMap::new());
         let measure_at = |which: SliceArg, weight: f32| -> Result<Section> {
-            let emissions = NeuralEmissions {
-                scores,
-                emittable: self.emittable,
-                weight,
-                floor: self.floor,
+            let emissions = match input {
+                SourceInput::File(scores) => Sources::File(NeuralEmissions {
+                    scores,
+                    emittable: self.emittable,
+                    weight,
+                    floor: self.floor,
+                }),
+                SourceInput::Live(towers) => Sources::Live(LiveEmissions {
+                    towers,
+                    emittable: self.emittable,
+                    lexicon: &self.reader.lexicon,
+                    cache: &emission_cache,
+                    weight,
+                    floor: self.floor,
+                    with_context: self.with_context,
+                }),
             };
-            let request = request(weight);
+            let request = self.request(label, lm_weight, weight);
             let (report, rows) = measure(
                 self.set,
                 which,
@@ -474,7 +687,7 @@ impl Run<'_> {
                 request.as_ref(),
             )?;
             Ok(Section {
-                emission: "neural",
+                emission: emission_label,
                 weight,
                 transition: label,
                 slice: which.label(),
@@ -533,6 +746,7 @@ impl Run<'_> {
 pub fn fused_eval(
     eval_set: &Path,
     scores_path: Option<&Path>,
+    route_a: Option<(&Path, &RouteA, bool)>,
     emittable_path: &Path,
     floor: f32,
     weights: &[f32],
@@ -564,6 +778,9 @@ pub fn fused_eval(
         reader: &reader,
         scores: scores.as_ref(),
         scores_path,
+        route_a: route_a.map(|(_, towers, _)| towers),
+        route_a_path: route_a.map(|(path, _, _)| path),
+        with_context: route_a.is_none_or(|(_, _, with_context)| with_context),
         emittable: &emittable,
         emittable_path,
         floor,
@@ -659,8 +876,8 @@ where
         .enumerate()
         .filter(|(_, record)| slice.slice().holds(record, dev_share))
         .map(|(index, record)| -> Result<(Report, Vec<DumpRow>)> {
-            let (_, candidates) = reader.read(record)?;
-            let emission = emissions.model(index, &candidates)?;
+            let (segmentations, candidates) = reader.read(record)?;
+            let emission = emissions.model(index, record, &segmentations, &candidates)?;
             let hypotheses = decode_many(
                 &[Record {
                     candidates: &candidates,
@@ -725,14 +942,14 @@ where
 {
     let mut lattices = Vec::with_capacity(chunk.len());
     for &(index, record) in chunk {
-        let (_, candidates) = reader.read(record)?;
-        lattices.push((index, record, candidates));
+        let (segmentations, candidates) = reader.read(record)?;
+        lattices.push((index, record, segmentations, candidates));
     }
     let mut requests = Vec::with_capacity(lattices.len());
-    for (index, record, candidates) in &lattices {
+    for (index, record, segmentations, candidates) in &lattices {
         requests.push(Record {
             candidates,
-            emission: emissions.model(*index, candidates)?,
+            emission: emissions.model(*index, record, segmentations, candidates)?,
             context: record.context.as_deref(),
         });
     }
@@ -821,6 +1038,10 @@ struct ProgressRequest<'a> {
     stop_after: Option<usize>,
     eval_set: &'a Path,
     scores: Option<&'a Path>,
+    /// The export directory live emissions run from, when they do.
+    route_a: Option<&'a Path>,
+    /// Whether live emissions read the context; `None` with a score file.
+    with_context: Option<bool>,
     emittable: &'a Path,
     model: Option<&'a Path>,
     lm: Option<&'a Path>,
@@ -844,6 +1065,13 @@ struct ProgressRequest<'a> {
 struct Name {
     eval_set: PathBuf,
     scores: Option<PathBuf>,
+    /// The export directory a live-emission run decodes through.
+    #[serde(default)]
+    route_a: Option<PathBuf>,
+    /// Whether live emissions read the context; absent from a score-file
+    /// run's key.
+    #[serde(default)]
+    with_context: Option<bool>,
     emittable: PathBuf,
     model: Option<PathBuf>,
     lm: Option<PathBuf>,
@@ -1174,6 +1402,8 @@ where
         name: Name {
             eval_set: progress.eval_set.to_owned(),
             scores: progress.scores.map(Path::to_owned),
+            route_a: progress.route_a.map(Path::to_owned),
+            with_context: progress.with_context,
             emittable: progress.emittable.to_owned(),
             model: progress.model.map(Path::to_owned),
             lm: progress.lm.map(Path::to_owned),
@@ -1233,8 +1463,8 @@ where
     pending
         .par_iter()
         .map(|&(index, record)| -> Result<()> {
-            let (_, candidates) = reader.read(record)?;
-            let emission = emissions.model(index, &candidates)?;
+            let (segmentations, candidates) = reader.read(record)?;
+            let emission = emissions.model(index, record, &segmentations, &candidates)?;
             let hypotheses = decode_many(
                 &[Record {
                     candidates: &candidates,
@@ -1568,6 +1798,7 @@ mod tests {
             fused_eval(
                 &self.eval_set,
                 Some(&self.scores),
+                None,
                 &self.emittable,
                 -30.0,
                 weights,
