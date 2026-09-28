@@ -166,7 +166,7 @@ def launch(argv, log_name, pid_name):
 
 
 def main():
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "kaggle"], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle"], check=True)
     if not Path("/root/.kaggle/credentials.json").is_file():
         raise FileNotFoundError("upload ~/.kaggle/credentials.json to /root/.kaggle first")
     for uploaded in (KERNEL, METADATA, PUBLISHER):

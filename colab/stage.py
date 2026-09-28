@@ -44,7 +44,7 @@ def download(dataset):
 
 
 def main():
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "kaggle"], check=True)
+    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle"], check=True)
     if not Path("/root/.kaggle/credentials.json").is_file():
         raise FileNotFoundError("upload ~/.kaggle/credentials.json to /root/.kaggle first")
     if not KERNEL.is_file():
