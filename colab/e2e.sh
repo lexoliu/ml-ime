@@ -23,7 +23,9 @@ case $command in
     gpu=T4
     while [ $# -gt 0 ]; do case $1 in --gpu) gpu=$2; shift 2;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
     colab new -s $session --gpu "$gpu"
-    printf 'import os\nfor d in ("/root/.kaggle", "/kaggle/working"): os.makedirs(d, exist_ok=True)\n' | colab exec -s $session
+    # Colab mounts an empty, read-only /kaggle/input for its own Kaggle
+    # integration; the kernel reads the datasets staged there, so it goes first.
+    printf 'import os, subprocess\nif os.path.ismount("/kaggle/input"):\n    subprocess.run(["umount", "/kaggle/input"], check=True)\nfor d in ("/root/.kaggle", "/kaggle/input", "/kaggle/working"): os.makedirs(d, exist_ok=True)\n' | colab exec -s $session
     colab upload -s $session "$HOME/.kaggle/credentials.json" /root/.kaggle/credentials.json
     colab upload -s $session "$here/kaggle/e2e/kernel.py" /kaggle/kernel.py
     colab upload -s $session "$here/kaggle/e2e/kernel-metadata.json" /kaggle/kernel-metadata.json
