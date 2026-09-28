@@ -70,7 +70,7 @@ def make_batch_fixture(
         ]
         kept = [example for example in examples if example is not None]
         assert len(kept) == 2
-        return Collator(tokenizer, context_dropout=0.0)(kept)
+        return Collator(tokenizer, lexicon.candidate_mask, context_dropout=0.0)(kept)
 
     return build
 
@@ -80,7 +80,7 @@ def test_forward_emits_one_distribution_per_position(
 ) -> None:
     batch = make_batch()
     output = model(batch)
-    assert output.logits.shape == (2, 6, lexicon.size)
+    assert model.scores(batch).shape == (2, 6, lexicon.size)
     assert output.loss is not None
     assert output.loss.ndim == 0
     assert torch.isfinite(output.loss)
@@ -90,7 +90,13 @@ def test_a_batch_with_no_targets_has_no_loss(
     model: RouteAModel, make_batch: Callable[..., Batch]
 ) -> None:
     batch = make_batch()
-    blanked = Batch(**{**vars(batch), "targets": torch.full_like(batch.targets, IGNORE_INDEX)})
+    blanked = Batch(
+        **{
+            **vars(batch),
+            "targets": torch.full_like(batch.targets, IGNORE_INDEX),
+            "scored": torch.empty(0, dtype=torch.long),
+        }
+    )
     assert model(blanked).loss is None
 
 
@@ -99,7 +105,7 @@ def test_the_mask_removes_non_homophones_from_the_loss(
 ) -> None:
     """Moving a ruled-out character's logit must not move the loss at all."""
     batch = make_batch()
-    logits = model(batch).logits
+    logits = model.scores(batch)
     reference = model.loss(logits, batch)
     assert reference is not None
 
@@ -169,7 +175,7 @@ def test_a_shut_gate_makes_the_context_tower_a_no_op(
     with_context = make_batch()
     without_context = make_batch(context=None)
     with torch.no_grad():
-        assert torch.equal(model(with_context).logits, model(without_context).logits)
+        assert torch.equal(model.scores(with_context), model.scores(without_context))
 
 
 def test_an_open_gate_makes_the_context_matter(
@@ -182,7 +188,7 @@ def test_an_open_gate_makes_the_context_matter(
     with_context = make_batch()
     without_context = make_batch(context=None)
     with torch.no_grad():
-        assert not torch.equal(model(with_context).logits, model(without_context).logits)
+        assert not torch.equal(model.scores(with_context), model.scores(without_context))
 
 
 def test_the_gate_still_learns_from_a_zero_start(

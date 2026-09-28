@@ -269,6 +269,7 @@ class Vocabularies:
         """The collator a run of these settings pads its batches with."""
         return Collator(
             self.tokenizer,
+            self.lexicon.candidate_mask,
             context_dropout=context_dropout,
             max_context_tokens=max_context_tokens,
             seed=seed,
@@ -352,7 +353,7 @@ def route_a(
             )
 
     segment = train(model, stream, collator, training, paths.out, world, resume)
-    losses = _losses(segment.metrics)
+    losses = step_losses(segment.metrics)
     if not segment.finished:
         return paused_run(segment, losses, model.gates(), builder.counts.as_dict(), world)
     evaluation = held_out_examples(
@@ -447,7 +448,7 @@ def paused_run(
     )
 
 
-def _losses(metrics: Path) -> list[float]:
+def step_losses(metrics: Path) -> list[float]:
     """Every step loss the metrics file recorded, in order."""
     import json
 
