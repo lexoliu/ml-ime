@@ -1,8 +1,8 @@
 """Stage the e2e kernel's inputs on a Colab VM and start it detached.
 
-Runs inside the VM's kernel through `colab exec -f colab/e2e-stage.py` after
-`colab/e2e.sh` has uploaded the Kaggle credentials, the kernel script, its
-metadata and the checkpoint publisher. It recreates the mount layout the
+Runs on the VM as its own process, which `colab/e2e.sh start` launches
+(logging to `/kaggle/working/stage.out`) after it has uploaded the Kaggle
+credentials, the kernel script, its metadata and the checkpoint publisher. It recreates the mount layout the
 Kaggle kernel expects by downloading the same datasets, stages the resume
 point -- the newest `checkpoint-paused` trio by step among the latest
 COMPLETE Kaggle segment's output and the `mlime-e2e-resume` dataset -- stamps

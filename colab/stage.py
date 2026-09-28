@@ -1,11 +1,11 @@
 """Stage the char-lm kernel's inputs on a Colab VM and start it detached.
 
-Runs inside the VM's kernel through `colab exec -f colab/stage.py` after
-`colab/char-lm.sh` has uploaded the Kaggle credentials and the kernel script.
-It recreates the mount layout the Kaggle kernel expects (`/kaggle/input/<slug>`
+Runs on the VM as its own process, which `colab/char-lm.sh start` launches
+(logging to `/kaggle/working/stage.out`) after it has uploaded the Kaggle
+credentials and the kernel script. It recreates the mount layout the Kaggle kernel expects (`/kaggle/input/<slug>`
 holding each dataset's files, `/kaggle/working` for outputs) by downloading
 the same datasets with the Kaggle API, then launches the unchanged kernel as a
-process that outlives this cell.
+process that outlives this one.
 """
 
 import os
