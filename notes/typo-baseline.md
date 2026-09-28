@@ -55,9 +55,9 @@ digest prefers `clean` when present, so eval3-typo slices into the same 498
 dev / 5027 test records as eval3 and the other twins -- the comparison is
 record-for-record, which is what makes the sanity row below meaningful. The
 true syllable boundaries a fuzzy swap needs are taken from the lattice's
-character-aligned path (every record has one); without `--lattice` the
-generator falls back to a deterministic longest-first split, which mis-splits
-about 7.6% of records and misplaces fuzzy sites.
+character-aligned path (every record has one), and `--lattice` is required:
+re-segmenting the keystrokes instead would guess, and a longest-first guess
+mis-splits about 7.6% of records and misplaces their fuzzy sites.
 
 5525 records, 8554 edits (1.55 per record -- the twin raises `per_sentence`
 to 1):

@@ -354,38 +354,6 @@ def record_seed(seed: int, *fields: str) -> int:
     return int.from_bytes(digest.digest(), "big")
 
 
-def split_syllables(joined: str, count: int, inventory: set[str]) -> list[str]:
-    """Cut *joined* into exactly *count* syllables, preferring the longest first.
-
-    A full-pinyin record's ``pinyin`` is its syllables run together, and the
-    fuzzy pairs need them back. Ambiguity is resolved deterministically by
-    taking the earliest span longest-first: ``xian`` splits ``xian``, and only
-    where that blocks the remaining count does a shorter span win.
-    """
-    length = len(joined)
-    can: list[list[bool]] = [[False] * (count + 1) for _ in range(length + 1)]
-    can[length][0] = True
-    for i in range(length - 1, -1, -1):
-        for k in range(1, count + 1):
-            can[i][k] = any(
-                joined[i:j] in inventory and can[j][k - 1]
-                for j in range(i + 1, min(length, i + MAX_SYLLABLE_LEN) + 1)
-            )
-    if not can[0][count]:
-        raise ValueError(f"{joined!r} does not segment into {count} syllables")
-    out: list[str] = []
-    at = 0
-    for remaining in range(count, 0, -1):
-        for end in range(min(length, at + MAX_SYLLABLE_LEN), at, -1):
-            if joined[at:end] in inventory and can[end][remaining - 1]:
-                out.append(joined[at:end])
-                at = end
-                break
-    if "".join(out) != joined or len(out) != count:
-        raise ValueError(f"{joined!r} did not rebuild itself into {count} syllables")
-    return out
-
-
 def segmentable(joined: str, inventory: set[str]) -> bool:
     """Whether *joined* has any reading under the evaluation's segmentation.
 
@@ -419,7 +387,7 @@ def typo_twin(
     seed: int,
     typo_table: Path,
     syllables_path: Path,
-    lattice: Path | None = None,
+    lattice: Path,
 ) -> str:
     """Write the typo twin of *eval_set* and return the report for the terminal.
 
@@ -428,28 +396,26 @@ def typo_twin(
     the twin the parent set's record identities and its dev/test slices match
     the parent's exactly.
 
-    The fuzzy pairs fire on the syllables the typist meant. Where *lattice*
-    names the set's ``emit-lattice`` output, its character-aligned path -- one
-    syllable per ``text`` character -- is that spelling; otherwise the
-    keystrokes are re-segmented into ``len(text)`` syllables, longest first --
-    which gets the classic ``keneng``/``ke+neng`` cases wrong.
+    The fuzzy pairs fire on the syllables the typist meant: *lattice*, the
+    set's ``emit-lattice`` output, gives that spelling as its character-aligned
+    path -- one syllable per ``text`` character. Re-segmenting the keystrokes
+    instead would guess, and a guess gets cases like ``keneng`` (``ke+neng``)
+    wrong and puts fuzzy swaps at sites the typist never had.
     """
     model = NoiseModel.load(typo_table)
     inventory = load_syllables(syllables_path)
-    gold: dict[int, list[list[str]]] | None = None
-    if lattice is not None:
-        gold = {}
-        with lattice.open(encoding="utf-8") as lines:
-            for raw in lines:
-                if not raw.strip():
-                    continue
-                row = _mapping(json.loads(raw), f"{lattice} record")
-                index = int(str(row["record"]))
-                where = f"{lattice} record {index}"
-                gold[index] = [
-                    [str(span) for span in _list(_mapping(path, where)["spans"], where)]
-                    for path in _list(row["paths"], where)
-                ]
+    gold: dict[int, list[list[str]]] = {}
+    with lattice.open(encoding="utf-8") as lines:
+        for raw in lines:
+            if not raw.strip():
+                continue
+            row = _mapping(json.loads(raw), f"{lattice} record")
+            index = int(str(row["record"]))
+            where = f"{lattice} record {index}"
+            gold[index] = [
+                [str(span) for span in _list(_mapping(path, where)["spans"], where)]
+                for path in _list(row["paths"], where)
+            ]
     histogram = {kind: 0 for kind in EDIT_TYPES}
     unsegmentable = 0
     records = 0
@@ -462,17 +428,14 @@ def typo_twin(
             pinyin = _word(row["pinyin"], "pinyin")
             text = str(row["text"])
             context = row.get("context")
-            if gold is not None:
-                if index not in gold:
-                    raise ValueError(f"{lattice} holds no record {index}")
-                aligned = [spans for spans in gold[index] if len(spans) == len(text)]
-                if not aligned or "".join(aligned[0]) != pinyin:
-                    raise ValueError(
-                        f"{lattice} record {index} has no {len(text)}-span path for {pinyin!r}"
-                    )
-                syllables = aligned[0]
-            else:
-                syllables = split_syllables(pinyin, len(text), inventory)
+            if index not in gold:
+                raise ValueError(f"{lattice} holds no record {index}")
+            aligned = [spans for spans in gold[index] if len(spans) == len(text)]
+            if not aligned or "".join(aligned[0]) != pinyin:
+                raise ValueError(
+                    f"{lattice} record {index} has no {len(text)}-span path for {pinyin!r}"
+                )
+            syllables = aligned[0]
             rng = random.Random(record_seed(seed, pinyin, text, str(context or "")))
             corruption = model.corrupt(syllables, rng, min_edits=1)
             if not segmentable(corruption.text, inventory):

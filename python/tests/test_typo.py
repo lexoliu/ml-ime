@@ -18,7 +18,6 @@ from mlime.typo import (
     load_syllables,
     record_seed,
     segmentable,
-    split_syllables,
     typo_twin,
 )
 
@@ -167,29 +166,6 @@ def test_edits_stay_within_bounds(model: NoiseModel) -> None:
         assert len(corruption.text) > 0
 
 
-def test_split_syllables_recovers_the_reading(inventory: set[str]) -> None:
-    assert split_syllables("zuixiamianleiniaode", 6, inventory) == [
-        "zui",
-        "xia",
-        "mian",
-        "lei",
-        "niao",
-        "de",
-    ]
-
-
-def test_split_syllables_ambiguous_count_one(inventory: set[str]) -> None:
-    assert split_syllables("xian", 1, inventory) == ["xian"]
-    # ``n`` is itself a syllable (嗯), so longest-first takes ``xia`` over
-    # ``xi`` + ``an``.
-    assert split_syllables("xian", 2, inventory) == ["xia", "n"]
-
-
-def test_split_syllables_raises_when_impossible(inventory: set[str]) -> None:
-    with pytest.raises(ValueError, match="does not segment"):
-        split_syllables("qjqj", 1, inventory)
-
-
 def test_segmentable_mirrors_the_lattice(inventory: set[str]) -> None:
     assert segmentable("nihao", inventory)
     assert segmentable("z", inventory)  # single-letter abbreviation
@@ -205,6 +181,25 @@ def test_record_seed_is_stable() -> None:
     assert record_seed(0, "a", "b", "") != record_seed(0, "a", "b", "c")
 
 
+def write_lattice(path: Path, spellings: list[list[str]]) -> Path:
+    """An emit-lattice file whose one path per record is *spellings*' syllables."""
+    path.write_text(
+        "".join(
+            json.dumps(
+                {
+                    "record": index,
+                    "pinyin": "".join(spans),
+                    "paths": [{"spans": spans, "candidates": ["" for _ in spans]}],
+                }
+            )
+            + "\n"
+            for index, spans in enumerate(spellings)
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
 def test_typo_twin_writes_corrupted_records(tmp_path: Path, inventory: set[str]) -> None:
     eval_set = tmp_path / "eval.jsonl"
     records: list[dict[str, str | None]] = [
@@ -215,8 +210,9 @@ def test_typo_twin_writes_corrupted_records(tmp_path: Path, inventory: set[str])
         "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in records),
         encoding="utf-8",
     )
+    lattice = write_lattice(tmp_path / "lattice.jsonl", [["ni", "hao"], ["zhong", "guo", "ren"]])
     out = tmp_path / "twin.jsonl"
-    report = typo_twin(eval_set, out, 0, MODEL_PATH, SYLLABLES)
+    report = typo_twin(eval_set, out, 0, MODEL_PATH, SYLLABLES, lattice)
     lines: list[dict[str, str]] = [
         json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()
     ]
@@ -241,7 +237,20 @@ def test_typo_twin_is_deterministic(tmp_path: Path) -> None:
         + "\n",
         encoding="utf-8",
     )
+    lattice = write_lattice(tmp_path / "lattice.jsonl", [["zhong", "guo", "ren", "min"]])
     one, two = tmp_path / "one.jsonl", tmp_path / "two.jsonl"
-    typo_twin(eval_set, one, 0, MODEL_PATH, SYLLABLES)
-    typo_twin(eval_set, two, 0, MODEL_PATH, SYLLABLES)
+    typo_twin(eval_set, one, 0, MODEL_PATH, SYLLABLES, lattice)
+    typo_twin(eval_set, two, 0, MODEL_PATH, SYLLABLES, lattice)
     assert one.read_bytes() == two.read_bytes()
+
+
+def test_typo_twin_refuses_a_lattice_without_the_record(tmp_path: Path) -> None:
+    """A record the lattice does not spell is an error, never a guessed split."""
+    eval_set = tmp_path / "eval.jsonl"
+    eval_set.write_text(
+        json.dumps({"pinyin": "nihao", "text": "你好", "context": None}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    lattice = write_lattice(tmp_path / "lattice.jsonl", [["ni", "hao", "ma"]])
+    with pytest.raises(ValueError, match="no 2-span path"):
+        typo_twin(eval_set, tmp_path / "twin.jsonl", 0, MODEL_PATH, SYLLABLES, lattice)

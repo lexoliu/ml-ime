@@ -1021,9 +1021,9 @@ def eval_typo_twin(
         None, "--syllables", help="ime-pinyin's syllables.txt; found upwards when omitted"
     ),
     lattice: Path = typer.Option(
-        None,
+        ...,
         "--lattice",
-        help="The set's emit-lattice output; its first path is the true spelling",
+        help="The set's emit-lattice output; its character-aligned path is the true spelling",
     ),
     verbose: bool = VERBOSE,
 ) -> None:
