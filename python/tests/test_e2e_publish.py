@@ -1,8 +1,10 @@
-"""The Colab publisher's create-or-version decision, against a stubbed kaggle.
+"""The Colab publisher's alternation between two resume slots, against a fake kaggle.
 
 colab/e2e-publish.py is a script rather than a package module, so it is
-imported by path with its filesystem constants redirected; the `kaggle` the
-decision drives is a stub on PATH that records its argv.
+imported by path with its filesystem constants redirected; the `kaggle` it
+drives is a stub on PATH that keeps each "dataset" as a directory, so create,
+delete, list and a single-file download behave the way the real service does
+for the calls the publisher makes, and every argv is recorded.
 """
 
 import importlib.util
@@ -31,63 +33,95 @@ def load_publisher(monkeypatch: pytest.MonkeyPatch, working: Path) -> ModuleType
 
 @pytest.fixture
 def kaggle_stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A `kaggle` on PATH recording its argv; `datasets list` reads a flag."""
+    """A fake `kaggle` on PATH whose datasets are directories under ``store``."""
     log = tmp_path / "kaggle-calls.log"
+    store = tmp_path / "store"
+    store.mkdir()
     binary = tmp_path / "bin" / "kaggle"
     binary.parent.mkdir()
-    exists_flag = tmp_path / "dataset-exists"
     binary.write_text(
         "#!/bin/bash\n"
         f'echo "$@" >> "{log}"\n'
-        'if [ "$1 $2" = "datasets list" ]; then\n'
-        '  echo "ref,title,size,lastUpdated,downloadCount,voteCount,usabilityRating"\n'
-        '  echo "lexoliu/mlime-e2e-init,mlime-e2e-init,1,2026-09-28,0,0,0"\n'
-        f'  if [ -f "{exists_flag}" ]; then '
-        'echo "lexoliu/mlime-e2e-resume,mlime-e2e-resume,1,2026-09-28,0,0,0"; fi\n'
-        "fi\n"
-        "exit 0\n"
+        f'store="{store}"\n'
+        'case "$1 $2" in\n'
+        '  "datasets list")\n'
+        '    echo "ref,title,size,lastUpdated,downloadCount,voteCount,usabilityRating"\n'
+        '    for d in "$store"/*; do [ -d "$d" ] && '
+        'echo "lexoliu/$(basename "$d"),x,1,2026-09-28,0,0,0"; done; true ;;\n'
+        '  "datasets download")\n'
+        '    cp "$store/${3#lexoliu/}/$5" "$7/$5" ;;\n'
+        '  "datasets delete")\n'
+        '    rm -rf "$store/${4#lexoliu/}" ;;\n'
+        '  "datasets create")\n'
+        "    id=$(python3 -c \"import json,sys; print(json.load(open(sys.argv[1]))['id'])\" "
+        '"$4/dataset-metadata.json")\n'
+        '    mkdir -p "$store/${id#lexoliu/}" && cp "$4"/* "$store/${id#lexoliu/}/" ;;\n'
+        '  *) echo "unexpected kaggle call: $*" >&2; exit 1 ;;\n'
+        "esac\n"
     )
     binary.chmod(0o755)
     monkeypatch.setenv("PATH", f"{binary.parent}:{os.environ['PATH']}")
-    return log
+    return store
 
 
 def write_trio(directory: Path, step: int) -> Path:
-    """A resume trio whose checkpoint records *step*."""
+    """A resume trio whose checkpoint and summary record *step*."""
     directory.mkdir(parents=True, exist_ok=True)
     torch.save({"step": step, "positions": [{}, {}]}, directory / "checkpoint-paused.pt")
     (directory / "run-config.json").write_text(json.dumps({"max_steps": 100}))
-    (directory / "run-summary.json").write_text(json.dumps({"last_step": step}))
+    (directory / "run-summary.json").write_text(
+        json.dumps({"last_step": step, "checkpoint_step": step})
+    )
     return directory
 
 
-def test_an_absent_dataset_is_created(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kaggle_stub: Path
-) -> None:
-    """Without lexoliu/mlime-e2e-resume the first publish creates it."""
-    working = tmp_path / "working"
-    write_trio(working, step=30)
+def held(store: Path) -> dict[str, int]:
+    """The step each existing fake slot holds."""
+    return {
+        slot.name: json.loads((slot / "run-summary.json").read_text())["checkpoint_step"]
+        for slot in sorted(store.iterdir())
+    }
+
+
+def publish_once(monkeypatch: pytest.MonkeyPatch, working: Path, step: int) -> None:
+    """Put a trio at *step* in the working root and run one publisher pass."""
+    write_trio(working, step=step)
     publisher = load_publisher(monkeypatch, working)
     monkeypatch.setenv("ONCE", "1")
     publisher.main()
-    calls = kaggle_stub.read_text()
-    assert "datasets list" in calls and "datasets create" in calls
+
+
+def test_slots_fill_then_the_older_one_is_replaced(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kaggle_stub: Path
+) -> None:
+    """Two creates fill both slots; the third publish deletes and recreates the older."""
+    working = tmp_path / "working"
+    publish_once(monkeypatch, working, 30)
+    assert held(kaggle_stub) == {"mlime-e2e-resume-a": 30}
+    publish_once(monkeypatch, working, 40)
+    assert held(kaggle_stub) == {"mlime-e2e-resume-a": 30, "mlime-e2e-resume-b": 40}
+    publish_once(monkeypatch, working, 50)
+    assert held(kaggle_stub) == {"mlime-e2e-resume-a": 50, "mlime-e2e-resume-b": 40}
+    publish_once(monkeypatch, working, 60)
+    assert held(kaggle_stub) == {"mlime-e2e-resume-a": 50, "mlime-e2e-resume-b": 60}
+    calls = (tmp_path / "kaggle-calls.log").read_text()
     assert "datasets version" not in calls
+    assert calls.count("datasets delete") == 2
     state = json.loads((working / "publish-state.json").read_text())
-    assert state["last_published_step"] == 30
+    assert state["last_published_step"] == 60
 
 
-def test_an_existing_dataset_is_versioned(
+def test_nothing_newer_publishes_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kaggle_stub: Path
 ) -> None:
+    """A trio no newer than what a slot already holds is not published again."""
     working = tmp_path / "working"
-    write_trio(working, step=30)
-    (tmp_path / "dataset-exists").touch()
-    publisher = load_publisher(monkeypatch, working)
-    monkeypatch.setenv("ONCE", "1")
-    publisher.main()
-    calls = kaggle_stub.read_text()
-    assert "datasets version" in calls and "datasets create" not in calls
+    publish_once(monkeypatch, working, 30)
+    before = (tmp_path / "kaggle-calls.log").read_text()
+    publish_once(monkeypatch, working, 30)
+    after = (tmp_path / "kaggle-calls.log").read_text()
+    assert "datasets create" not in after[len(before) :]
+    assert held(kaggle_stub) == {"mlime-e2e-resume-a": 30}
 
 
 def test_a_second_poll_reads_no_checkpoint_again(

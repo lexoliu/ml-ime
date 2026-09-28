@@ -4,14 +4,14 @@
 #   colab/e2e.sh start [--gpu T4]   provision, stage, resume the newest trio, launch
 #   colab/e2e.sh status             tail of the kernel's and publisher's logs
 #   colab/e2e.sh fetch <out dir>    download the metrics, the summary, the logs
-#   colab/e2e.sh publish            version lexoliu/mlime-e2e-resume once, in the VM
+#   colab/e2e.sh publish            publish the newest trio to a resume slot once, in the VM
 #   colab/e2e.sh stop               release the VM
 #
 # The session is named e2e; `colab sessions` lists it. The kernel is the same
 # script Kaggle runs (kaggle/e2e/kernel.py): on one T4 it trains the run's
 # world of two as one process of two virtual ranks, and it resumes the newest
 # checkpoint-paused trio mounted -- the latest COMPLETE Kaggle segment's
-# output or the lexoliu/mlime-e2e-resume dataset, whichever reached the higher
+# output or the lexoliu/mlime-e2e-resume-{a,b} slots, whichever reached the higher
 # step. A publisher loop beside the kernel pushes each interval checkpoint to
 # that dataset, so a VM that dies without warning loses minutes, not the leg.
 set -euo pipefail
