@@ -17,7 +17,7 @@ use ime_eval::{EvalSet, evaluate};
 use ime_lm::CharLm;
 use ime_neural::RouteA;
 use ime_ngram::{Counter, NgramModel};
-use ime_pinyin::{Lexicon, SegmentOptions, SyllableTable};
+use ime_pinyin::{CorrectionTable, Lexicon, SegmentOptions, SyllableTable};
 use neural::{Models, SliceArgs, parse_weight};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
@@ -36,6 +36,10 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "FusedEval holds the whole search configuration inline; boxing it to shrink the enum costs an indirection per parse"
+)]
 enum Command {
     /// Estimate a Kneser-Ney trigram from a plain text corpus.
     TrainNgram {
@@ -159,6 +163,16 @@ enum Command {
         /// tuned on the dev slice in one pass.
         #[arg(long, value_parser = parse_weight, default_values_t = [1.0f32])]
         weight: Vec<f32>,
+        /// A weight on each widened candidate's correction prior; repeatable,
+        /// swept on the dev slice alongside `--weight` in one pass. Meaningful
+        /// only with `--typos`, where the prior is nonzero.
+        #[arg(
+            long,
+            value_parser = parse_weight,
+            default_values_t = [1.0f32],
+            requires = "typos"
+        )]
+        typo_weight: Vec<f32>,
         /// A directory the beam is dumped to: for every section the run
         /// evaluates, one JSON Lines file named for the section, one record's
         /// hypotheses and their scores per line. The report is unchanged.
@@ -220,6 +234,12 @@ struct SearchArgs {
     /// How many distinct characters a guarded position keeps lineages for.
     #[arg(long, default_value = "3")]
     diversity_chars: usize,
+    /// Resolve mistyped keystrokes against the noise model: an off-inventory
+    /// span can become a segment at a prior cost, and every position's
+    /// candidates widen to the union of the span's corrections' homophones,
+    /// each paying the cheapest correction that reaches it.
+    #[arg(long)]
+    typos: bool,
 }
 
 impl SearchArgs {
@@ -231,6 +251,18 @@ impl SearchArgs {
         }
     }
 
+    /// The shared noise model when `--typos` asked for corrections.
+    ///
+    /// # Errors
+    ///
+    /// If the embedded noise model disagrees with the syllable inventory.
+    fn corrections(&self, table: &SyllableTable) -> Result<Option<CorrectionTable>> {
+        self.typos
+            .then(|| CorrectionTable::load(table))
+            .transpose()
+            .context("could not load the typo noise model")
+    }
+
     fn beam(&self) -> BeamOptions {
         BeamOptions {
             beam_width: self.beam_width,
@@ -238,6 +270,9 @@ impl SearchArgs {
             segmentation_weight: self.segmentation_weight,
             diversity_gap: self.diversity_gap,
             diversity_chars: self.diversity_chars,
+            // The noise model's own rate: the other decoders get no
+            // `--typo-weight` flag, so the prior is priced as written.
+            typo_weight: 1.0,
         }
     }
 }
@@ -295,6 +330,7 @@ async fn main() -> Result<()> {
             search,
         } => {
             let (table, lexicon) = tables()?;
+            let corrections = search.corrections(&table)?;
             neural::emit_lattice(
                 &eval_set,
                 &out,
@@ -302,6 +338,7 @@ async fn main() -> Result<()> {
                 table,
                 lexicon,
                 search.segment(),
+                corrections,
             )
         }
         Command::FusedEval {
@@ -316,6 +353,7 @@ async fn main() -> Result<()> {
             emittable,
             unscored,
             weight,
+            typo_weight,
             no_transition,
             dump,
             progress,
@@ -340,6 +378,7 @@ async fn main() -> Result<()> {
                 emittable: &emittable,
                 unscored,
                 weights: &weight,
+                typo_weights: &typo_weight,
                 no_transition,
                 dump: dump.as_deref(),
                 progress: progress.as_deref(),
@@ -396,12 +435,14 @@ fn train_ngram(corpus: &Path, out: &Path) -> Result<()> {
 fn load_baseline(model: &Path, search: &SearchArgs) -> Result<Baseline> {
     let (table, lexicon) = tables()?;
     let model = load_ngram(model, &lexicon)?;
+    let corrections = search.corrections(&table)?;
     Ok(Baseline::new(
         table,
         lexicon,
         model,
         search.segment(),
         search.beam(),
+        corrections,
     ))
 }
 
@@ -461,6 +502,9 @@ struct FusedRun<'a> {
     emittable: &'a Path,
     unscored: f32,
     weights: &'a [f32],
+    /// The correction-prior weights the sweep tries, one entry per
+    /// `--typo-weight`.
+    typo_weights: &'a [f32],
     /// Whether the run drops the transition, emissions alone.
     no_transition: bool,
     /// Where every evaluated section's beam lands, or `None` to report only.
@@ -558,6 +602,7 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
             lm_weight: run.lm_weight,
         },
     };
+    let corrections = run.search.corrections(&table)?;
     let progress = run.progress.map(|dir| neural::Progress {
         dir,
         model: run.model,
@@ -573,12 +618,14 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
         run.emittable,
         run.unscored,
         run.weights,
+        run.typo_weights,
         run.slice,
         run.dump,
         progress.as_ref(),
         table,
         lexicon,
         run.search.segment(),
+        corrections,
         &run.search.beam(),
         run.batch,
         transition,

@@ -104,7 +104,7 @@ def test_noise_and_the_switch_come_together(
     noise: NoiseModel,
     corrections: CorrectionTable,
 ) -> None:
-    space = CandidateSpace(spans, lexicon.candidate_mask, corrections)
+    space = CandidateSpace(spans, lexicon.candidate_mask, corrections, lexicon.homophones)
     clean = CandidateSpace(spans, lexicon.candidate_mask)
     with pytest.raises(ValueError, match="come together"):
         SampleBuilder(lexicon, spans, arbitration, Augmentation(typos=True), noise=None)
@@ -134,7 +134,7 @@ def test_a_typoed_example_keeps_alignment_and_target(
         Augmentation(typos=True),
         seed=0,
         noise=always_typos(),
-        candidates=CandidateSpace(spans, lexicon.candidate_mask, corrections),
+        candidates=CandidateSpace(spans, lexicon.candidate_mask, corrections, lexicon.homophones),
     )
     syllables = ["wo3", "ai4", "bei3", "jing1"]
     # A slip whose span admits nothing is a counted drop; walk the ids until a
@@ -170,7 +170,9 @@ def test_typo_corruption_is_seeded_per_example(
             Augmentation(typos=True),
             seed=seed,
             noise=always_typos(),
-            candidates=CandidateSpace(spans, lexicon.candidate_mask, corrections),
+            candidates=CandidateSpace(
+                spans, lexicon.candidate_mask, corrections, lexicon.homophones
+            ),
         )
         built = builder.build(
             Sample(id=sample_id, source="test", text="中重我绿", context=None),
@@ -202,7 +204,7 @@ def test_candidate_space_widens_over_corrections(
     lexicon: Lexicon, spans: SpanVocab, corrections: CorrectionTable
 ) -> None:
     clean = CandidateSpace(spans, lexicon.candidate_mask)
-    space = CandidateSpace(spans, lexicon.candidate_mask, corrections)
+    space = CandidateSpace(spans, lexicon.candidate_mask, corrections, lexicon.homophones)
 
     def expected_union(span: str) -> set[int]:
         # The homophones of every correction: a character is admitted when one
@@ -258,7 +260,7 @@ def test_a_typoed_span_collates_under_the_typo_space(
     corrections: CorrectionTable,
 ) -> None:
     typoed = example(lexicon, spans, "中", ("zhpng",))
-    space = CandidateSpace(spans, lexicon.candidate_mask, corrections)
+    space = CandidateSpace(spans, lexicon.candidate_mask, corrections, lexicon.homophones)
     batch = Collator(tokenizer, space)([typoed])
     assert batch.span_letters[0, 1, :5].tolist() == [25, 7, 15, 13, 6]
     count = int(batch.candidate_counts[0, 1])
@@ -381,6 +383,7 @@ def test_a_pre_letter_checkpoint_resumes_a_typo_run(
             spans,
             lexicon.candidate_mask,
             CorrectionTable(noise, load_syllables(SYLLABLES)) if noise is not None else None,
+            lexicon.homophones,
         )
         return (
             CorpusStream(

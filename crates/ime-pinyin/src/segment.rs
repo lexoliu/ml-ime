@@ -6,57 +6,139 @@
 //! paths through it -- which downstream is exactly the batch of candidate lengths
 //! that go into a single encoder forward.
 
+use std::sync::Arc;
+
+use crate::corrections::{CORRECTIONS_MAX_EDITS, Correction, CorrectionTable};
 use crate::syllable::{MAX_SYLLABLE_LEN, SyllableRange, SyllableTable};
 use thiserror::Error;
+
+/// The longest typed span a corrected segment can cover: a full syllable can
+/// only drift two edits' worth of letters from what was meant.
+const MAX_CORRECTED_LEN: usize = MAX_SYLLABLE_LEN + CORRECTIONS_MAX_EDITS;
+
+/// What a typed span can be read as. The inventory case keeps the syllable
+/// range; a span the inventory does not reach -- a typo -- instead carries the
+/// noise model's corrections with their costs.
+#[derive(Clone, PartialEq, Debug)]
+pub enum Readings {
+    /// The span is a syllable or a prefix of one: the table range covering
+    /// every syllable the keystrokes could complete to or abbreviate.
+    Syllables(SyllableRange),
+    /// The span reaches the inventory only through the noise model: its
+    /// `K`-capped corrections, cheapest first. The list is shared -- every
+    /// segment spelling the same span points at the same entries.
+    Corrections(Arc<[Correction]>),
+}
+
+/// Add the `start..end` segment to the bucket unless its readings are empty
+/// or an identical edge already exists.
+fn push(edges: &mut Vec<Segment>, start: u32, end: u32, readings: Readings) {
+    let segment = Segment {
+        start,
+        end,
+        readings,
+    };
+    let empty = matches!(&segment.readings, Readings::Syllables(range) if range.is_empty());
+    if !empty && !edges.contains(&segment) {
+        edges.push(segment);
+    }
+}
 
 /// One output character position: the span of input it consumes, and every
 /// syllable that span can be read as.
 ///
 /// The three cases an IME distinguishes -- a complete syllable, an initial-only
 /// abbreviation, a syllable still being typed -- differ only in how wide
-/// [`Segment::syllables`] is, so they need no tag.
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+/// [`Readings::Syllables`] is, so they need no tag. A fourth case exists only
+/// when the lattice is built against a [`CorrectionTable`]: the span is a
+/// typo, and its readings are the syllables the noise model says were meant.
+#[derive(Clone, PartialEq, Debug)]
 pub struct Segment {
     start: u32,
     end: u32,
-    syllables: SyllableRange,
+    readings: Readings,
 }
 
 impl Segment {
     /// Byte offset where this segment starts in the typed string.
     #[must_use]
-    pub const fn start(self) -> usize {
+    pub const fn start(&self) -> usize {
         self.start as usize
     }
 
     /// Byte offset one past this segment's last keystroke.
     #[must_use]
-    pub const fn end(self) -> usize {
+    pub const fn end(&self) -> usize {
         self.end as usize
     }
 
     /// The readings this segment admits.
     #[must_use]
-    pub const fn syllables(self) -> SyllableRange {
-        self.syllables
+    pub const fn readings(&self) -> &Readings {
+        &self.readings
+    }
+
+    /// The syllable range this segment admits, when the span is on the
+    /// inventory. `None` for a corrected segment -- its readings are syllables
+    /// the noise model picked, not a prefix range.
+    #[must_use]
+    pub const fn syllables(&self) -> Option<SyllableRange> {
+        match &self.readings {
+            Readings::Syllables(range) => Some(*range),
+            Readings::Corrections(_) => None,
+        }
+    }
+
+    /// Whether this segment exists only because the noise model reaches it --
+    /// i.e. the typed span is no syllable or prefix.
+    #[must_use]
+    pub const fn corrected(&self) -> bool {
+        matches!(self.readings, Readings::Corrections(_))
+    }
+
+    /// The corrections this segment reads as, when it is a corrected one.
+    #[must_use]
+    pub const fn corrections(&self) -> Option<&Arc<[Correction]>> {
+        match &self.readings {
+            Readings::Syllables(_) => None,
+            Readings::Corrections(entries) => Some(entries),
+        }
     }
 
     /// How many readings this segment admits. One means the user typed the
     /// syllable out in full.
     #[must_use]
-    pub const fn ambiguity(self) -> usize {
-        self.syllables.len()
+    pub fn ambiguity(&self) -> usize {
+        match &self.readings {
+            Readings::Syllables(range) => range.len(),
+            Readings::Corrections(entries) => entries.len(),
+        }
+    }
+
+    /// The prior a corrected span costs: the cheapest correction's `-log P`.
+    fn prior(&self) -> f32 {
+        match &self.readings {
+            Readings::Syllables(_) => 0.0,
+            Readings::Corrections(entries) =>
+            {
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a -log of a two-edit probability stays small"
+                )]
+                entries.first().map_or(0.0, |entry| entry.cost() as f32)
+            }
+        }
     }
 
     /// This segment's contribution to a path's cost.
     #[must_use]
-    fn cost(self, options: &SegmentOptions) -> f32 {
+    fn cost(&self, options: &SegmentOptions) -> f32 {
         #[expect(
             clippy::cast_precision_loss,
             reason = "ambiguity is at most the inventory size"
         )]
         let ambiguity = self.ambiguity() as f32;
-        options.segment_cost + options.ambiguity_weight * ambiguity.ln()
+        options.segment_cost + options.ambiguity_weight * ambiguity.ln() + self.prior()
     }
 }
 
@@ -122,7 +204,7 @@ pub enum SegmentError {
 }
 
 /// One complete reading of the input: a character position per segment.
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Segmentation {
     segments: Vec<Segment>,
     cost: f32,
@@ -167,6 +249,9 @@ pub struct SegmentLattice<'input> {
 /// A partial path during the k-best sweep.
 #[derive(Clone, Copy, Debug)]
 struct Trace {
+    /// Summed segment costs -- a corrected segment adds its prior through
+    /// [`Segment::cost`], so paths rank by summed prior the way #101
+    /// specifies, and a clean path's cost is exactly today's.
     cost: f32,
     /// `(start position, index into `edges[start]`, rank within `best[start]`)`.
     /// Absent only for the empty path at position zero.
@@ -174,7 +259,7 @@ struct Trace {
 }
 
 impl<'input> SegmentLattice<'input> {
-    /// Build the lattice for *input*.
+    /// Build the lattice for *input*, without corrections.
     ///
     /// # Errors
     ///
@@ -184,6 +269,36 @@ impl<'input> SegmentLattice<'input> {
         input: &'input str,
         table: &SyllableTable,
         options: &SegmentOptions,
+    ) -> Result<Self, SegmentError> {
+        Self::build_inner(input, table, options, None)
+    }
+
+    /// Build the lattice for *input* against the typo noise model.
+    ///
+    /// Inventory spans segment exactly as [`SegmentLattice::build`] does. A
+    /// typed stretch that is no syllable and no prefix of one may still become
+    /// a segment when the noise model reaches it -- its candidates are the
+    /// span's corrections and it carries the cheapest one's cost as a prior.
+    ///
+    /// # Errors
+    ///
+    /// The same conditions [`SegmentLattice::build`] rejects.
+    pub fn build_corrections(
+        input: &'input str,
+        table: &SyllableTable,
+        options: &SegmentOptions,
+        corrections: &CorrectionTable,
+    ) -> Result<Self, SegmentError> {
+        Self::build_inner(input, table, options, Some(corrections))
+    }
+
+    /// Build *input*'s edge table, with corrected edges where the inventory
+    /// cannot reach and *corrections* can.
+    fn build_inner(
+        input: &'input str,
+        table: &SyllableTable,
+        options: &SegmentOptions,
+        corrections: Option<&CorrectionTable>,
     ) -> Result<Self, SegmentError> {
         if input.is_empty() {
             return Err(SegmentError::Empty);
@@ -196,33 +311,45 @@ impl<'input> SegmentLattice<'input> {
         }
 
         let len = input.len();
+        let max_span = if corrections.is_some() {
+            MAX_CORRECTED_LEN
+        } else {
+            MAX_SYLLABLE_LEN
+        };
         let mut edges: Vec<Vec<Segment>> = vec![Vec::new(); len];
         for start in 0..len {
-            for end in (start + 1)..=len.min(start + MAX_SYLLABLE_LEN) {
+            for end in (start + 1)..=len.min(start + max_span) {
                 let span = &input[start..end];
                 #[expect(
                     clippy::cast_possible_truncation,
                     reason = "len fits u32, checked above"
                 )]
                 let (s, e) = (start as u32, end as u32);
-                let mut push = |syllables: SyllableRange| {
-                    let segment = Segment {
-                        start: s,
-                        end: e,
-                        syllables,
-                    };
-                    if !syllables.is_empty() && !edges[start].contains(&segment) {
-                        edges[start].push(segment);
+                if !table.prefix_range(span).is_empty() {
+                    if let Some(exact) = table.exact_range(span) {
+                        push(&mut edges[start], s, e, Readings::Syllables(exact));
                     }
-                };
-                if let Some(exact) = table.exact_range(span) {
-                    push(exact);
-                }
-                if options.allow_abbreviation && SyllableTable::is_abbreviation(span) {
-                    push(table.prefix_range(span));
-                }
-                if options.allow_incomplete_tail && end == len {
-                    push(table.prefix_range(span));
+                    if options.allow_abbreviation && SyllableTable::is_abbreviation(span) {
+                        push(
+                            &mut edges[start],
+                            s,
+                            e,
+                            Readings::Syllables(table.prefix_range(span)),
+                        );
+                    }
+                    if options.allow_incomplete_tail && end == len {
+                        push(
+                            &mut edges[start],
+                            s,
+                            e,
+                            Readings::Syllables(table.prefix_range(span)),
+                        );
+                    }
+                } else if let Some(noise) = corrections {
+                    let entries = noise.corrections(span);
+                    if !entries.is_empty() {
+                        push(&mut edges[start], s, e, Readings::Corrections(entries));
+                    }
                 }
             }
         }
@@ -322,7 +449,7 @@ impl<'input> SegmentLattice<'input> {
         let mut segments = Vec::new();
         let mut current = trace;
         while let Some((position, edge, rank)) = current.back {
-            segments.push(self.edges[position][edge]);
+            segments.push(self.edges[position][edge].clone());
             current = best[position][rank];
         }
         segments.reverse();
@@ -337,14 +464,12 @@ mod tests {
     fn spellings(table: &SyllableTable, seg: &Segmentation) -> Vec<String> {
         seg.segments()
             .iter()
-            .map(|s| {
-                if s.ambiguity() == 1 {
-                    table
-                        .spelling(s.syllables().iter().next().expect("singleton"))
-                        .to_owned()
-                } else {
-                    format!("{}*", s.ambiguity())
-                }
+            .map(|s| match s.readings() {
+                Readings::Corrections(entries) => format!("{}?", entries.len()),
+                Readings::Syllables(range) if range.len() == 1 => table
+                    .spelling(range.iter().next().expect("singleton"))
+                    .to_owned(),
+                Readings::Syllables(range) => format!("{}*", range.len()),
             })
             .collect()
     }
@@ -511,5 +636,113 @@ mod tests {
             }
             assert_eq!(cursor, lattice.input().len(), "path did not span the input");
         }
+    }
+
+    #[test]
+    fn a_typo_segments_only_under_corrections() {
+        // `wo jai jia` typed with `jai` for `jia`: with abbreviations off no
+        // inventory reading tiles the input, so without the noise model it
+        // cannot be read at all.
+        let table = SyllableTable::load();
+        let corrections = CorrectionTable::load(&table).expect("the noise table parses");
+        let strict = SegmentOptions {
+            allow_abbreviation: false,
+            allow_incomplete_tail: false,
+            ..SegmentOptions::default()
+        };
+        assert_eq!(
+            SegmentLattice::build("wojaijia", &table, &strict)
+                .expect_err("a typo must not segment without corrections"),
+            SegmentError::NoSegmentation {
+                input: "wojaijia".to_owned()
+            }
+        );
+        let lattice = SegmentLattice::build_corrections("wojaijia", &table, &strict, &corrections)
+            .expect("the typo reads through corrections");
+        let best = &lattice.k_best(&strict)[0];
+        let corrected: Vec<_> = best.segments().iter().filter(|s| s.corrected()).collect();
+        assert_eq!(corrected.len(), 1, "exactly one segment is a typo");
+        let segment = corrected[0];
+        assert_eq!(
+            &lattice.input()[segment.start()..segment.end()],
+            "jai",
+            "the corrected segment covers the typoed span"
+        );
+        assert_eq!(
+            segment
+                .corrections()
+                .expect("a corrected segment holds its entries")[0]
+                .syllable(),
+            "jia",
+            "the cheapest correction of `jai` must be `jia`"
+        );
+    }
+
+    #[test]
+    fn corrections_never_reorder_clean_segmentations() {
+        // The invariance the decoder depends on: with the noise model on, a
+        // clean path's cost is byte-identical to today's -- a corrected
+        // segment only ever adds a positive prior -- so the clean subset of
+        // the batch is a subsequence of the plain lattice's list, in order.
+        let table = SyllableTable::load();
+        let corrections = CorrectionTable::load(&table).expect("the noise table parses");
+        let options = SegmentOptions {
+            max_paths: 8,
+            ..offline()
+        };
+        for input in [
+            "nihao",
+            "xian",
+            "zgrm",
+            "womenzaijianzhongwen",
+            "zhongguorenm",
+        ] {
+            let plain = SegmentLattice::build(input, &table, &options).expect("reads");
+            let noisy = SegmentLattice::build_corrections(input, &table, &options, &corrections)
+                .expect("reads");
+            let survivors: Vec<_> = noisy
+                .k_best(&options)
+                .into_iter()
+                .filter(|path| path.segments().iter().all(|s| !s.corrected()))
+                .collect();
+            let mut expected = plain.k_best(&options).into_iter();
+            for survivor in &survivors {
+                assert_eq!(
+                    Some(survivor),
+                    expected.find(|e| e == survivor).as_ref(),
+                    "{input:?}: clean paths must keep today's order"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_correction_prior_prices_typoed_paths() {
+        // `jai` is `jia` one transposition in -- or `j` + `ai` already. The
+        // batch must offer both: the summed prior puts the honest path first
+        // and the corrected one close enough for the decoder to pick it.
+        let table = SyllableTable::load();
+        let corrections = CorrectionTable::load(&table).expect("the noise table parses");
+        let options = offline();
+        let lattice = SegmentLattice::build_corrections("jai", &table, &options, &corrections)
+            .expect("jai reads");
+        let paths = lattice.k_best(&options);
+        assert!(
+            paths[0].segments().iter().all(|s| !s.corrected()),
+            "the clean j+ai reading still ranks ahead"
+        );
+        let corrected = paths
+            .iter()
+            .find(|p| p.segments().iter().any(Segment::corrected))
+            .expect("the corrected reading is in the batch");
+        let span_cost = corrections
+            .corrections("jai")
+            .first()
+            .expect("jai has corrections")
+            .cost();
+        assert!(
+            f64::from(corrected.cost()) > span_cost,
+            "the path cost includes the correction prior"
+        );
     }
 }

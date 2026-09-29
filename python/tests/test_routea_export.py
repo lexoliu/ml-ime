@@ -100,6 +100,7 @@ def _run_fill(export: Path, batch) -> np.ndarray:
             "input_ids": batch.input_ids.numpy(),
             "attention_mask": batch.attention_mask.numpy(),
             "span_ids": batch.span_ids.numpy(),
+            "span_letters": batch.span_letters.numpy(),
             "span_positions": batch.span_positions.numpy(),
             "context": context,
             "context_mask": np.broadcast_to(

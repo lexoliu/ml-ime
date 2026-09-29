@@ -183,7 +183,7 @@ fn emit(args: &Args) -> Result<(), EmitError> {
             continue;
         }
         let start = Instant::now();
-        let paths = towers.emission(&record, args.with_context)?;
+        let paths = towers.emission(&record, None, args.with_context)?;
         // The score file carries four decimals, as `mlime train emit` writes
         // it; `emission` itself returns the raw log probabilities.
         let paths: Vec<Vec<Vec<f32>>> = if args.raw {

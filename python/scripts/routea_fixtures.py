@@ -156,6 +156,7 @@ def _score_record(
     input_ids = np.full((rows, width), tokenizer.pad_token_id, dtype=np.int64)
     attention_mask = np.zeros((rows, width), dtype=np.int64)
     span_ids_array = np.zeros((rows, width), dtype=np.int64)
+    span_letters = np.full((rows, width, 12), 26, dtype=np.int64)
     span_positions = np.zeros((rows, width), dtype=np.bool_)
     asked: list[list[list[int]]] = []
     for row, path in enumerate(paths):
@@ -169,6 +170,9 @@ def _score_record(
         ):
             span_ids_array[row, position + 1] = span_ids[span]
             span_positions[row, position + 1] = True
+            span_letters[row, position + 1, : len(span)] = [
+                ord(letter) - ord("a") for letter in span
+            ]
             positions.append([emissions[character] for character in candidates])
         asked.append(positions)
 
@@ -197,6 +201,7 @@ def _score_record(
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "span_ids": span_ids_array,
+            "span_letters": span_letters,
             "span_positions": span_positions,
             "context": context,
             "context_mask": context_masks,

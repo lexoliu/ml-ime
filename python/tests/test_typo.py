@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+from mlime.train.lexicon import CANDIDATES_FIXTURE_RELATIVE
 from mlime.typo import (
     CORRECTIONS_FIXTURE_RELATIVE,
     CORRECTIONS_K,
@@ -28,7 +29,9 @@ from mlime.typo import (
 
 MODEL_PATH = Path(__file__).parent.parent / "src/mlime/data/typo_model.json"
 SYLLABLES = Path(__file__).parent.parent.parent / "crates/ime-pinyin/data/syllables.txt"
+CHAR_TABLE = Path(__file__).parent.parent.parent / "crates/ime-pinyin/data/char_pinyin.tsv"
 CORRECTIONS_FIXTURE = Path(__file__).parent.parent.parent / CORRECTIONS_FIXTURE_RELATIVE
+CANDIDATES_FIXTURE = Path(__file__).parent.parent.parent / CANDIDATES_FIXTURE_RELATIVE
 
 
 @pytest.fixture(scope="module")
@@ -365,6 +368,78 @@ def test_corrections_fixture_is_current(correction_table: CorrectionTable, tmp_p
         corrections_fixture_spans(correction_table)
     )
     assert regenerated.read_bytes() == CORRECTIONS_FIXTURE.read_bytes()
+
+
+def test_priors_price_widened_candidates_at_their_correction_cost(
+    correction_table: CorrectionTable,
+) -> None:
+    """Every admitted id pays the cheapest correction that reaches it: nothing
+    for a span's own readings, a positive model cost for the rest, and zero
+    everywhere under a space with no noise model."""
+    from mlime.train.lexicon import (
+        CandidateSpace,
+        build_lexicon,
+        read_char_readings,
+    )
+    from mlime.train.spans import SpanVocab
+
+    readings = read_char_readings(CHAR_TABLE)
+    spans = SpanVocab.load()
+    vocabulary = {character: index for index, character in enumerate(readings)}
+    lexicon = build_lexicon(readings, vocabulary, spans)
+    space = CandidateSpace(spans, lexicon.candidate_mask, correction_table, lexicon.homophones)
+
+    # "jia" is a valid syllable, so its own readings -- the exact
+    # homophones, not the prefix completions the wider union adds -- are
+    # free, and every widened character pays a positive model cost.
+    priors = space.priors("jia")
+    assert set(priors) == set(space.resolve("jia"))
+    own = set(lexicon.homophones["jia"])
+    assert own
+    assert all(priors[index] == 0.0 for index in own)
+    for index in priors:
+        if index not in own:
+            assert priors[index] > 0.0
+
+    # "jai" is off-inventory: every candidate comes through a correction.
+    priors = space.priors("jai")
+    assert priors
+    assert all(cost > 0.0 for cost in priors.values())
+    assert set(priors) == set(space.resolve("jai"))
+
+    # A space with no noise model prices the clean union at zero, matching the
+    # Rust clean path whose candidates carry no priors at all.
+    clean = CandidateSpace(spans, lexicon.candidate_mask)
+    assert set(clean.priors("jia")) == set(clean.resolve("jia"))
+    assert all(cost == 0.0 for cost in clean.priors("jia").values())
+
+
+def test_candidates_fixture_is_current(correction_table: CorrectionTable, tmp_path: Path) -> None:
+    """The union each fixture span resolves to under ``CandidateSpace`` -- the
+    same contract as the corrections fixture, one level up, byte-for-byte.
+
+    The space is built over the whole lexicon standing in for the base
+    vocabulary, which is what makes its emission index the character table's
+    own order -- the ``CharId`` numbering the Rust test compares against.
+    """
+    from mlime.train.lexicon import (
+        CandidateSpace,
+        build_lexicon,
+        read_char_readings,
+        write_candidates_fixture,
+    )
+    from mlime.train.spans import SpanVocab
+
+    readings = read_char_readings(CHAR_TABLE)
+    spans = SpanVocab.load()
+    vocabulary = {character: index for index, character in enumerate(readings)}
+    lexicon = build_lexicon(readings, vocabulary, spans)
+    space = CandidateSpace(spans, lexicon.candidate_mask, correction_table, lexicon.homophones)
+    regenerated = tmp_path / "typo-candidates.json"
+    assert write_candidates_fixture(space, regenerated) == len(
+        corrections_fixture_spans(correction_table)
+    )
+    assert regenerated.read_bytes() == CANDIDATES_FIXTURE.read_bytes()
 
 
 def test_corrections_fixture_spans_cover_the_edit_space(

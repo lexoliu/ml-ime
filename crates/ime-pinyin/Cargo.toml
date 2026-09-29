@@ -8,6 +8,8 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
 thiserror = "2.0.20"
 
 [lints]
