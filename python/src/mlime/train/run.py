@@ -257,7 +257,9 @@ class Vocabularies:
             return CandidateSpace(self.spans, self.lexicon.candidate_mask)
         model = NoiseModel.load(TYPO_MODEL_PATH)
         table = CorrectionTable(model, self.syllables)
-        return CandidateSpace(self.spans, self.lexicon.candidate_mask, table)
+        return CandidateSpace(
+            self.spans, self.lexicon.candidate_mask, table, self.lexicon.homophones
+        )
 
     def builder(self, augmentation: Augmentation | None, seed: int) -> SampleBuilder:
         """A builder that types sentences the way *seed* and *augmentation* say."""

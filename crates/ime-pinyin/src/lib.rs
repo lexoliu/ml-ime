@@ -9,10 +9,12 @@
 //!
 //! [`ime-decode`]: https://github.com/lexoliu/ml-ime
 
+mod corrections;
 mod lexicon;
 mod segment;
 mod syllable;
 
+pub use corrections::{Correction, CorrectionTable, NoiseError};
 pub use lexicon::{CharId, Lexicon, LexiconError};
-pub use segment::{Segment, SegmentError, SegmentLattice, SegmentOptions, Segmentation};
+pub use segment::{Readings, Segment, SegmentError, SegmentLattice, SegmentOptions, Segmentation};
 pub use syllable::{MAX_SYLLABLE_LEN, SyllableId, SyllableRange, SyllableTable};

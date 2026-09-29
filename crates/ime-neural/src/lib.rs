@@ -34,6 +34,7 @@
 //! plus per-thread working space no matter how many threads score.
 
 use ime_decode::{Candidates, EmissionError, Emittable, LatticeRecord, Scored};
+use ime_pinyin::CorrectionTable;
 use memmap2::Mmap;
 use ort::AsPointer;
 use ort::ep::ExecutionProviderDispatch;
@@ -154,6 +155,9 @@ pub struct RouteA {
     /// Each typed span's id: `model.span_embeddings`' row and a `span_ids`
     /// value, in the manifest's order.
     spans: HashMap<String, usize>,
+    /// The reserved ``<unk>`` row's id: the row a typoed span embeds through,
+    /// since a span no syllable's prefix covers has no row of its own.
+    unknown_span: usize,
     /// Each character's index into the emission axis: `log_probs`' last axis
     /// and a `candidate_mask` column, in the manifest's order.
     emissions: HashMap<char, usize>,
@@ -207,23 +211,7 @@ impl RouteA {
                 path: dir.join("tokenizer.json"),
                 source,
             })?;
-        let mut emissions = HashMap::with_capacity(manifest.characters.len());
-        for (index, character) in manifest.characters.iter().enumerate() {
-            let mut chars = character.chars();
-            let (Some(character), None) = (chars.next(), chars.next()) else {
-                return Err(NeuralError::ManifestShape {
-                    path: dir.to_path_buf(),
-                    reason: format!("{character:?} is not one character"),
-                });
-            };
-            emissions.insert(character, index);
-        }
-        let spans: HashMap<String, usize> = manifest
-            .spans
-            .iter()
-            .enumerate()
-            .map(|(id, span)| (span.clone(), id))
-            .collect();
+        let (emissions, spans, unknown_span) = vocabularies(&manifest, dir)?;
 
         let mut maps = HashMap::new();
         let context_table = &manifest.weights.context;
@@ -271,6 +259,7 @@ impl RouteA {
             hidden: manifest.hidden,
             specials: manifest.specials,
             spans,
+            unknown_span,
             emissions,
             mask,
             weights: maps.into_values().collect(),
@@ -302,6 +291,12 @@ impl RouteA {
     /// `context off` score files: off, or a record with no context, runs the
     /// fill graph with the gate zeroed and the context tower skipped.
     ///
+    /// *corrections*, when set, is the shared typo noise model: an
+    /// off-inventory span embeds through the `<unk>` row, and a position's
+    /// admission check is the union over its corrections' mask rows rather
+    /// than the span's own -- the same widening the training side's
+    /// `CandidateSpace.resolve` applies.
+    ///
     /// [`ScoreRecord`]: ime_decode::ScoreRecord
     ///
     /// # Errors
@@ -312,6 +307,7 @@ impl RouteA {
     pub fn emission(
         &self,
         record: &LatticeRecord,
+        corrections: Option<&CorrectionTable>,
         with_context: bool,
     ) -> Result<Vec<Vec<Vec<f32>>>, NeuralError> {
         if record.paths.is_empty() {
@@ -325,9 +321,10 @@ impl RouteA {
             input_ids,
             attention_mask,
             span_ids,
+            span_letters,
             span_positions,
             asked,
-        } = self.fill_inputs(record)?;
+        } = self.fill_inputs(record, corrections)?;
         let rows = record.paths.len();
         // The context tower once per record; a gated-off context is a zeros
         // row, bitwise equivalent to encoding the sentinels and multiplying
@@ -358,6 +355,10 @@ impl RouteA {
             "input_ids" => Tensor::from_array((vec![dim(rows), dim(width)], input_ids))?,
             "attention_mask" => Tensor::from_array((vec![dim(rows), dim(width)], attention_mask))?,
             "span_ids" => Tensor::from_array((vec![dim(rows), dim(width)], span_ids))?,
+            "span_letters" => Tensor::from_array((
+                vec![dim(rows), dim(width), dim(MAX_SPAN_LETTERS)],
+                span_letters
+            ))?,
             "span_positions" =>
                 Tensor::from_array((vec![dim(rows), dim(width)], span_positions))?,
             "context" => Tensor::from_array((
@@ -402,13 +403,18 @@ impl RouteA {
     /// and every asked candidate resolved to its emission index with the
     /// candidate mask checked -- a candidate the model was not trained to
     /// admit is an error, never a floor score.
-    fn fill_inputs(&self, record: &LatticeRecord) -> Result<FillInputs, NeuralError> {
+    fn fill_inputs(
+        &self,
+        record: &LatticeRecord,
+        corrections: Option<&CorrectionTable>,
+    ) -> Result<FillInputs, NeuralError> {
         let width = record
             .paths
             .iter()
             .fold(0usize, |width, path| width.max(path.spans.len() + 2));
         let rows = record.paths.len();
         let mut span_ids = vec![0i64; rows * width];
+        let mut span_letters = vec![LETTER_PAD; rows * width * MAX_SPAN_LETTERS];
         let mut asked: Vec<Vec<Vec<usize>>> = Vec::with_capacity(rows);
         let mut input_ids = vec![i64::from(self.specials.pad); rows * width];
         let mut attention_mask = vec![0i64; rows * width];
@@ -432,12 +438,12 @@ impl RouteA {
             for (position, (span, candidates)) in
                 path.spans.iter().zip(&path.candidates).enumerate()
             {
-                let span_id = *self.spans.get(span.as_str()).ok_or(NeuralError::Span {
-                    record: record.record,
-                    span: span.clone(),
-                })?;
+                let (span_id, admitted) = self.span_layout(record.record, span, corrections)?;
                 input_ids[base + position + 1] = i64::from(self.specials.mask);
                 span_ids[base + position + 1] = dim(span_id);
+                span_letters[(base + position + 1) * MAX_SPAN_LETTERS
+                    ..(base + position + 2) * MAX_SPAN_LETTERS]
+                    .copy_from_slice(&letter_ids(record.record, span)?);
                 span_positions[base + position + 1] = true;
                 let mut emissions = Vec::with_capacity(candidates.chars().count());
                 for character in candidates.chars() {
@@ -449,7 +455,10 @@ impl RouteA {
                                 record: record.record,
                                 character,
                             })?;
-                    if !self.mask[span_id * self.emissions.len() + emission] {
+                    let admitted_here = admitted
+                        .iter()
+                        .any(|row| self.mask[row * self.emissions.len() + emission]);
+                    if !admitted_here {
                         return Err(NeuralError::Unadmitted {
                             record: record.record,
                             span: span.clone(),
@@ -467,6 +476,7 @@ impl RouteA {
             input_ids,
             attention_mask,
             span_ids,
+            span_letters,
             span_positions,
             asked,
         })
@@ -491,7 +501,7 @@ impl RouteA {
         floor: f32,
         with_context: bool,
     ) -> Result<Scored<'a>, NeuralError> {
-        let scores = self.emission(record, with_context)?;
+        let scores = self.emission(record, None, with_context)?;
         Ok(Scored::attach(
             record.record,
             candidates,
@@ -527,6 +537,44 @@ impl RouteA {
             .map(|&bit| i64::from(bit))
             .collect();
         Ok((ids, mask))
+    }
+
+    /// The span-table row *span* embeds through and the mask rows a
+    /// candidate at its position must be admitted by.
+    ///
+    /// Without the noise model the rows are the span's own row alone, today's
+    /// check. With it, the span's `corrections` name the rows: an
+    /// off-inventory span embeds through the reserved ``<unk>`` row while
+    /// every correction's row contributes to the union -- the mask a typoed
+    /// span asks about is the mask of every syllable it could have meant.
+    fn span_layout(
+        &self,
+        record: usize,
+        span: &str,
+        corrections: Option<&CorrectionTable>,
+    ) -> Result<(usize, Vec<usize>), NeuralError> {
+        if let Some(noise) = corrections {
+            let id = self.spans.get(span).copied().unwrap_or(self.unknown_span);
+            let rows = noise
+                .corrections(span)
+                .iter()
+                .map(|entry| {
+                    self.spans
+                        .get(entry.syllable())
+                        .copied()
+                        .ok_or(NeuralError::Span {
+                            record,
+                            span: entry.syllable().to_owned(),
+                        })
+                })
+                .collect::<Result<Vec<usize>, NeuralError>>()?;
+            return Ok((id, rows));
+        }
+        let id = *self.spans.get(span).ok_or(NeuralError::Span {
+            record,
+            span: span.to_owned(),
+        })?;
+        Ok((id, vec![id]))
     }
 
     /// The context tower's last hidden state over the encoded context:
@@ -597,6 +645,9 @@ struct FillInputs {
     attention_mask: Vec<i64>,
     /// The span vocabulary id at each span position, 0 elsewhere.
     span_ids: Vec<i64>,
+    /// The keys pressed per span position, `a`-`z` as 0-25 and 26 at padding,
+    /// the collator's encoding.
+    span_letters: Vec<i64>,
     /// True at each span position, false at the sentinels and padding.
     span_positions: Vec<bool>,
     /// `asked[path][position]` holds the emission indices to read back.
@@ -818,6 +869,69 @@ pub enum NeuralError {
 /// hold it exactly.
 const LAYOUT: &str = "towers";
 
+/// The character and span tables as name -> id maps, with the reserved
+/// ``<unk>`` span row's id.
+type Vocabularies = (HashMap<char, usize>, HashMap<String, usize>, usize);
+
+/// The manifest's character and span tables as name -> id maps, with the
+/// reserved ``<unk>`` span row's id resolved.
+fn vocabularies(manifest: &Manifest, dir: &Path) -> Result<Vocabularies, NeuralError> {
+    let mut emissions = HashMap::with_capacity(manifest.characters.len());
+    for (index, character) in manifest.characters.iter().enumerate() {
+        let mut chars = character.chars();
+        let (Some(character), None) = (chars.next(), chars.next()) else {
+            return Err(NeuralError::ManifestShape {
+                path: dir.to_path_buf(),
+                reason: format!("{character:?} is not one character"),
+            });
+        };
+        emissions.insert(character, index);
+    }
+    let spans: HashMap<String, usize> = manifest
+        .spans
+        .iter()
+        .enumerate()
+        .map(|(id, span)| (span.clone(), id))
+        .collect();
+    let unknown_span = *spans
+        .get("<unk>")
+        .ok_or_else(|| NeuralError::ManifestShape {
+            path: dir.to_path_buf(),
+            reason: "the span table has no reserved <unk> row".to_owned(),
+        })?;
+    Ok((emissions, spans, unknown_span))
+}
+
+/// A span's `span_letters` row: `a`-`z` as 0-25 and `LETTER_PAD` past its
+/// end -- the collator's encoding.
+///
+/// # Errors
+///
+/// If the span is longer than `MAX_SPAN_LETTERS` or holds a byte outside
+/// `a`-`z`.
+fn letter_ids(record: usize, span: &str) -> Result<[i64; MAX_SPAN_LETTERS], NeuralError> {
+    if span.len() > MAX_SPAN_LETTERS {
+        return Err(NeuralError::Malformed {
+            record,
+            reason: format!(
+                "span {span:?} is {} letters; the letter encoding reads at most {MAX_SPAN_LETTERS}",
+                span.len()
+            ),
+        });
+    }
+    let mut letters = [LETTER_PAD; MAX_SPAN_LETTERS];
+    for (slot, byte) in letters.iter_mut().zip(span.bytes()) {
+        if !byte.is_ascii_lowercase() {
+            return Err(NeuralError::Malformed {
+                record,
+                reason: format!("span {span:?} holds byte {byte:#04x}, which is not a letter"),
+            });
+        }
+        *slot = i64::from(byte - b'a');
+    }
+    Ok(letters)
+}
+
 /// The context graph's input names.
 const CONTEXT_INPUTS: &[&str] = &["context_ids", "context_mask"];
 
@@ -826,11 +940,20 @@ const FILL_INPUTS: &[&str] = &[
     "input_ids",
     "attention_mask",
     "span_ids",
+    "span_letters",
     "span_positions",
     "context",
     "context_mask",
     "has_context",
 ];
+
+/// The letter id of a padding slot in `span_letters`: `a`..`z` are 0..25, so
+/// 26 marks a column no letter occupies -- the collator's encoding.
+const LETTER_PAD: i64 = 26;
+
+/// The most letters a span's `span_letters` encoding reads; the collator's
+/// `MAX_SPAN_LETTERS`.
+const MAX_SPAN_LETTERS: usize = 12;
 
 /// `route-a.json`, the fields the run consults; the manifest also records the
 /// training step, the base model and the element types, which the tensor

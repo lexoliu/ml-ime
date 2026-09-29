@@ -37,7 +37,12 @@ from mlime.logging import log
 from mlime.train.charlm import _externalize, _weights_table
 from mlime.train.lexicon import Lexicon
 from mlime.train.model import GatedCrossAttention, RouteAModel
-from mlime.train.samples import DEFAULT_CONTEXT_TOKENS, BaseTokenizer
+from mlime.train.samples import (
+    DEFAULT_CONTEXT_TOKENS,
+    LETTER_PAD,
+    MAX_SPAN_LETTERS,
+    BaseTokenizer,
+)
 from mlime.train.spans import SpanVocab
 
 #: The layout string `route-a.json` carries and `ime-neural` requires.
@@ -149,6 +154,7 @@ class _FillGraph(nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         span_ids: torch.Tensor,
+        span_letters: torch.Tensor,
         span_positions: torch.Tensor,
         context: torch.Tensor,
         context_mask: torch.Tensor,
@@ -156,7 +162,11 @@ class _FillGraph(nn.Module):
     ) -> torch.Tensor:
         model = self.model
         words: torch.Tensor = model.fill.embeddings.word_embeddings(input_ids)
-        embeds = words + model.span_embeddings(span_ids) * span_positions.to(words.dtype)[..., None]
+        embeds = (
+            words
+            + (model.span_embeddings(span_ids) + model.letter_encoder(span_letters))
+            * span_positions.to(words.dtype)[..., None]
+        )
         hidden = _embeddings(model.fill.embeddings, embeds)
         mask = _additive_mask(attention_mask)
         gated = model.gated_layers()
@@ -208,8 +218,9 @@ def export_onnx(
     ``context.onnx`` takes ``context_ids [rows, length]`` and ``context_mask``
     and returns ``context [rows, length, hidden]``. ``fill.onnx`` takes one
     record's readings as ``input_ids``, ``attention_mask``, ``span_ids`` and
-    ``span_positions`` -- all ``[paths, width]`` -- plus ``context`` and
-    ``context_mask`` ``[paths, context_length]`` (the context tower's output
+    ``span_positions`` -- all ``[paths, width]`` -- plus ``span_letters``
+    ``[paths, width, 12]`` (the keys pressed at each span position), ``context``
+    and ``context_mask`` ``[paths, context_length]`` (the context tower's output
     repeated per path, or zeros) and ``has_context [paths]``, and returns
     ``log_probs [paths, width, emissions]``. *quantize* is the same dynamic
     per-channel int8 ``export char-lm`` offers; *context_tokens* is the bound
@@ -220,13 +231,6 @@ def export_onnx(
     """
     if quantize not in (None, "int8"):
         raise ValueError(f"quantize must be 'int8' or None, got {quantize!r}")
-    letter_weight = model.letter_encoder.project.weight
-    if bool((letter_weight != 0).any()):
-        raise ValueError(
-            "this model's letter encoder carries trained weights and the fill graph "
-            "takes no span_letters input; the letter term is part of the decoder-side "
-            "work, not of this export"
-        )
     was_training = model.training
     model = model.eval()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -339,6 +343,7 @@ def _export_graphs(
     input_ids = torch.zeros(paths, width, dtype=torch.long)
     attention_mask = torch.ones(paths, width, dtype=torch.long)
     span_ids = torch.zeros(paths, width, dtype=torch.long)
+    span_letters = torch.full((paths, width, MAX_SPAN_LETTERS), LETTER_PAD, dtype=torch.long)
     span_positions = torch.zeros(paths, width, dtype=torch.bool)
     hidden = int(model.fill.embeddings.word_embeddings.weight.shape[1])
     context = torch.zeros(paths, context_ids.shape[1], hidden)
@@ -352,6 +357,7 @@ def _export_graphs(
                 input_ids,
                 attention_mask,
                 span_ids,
+                span_letters,
                 span_positions,
                 context,
                 fill_context_mask,
@@ -362,6 +368,7 @@ def _export_graphs(
                 "input_ids",
                 "attention_mask",
                 "span_ids",
+                "span_letters",
                 "span_positions",
                 "context",
                 "context_mask",
@@ -372,6 +379,7 @@ def _export_graphs(
                 "input_ids": {0: "paths", 1: "width"},
                 "attention_mask": {0: "paths", 1: "width"},
                 "span_ids": {0: "paths", 1: "width"},
+                "span_letters": {0: "paths", 1: "width"},
                 "span_positions": {0: "paths", 1: "width"},
                 "context": {0: "paths", 1: "context"},
                 "context_mask": {0: "paths", 1: "context"},

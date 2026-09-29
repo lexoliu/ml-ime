@@ -36,7 +36,7 @@ use ime_eval::{EvalRecord, EvalSet, Observation, Report, Slice};
 use ime_lm::CharLm;
 use ime_neural::RouteA;
 use ime_ngram::NgramModel;
-use ime_pinyin::{Lexicon, SegmentOptions, Segmentation, SyllableTable};
+use ime_pinyin::{CorrectionTable, Lexicon, SegmentOptions, Segmentation, SyllableTable};
 use rayon::iter::{
     IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
 };
@@ -227,6 +227,8 @@ fn lattice_paths(
 struct LiveEmissions<'a> {
     /// The towers the export directory loaded into.
     towers: &'a RouteA,
+    /// The typo noise model the run decodes under, when it does.
+    corrections: Option<&'a CorrectionTable>,
     /// The emittable set the lattice's candidates are restricted to.
     emittable: &'a Emittable,
     /// The lexicon `restrict`'s ids name characters through.
@@ -276,7 +278,7 @@ impl Emissions for LiveEmissions<'_> {
             };
             let computed = self
                 .towers
-                .emission(&lattice, self.with_context)
+                .emission(&lattice, self.corrections, self.with_context)
                 .with_context(|| format!("could not score record {record} with the towers"))?;
             self.cache
                 .lock()
@@ -365,6 +367,11 @@ impl Emissions for NeuralEmissions<'_> {
 struct Section {
     emission: &'static str,
     weight: f32,
+    /// The weight this section's candidates paid their correction prior at.
+    typo_weight: f32,
+    /// Whether the run corrected keystrokes; the report shows the prior's
+    /// weight only where it can act.
+    corrections: bool,
     transition: &'static str,
     slice: &'static str,
     /// Whether the weight won a dev sweep rather than being given on the
@@ -406,6 +413,9 @@ struct Reader {
     table: SyllableTable,
     lexicon: Lexicon,
     segment: SegmentOptions,
+    /// The typo noise model, when the run corrects keystrokes: absent, the
+    /// lattice and the candidate masks are exactly the clean path's.
+    corrections: Option<CorrectionTable>,
 }
 
 impl Reader {
@@ -416,7 +426,13 @@ impl Reader {
     /// the engine could not even read is the extreme case of one it got wrong,
     /// so callers score it as unanswered. Every other failure still raises.
     fn read(&self, record: &EvalRecord) -> Result<Option<(Vec<Segmentation>, Candidates)>> {
-        match read(&record.pinyin, &self.table, &self.segment, &self.lexicon) {
+        match read(
+            &record.pinyin,
+            &self.table,
+            &self.segment,
+            self.corrections.as_ref(),
+            &self.lexicon,
+        ) {
             Ok(resolved) => Ok(Some(resolved)),
             Err(crate::engine::BaselineError::Segment {
                 source: ime_pinyin::SegmentError::NoSegmentation { .. },
@@ -440,6 +456,7 @@ pub fn emit_lattice(
     table: SyllableTable,
     lexicon: Lexicon,
     segment: SegmentOptions,
+    corrections: Option<CorrectionTable>,
 ) -> Result<()> {
     let set = load_set(eval_set)?;
     let emittable = load_emittable(emittable, &lexicon)?;
@@ -447,6 +464,7 @@ pub fn emit_lattice(
         table,
         lexicon,
         segment,
+        corrections,
     };
     let file =
         fs::File::create(out).with_context(|| format!("could not create {}", out.display()))?;
@@ -567,6 +585,9 @@ struct Run<'a> {
     emittable_path: &'a Path,
     floor: f32,
     weights: &'a [f32],
+    /// The correction-prior weights the sweep tries; each is one entry in the
+    /// `weight x typo-weight` product a select-on-dev run decodes.
+    typo_weights: &'a [f32],
     slice: &'a SliceArgs,
     beam: &'a BeamOptions,
     /// How many records one `decode_many` call decodes in lockstep. One keeps
@@ -583,6 +604,7 @@ impl<'a> Run<'a> {
         label: &'static str,
         lm_weight: f32,
         weight: f32,
+        typo_weight: f32,
     ) -> Option<ProgressRequest<'_>> {
         self.progress.map(|progress| ProgressRequest {
             dir: progress.dir,
@@ -597,6 +619,7 @@ impl<'a> Run<'a> {
             lm_weight,
             floor: self.floor,
             weight,
+            typo_weight,
             transition: label,
         })
     }
@@ -642,32 +665,14 @@ impl<'a> Run<'a> {
         lockstep: bool,
     ) -> Result<Vec<Section>> {
         let Some((input, emission_label)) = self.source()? else {
-            let request = self.request(label, lm_weight, 0.0);
-            let (report, rows) = measure(
-                self.set,
-                self.slice.slice,
-                self.slice.dev_share,
-                self.reader,
-                &NoEmissions,
-                transition,
-                self.beam,
-                self.batch,
-                lockstep,
-                self.dump,
-                request.as_ref(),
-            )?;
-            return Ok(vec![Section {
-                emission: "none",
-                weight: 0.0,
-                transition: label,
-                slice: self.slice.slice.label(),
-                selected: false,
-                report,
-                rows,
-            }]);
+            return self.transition_only(transition, label, lm_weight, lockstep);
         };
         let emission_cache = Mutex::new(HashMap::new());
-        let measure_at = |which: SliceArg, weight: f32| -> Result<Section> {
+        let measure_at = |which: SliceArg, weight: f32, typo_weight: f32| -> Result<Section> {
+            let beam = BeamOptions {
+                typo_weight,
+                ..(*self.beam).clone()
+            };
             let emissions = match input {
                 SourceInput::File(scores) => Sources::File(NeuralEmissions {
                     scores,
@@ -677,6 +682,7 @@ impl<'a> Run<'a> {
                 }),
                 SourceInput::Live(towers) => Sources::Live(LiveEmissions {
                     towers,
+                    corrections: self.reader.corrections.as_ref(),
                     emittable: self.emittable,
                     lexicon: &self.reader.lexicon,
                     cache: &emission_cache,
@@ -685,7 +691,7 @@ impl<'a> Run<'a> {
                     with_context: self.with_context,
                 }),
             };
-            let request = self.request(label, lm_weight, weight);
+            let request = self.request(label, lm_weight, weight, typo_weight);
             let (report, rows) = measure(
                 self.set,
                 which,
@@ -693,7 +699,7 @@ impl<'a> Run<'a> {
                 self.reader,
                 &emissions,
                 transition,
-                self.beam,
+                &beam,
                 self.batch,
                 lockstep,
                 self.dump,
@@ -702,6 +708,8 @@ impl<'a> Run<'a> {
             Ok(Section {
                 emission: emission_label,
                 weight,
+                typo_weight,
+                corrections: self.reader.corrections.is_some(),
                 transition: label,
                 slice: which.label(),
                 selected: false,
@@ -709,10 +717,19 @@ impl<'a> Run<'a> {
                 rows,
             })
         };
+        // Without the noise model every prior is zero and the sweep is one
+        // entry wide, however many `--typo-weight`s the command line lists.
+        let typo_weights = if self.reader.corrections.is_some() {
+            self.typo_weights
+        } else {
+            &self.typo_weights[..self.typo_weights.len().min(1)]
+        };
         let mut sections = Vec::new();
         if self.slice.select_on_dev {
             for &weight in self.weights {
-                sections.push(measure_at(SliceArg::Dev, weight)?);
+                for &typo_weight in typo_weights {
+                    sections.push(measure_at(SliceArg::Dev, weight, typo_weight)?);
+                }
             }
             let mut winner = 0;
             for (index, section) in sections.iter().enumerate().skip(1) {
@@ -720,15 +737,63 @@ impl<'a> Run<'a> {
                     winner = index;
                 }
             }
-            let mut test = measure_at(SliceArg::Test, sections[winner].weight)?;
+            let mut test = measure_at(
+                SliceArg::Test,
+                sections[winner].weight,
+                sections[winner].typo_weight,
+            )?;
             test.selected = true;
             sections.push(test);
         } else {
             for &weight in self.weights {
-                sections.push(measure_at(self.slice.slice, weight)?);
+                for &typo_weight in typo_weights {
+                    sections.push(measure_at(self.slice.slice, weight, typo_weight)?);
+                }
             }
         }
         Ok(sections)
+    }
+
+    /// The one section a run without emissions produces: the transition alone
+    /// over the requested slice, at the sweep's first prior weight -- the
+    /// `--weight` sweep has no emission term to scale here.
+    fn transition_only<T: Transition + Sync>(
+        &self,
+        transition: &T,
+        label: &'static str,
+        lm_weight: f32,
+        lockstep: bool,
+    ) -> Result<Vec<Section>> {
+        let typo_weight = self.typo_weights.first().copied().unwrap_or(1.0);
+        let beam = BeamOptions {
+            typo_weight,
+            ..(*self.beam).clone()
+        };
+        let request = self.request(label, lm_weight, 0.0, typo_weight);
+        let (report, rows) = measure(
+            self.set,
+            self.slice.slice,
+            self.slice.dev_share,
+            self.reader,
+            &NoEmissions,
+            transition,
+            &beam,
+            self.batch,
+            lockstep,
+            self.dump,
+            request.as_ref(),
+        )?;
+        Ok(vec![Section {
+            emission: "none",
+            weight: 0.0,
+            typo_weight,
+            corrections: self.reader.corrections.is_some(),
+            transition: label,
+            slice: self.slice.slice.label(),
+            selected: false,
+            report,
+            rows,
+        }])
     }
 }
 
@@ -736,8 +801,9 @@ impl<'a> Run<'a> {
 /// both fused.
 ///
 /// Without a score file the run is the n-gram baseline; without an n-gram it is
-/// the emissions alone; with both, every weight in *weights* is one fused
-/// configuration. With `--select-on-dev` the weights are swept on the dev
+/// the emissions alone; with both, every weight in *weights* paired with every
+/// correction-prior weight in *`typo_weights`* is one fused configuration. With
+/// `--select-on-dev` the weights are swept on the dev
 /// slice instead and the report closes with the test slice at whichever weight
 /// scored the highest sentence top-1 there. With *dump* every evaluated
 /// section's beam is written there too, one JSON Lines file per section.
@@ -763,12 +829,14 @@ pub fn fused_eval(
     emittable_path: &Path,
     floor: f32,
     weights: &[f32],
+    typo_weights: &[f32],
     slice: &SliceArgs,
     dump: Option<&Path>,
     progress: Option<&Progress<'_>>,
     table: SyllableTable,
     lexicon: Lexicon,
     segment: SegmentOptions,
+    corrections: Option<CorrectionTable>,
     beam: &BeamOptions,
     batch: usize,
     transition: Models<'_>,
@@ -779,6 +847,7 @@ pub fn fused_eval(
         table,
         lexicon,
         segment,
+        corrections,
     };
     if let Some(dir) = dump {
         fs::create_dir_all(dir)
@@ -798,6 +867,7 @@ pub fn fused_eval(
         emittable_path,
         floor,
         weights,
+        typo_weights,
         slice,
         beam,
         batch,
@@ -1100,6 +1170,8 @@ struct ProgressRequest<'a> {
     floor: f32,
     /// The emission weight this call decodes at.
     weight: f32,
+    /// The correction-prior weight this call decodes at.
+    typo_weight: f32,
     /// The transition's label in the report.
     transition: &'static str,
 }
@@ -1128,6 +1200,9 @@ struct Name {
     lm: Option<PathBuf>,
     slice: String,
     weight: f32,
+    /// The correction-prior weight the decode ran at; part of the name so a
+    /// sweep's files stay distinct.
+    typo_weight: f32,
     transition: String,
 }
 
@@ -1147,6 +1222,8 @@ struct Key {
     max_paths: usize,
     /// Whether a lone initial may stand for a syllable.
     allow_abbreviation: bool,
+    /// Whether the lattice corrected keystrokes against the typo noise model.
+    corrections: bool,
     /// Whether a trailing half-typed syllable is accepted.
     incomplete_tail: bool,
     /// The flat cost of one more character position.
@@ -1460,12 +1537,14 @@ where
             lm: progress.lm.map(Path::to_owned),
             slice: slice.label().to_owned(),
             weight: progress.weight,
+            typo_weight: progress.typo_weight,
             transition: progress.transition.to_owned(),
         },
         lm_weight: progress.lm_weight,
         floor: progress.floor,
         max_paths: reader.segment.max_paths,
         allow_abbreviation: reader.segment.allow_abbreviation,
+        corrections: reader.corrections.is_some(),
         incomplete_tail: reader.segment.allow_incomplete_tail,
         segment_cost: reader.segment.segment_cost,
         ambiguity_weight: reader.segment.ambiguity_weight,
@@ -1579,9 +1658,14 @@ fn fold_journal(
 ///
 /// If the file cannot be created or written.
 fn write_dump(dir: &Path, section: &Section) -> Result<()> {
+    let typo_weight = if section.corrections {
+        format!("-t{:.3}", section.typo_weight)
+    } else {
+        String::new()
+    };
     let path = dir.join(format!(
-        "{}-w{:.3}-{}-{}.jsonl",
-        section.emission, section.weight, section.transition, section.slice
+        "{}-w{:.3}{}-{}-{}.jsonl",
+        section.emission, section.weight, typo_weight, section.transition, section.slice
     ));
     let file =
         fs::File::create(&path).with_context(|| format!("could not create {}", path.display()))?;
@@ -1792,6 +1876,7 @@ mod tests {
                 SyllableTable::load(),
                 self.lexicon(),
                 segment(),
+                None,
             )
             .expect("the lattice emits");
             let source = fs::read_to_string(&lattice).expect("the lattice reads");
@@ -1840,6 +1925,7 @@ mod tests {
                 &self.emittable,
                 -30.0,
                 weights,
+                &[1.0],
                 &SliceArgs {
                     slice: SliceArg::All,
                     dev_share,
@@ -1850,6 +1936,7 @@ mod tests {
                 SyllableTable::load(),
                 self.lexicon(),
                 segment(),
+                None,
                 &BeamOptions {
                     beam_width: NonZeroUsize::new(16).expect("16 is not zero"),
                     ..BeamOptions::default()
