@@ -34,7 +34,6 @@ from typing import Any, ClassVar
 
 import torch
 from torch import nn
-from torch.nn.utils.rnn import pad_sequence
 from transformers import BertConfig, BertForMaskedLM, BertModel
 
 from mlime.train.charlm_model import Block, CharLmConfig, TransformerCharLm
@@ -49,10 +48,11 @@ from mlime.train.model import (
 )
 from mlime.train.samples import IGNORE_INDEX, Batch
 
-#: Decoder-side parameter name prefixes that train at the higher learning rate.
+#: Decoder-side parameter name prefixes that train at the higher learning rate,
+#: plus the encoder's letter encoder, which no earlier checkpoint carries.
 #: The towers, the span table, the context gates and the reader all arrive
 #: trained; only the span-input projection and the cross-attention are new.
-NEW_PARAMETER_PREFIXES = ("decoder.span_input", "decoder.cross_attention")
+NEW_PARAMETER_PREFIXES = ("decoder.span_input", "decoder.cross_attention", "letter_encoder")
 
 
 def _default_reader() -> CharLmConfig:
@@ -194,15 +194,12 @@ class Decoder(nn.Module):
 
     reader: TransformerCharLm
     emit_ids: torch.Tensor
-    span_candidates: torch.Tensor
-    span_candidate_counts: torch.Tensor
 
     def __init__(
         self,
         reader: TransformerCharLm,
         encoder_width: int,
         emit_ids: torch.Tensor,
-        candidate_mask: torch.Tensor,
     ):
         super().__init__()
         if emit_ids.numel() == 0:
@@ -216,20 +213,10 @@ class Decoder(nn.Module):
             EncoderAttention(reader.config, encoder_width) for _ in reader.layers()
         )
         self.register_buffer("emit_ids", emit_ids, persistent=True)
-        # The per-span homophone lists the decode and the score frame restrict
-        # to: the lexicon mask's rows unrolled into a padded id table, so a
-        # position's candidates are one index_select away rather than a masked
-        # walk over the whole emittable set.
-        rows = [row.nonzero(as_tuple=True)[0] for row in candidate_mask]
-        counts = candidate_mask.sum(dim=1)
-        if not rows or int(counts.max()) == 0:
-            raise ValueError("the lexicon admits no characters at all")
-        self.register_buffer(
-            "span_candidates",
-            pad_sequence(rows, batch_first=True, padding_value=0),
-            persistent=True,
-        )
-        self.register_buffer("span_candidate_counts", counts, persistent=True)
+        # The per-position candidate lists the decode and the score frame
+        # restrict to travel with the batch itself: a typoed span admits the
+        # union of its corrections' homophones, a set no span-table row can
+        # name, so the collator writes the lists and the decoder reads them.
 
     def gated_layers(self) -> list[EncoderAttention]:
         """The cross-attention layers, narrowed out of the untyped module list."""
@@ -345,9 +332,8 @@ class _Scored:
 
     ``decoder`` and ``encoder`` are ``[P, E]`` rows at the scored positions;
     ``candidates`` is the ``[P, E]`` mask the restriction applies on both, and
-    ``targets`` the ``[P]`` emission ids. ``region`` and ``span_ids`` keep the
-    scored positions' coordinates in span-column space for the ``scores``
-    frame.
+    ``targets`` the ``[P]`` emission ids. ``region`` keeps the scored
+    positions' coordinates in span-column space for the ``scores`` frame.
     """
 
     decoder: torch.Tensor
@@ -355,7 +341,6 @@ class _Scored:
     candidates: torch.Tensor
     targets: torch.Tensor
     region: torch.Tensor
-    span_ids: torch.Tensor
 
 
 class E2EModel(RouteAModel):
@@ -386,7 +371,7 @@ class E2EModel(RouteAModel):
     ):
         super().__init__(fill, context, lexicon, config)
         self.e2e_config = config
-        self.decoder = Decoder(reader, fill.config.hidden_size, emit_ids, lexicon.candidate_mask)
+        self.decoder = Decoder(reader, fill.config.hidden_size, emit_ids)
 
     @classmethod
     def compose(
@@ -418,13 +403,22 @@ class E2EModel(RouteAModel):
 
         The towers, the span table, the context gates and the reader all arrive
         trained; only the span-input projection and the decoder's
-        cross-attention are new.
+        cross-attention are new. The letter encoder trails the group so a
+        checkpoint that predates it resumes with its saved states landing on
+        the parameters they were trained beside.
         """
         base: list[nn.Parameter] = []
         new: list[nn.Parameter] = []
+        letters: list[nn.Parameter] = []
         for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if name.startswith("letter_encoder"):
+                letters.append(parameter)
+                continue
             target = new if name.startswith(NEW_PARAMETER_PREFIXES) else base
             target.append(parameter)
+        new += letters
         if not new:
             raise ValueError("no new parameters found; the naming convention has drifted")
         return [{"params": base, "lr": base_lr}, {"params": new, "lr": new_lr}]
@@ -444,7 +438,7 @@ class E2EModel(RouteAModel):
         ``batch.scored`` from the collator, so nothing here waits on the device:
         no ``nonzero``, no mask-indexing, no boolean read back to the host.
         ``targets`` and ``candidates`` are shared by the two heads; ``region``
-        and ``scored_span_ids`` index the span-column space for ``scores``.
+        indexes the span-column space for ``scores``.
         ``None`` when the batch holds no scored position.
         """
         decoder = self.decoder
@@ -481,8 +475,7 @@ class E2EModel(RouteAModel):
         # positions sit inside those columns is the collator's checked
         # invariant, not something a step may afford to verify.
         region = (positions // width) * (width - 2) + columns - 1
-        scored_span_ids = batch.span_ids.reshape(-1).index_select(0, positions)
-        candidates = self.candidate_mask.index_select(0, scored_span_ids)
+        candidates = self.candidates_at(batch, positions)
         scored_targets = batch.targets.reshape(-1).index_select(0, positions)
 
         reader = decoder.reader
@@ -500,7 +493,6 @@ class E2EModel(RouteAModel):
             candidates=candidates,
             targets=scored_targets,
             region=region,
-            span_ids=scored_span_ids,
         )
 
     def forward(self, batch: Batch) -> RouteAOutput:
@@ -535,22 +527,23 @@ class E2EModel(RouteAModel):
     def scores(self, batch: Batch) -> torch.Tensor:
         """The ``[B, W, K]`` candidate frame, for the eval-side callers.
 
-        A row's columns are that position's candidate list
-        (``span_candidates[span_id]``), padded at the dtype's minimum;
+        A row's columns are that position's candidate list from the batch
+        itself (``candidate_ids``), padded at the dtype's minimum;
         ``predictions`` maps an argmax back to its emission index. A position
         no span was typed at keeps the floor.
         """
         scored = self._scored(batch)
         width = batch.targets.shape[1]
-        k = self.decoder.span_candidates.shape[1]
+        ids = batch.candidate_ids[:, 1 : width - 1]
+        counts = batch.candidate_counts[:, 1 : width - 1]
+        k = ids.shape[-1]
         weight = self.head.decoder.weight
         floor = torch.finfo(weight.dtype).min
         frame = weight.new_full((batch.size, width, k), floor)
         if scored is not None:
-            ids = self.decoder.span_candidates.index_select(0, scored.span_ids)
-            gathered = scored.decoder.gather(1, ids)
-            counts = self.decoder.span_candidate_counts.index_select(0, scored.span_ids)
-            within = torch.arange(k, device=ids.device).unsqueeze(0) < counts.unsqueeze(1)
+            gathered = scored.decoder.gather(1, ids.reshape(-1, k).index_select(0, scored.region))
+            counts_here = counts.reshape(-1).index_select(0, scored.region)
+            within = torch.arange(k, device=ids.device).unsqueeze(0) < counts_here.unsqueeze(1)
             flat = frame.new_full((batch.size * (width - 2), k), floor)
             flat[scored.region] = gathered.masked_fill(~within, floor)
             frame[:, 1 : width - 1] = flat.view(batch.size, width - 2, -1)
@@ -561,9 +554,8 @@ class E2EModel(RouteAModel):
 
         ``logits`` is the ``[B, W, K]`` frame :meth:`scores` fills, each row
         scored over that position's own candidate list; the argmax's index
-        selects the emission id out of ``span_candidates[span_id]``.
+        selects the emission id out of the batch's ``candidate_ids``.
         """
-        candidates = self.decoder.span_candidates.index_select(0, batch.span_ids.reshape(-1))
-        candidates = candidates.reshape(*batch.span_ids.shape, -1)
+        candidates = batch.candidate_ids
         best = candidates.gather(-1, logits.argmax(dim=-1, keepdim=True)).squeeze(-1)
         return best.masked_fill(batch.targets == IGNORE_INDEX, IGNORE_INDEX)

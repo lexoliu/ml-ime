@@ -19,7 +19,7 @@ import torch
 from transformers import BertConfig
 
 from mlime.train.arbitration import ReadingArbitration
-from mlime.train.lexicon import Lexicon
+from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.loop import (
     PHASES,
     Accuracy,
@@ -102,7 +102,7 @@ def test_the_loss_falls_and_the_run_leaves_its_evidence(
         seed=3,
     )
     out_dir = tmp_path / "run"
-    collator = Collator(tokenizer, lexicon.candidate_mask)
+    collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
     metrics_path = train(model, [(stream, collator)], config, out_dir).metrics
 
     records = [json.loads(line) for line in metrics_path.read_text().splitlines()]
@@ -129,7 +129,7 @@ def test_the_schedule_reaches_both_learning_rates(
     model = RouteAModel.from_config(TINY, lexicon, RouteAConfig(cross_attention_layers=1))
     stream = CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, arbitration))
     config = TrainingConfig(max_steps=25, token_budget=64, log_every=1, fp16=False)
-    collator = Collator(tokenizer, lexicon.candidate_mask)
+    collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
     metrics_path = train(model, [(stream, collator)], config, tmp_path / "run").metrics
     steps = [
         json.loads(line)
@@ -156,7 +156,13 @@ def test_accuracy_is_reported_with_and_without_context(
     assert examples
     for with_context in (True, False):
         accuracy = evaluate(
-            model, examples, tokenizer, torch.device("cpu"), 512, with_context=with_context
+            model,
+            examples,
+            tokenizer,
+            torch.device("cpu"),
+            512,
+            with_context=with_context,
+            candidates=CandidateSpace(spans, lexicon.candidate_mask),
         )
         assert accuracy.scored == sum(len(example) for example in examples)
         assert 0.0 <= accuracy.rate <= 1.0
@@ -197,7 +203,7 @@ def stream_and_collator(
     samples_dir, labels_dir = corpus
     return (
         CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, arbitration, seed=1)),
-        Collator(tokenizer, lexicon.candidate_mask),
+        Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)),
     )
 
 
@@ -697,7 +703,7 @@ def _rank_lanes(
                 rank=first_rank + index,
                 world_size=2,
             ),
-            Collator(tokenizer, lexicon.candidate_mask),
+            Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)),
         )
         for index in range(count)
     ]

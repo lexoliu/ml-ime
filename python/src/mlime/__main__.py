@@ -463,6 +463,11 @@ def train_e2e(
     aux_weight: float = typer.Option(
         0.3, help="Weight of the encoder head's loss inside the total"
     ),
+    typos: bool = typer.Option(
+        False,
+        "--typos/--no-typos",
+        help="Corrupt the typed keystrokes with the shared noise model, per its authored rate",
+    ),
     max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
     token_budget: int = TOKEN_BUDGET,
     base_lr: float = typer.Option(3e-5, help="Learning rate for the pretrained weights"),
@@ -536,6 +541,7 @@ def train_e2e(
     from mlime.train.e2e import e2e
     from mlime.train.loop import TrainingConfig
     from mlime.train.run import describe_device
+    from mlime.train.samples import Augmentation
 
     typer.echo(f"device: {describe_device()}")
     try:
@@ -565,6 +571,7 @@ def train_e2e(
             init_encoder=init_encoder,
             init_decoder=init_decoder,
             aux_weight=aux_weight,
+            augmentation=Augmentation(typos=typos),
             resume=resume,
             activation_checkpointing=activation_checkpointing,
             run_config=run_config,

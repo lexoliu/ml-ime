@@ -41,6 +41,7 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 from mlime.logging import log
+from mlime.train.lexicon import CandidateSpace
 from mlime.train.model import RouteAConfig, RouteAModel, count_correct
 from mlime.train.samples import (
     BaseTokenizer,
@@ -448,6 +449,44 @@ class Prefetcher(Iterator[Produced]):
         self._thread.join(timeout=10)
 
 
+def _load_resumed_optimiser(
+    optimiser: torch.optim.AdamW, saved: dict[str, Any], path: Path
+) -> None:
+    """Load a checkpointed optimiser state, padding groups the model has since grown.
+
+    A checkpoint written before the letter encoder existed saves a
+    new-parameter group without its entries. ``load_state_dict`` insists the
+    saved and current groups be the same length, so the saved group's id list
+    is padded with fresh ids: they map onto the trailing parameters the saved
+    file never had state for, which is what the letter parameters arriving at
+    zero momentum means. The padding only lines up because
+    ``parameter_groups`` appends the letter encoder last inside its group; a
+    group that grew anywhere else is a drifted checkpoint and is refused.
+    """
+    patched = {
+        "param_groups": [
+            dict(group, params=list(group["params"])) for group in saved["param_groups"]
+        ],
+        "state": dict(saved["state"]),
+    }
+    spare = max(
+        (identifier for group in saved["param_groups"] for identifier in group["params"]),
+        default=-1,
+    )
+    for index, (group, stored) in enumerate(
+        zip(optimiser.param_groups, patched["param_groups"], strict=True)
+    ):
+        extra = len(group["params"]) - len(stored["params"])
+        if extra < 0:
+            raise ValueError(
+                f"{path}'s optimiser group {index} holds {len(stored['params'])} parameters "
+                f"against this model's {len(group['params'])}; the checkpoint does not fit"
+            )
+        stored["params"] += list(range(spare + 1, spare + 1 + extra))
+        spare += extra
+    optimiser.load_state_dict(patched)
+
+
 #: Steps a profiling run leaves unmeasured first, so the phase table describes
 #: the loop at cruising speed rather than at cold caches and lazy imports.
 PROFILE_WARMUP_STEPS = 10
@@ -771,6 +810,7 @@ def evaluate(
     device: torch.device,
     token_budget: int,
     with_context: bool,
+    candidates: CandidateSpace,
 ) -> Accuracy:
     """Masked-character accuracy over *examples*, with the context on or off.
 
@@ -780,7 +820,7 @@ def evaluate(
     route = unwrap(model)
     collator = Collator(
         tokenizer,
-        route.candidate_mask,
+        candidates,
         context_dropout=0.0 if with_context else 1.0,
     )
     correct = scored = 0
@@ -852,7 +892,7 @@ def train(
         else None
     )
     if resumed is not None:
-        model.load_state_dict(resumed.model)
+        model.load_resumed(resumed.model, resumed.path)
     trained: nn.Module = model
     if world.world_size > 1:
         trained = DistributedDataParallel(
@@ -912,7 +952,7 @@ def train(
 
     step = 0
     if resumed is not None:
-        optimiser.load_state_dict(resumed.optimiser)
+        _load_resumed_optimiser(optimiser, resumed.optimiser, resumed.path)
         scheduler.load_state_dict(resumed.scheduler)
         scaler.load_state_dict(resumed.scaler)
         step = resumed.step

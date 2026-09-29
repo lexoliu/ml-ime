@@ -37,7 +37,7 @@ from mlime.train.e2e_eval import (
 )
 from mlime.train.e2e_model import E2EConfig, E2EModel, emittable_ids
 from mlime.train.emit import CandidateIndex, LatticePath, LatticeRecord
-from mlime.train.lexicon import Lexicon, build_lexicon
+from mlime.train.lexicon import CandidateSpace, Lexicon, build_lexicon
 from mlime.train.loop import TrainingConfig, train
 from mlime.train.model import RouteAConfig, RouteAModel, restricted_cross_entropy
 from mlime.train.samples import (
@@ -111,7 +111,7 @@ def test_the_emission_logits_have_the_frame_route_a_uses(
     e2e_config: E2EConfig,
 ) -> None:
     model = tiny_e2e(lexicon, reader_vocab, e2e_config).eval()
-    batch = Collator(tokenizer, lexicon.candidate_mask)(
+    batch = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
         [example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing"))]
     )
     with torch.no_grad():
@@ -119,7 +119,7 @@ def test_the_emission_logits_have_the_frame_route_a_uses(
         frame = model.scores(batch)
     # The frame's last axis is the position's own candidate list: its columns
     # count is the widest span's, not the emittable alphabet's.
-    assert frame.shape == (1, batch.input_ids.shape[1], model.decoder.span_candidates.shape[1])
+    assert frame.shape == (1, batch.input_ids.shape[1], batch.candidate_ids.shape[2])
     assert output.loss is not None and output.loss.ndim == 0
     assert set(output.extras) == {"decoder_loss", "encoder_loss"}
     scored = batch.targets != IGNORE_INDEX
@@ -139,7 +139,7 @@ def test_the_vectorised_loss_is_the_masked_full_vocabulary_loss(
 ) -> None:
     """forward()'s [P, E] losses equal restricted CE on wide logits."""
     model = tiny_e2e(lexicon, reader_vocab, e2e_config).eval()
-    batch = Collator(tokenizer, lexicon.candidate_mask)(
+    batch = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
         [
             example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing")),
             example(spans, lexicon, "钟爱北京", ("zhong", "ai", "bei", "jing")),
@@ -193,7 +193,7 @@ def test_with_zero_gates_the_decoder_is_the_reader(
     reader = TransformerCharLm(len(reader_vocab), READER_TINY).eval()
     reader.load_state_dict(model.decoder.reader.state_dict())
 
-    batch = Collator(tokenizer, lexicon.candidate_mask)(
+    batch = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
         [example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing"))]
     )
     with torch.no_grad():
@@ -210,9 +210,8 @@ def test_with_zero_gates_the_decoder_is_the_reader(
         frame = model.scores(batch)
         floor = torch.finfo(frame.dtype).min
         for position in range(targets.shape[1]):
-            span = int(batch.span_ids[0, position + 1])
-            count = int(model.decoder.span_candidate_counts[span])
-            cand_ids = model.decoder.span_candidates[span, :count]
+            count = int(batch.candidate_counts[0, position + 1])
+            cand_ids = batch.candidate_ids[0, position + 1, :count]
             wanted = reader_logits[0, position].index_select(0, emit.index_select(0, cand_ids))
             got = frame[0, position + 1]
             # Raw equality over the position's candidates, and therefore
@@ -244,7 +243,7 @@ def test_with_zero_gates_the_encoder_is_route_a(
     assert result.unexpected_keys == []
     assert all(name.startswith("decoder.") for name in result.missing_keys)
 
-    batch = Collator(tokenizer, lexicon.candidate_mask)(
+    batch = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
         [example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing"))]
     )
     with torch.no_grad():
@@ -266,7 +265,7 @@ def test_the_step_path_matches_the_teacher_forced_path(
         cross.gate.data.fill_(0.25)
     decoder.span_input.weight.data.normal_(0, 0.1)
 
-    batch = Collator(tokenizer, lexicon.candidate_mask)(
+    batch = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
         [example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing"))]
     )
     with torch.no_grad():
@@ -283,9 +282,10 @@ def test_the_step_path_matches_the_teacher_forced_path(
         features = decoder(tokens, spans_v.unsqueeze(0), mask.unsqueeze(0))
         # Per position the two paths agree over that span's candidates.
         candidates = [
-            decoder.span_candidates[
-                int(batch.span_ids[0, position + 1]),
-                : int(decoder.span_candidate_counts[int(batch.span_ids[0, position + 1])]),
+            batch.candidate_ids[
+                0,
+                position + 1,
+                : int(batch.candidate_counts[0, position + 1]),
             ]
             for position in range(n)
         ]
@@ -327,7 +327,7 @@ def test_two_records_overfit_to_near_zero_loss(
     e2e_config: E2EConfig,
 ) -> None:
     model = tiny_e2e(lexicon, reader_vocab, e2e_config).train()
-    collator = Collator(tokenizer, lexicon.candidate_mask)
+    collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
     batch = collator(
         [
             example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing")),
@@ -398,7 +398,7 @@ def test_an_overfit_model_resolves_the_pronoun(spans: SpanVocab, tmp_path: Path)
     vocab = CharVocab(chars=SPECIALS + tuple(lexicon.characters))
     model = tiny_e2e(lexicon, vocab, E2EConfig(cross_attention_layers=1, decoder=READER_TINY))
     tokenizer = StubTokenizer()
-    collator = Collator(tokenizer, lexicon.candidate_mask)
+    collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
     batch = collator(
         [
             TrainingExample(
@@ -439,7 +439,7 @@ def test_decode_returns_ranked_hypotheses_within_top_k(
     e2e_config: E2EConfig,
 ) -> None:
     model = tiny_e2e(lexicon, reader_vocab, e2e_config).eval()
-    collator = Collator(tokenizer, lexicon.candidate_mask)
+    collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
     record = LatticeRecord(
         record=0,
         pinyin="woaibeijing",
@@ -547,7 +547,7 @@ def test_a_resumed_e2e_run_is_the_run_that_was_not_interrupted(
     stream = CorpusStream(
         short_corpus[0], short_corpus[1], SampleBuilder(lexicon, spans, arbitration, seed=1)
     )
-    collator = Collator(tokenizer, lexicon.candidate_mask)
+    collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
     whole = train(uninterrupted, [(stream, collator)], resumable, whole_dir).metrics
     checkpoint = torch.load(whole_dir / "checkpoint-000003.pt", weights_only=False)
     assert "e2e" in checkpoint and "route_a" not in checkpoint
@@ -559,7 +559,7 @@ def test_a_resumed_e2e_run_is_the_run_that_was_not_interrupted(
     )
     resumed = train(
         resumed_model,
-        [(stream, Collator(tokenizer, lexicon.candidate_mask))],
+        [(stream, Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)))],
         resumable,
         tmp_path / "resumed",
         resume=whole_dir / "checkpoint-000003.pt",
@@ -586,7 +586,7 @@ def test_a_resumed_e2e_run_is_the_run_that_was_not_interrupted(
     )
     train(
         route,
-        [(stream, Collator(tokenizer, lexicon.candidate_mask))],
+        [(stream, Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)))],
         resumable,
         tmp_path / "route-a",
     )
@@ -600,7 +600,7 @@ def test_a_resumed_e2e_run_is_the_run_that_was_not_interrupted(
                         short_corpus[1],
                         SampleBuilder(lexicon, spans, arbitration, seed=1),
                     ),
-                    Collator(tokenizer, lexicon.candidate_mask),
+                    Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)),
                 )
             ],
             resumable,
@@ -686,7 +686,7 @@ def test_a_training_step_issues_no_host_syncs(
 ) -> None:
     """set_sync_debug_mode("error") fails the test if forward or backward syncs."""
     model = tiny_e2e(lexicon, reader_vocab, e2e_config).cuda()
-    batch = Collator(tokenizer, lexicon.candidate_mask)(
+    batch = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
         [
             example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing")),
             example(spans, lexicon, "钟爱北京", ("zhong", "ai", "bei", "jing")),
@@ -720,7 +720,7 @@ def test_compiling_changes_no_checkpoint_or_parameter_names(
     compile_modules(model, "default")
     assert list(model.state_dict()) == keys_before
     assert [name for name, _ in model.named_parameters()] == params_before
-    batch = Collator(tokenizer, lexicon.candidate_mask)(
+    batch = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
         [example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing"))]
     )
     compiled = model(batch).loss
@@ -745,7 +745,7 @@ def test_the_prefilled_masks_skip_the_builder(
     the same mask the builder would have made -- ``True`` attends.
     """
     model = tiny_e2e(lexicon, reader_vocab, e2e_config).eval()
-    batch = Collator(tokenizer, lexicon.candidate_mask)(
+    batch = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
         [example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing"))]
     )
     embeddings = model.fill.embeddings(inputs_embeds=model._fill_inputs(batch))
@@ -802,7 +802,7 @@ def test_the_first_compile_is_already_dynamic(
     model.decoder.forward = torch.compile(  # type: ignore[method-assign]
         model.decoder.forward, dynamic=True, backend="eager"
     )
-    collator = Collator(tokenizer, lexicon.candidate_mask)
+    collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
     batches = [
         collator([example(spans, lexicon, text, pinyin)])
         for text, pinyin in (

@@ -38,7 +38,7 @@ from mlime.train.charlm_vocab import BOS
 from mlime.train.e2e import load_model
 from mlime.train.e2e_model import E2EModel
 from mlime.train.emit import CandidateIndex, LatticeRecord, examples_for, read_lattice
-from mlime.train.lexicon import Lexicon
+from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.model import mark_dynamic
 from mlime.train.samples import (
     DEFAULT_CONTEXT_TOKENS,
@@ -285,7 +285,7 @@ def evaluate(
     model, step = load_model(checkpoint, lexicon, device)
     collator = Collator(
         tokenizer,
-        lexicon.candidate_mask,
+        CandidateSpace(spans, lexicon.candidate_mask),
         context_dropout=0.0 if with_context else 1.0,
         max_context_tokens=max_context_tokens,
     )

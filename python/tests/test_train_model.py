@@ -19,7 +19,7 @@ from transformers import BertConfig
 
 from mlime.data.corpus import Sample
 from mlime.train.arbitration import ReadingArbitration
-from mlime.train.lexicon import Lexicon
+from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.model import (
     RouteAConfig,
     RouteAModel,
@@ -70,7 +70,9 @@ def make_batch_fixture(
         ]
         kept = [example for example in examples if example is not None]
         assert len(kept) == 2
-        return Collator(tokenizer, lexicon.candidate_mask, context_dropout=0.0)(kept)
+        return Collator(
+            tokenizer, CandidateSpace(spans, lexicon.candidate_mask), context_dropout=0.0
+        )(kept)
 
     return build
 
@@ -208,8 +210,12 @@ def test_the_new_parameters_are_the_ones_we_added(model: RouteAModel) -> None:
     assert base["lr"] == 3e-5
     assert new["lr"] == 1e-4
     added = sum(parameter.numel() for parameter in new["params"])
-    expected = model.span_embeddings.weight.numel() + sum(
-        parameter.numel() for layer in model.gated_layers() for parameter in layer.parameters()
+    expected = (
+        model.span_embeddings.weight.numel()
+        + sum(parameter.numel() for parameter in model.letter_encoder.parameters())
+        + sum(
+            parameter.numel() for layer in model.gated_layers() for parameter in layer.parameters()
+        )
     )
     assert added == expected
 

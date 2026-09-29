@@ -29,7 +29,7 @@ from mlime.train.emit import (
     read_lattice,
     score_chunk,
 )
-from mlime.train.lexicon import Lexicon
+from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.model import RouteAConfig, RouteAModel
 from mlime.train.samples import BaseTokenizer, Collator
 from mlime.train.spans import SpanVocab
@@ -134,7 +134,7 @@ def test_the_scores_come_back_in_the_order_the_lattice_asked(
     asked = record()
     scored = score_chunk(
         model,
-        Collator(tokenizer, lexicon.candidate_mask, context_dropout=0.0),
+        Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask), context_dropout=0.0),
         CandidateIndex(lexicon),
         [asked],
         spans,
@@ -147,7 +147,7 @@ def test_the_scores_come_back_in_the_order_the_lattice_asked(
     assert len(paths) == 1
     assert [len(position) for position in paths[0]] == [3, 1]
 
-    batch = Collator(tokenizer, lexicon.candidate_mask, context_dropout=0.0)(
+    batch = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask), context_dropout=0.0)(
         [example for _, example in examples_for(asked, spans)]
     )
     with torch.no_grad():
@@ -166,7 +166,7 @@ def test_a_position_with_nothing_emittable_is_scored_as_an_empty_row(
 ) -> None:
     scored = score_chunk(
         model,
-        Collator(tokenizer, lexicon.candidate_mask, context_dropout=0.0),
+        Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask), context_dropout=0.0),
         CandidateIndex(lexicon),
         [record(candidates=("", "我"))],
         spans,

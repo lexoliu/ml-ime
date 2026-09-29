@@ -19,7 +19,7 @@ import pytest
 import torch
 from transformers import BertConfig
 
-from mlime.train.lexicon import Lexicon
+from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.model import RouteAConfig, RouteAModel
 from mlime.train.routea import LAYOUT, export_onnx
 from mlime.train.samples import BaseTokenizer, Collator, TrainingExample
@@ -121,17 +121,20 @@ def test_exported_graphs_reproduce_torch(
     export_onnx(model, 7, lexicon, spans, tokenizer, tmp_path)
 
     for dropout, context in ((0.0, "北京大学"), (1.0, "北京大学"), (0.0, None)):
-        batch = Collator(tokenizer, lexicon.candidate_mask, context_dropout=dropout)(
-            _examples(spans, context)
-        )
+        batch = Collator(
+            tokenizer, CandidateSpace(spans, lexicon.candidate_mask), context_dropout=dropout
+        )(_examples(spans, context))
         got = _run_fill(tmp_path, batch)
         expected = _restricted_log_probs(model, batch).numpy()
         np.testing.assert_allclose(got, expected, atol=1e-4, rtol=1e-4)
 
     # A different batch width and a longer context exercise the dynamic axes.
-    batch = Collator(tokenizer, lexicon.candidate_mask, context_dropout=0.0, max_context_tokens=16)(
-        _examples(spans, "北京" * 10)[:1]
-    )
+    batch = Collator(
+        tokenizer,
+        CandidateSpace(spans, lexicon.candidate_mask),
+        context_dropout=0.0,
+        max_context_tokens=16,
+    )(_examples(spans, "北京" * 10)[:1])
     got = _run_fill(tmp_path, batch)
     expected = _restricted_log_probs(model, batch).numpy()
     np.testing.assert_allclose(got, expected, atol=1e-4, rtol=1e-4)
@@ -189,7 +192,7 @@ def test_int8_export_tracks_fp32(
     """The quantized graphs load in onnxruntime and stay within the int8 bound."""
     export_onnx(model, 7, lexicon, spans, tokenizer, tmp_path / "fp32")
     export_onnx(model, 7, lexicon, spans, tokenizer, tmp_path / "int8", quantize="int8")
-    batch = Collator(tokenizer, lexicon.candidate_mask, context_dropout=0.0)(
+    batch = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask), context_dropout=0.0)(
         _examples(spans, "北京大学")
     )
     np.testing.assert_allclose(

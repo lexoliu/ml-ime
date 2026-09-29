@@ -52,11 +52,21 @@ from mlime.data.text import HAN
 from mlime.logging import log
 from mlime.train.arbitration import ReadingArbitration
 from mlime.train.labels import keyboard_form
-from mlime.train.lexicon import Lexicon
+from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.spans import SpanVocab, initial
+from mlime.typo import NoiseModel
 
 #: Loss is not taken at padding or at the two sentinel positions.
 IGNORE_INDEX = -100
+
+#: The letter id of a padding slot in ``span_letters``: ``a``..``z`` are 0..25,
+#: so 26 marks a column no letter occupies.
+LETTER_PAD = 26
+
+#: The most letters a span's encoding reads. The longest syllable is six and a
+#: corruption can stretch a bound by at most the four edits the model can draw,
+#: so twelve never truncates real input.
+MAX_SPAN_LETTERS = 12
 
 #: The three typing styles, in the order their probabilities are given.
 STYLES = ("full", "abbreviated", "mixed")
@@ -90,18 +100,24 @@ class Augmentation:
 
     The defaults are milestone 3's plan verbatim. They are a dataclass rather
     than constants so an ablation is a different value, not a different branch.
+    ``typos`` is a switch, not a rate: on, the keystrokes the styles produce
+    pass through the shared noise model, whose own per-sentence coin decides
+    each example.
     """
 
     full: float = 0.55
     abbreviated: float = 0.25
     mixed: float = 0.20
     abbreviate_syllable: float = 0.7
+    typos: bool = False
 
     def __post_init__(self) -> None:
         total = self.full + self.abbreviated + self.mixed
         if abs(total - 1.0) > 1e-9:
             raise ValueError(f"the style probabilities must sum to 1, got {total}")
         for name, value in vars(self).items():
+            if isinstance(value, bool):
+                continue
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be a probability, got {value}")
 
@@ -212,7 +228,9 @@ class SampleBuilder:
     The arbitration table is passed in rather than loaded here, because it is one
     of the things a run is made of -- like the lexicon and the span inventory --
     and a builder that loaded its own could differ from the one the provenance
-    record describes.
+    record describes. *noise* is the shared typo model the ``typos`` switch
+    expects: a builder told to corrupt without it is a wiring bug, not a quiet
+    clean pass, and so is a noise model handed in beside the switch off.
     """
 
     def __init__(
@@ -222,11 +240,23 @@ class SampleBuilder:
         arbitration: ReadingArbitration,
         augmentation: Augmentation | None = None,
         seed: int = 0,
+        noise: NoiseModel | None = None,
+        candidates: CandidateSpace | None = None,
     ):
         self.lexicon = lexicon
         self.spans = spans
         self.arbitration = arbitration
         self.augmentation = augmentation or Augmentation()
+        has_noise = noise is not None
+        has_table = candidates is not None and candidates.table is not None
+        if has_noise != self.augmentation.typos or has_table != self.augmentation.typos:
+            raise ValueError(
+                "the typo noise model, the widened candidate space and "
+                "augmentation.typos must come together; "
+                f"got noise={has_noise}, table={has_table}, typos={self.augmentation.typos}"
+            )
+        self.noise = noise
+        self.candidates = candidates or CandidateSpace(spans, lexicon.candidate_mask)
         self.seed = seed
         self.counts = BuildCounts()
 
@@ -261,11 +291,16 @@ class SampleBuilder:
 
         rng = example_rng(self.seed, epoch, sample.id)
         spans = type_syllables(readings, rng, self.augmentation)
-        span_ids = tuple(self.spans.id(span) for span in spans)
+        if self.noise is not None:
+            # The styles choose *which* keys the typist meant to press and the
+            # noise model then slips them -- corrupting before the abbreviation
+            # would let the initial of a typoed syllable erase the slip.
+            spans = self.noise.maybe_corrupt(spans, rng).spans
+        span_ids = tuple(self.spans.id_or_unknown(span) for span in spans)
         targets = tuple(self.lexicon.index(character) for character in characters)
         if not all(
-            bool(self.lexicon.candidate_mask[span_id, target])
-            for span_id, target in zip(span_ids, targets, strict=True)
+            self.candidates.admits(span, target)
+            for span, target in zip(spans, targets, strict=True)
         ):
             self.counts.target_not_admitted += 1
             return None
@@ -391,6 +426,13 @@ class Batch:
     ``scored`` is ``targets != IGNORE_INDEX`` as flat indices into the ``[B, W]``
     layout -- the ``nonzero`` a step would otherwise run on the device, done here
     on the host where finding positions costs no synchronisation.
+
+    ``candidate_ids [B, W, K]`` is each position's own candidate list in
+    emission space -- the lexicon row, or the corrections' union for a typoed
+    span -- padded by ``candidate_counts``; carrying it is what lets a
+    correction-widened set vary per position without a new mask row. ``span_letters
+    [B, W, L]`` is the raw keys pressed, ``a``-``z`` as 0-25 and ``LETTER_PAD``
+    past each span's length, which is all the letter encoder sees of a typo.
     """
 
     input_ids: torch.Tensor
@@ -402,6 +444,9 @@ class Batch:
     context_ids: torch.Tensor
     context_mask: torch.Tensor
     has_context: torch.Tensor
+    candidate_ids: torch.Tensor
+    candidate_counts: torch.Tensor
+    span_letters: torch.Tensor
     ids: tuple[str, ...] = field(default=())
 
     @property
@@ -437,6 +482,9 @@ class Batch:
             context_ids=self.context_ids.to(device, non_blocking=True),
             context_mask=self.context_mask.to(device, non_blocking=True),
             has_context=self.has_context.to(device, non_blocking=True),
+            candidate_ids=self.candidate_ids.to(device, non_blocking=True),
+            candidate_counts=self.candidate_counts.to(device, non_blocking=True),
+            span_letters=self.span_letters.to(device, non_blocking=True),
             ids=self.ids,
         )
 
@@ -452,7 +500,7 @@ class Collator:
     def __init__(
         self,
         tokenizer: BaseTokenizer,
-        candidate_mask: torch.Tensor,
+        candidates: CandidateSpace,
         context_dropout: float = 0.3,
         max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
         seed: int = 0,
@@ -460,11 +508,12 @@ class Collator:
         if not 0.0 <= context_dropout <= 1.0:
             raise ValueError(f"context_dropout must be a probability, got {context_dropout}")
         self.tokenizer = tokenizer
-        #: ``[spans, E]`` -- which characters each typed span admits. The batch
-        #: is where the examples become tensors, so it is also where an example
-        #: whose target its span does not admit (or a span admitting nothing)
-        #: fails, on the host, instead of inside a training step on the device.
-        self.candidate_mask = candidate_mask
+        #: The per-position candidate resolver -- the lexicon mask under clean
+        #: input, the corrections' union under the typo model. The batch is
+        #: where the examples become tensors, so it is also where an example
+        #: whose target its span does not admit fails, on the host, instead of
+        #: inside a training step on the device.
+        self.candidates = candidates
         self.context_dropout = context_dropout
         self.max_context_tokens = max_context_tokens
         self.rng = random.Random(seed)
@@ -481,6 +530,17 @@ class Collator:
         span_positions = torch.zeros((size, width), dtype=torch.bool)
         targets = torch.full((size, width), IGNORE_INDEX, dtype=torch.long)
 
+        candidate_lists = [
+            [self.candidates.resolve(span) for span in example.spans] for example in examples
+        ]
+        candidate_width = max(
+            (len(row) for example_lists in candidate_lists for row in example_lists),
+            default=1,
+        )
+        candidate_ids = torch.zeros((size, width, candidate_width), dtype=torch.long)
+        candidate_counts = torch.zeros((size, width), dtype=torch.long)
+        span_letters = torch.full((size, width, MAX_SPAN_LETTERS), LETTER_PAD, dtype=torch.long)
+
         contexts: list[str] = []
         has_context = torch.zeros(size, dtype=torch.float)
         for row, example in enumerate(examples):
@@ -491,8 +551,29 @@ class Collator:
             attention_mask[row, : length + 2] = 1
             row_spans = torch.tensor(example.span_ids, dtype=torch.long)
             row_targets = torch.tensor(example.targets, dtype=torch.long)
+            for column, (span, listed) in enumerate(
+                zip(example.spans, candidate_lists[row], strict=True)
+            ):
+                if len(span) > MAX_SPAN_LETTERS:
+                    raise ValueError(
+                        f"example {example.id} holds a {len(span)}-letter span {span!r}; "
+                        f"the letter encoding reads at most {MAX_SPAN_LETTERS}"
+                    )
+                candidate_ids[row, column + 1, : len(listed)] = torch.tensor(
+                    listed, dtype=torch.long
+                )
+                candidate_counts[row, column + 1] = len(listed)
+                span_letters[row, column + 1, : len(span)] = torch.tensor(
+                    [letter_id(letter) for letter in span], dtype=torch.long
+                )
             scored = row_targets != IGNORE_INDEX
-            if not bool(self.candidate_mask[row_spans[scored], row_targets[scored]].all()):
+            admitted = torch.tensor(
+                [
+                    self.candidates.admits(span, int(target))
+                    for span, target in zip(example.spans, example.targets, strict=True)
+                ]
+            )
+            if not bool(admitted[scored].all()):
                 raise ValueError(f"example {example.id} has a target its span does not admit")
             span_ids[row, 1 : length + 1] = row_spans
             span_positions[row, 1 : length + 1] = True
@@ -529,8 +610,19 @@ class Collator:
             context_ids=encoded["input_ids"],
             context_mask=encoded["attention_mask"],
             has_context=has_context,
+            candidate_ids=candidate_ids,
+            candidate_counts=candidate_counts,
+            span_letters=span_letters,
             ids=tuple(example.id for example in examples),
         )
+
+
+def letter_id(letter: str) -> int:
+    """The letter-encoder id of one pressed key; anything but a-z is a bug."""
+    value = ord(letter) - ord("a")
+    if not 0 <= value < LETTER_PAD:
+        raise ValueError(f"{letter!r} is not a keystroke letter")
+    return value
 
 
 def token_budget_batches(
