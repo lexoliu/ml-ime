@@ -155,6 +155,11 @@ WORLD = 2
 #: its publisher ships.
 CHECKPOINT_MINUTES = 0
 
+#: Corrupt each example's typed keystrokes with the shared typo noise model.
+#: Off by default so the running chain stays on clean input until a pushed
+#: copy turns it on deliberately.
+TYPOS = False
+
 #: The three files a leg hands the next one.
 RESUME_MARKERS = ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
 
@@ -428,6 +433,8 @@ def train_argv(
         argv += ["--resume", str(resume)]
     if ACTIVATION_CHECKPOINTING:
         argv.append("--activation-checkpointing")
+    if TYPOS:
+        argv.append("--typos")
     return argv
 
 

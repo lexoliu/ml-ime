@@ -13,16 +13,22 @@ from pathlib import Path
 import pytest
 
 from mlime.typo import (
+    CORRECTIONS_FIXTURE_RELATIVE,
+    CORRECTIONS_K,
     EDIT_TYPES,
+    CorrectionTable,
     NoiseModel,
+    corrections_fixture_spans,
     load_syllables,
     record_seed,
     segmentable,
     typo_twin,
+    write_corrections_fixture,
 )
 
 MODEL_PATH = Path(__file__).parent.parent / "src/mlime/data/typo_model.json"
 SYLLABLES = Path(__file__).parent.parent.parent / "crates/ime-pinyin/data/syllables.txt"
+CORRECTIONS_FIXTURE = Path(__file__).parent.parent.parent / CORRECTIONS_FIXTURE_RELATIVE
 
 
 @pytest.fixture(scope="module")
@@ -166,6 +172,14 @@ def test_edits_stay_within_bounds(model: NoiseModel) -> None:
         assert len(corruption.text) > 0
 
 
+def test_corruption_spans_cover_every_pressed_key(model: NoiseModel) -> None:
+    """``spans`` is the text re-sliced per input item: no key lost, none gained."""
+    for seed in range(500):
+        corruption = model.corrupt(["wo", "zai", "jia", "li"], random.Random(seed), min_edits=1)
+        assert len(corruption.spans) == 4
+        assert "".join(corruption.spans) == corruption.text
+
+
 def test_segmentable_mirrors_the_lattice(inventory: set[str]) -> None:
     assert segmentable("nihao", inventory)
     assert segmentable("z", inventory)  # single-letter abbreviation
@@ -254,3 +268,125 @@ def test_typo_twin_refuses_a_lattice_without_the_record(tmp_path: Path) -> None:
     lattice = write_lattice(tmp_path / "lattice.jsonl", [["ni", "hao", "ma"]])
     with pytest.raises(ValueError, match="no 2-span path"):
         typo_twin(eval_set, tmp_path / "twin.jsonl", 0, MODEL_PATH, SYLLABLES, lattice)
+
+
+@pytest.fixture(scope="module")
+def correction_table(model: NoiseModel) -> CorrectionTable:
+    return CorrectionTable.load(MODEL_PATH, SYLLABLES)
+
+
+def test_corrections_valid_span_keeps_self_at_cost_zero(
+    correction_table: CorrectionTable,
+) -> None:
+    """A valid syllable's own entry leads the list and costs nothing."""
+    for span in ("jia", "zhong", "wo", "a"):
+        entries = dict(correction_table.corrections(span))
+        assert entries[span] == 0.0
+        assert next(iter(correction_table.corrections(span))) == (span, 0.0)
+
+
+def test_corrections_prefix_keeps_self_at_cost_zero(
+    correction_table: CorrectionTable,
+) -> None:
+    """An abbreviation's own entry is cost 0 too, per the shared spec."""
+    entries = dict(correction_table.corrections("zh"))
+    assert entries["zh"] == 0.0
+
+
+def test_corrections_typo_finds_the_intended_syllable(
+    correction_table: CorrectionTable,
+) -> None:
+    """The motivating reading: 'jai' transposes back to 'jia', ahead of
+    neighbours' one-slip corrections, and fuzzy 'zi' reaches 'zhi'."""
+    jai = correction_table.corrections("jai")
+    assert jai[0][0] == "jia"
+    assert 0.0 < jai[0][1] < dict(jai)["mai"]
+    zi = dict(correction_table.corrections("zi"))
+    assert 0.0 < zi["zhi"] < zi["zui"]
+
+
+def test_corrections_costs_are_sorted_and_capped(
+    correction_table: CorrectionTable,
+) -> None:
+    """Every list is cost-ordered, ties broken by spelling, at most K long."""
+    for span in ("z", "o", "jai", "zhong", "wo", "kan"):
+        entries = correction_table.corrections(span)
+        assert entries == tuple(sorted(entries, key=lambda item: (item[1], item[0])))
+        assert len(entries) <= CORRECTIONS_K
+        # Single letters sit farthest from any reading and hit the cap.
+    assert len(correction_table.corrections("z")) == CORRECTIONS_K
+
+
+def test_corrections_unreachable_span_is_empty(
+    correction_table: CorrectionTable,
+) -> None:
+    """No reading reaches 'qqzx' within two edits; the list is empty, not a
+    fallback guess."""
+    assert correction_table.corrections("qqzx") == ()
+
+
+def test_corrections_one_edit_probability_matches_the_enumerator(
+    correction_table: CorrectionTable,
+) -> None:
+    """The closed-form single-edit probability and the brute-force forward
+    enumeration agree exactly -- both sides of the two-edit sum are checked."""
+    spans = [
+        "jia",
+        "zai",
+        "wo",
+        "zhong",
+        "an",
+        "zh",
+        "xai",
+        "jai",
+        "hia",
+        "cann",
+        "z",
+        "zi",
+        "ang",
+        "lan",
+        "e",
+        "qax",
+        "",
+    ]
+    for source in spans:
+        outcomes = correction_table._outcomes(source)
+        for produced in spans:
+            assert correction_table._one_edit_probability(source, produced) == pytest.approx(
+                outcomes.get(produced, 0.0), abs=1e-12
+            )
+
+
+def test_corrections_fixture_is_current(correction_table: CorrectionTable, tmp_path: Path) -> None:
+    """The shared fixture both languages test against is byte-for-byte what
+    the Python implementation writes today."""
+    regenerated = tmp_path / "typo-corrections.json"
+    assert write_corrections_fixture(correction_table, regenerated) == len(
+        corrections_fixture_spans(correction_table)
+    )
+    assert regenerated.read_bytes() == CORRECTIONS_FIXTURE.read_bytes()
+
+
+def test_corrections_fixture_spans_cover_the_edit_space(
+    correction_table: CorrectionTable,
+) -> None:
+    """The fixture exercises valid syllables, non-syllable prefixes, one- and
+    two-edit typos and every fuzzy direction."""
+    spans = corrections_fixture_spans(correction_table)
+    assert len(set(spans)) == len(spans)
+    syllables = correction_table._syllables
+    prefixes = correction_table._prefixes
+    assert any(span in syllables for span in spans)
+    assert any(span in prefixes and span not in syllables for span in spans)
+    assert any(
+        span not in syllables and span not in prefixes and dict(correction_table.corrections(span))
+        for span in spans
+    )
+    model = correction_table._model
+    directions = {
+        (pair.frm, pair.to)
+        for span in spans
+        for pair in model._fuzzy_pairs
+        if span not in syllables
+    }
+    assert len(directions) >= 1

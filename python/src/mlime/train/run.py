@@ -28,10 +28,11 @@ from pathlib import Path
 
 import torch
 
+from mlime.data.pinyin_tables import TYPO_MODEL_PATH
 from mlime.data.shards import shard_paths
 from mlime.logging import log
 from mlime.train.arbitration import ReadingArbitration
-from mlime.train.lexicon import Lexicon, build_lexicon, read_char_readings
+from mlime.train.lexicon import CandidateSpace, Lexicon, build_lexicon, read_char_readings
 from mlime.train.loop import (
     Accuracy,
     Distributed,
@@ -52,6 +53,7 @@ from mlime.train.samples import (
     TrainingExample,
 )
 from mlime.train.spans import SpanVocab
+from mlime.typo import CorrectionTable, NoiseModel
 
 
 @dataclass(frozen=True)
@@ -220,17 +222,24 @@ class Vocabularies:
     tokenizer: BaseTokenizer
     lexicon: Lexicon
     arbitration: ReadingArbitration
+    syllables: frozenset[str]
 
     @classmethod
     def load(cls, char_table: Path, base_model: str) -> Vocabularies:
         """Load the span table, the tokenizer, the lexicon over both, and the arbitration."""
         spans = SpanVocab.load()
         tokenizer = load_tokenizer(base_model)
+        readings = read_char_readings(char_table)
         return cls(
             spans=spans,
             tokenizer=tokenizer,
-            lexicon=build_lexicon_for(char_table, tokenizer, spans),
+            lexicon=build_lexicon(readings, vocabulary_of(tokenizer), spans),
             arbitration=ReadingArbitration.load(spans),
+            syllables=frozenset(
+                syllable
+                for character_readings in readings.values()
+                for syllable in character_readings
+            ),
         )
 
     @property
@@ -238,9 +247,30 @@ class Vocabularies:
         """The base model's ``token -> id`` map."""
         return vocabulary_of(self.tokenizer)
 
+    def noise_model(self, typos: bool) -> NoiseModel | None:
+        """The shared typo model when *typos* is on; ``None`` is the clean path."""
+        return NoiseModel.load(TYPO_MODEL_PATH) if typos else None
+
+    def candidate_space(self, typos: bool) -> CandidateSpace:
+        """The per-position candidate resolver: the lexicon mask, or the corrections' union."""
+        if not typos:
+            return CandidateSpace(self.spans, self.lexicon.candidate_mask)
+        model = NoiseModel.load(TYPO_MODEL_PATH)
+        table = CorrectionTable(model, self.syllables)
+        return CandidateSpace(self.spans, self.lexicon.candidate_mask, table)
+
     def builder(self, augmentation: Augmentation | None, seed: int) -> SampleBuilder:
         """A builder that types sentences the way *seed* and *augmentation* say."""
-        return SampleBuilder(self.lexicon, self.spans, self.arbitration, augmentation, seed=seed)
+        augmented = augmentation or Augmentation()
+        return SampleBuilder(
+            self.lexicon,
+            self.spans,
+            self.arbitration,
+            augmentation,
+            seed=seed,
+            noise=self.noise_model(augmented.typos),
+            candidates=self.candidate_space(augmented.typos),
+        )
 
     def stream(
         self,
@@ -265,11 +295,12 @@ class Vocabularies:
         context_dropout: float = 0.3,
         max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
         seed: int = 0,
+        typos: bool = False,
     ) -> Collator:
         """The collator a run of these settings pads its batches with."""
         return Collator(
             self.tokenizer,
-            self.lexicon.candidate_mask,
+            self.candidate_space(typos),
             context_dropout=context_dropout,
             max_context_tokens=max_context_tokens,
             seed=seed,
@@ -329,9 +360,16 @@ def route_a(
     spans, tokenizer, lexicon = vocabularies.spans, vocabularies.tokenizer, vocabularies.lexicon
     model = RouteAModel.from_pretrained(route, lexicon, spans, vocabularies.vocabulary)
 
-    builder = vocabularies.builder(augmentation, training.seed)
+    augmented = augmentation or Augmentation()
+    builder = vocabularies.builder(augmented, training.seed)
     stream = vocabularies.stream(paths, slices.train, builder, world.rank, world.world_size)
-    collator = vocabularies.collator(context_dropout, max_context_tokens, training.seed)
+    collator = vocabularies.collator(
+        context_dropout, max_context_tokens, training.seed, typos=augmented.typos
+    )
+    # The letter encoder only earns its weights under the noise model; off, it
+    # stays frozen at zero so the fill tower is exactly the pre-letter one and
+    # the ONNX export's span_ids-only graph still describes it.
+    model.letter_encoder.requires_grad_(augmented.typos)
 
     paths.out.mkdir(parents=True, exist_ok=True)
     with MetricLog(paths.out / "metrics.jsonl") as provenance:
@@ -357,11 +395,16 @@ def route_a(
     if not segment.finished:
         return paused_run(segment, losses, model.gates(), builder.counts.as_dict(), world)
     evaluation = held_out_examples(
-        paths, vocabularies.builder(augmentation, training.seed + 1), slices
+        paths, vocabularies.builder(augmented, training.seed + 1), slices
     )
     device = world.device
-    with_context = evaluate(model, evaluation, tokenizer, device, training.token_budget, True)
-    without_context = evaluate(model, evaluation, tokenizer, device, training.token_budget, False)
+    candidates = vocabularies.candidate_space(augmented.typos)
+    with_context = evaluate(
+        model, evaluation, tokenizer, device, training.token_budget, True, candidates
+    )
+    without_context = evaluate(
+        model, evaluation, tokenizer, device, training.token_budget, False, candidates
+    )
     result = RunResult(
         metrics=segment.metrics,
         first_loss=losses[0],

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import ClassVar
 
 import torch
@@ -31,12 +32,43 @@ from transformers import BertConfig, BertForMaskedLM, BertModel
 
 from mlime.logging import log
 from mlime.train.lexicon import Lexicon
-from mlime.train.samples import IGNORE_INDEX, Batch
-from mlime.train.spans import SpanVocab
+from mlime.train.samples import IGNORE_INDEX, LETTER_PAD, Batch
+from mlime.train.spans import UNKNOWN_SPAN, SpanVocab
 
 #: Parameters under these prefixes did not come from the pretrained checkpoint and
 #: train at the higher learning rate.
-NEW_PARAMETER_PREFIXES = ("span_embeddings", "cross_attention")
+NEW_PARAMETER_PREFIXES = ("span_embeddings", "cross_attention", "letter_encoder")
+
+#: Width of the letter encoder's internal space before the projection to the
+#: tower width. Sixty-four is plenty to hold six letters' identities.
+LETTER_WIDTH = 64
+
+
+class LetterEncoder(nn.Module):
+    """A span vector out of the keys actually pressed, added through a zero gate.
+
+    ``letters`` and ``positions`` summed per key, meaned over the span, then a
+    projection that starts at zero -- so the encoder separates ``na`` from
+    ``an`` (the position table carries the order), and a fresh model's output
+    is bit-identical to one without the path, because the projection's zero
+    keeps the whole term exactly 0.
+    """
+
+    def __init__(self, hidden_size: int, width: int = LETTER_WIDTH, max_letters: int = 12):
+        super().__init__()
+        self.letters = nn.Embedding(LETTER_PAD + 1, width, padding_idx=LETTER_PAD)
+        self.positions = nn.Embedding(max_letters, width)
+        self.project = nn.Linear(width, hidden_size, bias=False)
+        nn.init.zeros_(self.project.weight)
+
+    def forward(self, span_letters: torch.Tensor) -> torch.Tensor:
+        """``[B, W, L]`` letter ids to ``[B, W, hidden]`` additive span terms."""
+        valid = span_letters != LETTER_PAD
+        positions = self.positions.weight[: span_letters.shape[-1]]
+        letters = (self.letters(span_letters) + positions) * valid[..., None]
+        pooled = letters.sum(dim=2) / valid.sum(dim=2, keepdim=True).clamp(min=1)
+        encoded: torch.Tensor = self.project(pooled)
+        return encoded
 
 
 @dataclass(frozen=True)
@@ -196,6 +228,9 @@ def mark_dynamic(batch: Batch) -> None:
     ):
         torch._dynamo.maybe_mark_dynamic(tensor, (0, 1))
     torch._dynamo.maybe_mark_dynamic(batch.has_context, 0)
+    torch._dynamo.maybe_mark_dynamic(batch.candidate_ids, (0, 1, 2))
+    torch._dynamo.maybe_mark_dynamic(batch.candidate_counts, (0, 1))
+    torch._dynamo.maybe_mark_dynamic(batch.span_letters, (0, 1, 2))
 
 
 class RouteAModel(nn.Module):
@@ -260,6 +295,7 @@ class RouteAModel(nn.Module):
             fill.cls.predictions.transform, fill.cls.predictions.decoder, lexicon.token_ids
         )
         self.span_embeddings = nn.Embedding(lexicon.spans, bert_config.hidden_size)
+        self.letter_encoder = LetterEncoder(bert_config.hidden_size)
         self.cross_attention = nn.ModuleList(
             GatedCrossAttention(
                 bert_config.hidden_size,
@@ -320,17 +356,34 @@ class RouteAModel(nn.Module):
         with torch.no_grad():
             for index, letters in enumerate(letter_ids):
                 if not letters:
-                    raise ValueError(f"span {index} has no letters")
+                    # The reserved ``<unk>`` tail: a typoed span's signal is its
+                    # letters, which the letter encoder supplies -- the table
+                    # row itself starts at zero rather than a fabricated mean.
+                    self.span_embeddings.weight[index].zero_()
+                    continue
                 ids = torch.tensor(letters, dtype=torch.long, device=words.device)
                 self.span_embeddings.weight[index] = words.index_select(0, ids).mean(dim=0)
 
     def parameter_groups(self, base_lr: float, new_lr: float) -> list[dict[str, object]]:
-        """Split the parameters into the pretrained ones and the ones we added."""
+        """Split the parameters into the pretrained ones and the ones we added.
+
+        The letter encoder trails the new group on purpose: a checkpoint that
+        predates it holds the rest of this group in the same order, so the
+        resumed optimiser's states land on the parameters they were trained
+        beside and the letters simply arrive with none.
+        """
         base: list[nn.Parameter] = []
         new: list[nn.Parameter] = []
+        letters: list[nn.Parameter] = []
         for name, parameter in self.named_parameters():
+            if not parameter.requires_grad:
+                continue
+            if name.startswith("letter_encoder"):
+                letters.append(parameter)
+                continue
             target = new if name.startswith(NEW_PARAMETER_PREFIXES) else base
             target.append(parameter)
+        new += letters
         if not new:
             raise ValueError("no new parameters found; the naming convention has drifted")
         return [{"params": base, "lr": base_lr}, {"params": new, "lr": new_lr}]
@@ -369,9 +422,16 @@ class RouteAModel(nn.Module):
         return encoded
 
     def _fill_inputs(self, batch: Batch) -> torch.Tensor:
-        """``[MASK]`` everywhere a span was typed, plus that span's own embedding."""
+        """``[MASK]`` everywhere a span was typed, plus that span's embedding and letters.
+
+        The letter term is gated by the same ``span_positions`` the table row
+        is, and its projection is zero-initialised, so at init this is exactly
+        the old sum.
+        """
         words: torch.Tensor = self.fill.embeddings.word_embeddings(batch.input_ids)
-        spans: torch.Tensor = self.span_embeddings(batch.span_ids)
+        spans: torch.Tensor = self.span_embeddings(batch.span_ids) + self.letter_encoder(
+            batch.span_letters
+        )
         return words + spans * batch.span_positions[..., None]
 
     def encode(self, batch: Batch) -> torch.Tensor:
@@ -424,6 +484,24 @@ class RouteAModel(nn.Module):
         logits: torch.Tensor = self.head(self.encode(batch))
         return logits
 
+    def candidates_at(self, batch: Batch, positions: torch.Tensor) -> torch.Tensor:
+        """The ``[P, E]`` mask the batch's own candidate lists describe.
+
+        The batch carries each position's list because a typoed span admits the
+        union of its corrections' homophones -- a per-position set no span-table
+        row can name. Reassembling the mask here keeps the restricted loss's
+        ``[P, E]`` contract while the candidate source stays per-example.
+        """
+        ids = batch.candidate_ids.reshape(-1, batch.candidate_ids.shape[-1]).index_select(
+            0, positions
+        )
+        counts = batch.candidate_counts.reshape(-1).index_select(0, positions)
+        size = self.candidate_mask.shape[1]
+        within = torch.arange(ids.shape[1], device=ids.device).unsqueeze(0) < counts.unsqueeze(1)
+        mask = torch.zeros((ids.shape[0], size + 1), dtype=torch.bool, device=ids.device)
+        mask.scatter_(1, ids.masked_fill(~within, size), within)
+        return mask[:, :-1]
+
     def loss(self, logits: torch.Tensor, batch: Batch) -> torch.Tensor | None:
         """Restricted, smoothed cross-entropy at the positions a span was typed.
 
@@ -434,11 +512,10 @@ class RouteAModel(nn.Module):
         scored = batch.scored
         if not scored.numel():
             return None
-        span_ids = batch.span_ids.reshape(-1).index_select(0, scored)
         return restricted_cross_entropy(
             logits.reshape(-1, logits.shape[-1]).index_select(0, scored),
             batch.targets.reshape(-1).index_select(0, scored),
-            self.candidate_mask.index_select(0, span_ids),
+            self.candidates_at(batch, scored),
             self.config.label_smoothing,
             check=False,
         )
@@ -449,11 +526,66 @@ class RouteAModel(nn.Module):
         Positions with no target are left at :data:`IGNORE_INDEX` so a caller can
         compare against ``batch.targets`` directly.
         """
-        candidates = self.candidate_mask.index_select(0, batch.span_ids.reshape(-1))
-        candidates = candidates.reshape(*batch.span_ids.shape, -1)
+        flat = torch.arange(batch.span_ids.numel(), device=logits.device)
+        candidates = self.candidates_at(batch, flat).reshape(*batch.span_ids.shape, -1)
         floor = torch.finfo(logits.dtype).min
         best = logits.masked_fill(~candidates, floor).argmax(dim=-1)
         return best.masked_fill(batch.targets == IGNORE_INDEX, IGNORE_INDEX)
+
+    def load_resumed(self, weights: Mapping[str, torch.Tensor], path: Path | str) -> None:
+        """Load a checkpoint that may predate the typo inputs, tolerantly.
+
+        A run checkpointed before this stage lacks ``letter_encoder.*`` (the
+        zero projection is its initialisation) and carries one row fewer of
+        ``span_embeddings`` and ``candidate_mask`` -- the ``<unk>`` tail is
+        appended, so the old rows prefix the new. The decoder's derived
+        ``span_candidates`` buffers are gone now that the batch carries them.
+        Anything else missing or unexpected is still a refusal, not a fold.
+        """
+        own = self.state_dict()
+        grown = dict(weights)
+        popped: set[str] = set()
+        for name in ("decoder.span_candidates", "decoder.span_candidate_counts"):
+            if name not in own and grown.pop(name, None) is not None:
+                popped.add(name)
+        for name in ("span_embeddings.weight", "candidate_mask"):
+            stored = grown.get(name)
+            if stored is None or name not in own or stored.shape == own[name].shape:
+                continue
+            if (
+                stored.shape[0] + 1 == own[name].shape[0]
+                and stored.shape[1:] == own[name].shape[1:]
+            ):
+                if name == "candidate_mask":
+                    if not torch.equal(stored, own[name][: stored.shape[0]]):
+                        raise ValueError(
+                            f"{path}'s candidate mask disagrees with the lexicon's prefix rows"
+                        )
+                    grown.pop(name)  # the built table already carries the tail row
+                    popped.add(name)
+                else:
+                    merged = own[name].clone()
+                    merged[: stored.shape[0]] = stored
+                    # The appended ``<unk>`` tail resumes at zero, matching what
+                    # ``initialise_span_embeddings`` writes into a fresh table.
+                    merged[stored.shape[0] :] = 0
+                    grown[name] = merged
+            else:
+                raise ValueError(
+                    f"{path}'s {name} is {tuple(stored.shape)} against this model's "
+                    f"{tuple(own[name].shape)}; the span table drifted"
+                )
+        result = self.load_state_dict(grown, strict=False)
+        missing = [
+            name
+            for name in result.missing_keys
+            if name not in popped and not name.startswith(("decoder.", "letter_encoder."))
+        ]
+        if missing or result.unexpected_keys:
+            raise ValueError(
+                f"{path} does not fit this model: "
+                f"missing {missing[:4]}, unexpected {result.unexpected_keys[:4]}"
+            )
 
 
 def letter_token_ids(spans: SpanVocab, vocabulary: dict[str, int]) -> list[list[int]]:
@@ -461,10 +593,14 @@ def letter_token_ids(spans: SpanVocab, vocabulary: dict[str, int]) -> list[list[
 
     A pinyin span is ASCII, and the base vocabulary holds every ASCII letter as
     its own token, so a miss here means the tokenizer is not the one the table
-    was built for.
+    was built for. The reserved ``<unk>`` tail carries no letters at all -- the
+    caller seeds its row to zeros.
     """
     ids: list[list[int]] = []
     for span in spans:
+        if span == UNKNOWN_SPAN:
+            ids.append([])
+            continue
         letters = []
         for letter in span:
             if letter not in vocabulary:
