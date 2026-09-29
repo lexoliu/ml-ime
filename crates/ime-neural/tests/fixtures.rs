@@ -180,7 +180,7 @@ fn the_exported_towers_reproduce_the_recorded_tables() {
                     })
                     .expect("every lattice record is recorded");
                 let got = model
-                    .emission(record, with_context)
+                    .emission(record, None, with_context)
                     .expect("the fixture scores");
                 assert_table(
                     &got,

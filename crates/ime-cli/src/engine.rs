@@ -3,7 +3,9 @@
 use ime_decode::{BeamOptions, Candidates, Hypothesis, Record, Uniform, decode_many};
 use ime_eval::{Hypothesize, Request};
 use ime_ngram::NgramModel;
-use ime_pinyin::{Lexicon, SegmentLattice, SegmentOptions, Segmentation, SyllableTable};
+use ime_pinyin::{
+    CorrectionTable, Lexicon, SegmentLattice, SegmentOptions, Segmentation, SyllableTable,
+};
 use std::num::NonZeroUsize;
 use thiserror::Error;
 
@@ -42,10 +44,15 @@ pub struct Baseline {
     model: NgramModel,
     segment: SegmentOptions,
     beam: BeamOptions,
+    corrections: Option<CorrectionTable>,
 }
 
 impl Baseline {
     /// Assemble a baseline from a loaded model.
+    ///
+    /// *corrections* is the shared typo noise model: set, the lattice admits
+    /// an off-inventory span the model can correct and every position's
+    /// candidates widen to the union of its corrections' homophones.
     #[must_use]
     pub fn new(
         table: SyllableTable,
@@ -53,6 +60,7 @@ impl Baseline {
         model: NgramModel,
         segment: SegmentOptions,
         beam: BeamOptions,
+        corrections: Option<CorrectionTable>,
     ) -> Self {
         Self {
             table,
@@ -60,6 +68,7 @@ impl Baseline {
             model,
             segment,
             beam,
+            corrections,
         }
     }
 
@@ -79,7 +88,13 @@ impl Baseline {
         pinyin: &str,
         top_k: NonZeroUsize,
     ) -> Result<Vec<Hypothesis>, BaselineError> {
-        let (_, batch) = read(pinyin, &self.table, &self.segment, &self.lexicon)?;
+        let (_, batch) = read(
+            pinyin,
+            &self.table,
+            &self.segment,
+            self.corrections.as_ref(),
+            &self.lexicon,
+        )?;
         let options = BeamOptions {
             top_k,
             ..self.beam.clone()
@@ -116,15 +131,23 @@ pub fn read(
     pinyin: &str,
     table: &SyllableTable,
     options: &SegmentOptions,
+    corrections: Option<&CorrectionTable>,
     lexicon: &Lexicon,
 ) -> Result<(Vec<Segmentation>, Candidates), BaselineError> {
-    let lattice =
-        SegmentLattice::build(pinyin, table, options).map_err(|source| BaselineError::Segment {
-            input: pinyin.to_owned(),
-            source,
-        })?;
+    let lattice = match corrections {
+        Some(model) => SegmentLattice::build_corrections(pinyin, table, options, model),
+        None => SegmentLattice::build(pinyin, table, options),
+    }
+    .map_err(|source| BaselineError::Segment {
+        input: pinyin.to_owned(),
+        source,
+    })?;
     let readings = lattice.k_best(options);
-    let batch = Candidates::build(&readings, lexicon).map_err(|source| BaselineError::Decode {
+    let batch = match corrections {
+        Some(model) => Candidates::build_corrections(&readings, pinyin, table, model, lexicon),
+        None => Candidates::build(&readings, lexicon),
+    }
+    .map_err(|source| BaselineError::Decode {
         input: pinyin.to_owned(),
         source,
     })?;

@@ -407,6 +407,7 @@ class CorrectionTable:
         self._prefixes = frozenset(prefixes)
         self._k = k
         self._cache: dict[str, tuple[tuple[str, float], ...]] = {}
+        self._costs_cache: dict[str, dict[str, float]] = {}
 
     @classmethod
     def load(
@@ -414,6 +415,10 @@ class CorrectionTable:
     ) -> CorrectionTable:
         """Build the table the generated ``typo.json`` and syllable inventory describe."""
         return cls(NoiseModel.load(typo_table), load_syllables(syllables_path), k=k)
+
+    def __contains__(self, syllable: str) -> bool:
+        """Whether *syllable* is an inventory syllable the table prices."""
+        return syllable in self._syllables
 
     def corrections(self, span: str) -> tuple[tuple[str, float], ...]:
         """The ``(syllable, cost)`` entries for *span*, sorted then capped at ``K``."""
@@ -423,7 +428,24 @@ class CorrectionTable:
             self._cache[span] = cached
         return cached
 
+    def costs(self, span: str) -> dict[str, float]:
+        """Every syllable's ``-log P(span | y)`` within two edits, uncapped.
+
+        The map ``corrections`` truncates to its ``K`` best: a candidate prior
+        prices a character through the cheapest syllable that reads it, and
+        that syllable need not have survived the cap.
+        """
+        cached = self._costs_cache.get(span)
+        if cached is None:
+            cached = self._resolve_costs(span)
+            self._costs_cache[span] = cached
+        return cached
+
     def _resolve(self, span: str) -> tuple[tuple[str, float], ...]:
+        ranked = sorted(self.costs(span).items(), key=lambda entry: (entry[1], entry[0]))
+        return tuple(ranked[: self._k])
+
+    def _resolve_costs(self, span: str) -> dict[str, float]:
         costs: dict[str, float] = {}
         predecessors = self._predecessors(span)
         origins = predecessors | set().union(
@@ -438,8 +460,7 @@ class CorrectionTable:
                 costs[syllable] = -math.log(probability)
         if span in self._syllables or span in self._prefixes:
             costs[span] = 0.0
-        ranked = sorted(costs.items(), key=lambda entry: (entry[1], entry[0]))
-        return tuple(ranked[: self._k])
+        return costs
 
     def _applicable(self, letters: str) -> dict[str, float]:
         """Each edit kind's probability at *letters*, normalised the way `corrupt` draws it."""

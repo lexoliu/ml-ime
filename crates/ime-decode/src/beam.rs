@@ -28,6 +28,11 @@ pub struct BeamOptions {
     pub diversity_gap: f32,
     /// How many distinct characters a guarded position keeps lineages for.
     pub diversity_chars: usize,
+    /// Weight on each candidate's correction prior, the `-log P(span |
+    /// syllable)` a character reachable only through a typo correction pays.
+    /// Zero prices a widened character like a span's own reading; one charges
+    /// the noise model's own rate.
+    pub typo_weight: f32,
 }
 
 impl Default for BeamOptions {
@@ -38,6 +43,7 @@ impl Default for BeamOptions {
             segmentation_weight: 1.0,
             diversity_gap: 1.5,
             diversity_chars: 3,
+            typo_weight: 1.0,
         }
     }
 }
@@ -191,7 +197,7 @@ impl<S> Worker<'_, S> {
     }
 
     /// Score this worker's candidates at its current position down to the
-    /// `width` survivors the model will be advanced into.
+    /// `beam_width` survivors the model will be advanced into.
     ///
     /// Each position scores every candidate against every surviving beam's
     /// state and keeps the best way of reaching each distinct history; the
@@ -202,17 +208,15 @@ impl<S> Worker<'_, S> {
     /// Survivor selection reserves before it fills: the best candidate of
     /// each covered character at every guarded position keeps its slot, and
     /// the position itself is guarded when its runner-up character trails
-    /// the winner by no more than `gap` -- that is where a score-ordered
-    /// beam silently collapses the sentence onto one reading. Reserved slots
-    /// come out of `width`; when more guards would fit than the beam has
-    /// room for, the earliest positions keep theirs.
+    /// the winner by no more than `diversity_gap` -- that is where a
+    /// score-ordered beam silently collapses the sentence onto one reading.
+    /// Reserved slots come out of `beam_width`; when more guards would fit
+    /// than the beam has room for, the earliest positions keep theirs.
     fn survivors<E, T>(
         &mut self,
         emission: &E,
         transition: &T,
-        width: usize,
-        gap: f32,
-        covered: usize,
+        options: &BeamOptions,
         index: &mut HashMap<(History, Marks), usize>,
     ) -> Vec<Candidate>
     where
@@ -221,11 +225,13 @@ impl<S> Worker<'_, S> {
     {
         let position = self.history.len();
         let allowed = &self.reading.positions()[position];
+        let typo_weight = options.typo_weight;
         let mut next: Vec<Candidate> = Vec::with_capacity(allowed.len());
         index.clear();
         if position == 0 {
-            for &ch in allowed {
-                let score = emission.score(self.path, 0, ch) + transition.score(&self.start, ch);
+            for (slot, &ch) in allowed.iter().enumerate() {
+                let score = emission.score(self.path, 0, ch) + transition.score(&self.start, ch)
+                    - priced(typo_weight, self.reading.prior(0, slot));
                 relax(
                     &mut next,
                     index,
@@ -240,10 +246,11 @@ impl<S> Worker<'_, S> {
             }
         } else {
             for (parent, beam) in self.latest.iter().enumerate() {
-                for &ch in allowed {
+                for (slot, &ch) in allowed.iter().enumerate() {
                     let score = beam.candidate.score
                         + emission.score(self.path, position, ch)
-                        + transition.score(&beam.state, ch);
+                        + transition.score(&beam.state, ch)
+                        - priced(typo_weight, self.reading.prior(position, slot));
                     relax(
                         &mut next,
                         index,
@@ -259,7 +266,26 @@ impl<S> Worker<'_, S> {
             }
         }
         next.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+        let (keep, guarded_here) = self.reserve(&next, options);
+        let mut chosen = Vec::with_capacity(keep.len());
+        for index in keep {
+            let mut candidate = next[index];
+            if guarded_here {
+                candidate.marks = candidate.marks.pushed(candidate.ch);
+            }
+            chosen.push(candidate);
+        }
+        chosen
+    }
 
+    /// Which entries of the score-ordered *next* survive: each guarded
+    /// position's covered characters first, then score order to the beam
+    /// width. Returns the chosen indices and whether this position declared
+    /// its own guard, so the caller can mark every survivor's lineage.
+    fn reserve(&mut self, next: &[Candidate], options: &BeamOptions) -> (Vec<usize>, bool) {
+        let width = options.beam_width.get();
+        let gap = options.diversity_gap;
+        let covered = options.diversity_chars;
         // Existing guards: the best lineage of each covered character keeps
         // its slot, however far it has slipped in score order.
         let mut keep: Vec<usize> = Vec::new();
@@ -313,15 +339,7 @@ impl<S> Worker<'_, S> {
                 keep.push(index);
             }
         }
-        let mut chosen = Vec::with_capacity(keep.len());
-        for index in keep {
-            let mut candidate = next[index];
-            if guarded_here {
-                candidate.marks = candidate.marks.pushed(candidate.ch);
-            }
-            chosen.push(candidate);
-        }
-        chosen
+        (keep, guarded_here)
     }
 
     /// Follow the backpointers from a finished beam to the start of the
@@ -392,9 +410,6 @@ where
             return Err(crate::DecodeError::NoSegmentations);
         }
     }
-    let width = options.beam_width.get();
-    let gap = options.diversity_gap;
-    let covered = options.diversity_chars;
     let mut workers: Vec<Worker<'_, T::State>> = Vec::new();
     for (record, request) in records.iter().enumerate() {
         for (path, reading) in request.candidates.paths().iter().enumerate() {
@@ -430,9 +445,7 @@ where
             let next = worker.survivors(
                 &records[worker.record].emission,
                 transition,
-                width,
-                gap,
-                covered,
+                options,
                 &mut index,
             );
             // The states this step produces stand one position ahead: they
@@ -594,6 +607,24 @@ fn keep_diverse(hypotheses: &mut [Hypothesis], top_k: usize) -> Vec<Hypothesis> 
     keep.into_iter()
         .map(|index| hypotheses[index].clone())
         .collect()
+}
+
+/// A candidate prior's contribution at `typo_weight`. An unreachable
+/// character's `INFINITY` stays dead whenever the weight is on and weighs
+/// nothing when it is off -- `0 * inf` would price the character `NaN` and
+/// poison the beam's ordering.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a -log of a two-edit probability stays small"
+)]
+fn priced(typo_weight: f32, prior: f64) -> f32 {
+    if prior.is_infinite() {
+        if typo_weight > 0.0 {
+            return f32::INFINITY;
+        }
+        return 0.0;
+    }
+    typo_weight * prior as f32
 }
 
 /// Keep only the best way of reaching each beam state. Candidates whose

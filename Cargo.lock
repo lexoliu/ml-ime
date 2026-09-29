@@ -1772,10 +1772,14 @@ dependencies = [
 name = "ime-decode"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "ime-pinyin",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1861,6 +1865,8 @@ dependencies = [
 name = "ime-pinyin"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "thiserror",
 ]
 

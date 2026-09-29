@@ -1,6 +1,7 @@
 //! The character lexicon: which characters a syllable can be written as, and the
 //! per-position masks that constraint implies.
 
+use crate::corrections::CorrectionTable;
 use crate::syllable::{SyllableId, SyllableRange, SyllableTable};
 use thiserror::Error;
 
@@ -259,6 +260,88 @@ impl Lexicon {
         }
         out.sort_unstable();
         out.dedup();
+    }
+
+    /// The union of every prefix range `corrections(span)` names, with each
+    /// character's correction prior: the characters a position may take when
+    /// the typed span could be any of its corrections, paired with the
+    /// cheapest `-log P(span | y)` a syllable reading the character reaches
+    /// the keystrokes at. *own* is the candidate set the segment admitted
+    /// without the noise model -- `exact_range` for a full syllable, the
+    /// prefix range for a span still being typed, `None` for one the noise
+    /// model alone reaches -- and its characters pay nothing: they were
+    /// never widened. Every other union member pays its price even when the
+    /// `K` cap dropped the entry that put it there -- the uncapped table
+    /// still knows what a completion costs. The training side's
+    /// `CandidateSpace.priors` computes the same values; the shared fixture
+    /// pins both to it.
+    #[must_use]
+    pub fn corrections_priors(
+        &self,
+        span: &str,
+        own: Option<SyllableRange>,
+        syllables: &SyllableTable,
+        corrections: &CorrectionTable,
+    ) -> Vec<(CharId, f64)> {
+        // Every union write lands in one dense slot per character: the entry
+        // rows push their price straight in instead of building and sorting
+        // per-row masks, so a span whose union holds thousands stays linear
+        // in the rows it covers. The self entry builds the union but prices
+        // nothing: its row is the keystrokes themselves, and what the segment
+        // honestly reads is `own`, below -- everything else in that row
+        // reached here through a completion the noise model still has to pay
+        // for. `NAN` marks a character no row has touched; the cheapest write
+        // wins.
+        let mut priors = vec![f64::NAN; self.len()];
+        let mut touched = Vec::new();
+        let write = |priors: &mut Vec<f64>, touched: &mut Vec<CharId>, id: CharId, cost: f64| {
+            let slot = &mut priors[id.index()];
+            if slot.is_nan() {
+                touched.push(id);
+                *slot = cost;
+            } else {
+                *slot = slot.min(cost);
+            }
+        };
+        for entry in corrections.corrections(span).iter() {
+            let cost = if entry.syllable() == span {
+                f64::INFINITY
+            } else {
+                entry.cost()
+            };
+            for syllable in syllables.prefix_range(entry.syllable()) {
+                for &id in self.homophones(syllable) {
+                    write(&mut priors, &mut touched, id, cost);
+                }
+            }
+        }
+        if let Some(own) = own {
+            for syllable in own {
+                for &id in self.homophones(syllable) {
+                    write(&mut priors, &mut touched, id, 0.0);
+                }
+            }
+        }
+        // A character's prior is the cheapest syllable that both reads it and
+        // reaches the span: the entries above already carry the capped list's
+        // price, and the uncapped map supplies what the `K` cap dropped. The
+        // map's index lookups go through a dense table -- a union can hold
+        // tens of thousands of readings against it.
+        let costs = corrections.costs(span);
+        let mut dense = vec![f64::INFINITY; syllables.len()];
+        for (&index, &cost) in costs.iter() {
+            dense[index] = cost;
+        }
+        touched.sort_unstable();
+        let mut out = Vec::with_capacity(touched.len());
+        for id in touched {
+            let mut prior = priors[id.index()];
+            for reading in self.readings(id) {
+                prior = prior.min(dense[reading.index()]);
+            }
+            out.push((id, prior));
+        }
+        out
     }
 }
 
