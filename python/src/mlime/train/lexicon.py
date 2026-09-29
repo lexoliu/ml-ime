@@ -21,13 +21,14 @@ the model trains against and the mask the decoder applies are the same relation.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
 
 from mlime.logging import log
 from mlime.train.spans import SpanVocab
+from mlime.typo import CorrectionTable
 
 
 def read_char_readings(path: Path) -> dict[str, tuple[str, ...]]:
@@ -113,6 +114,67 @@ class Lexicon:
             cached = {character: index for index, character in enumerate(self.characters)}
             object.__setattr__(self, "_reverse_cache", cached)
         return cached
+
+
+@dataclass
+class CandidateSpace:
+    """The emission indices a typed span admits at one position.
+
+    The clean space is the lexicon mask, looked up by the span's id -- off-inventory
+    spans fold onto the ``<unk>`` row, which admits nothing, and the builder's
+    admission check then refuses them the way it always has.
+
+    The typo space widens each position to the union of the homophone lists of
+    the span's ``corrections``: a valid span keeps its own row (the cost-0 self
+    entry covers it), so the widened set is exactly the old one plus whatever
+    the noise model could have meant. The corrections cap keeps the union
+    bounded; a span no syllable reaches within two edits resolves to the empty
+    list, which the same admission check turns into a counted drop.
+    """
+
+    spans: SpanVocab
+    mask: torch.Tensor
+    table: CorrectionTable | None = None
+    _cache: dict[str, tuple[frozenset[int], tuple[int, ...]]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.mask.shape[0] != len(self.spans):
+            raise ValueError(
+                f"the candidate mask covers {self.mask.shape[0]} spans and the "
+                f"inventory holds {len(self.spans)}"
+            )
+        if self.mask.dtype is not torch.bool:
+            raise TypeError(f"the candidate mask must be boolean, got {self.mask.dtype}")
+
+    def resolve(self, span: str) -> tuple[int, ...]:
+        """The sorted emission ids *span* admits, cached on first ask."""
+        cached = self._cache.get(span)
+        if cached is None:
+            if self.table is None:
+                row = self.mask[self.spans.id_or_unknown(span)]
+                ids = tuple(int(index) for index in row.nonzero(as_tuple=True)[0].tolist())
+            else:
+                admitted: set[int] = set()
+                for syllable, _cost in self.table.corrections(span):
+                    admitted.update(
+                        int(index)
+                        for index in self.mask[self.spans.id(syllable)]
+                        .nonzero(as_tuple=True)[0]
+                        .tolist()
+                    )
+                ids = tuple(sorted(admitted))
+            cached = (frozenset(ids), ids)
+            self._cache[span] = cached
+        return cached[1]
+
+    def admits(self, span: str, emission_id: int) -> bool:
+        """Whether *span* may stand for the character at *emission_id*."""
+        return emission_id in self._lookup(span)
+
+    def _lookup(self, span: str) -> frozenset[int]:
+        """The membership set behind :meth:`resolve`, cached with it."""
+        self.resolve(span)
+        return self._cache[span][0]
 
 
 def write_emittable(path: Path, lexicon: Lexicon) -> int:

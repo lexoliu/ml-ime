@@ -39,6 +39,11 @@ SYLLABLES_RELATIVE = Path("crates/ime-pinyin/data/syllables.txt")
 #: letter, and a bare-vowel syllable's initial is its first vowel.
 MULTI_LETTER_INITIALS = ("zh", "ch", "sh")
 
+#: The reserved table entry every off-inventory span maps to -- a typo is not a
+#: prefix of any syllable, and the corruption augmentation produces plenty.
+#: It sorts ahead of every letter, so it must always sit last in the file.
+UNKNOWN_SPAN = "<unk>"
+
 
 def initial(syllable: str) -> str:
     """The abbreviation of *syllable*: its initial, kept whole for zh/ch/sh.
@@ -85,6 +90,7 @@ def build(out_path: Path = TYPED_SPANS_PATH, syllables_path: Path | None = None)
             f"no {SYLLABLES_RELATIVE} above the working directory; pass syllables_path"
         )
     spans = enumerate_spans(read_syllables(source))
+    spans.append(UNKNOWN_SPAN)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text("".join(f"{span}\n" for span in spans), encoding="utf-8")
     return spans
@@ -100,12 +106,15 @@ class SpanVocab:
     def __init__(self, spans: list[str]):
         if not spans:
             raise ValueError("the typed-span inventory is empty")
-        if spans != sorted(spans):
+        tail = spans[-1] == UNKNOWN_SPAN
+        inventory = spans[:-1] if tail else spans
+        if inventory != sorted(inventory):
             raise ValueError("the typed-span inventory is not sorted")
-        if len(set(spans)) != len(spans):
+        if len(set(inventory)) != len(inventory):
             raise ValueError("the typed-span inventory has duplicates")
         self._spans = spans
         self._ids = {span: index for index, span in enumerate(spans)}
+        self._unknown_id = len(spans) - 1 if tail else -1
 
     @classmethod
     def load(cls, path: Path = TYPED_SPANS_PATH) -> SpanVocab:
@@ -133,6 +142,23 @@ class SpanVocab:
             return self._ids[span]
         except KeyError:
             raise KeyError(f"{span!r} is not a typed span of any syllable") from None
+
+    @property
+    def unknown_id(self) -> int:
+        """The id of the reserved ``<unk>`` span, when the table carries one."""
+        if self._unknown_id < 0:
+            raise KeyError("the typed-span table has no reserved unknown span")
+        return self._unknown_id
+
+    def id_or_unknown(self, span: str) -> int:
+        """The id of *span*, or the reserved unknown id for an off-inventory span.
+
+        Corruption is the only expected producer of off-inventory spans; a caller
+        on the clean path should still use :meth:`id`, which raises.
+        """
+        if span in self._ids:
+            return self._ids[span]
+        return self.unknown_id
 
     def spelling(self, span_id: int) -> str:
         """The span at table index *span_id*."""

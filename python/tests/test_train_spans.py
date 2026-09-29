@@ -8,6 +8,7 @@ import pytest
 
 from mlime.train.spans import (
     TYPED_SPANS_PATH,
+    UNKNOWN_SPAN,
     SpanVocab,
     build,
     default_syllables_path,
@@ -16,10 +17,11 @@ from mlime.train.spans import (
     read_syllables,
 )
 
-#: Every prefix of every one of the 425 syllables in `ime-pinyin`'s inventory.
+#: Every prefix of every one of the 425 syllables in `ime-pinyin`'s inventory,
+#: plus the reserved `<unk>` tail the typo path folds off-inventory spans onto.
 #: The training plan estimated "~1.3k forms"; enumeration says 506, and the
 #: enumeration is the thing the model is built against.
-TYPED_SPAN_COUNT = 506
+TYPED_SPAN_COUNT = 507
 
 
 def test_inventory_size_is_pinned() -> None:
@@ -50,12 +52,20 @@ def test_an_unknown_span_raises_rather_than_folding() -> None:
         SpanVocab.load().id("qq")
 
 
+def test_off_inventory_spans_fold_onto_the_reserved_id() -> None:
+    spans = SpanVocab.load()
+    assert spans.spelling(spans.unknown_id) == UNKNOWN_SPAN
+    assert spans.unknown_id == len(spans) - 1
+    assert spans.id_or_unknown("qq") == spans.unknown_id
+    assert spans.id_or_unknown("jia") == spans.id("jia")
+
+
 def test_the_shipped_table_matches_the_syllable_inventory() -> None:
     """The generated file is only trustworthy while it is current."""
     source = default_syllables_path()
     if source is None:
         pytest.skip("not running from a checkout; the syllable inventory is absent")
-    assert enumerate_spans(read_syllables(source)) == list(SpanVocab.load())
+    assert [*enumerate_spans(read_syllables(source)), UNKNOWN_SPAN] == list(SpanVocab.load())
 
 
 def test_regeneration_reproduces_the_shipped_table(tmp_path: Path) -> None:

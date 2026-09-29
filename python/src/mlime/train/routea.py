@@ -220,6 +220,13 @@ def export_onnx(
     """
     if quantize not in (None, "int8"):
         raise ValueError(f"quantize must be 'int8' or None, got {quantize!r}")
+    letter_weight = model.letter_encoder.project.weight
+    if bool((letter_weight != 0).any()):
+        raise ValueError(
+            "this model's letter encoder carries trained weights and the fill graph "
+            "takes no span_letters input; the letter term is part of the decoder-side "
+            "work, not of this export"
+        )
     was_training = model.training
     model = model.eval()
     out_dir.mkdir(parents=True, exist_ok=True)

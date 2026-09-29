@@ -14,7 +14,7 @@ from pathlib import Path
 
 from mlime.train.arbitration import ReadingArbitration
 from mlime.train.count import CENSUS_VERSION, CountSpec, count_batches, matching_census
-from mlime.train.lexicon import Lexicon
+from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.loop import EpochBatches
 from mlime.train.run import RunPaths, Slices, Vocabularies
 from mlime.train.samples import (
@@ -63,7 +63,7 @@ def batches_in_first_epoch(
             rank=rank,
             world_size=world_size,
         ),
-        Collator(tokenizer, lexicon.candidate_mask),
+        Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)),
         BUDGET,
     )
     taken = 0
@@ -83,7 +83,13 @@ def test_the_count_is_the_number_of_batches_the_loop_would_take(
     tmp_path: Path,
 ) -> None:
     census = count_batches(
-        Vocabularies(spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration),
+        Vocabularies(
+            spans=spans,
+            tokenizer=tokenizer,
+            lexicon=lexicon,
+            arbitration=arbitration,
+            syllables=frozenset(),
+        ),
         census_paths(corpus, tmp_path),
         Slices(train=SHARDS, held_out=()),
         token_budget=BUDGET,
@@ -107,7 +113,13 @@ def test_every_rank_is_counted_over_the_shards_it_owns(
     # Shards are dealt out whole, so a rank's count is its own shards' count and
     # not half of everything: the run stops when the shortest rank is done.
     census = count_batches(
-        Vocabularies(spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration),
+        Vocabularies(
+            spans=spans,
+            tokenizer=tokenizer,
+            lexicon=lexicon,
+            arbitration=arbitration,
+            syllables=frozenset(),
+        ),
         census_paths(corpus, tmp_path),
         Slices(train=SHARDS, held_out=()),
         token_budget=BUDGET,
@@ -133,7 +145,13 @@ def test_a_census_covers_every_epoch_and_is_read_back_from_its_file(
     tmp_path: Path,
 ) -> None:
     census = count_batches(
-        Vocabularies(spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration),
+        Vocabularies(
+            spans=spans,
+            tokenizer=tokenizer,
+            lexicon=lexicon,
+            arbitration=arbitration,
+            syllables=frozenset(),
+        ),
         census_paths(corpus, tmp_path),
         Slices(train=SHARDS, held_out=()),
         token_budget=BUDGET,
@@ -164,7 +182,11 @@ def test_accumulation_divides_micro_batches_into_steps(
 ) -> None:
     """The rank totals count micro-batches; a step of N of them is a count/N."""
     vocabularies = Vocabularies(
-        spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration
+        spans=spans,
+        tokenizer=tokenizer,
+        lexicon=lexicon,
+        arbitration=arbitration,
+        syllables=frozenset(),
     )
     one = count_batches(
         vocabularies,
@@ -211,7 +233,11 @@ def test_a_stored_census_is_used_when_the_configuration_matches(
     tmp_path: Path,
 ) -> None:
     vocabularies = Vocabularies(
-        spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration
+        spans=spans,
+        tokenizer=tokenizer,
+        lexicon=lexicon,
+        arbitration=arbitration,
+        syllables=frozenset(),
     )
     counted = count_batches(
         vocabularies,
@@ -250,7 +276,11 @@ def test_a_stored_census_is_refused_when_one_field_differs(
     tmp_path: Path,
 ) -> None:
     vocabularies = Vocabularies(
-        spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration
+        spans=spans,
+        tokenizer=tokenizer,
+        lexicon=lexicon,
+        arbitration=arbitration,
+        syllables=frozenset(),
     )
     counted = count_batches(
         vocabularies,
@@ -302,7 +332,11 @@ def test_a_census_without_a_version_is_refused(
     configuration field matches.
     """
     vocabularies = Vocabularies(
-        spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration
+        spans=spans,
+        tokenizer=tokenizer,
+        lexicon=lexicon,
+        arbitration=arbitration,
+        syllables=frozenset(),
     )
     counted = count_batches(
         vocabularies,
@@ -340,7 +374,11 @@ def test_a_v1_shaped_census_is_refused_and_recounted(
 ) -> None:
     """A file shaped like an older census is refused, not trusted enough to raise on."""
     vocabularies = Vocabularies(
-        spans=spans, tokenizer=tokenizer, lexicon=lexicon, arbitration=arbitration
+        spans=spans,
+        tokenizer=tokenizer,
+        lexicon=lexicon,
+        arbitration=arbitration,
+        syllables=frozenset(),
     )
     counted = count_batches(
         vocabularies,

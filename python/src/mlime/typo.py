@@ -36,6 +36,7 @@ the shape of the result, which is what the shared table pins down.
 from __future__ import annotations
 
 import json
+import math
 import random
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
@@ -91,10 +92,17 @@ class Edit:
 
 @dataclass(frozen=True)
 class Corruption:
-    """The corrupted keystroke string and the edits that produced it."""
+    """The corrupted keystroke string and the edits that produced it.
+
+    ``spans`` is the corrupted text sliced back at the bounds the edits shifted:
+    ``spans[i]`` is what was pressed for syllable ``i`` of the input, so training
+    keeps its per-character alignment through a corruption that moves letters
+    across span boundaries.
+    """
 
     text: str
     edits: tuple[Edit, ...]
+    spans: tuple[str, ...] = ()
 
 
 class NoiseModel:
@@ -230,12 +238,16 @@ class NoiseModel:
             bounds.append([cursor, cursor + len(syllable)])
             cursor += len(syllable)
         edits = [self._apply(rng, letters, bounds) for _ in range(self._draw_count(rng, min_edits))]
-        return Corruption("".join(letters), tuple(edits))
+        return Corruption(
+            "".join(letters),
+            tuple(edits),
+            tuple("".join(letters[start:end]) for start, end in bounds),
+        )
 
     def maybe_corrupt(self, syllables: Sequence[str], rng: random.Random) -> Corruption:
         """The augmentation entry point: the per-sentence coin, then [`corrupt`]."""
         if rng.random() >= self._per_sentence:
-            return Corruption("".join(syllables), ())
+            return Corruption("".join(syllables), (), tuple(syllables))
         return self.corrupt(syllables, rng, min_edits=1)
 
     def _draw_count(self, rng: random.Random, at_least: int) -> int:
@@ -327,15 +339,250 @@ class NoiseModel:
 def _shift(bounds: list[list[int]], at: int, by: int) -> None:
     """Move bounds after an insertion or deletion at *at*.
 
-    The bound holding the edited position grows or shrinks with it; every bound
-    starting at or past it moves whole.
+    A pressed key always belongs to a bound: an insertion landing exactly on a
+    seam joins the bound that ends there -- it repeats that bound's last letter
+    -- while the bound that begins there only moves. A deletion touching a
+    bound's first letter shrinks that bound, never moves it under the previous
+    span's tail.
     """
     for bound in bounds:
-        if at <= bound[0]:
-            bound[0] += by
-            bound[1] += by
-        elif at < bound[1]:
-            bound[1] += by
+        if by > 0:
+            if bound[0] >= at:
+                bound[0] += by
+                bound[1] += by
+            elif bound[1] >= at:
+                bound[1] += by
+        else:
+            if bound[0] > at:
+                bound[0] += by
+                bound[1] += by
+            elif bound[1] > at:
+                bound[1] += by
+
+
+#: Corrections kept per typed span, per the shared #101 spec.
+CORRECTIONS_K = 8
+
+#: The deepest edit distance a correction can sit at, per the same spec.
+CORRECTIONS_MAX_EDITS = 2
+
+#: The generated correction fixture the Rust parity test reads.
+CORRECTIONS_FIXTURE_RELATIVE = Path("crates/ime-pinyin/tests/fixtures/typo-corrections.json")
+
+
+class CorrectionTable:
+    """``corrections(span)``: the syllables the noise model can bend into *span*.
+
+    This is the #101 spec's correction function: for a typed span ``s``, every
+    syllable ``y`` in the inventory that the noise model can turn into ``s``
+    within at most two edits, costed ``-log P(s | y)`` under the model's
+    edit-type probabilities. ``P(s | y)`` sums the probability of every one-
+    and two-edit path that produces ``s`` -- the edit-count distribution and the
+    per-sentence coin do not enter it, only the per-edit draws.
+
+    When ``s`` is itself a valid syllable or a valid prefix (the abbreviation
+    case), ``s`` appears in its own list at cost 0: reading the typed letters as
+    meant is always an option the decoder may price. Entries sort by cost with
+    the syllable breaking ties, and at most ``K`` of them survive -- the cap is
+    what keeps a high-entropy typo from exploding the candidate union.
+    """
+
+    def __init__(
+        self,
+        model: NoiseModel,
+        syllables: Iterable[str],
+        prefixes: Iterable[str] | None = None,
+        k: int = CORRECTIONS_K,
+    ) -> None:
+        if k < 1:
+            raise ValueError(f"the correction table keeps at least one entry, got {k}")
+        self._model = model
+        self._syllables = frozenset(syllables)
+        if prefixes is None:
+            prefixes = (
+                syllable[:length]
+                for syllable in self._syllables
+                for length in range(1, len(syllable))
+            )
+        self._prefixes = frozenset(prefixes)
+        self._k = k
+        self._cache: dict[str, tuple[tuple[str, float], ...]] = {}
+
+    @classmethod
+    def load(
+        cls, typo_table: Path, syllables_path: Path, k: int = CORRECTIONS_K
+    ) -> CorrectionTable:
+        """Build the table the generated ``typo.json`` and syllable inventory describe."""
+        return cls(NoiseModel.load(typo_table), load_syllables(syllables_path), k=k)
+
+    def corrections(self, span: str) -> tuple[tuple[str, float], ...]:
+        """The ``(syllable, cost)`` entries for *span*, sorted then capped at ``K``."""
+        cached = self._cache.get(span)
+        if cached is None:
+            cached = self._resolve(span)
+            self._cache[span] = cached
+        return cached
+
+    def _resolve(self, span: str) -> tuple[tuple[str, float], ...]:
+        costs: dict[str, float] = {}
+        predecessors = self._predecessors(span)
+        origins = predecessors | set().union(
+            *(self._predecessors(intermediate) for intermediate in predecessors)
+        )
+        for syllable in sorted(origins & self._syllables):
+            probability = self._one_edit_probability(syllable, span) + sum(
+                draw * self._one_edit_probability(intermediate, span)
+                for intermediate, draw in self._outcomes(syllable).items()
+            )
+            if probability > 0.0:
+                costs[syllable] = -math.log(probability)
+        if span in self._syllables or span in self._prefixes:
+            costs[span] = 0.0
+        ranked = sorted(costs.items(), key=lambda entry: (entry[1], entry[0]))
+        return tuple(ranked[: self._k])
+
+    def _applicable(self, letters: str) -> dict[str, float]:
+        """Each edit kind's probability at *letters*, normalised the way `corrupt` draws it."""
+        sites = self._sites(letters)
+        kinds = [kind for kind in EDIT_TYPES if kind != "fuzzy" or sites]
+        if not letters:
+            kinds.clear()
+        elif len(letters) < 2:
+            kinds.remove("transposition")
+            kinds.remove("omission")
+        weights = {kind: self._model._edit_type[kind] for kind in kinds}
+        total = sum(weights.values())
+        return {kind: weight / total for kind, weight in weights.items()}
+
+    def _sites(self, letters: str) -> list[FuzzyPair]:
+        """The fuzzy pairs the single-syllable string admits, as `fuzzy_sites` finds them."""
+        return [
+            pair
+            for pair in self._model._fuzzy_pairs
+            if (pair.where == "initial" and self._model.initial_of(letters) == pair.frm)
+            or (pair.where == "final" and self._model.final_of(letters) == pair.frm)
+        ]
+
+    def _apply_pair(self, letters: str, pair: FuzzyPair) -> str:
+        """The syllable after one fuzzy swap, as `_apply_fuzzy` writes it."""
+        if pair.where == "initial":
+            return pair.to + letters[len(pair.frm) :]
+        return letters[: -len(pair.frm)] + pair.to
+
+    def _outcomes(self, letters: str) -> dict[str, float]:
+        """Every ``(string, probability)`` one edit of *letters* produces, duplicates merged."""
+        kinds = self._applicable(letters)
+        length = len(letters)
+        out: dict[str, float] = {}
+
+        def add(produced: str, probability: float) -> None:
+            out[produced] = out.get(produced, 0.0) + probability
+
+        if "adjacent" in kinds:
+            each = kinds["adjacent"] / length
+            for index, letter in enumerate(letters):
+                near = self._model._neighbours[letter]
+                for replacement in near:
+                    add(
+                        letters[:index] + replacement + letters[index + 1 :],
+                        each / len(near),
+                    )
+        if "transposition" in kinds:
+            each = kinds["transposition"] / (length - 1)
+            for index in range(length - 1):
+                add(
+                    letters[:index] + letters[index + 1] + letters[index] + letters[index + 2 :],
+                    each,
+                )
+        if "omission" in kinds:
+            each = kinds["omission"] / length
+            for index in range(length):
+                add(letters[:index] + letters[index + 1 :], each)
+        if "doubling" in kinds:
+            each = kinds["doubling"] / length
+            for index in range(length):
+                add(letters[: index + 1] + letters[index] + letters[index + 1 :], each)
+        if "fuzzy" in kinds:
+            sites = self._sites(letters)
+            weight = sum(pair.weight for pair in sites)
+            for pair in sites:
+                add(self._apply_pair(letters, pair), kinds["fuzzy"] * pair.weight / weight)
+        return out
+
+    def _one_edit_probability(self, source: str, produced: str) -> float:
+        """``P(produced | source)`` for one edit, summed over every way it can happen."""
+        kinds = self._applicable(source)
+        length = len(source)
+        probability = 0.0
+        if len(produced) == length:
+            diffs = [
+                i
+                for i, (left, right) in enumerate(zip(source, produced, strict=True))
+                if left != right
+            ]
+            if not diffs and "transposition" in kinds:
+                # Transposing a pair of equal letters is a real draw that changes nothing.
+                hits = sum(1 for i in range(length - 1) if source[i] == source[i + 1])
+                probability += kinds["transposition"] * hits / (length - 1)
+            if len(diffs) == 1:
+                index = diffs[0]
+                near = self._model._neighbours[source[index]]
+                if produced[index] in near:
+                    probability += kinds["adjacent"] / length / len(near)
+            if len(diffs) == 2 and diffs[1] == diffs[0] + 1:
+                index = diffs[0]
+                if source[index] == produced[index + 1] and source[index + 1] == produced[index]:
+                    probability += kinds["transposition"] / (length - 1)
+        elif len(produced) == length - 1 and "omission" in kinds:
+            hits = sum(
+                1 for index in range(length) if source[:index] + source[index + 1 :] == produced
+            )
+            probability += kinds["omission"] * hits / length
+        elif len(produced) == length + 1 and "doubling" in kinds:
+            hits = sum(
+                1
+                for index in range(length)
+                if source[: index + 1] + source[index] + source[index + 1 :] == produced
+            )
+            probability += kinds["doubling"] * hits / length
+        if "fuzzy" in kinds:
+            sites = self._sites(source)
+            weight = sum(pair.weight for pair in sites)
+            for pair in sites:
+                if self._apply_pair(source, pair) == produced:
+                    probability += kinds["fuzzy"] * pair.weight / weight
+        return probability
+
+    def _predecessors(self, produced: str) -> set[str]:
+        """Every string one edit could have become *produced* from, valid or not.
+
+        The inverse of `_outcomes`: adjacent and transposition are their own
+        inverses (the neighbour table is symmetric by construction), omission
+        inverts to inserting any letter anywhere, doubling inverts to deleting
+        one letter of a repeated pair, and a fuzzy swap inverts to the pair's
+        other direction at the same site.
+        """
+        length = len(produced)
+        out: set[str] = set()
+        for index, letter in enumerate(produced):
+            for original in self._model._neighbours[letter]:
+                out.add(produced[:index] + original + produced[index + 1 :])
+        for index in range(length - 1):
+            out.add(
+                produced[:index] + produced[index + 1] + produced[index] + produced[index + 2 :]
+            )
+        for index in range(length + 1):
+            for letter in "abcdefghijklmnopqrstuvwxyz":
+                out.add(produced[:index] + letter + produced[index:])
+        for index in range(1, length):
+            if produced[index] == produced[index - 1]:
+                out.add(produced[:index] + produced[index + 1 :])
+        for pair in self._model._fuzzy_pairs:
+            if pair.where == "initial" and self._model.initial_of(produced) == pair.to:
+                out.add(pair.frm + produced[len(pair.to) :])
+            if pair.where == "final" and self._model.final_of(produced) == pair.to:
+                out.add(produced[: -len(pair.to)] + pair.frm)
+        return out
 
 
 def record_seed(seed: int, *fields: str) -> int:
@@ -462,6 +709,143 @@ def typo_twin(
     report += [f"  {kind:14s}{histogram[kind]}" for kind in EDIT_TYPES]
     report.append(f"unsegmentable under the lattice: {unsegmentable}")
     return "\n".join(report)
+
+
+def corrections_fixture_spans(table: CorrectionTable) -> tuple[str, ...]:
+    """The fixed ~200 spans the shared correction fixture covers.
+
+    Both languages' `corrections` must agree on every entry of this list: a
+    slice of valid syllables, the prefixes abbreviations produce, typos one edit
+    away, typos two edits away, and the fuzzy swaps the base syllables admit --
+    all fourteen pair directions. The list is deterministic -- rebuilt, it is
+    identical, so the test can fail on any drift the way the table itself does.
+    """
+    model = table._model
+    spans: list[str] = []
+    # Common syllables across the letter range: every initial -- single and
+    # multi-letter -- appears, and every fuzzy pair fires somewhere.
+    wanted = {
+        "a",
+        "ai",
+        "an",
+        "ang",
+        "ba",
+        "bei",
+        "bu",
+        "can",
+        "cha",
+        "chi",
+        "chong",
+        "ci",
+        "de",
+        "e",
+        "en",
+        "eng",
+        "er",
+        "fa",
+        "guo",
+        "hao",
+        "he",
+        "ji",
+        "jia",
+        "jing",
+        "kan",
+        "lai",
+        "lan",
+        "lv",
+        "ma",
+        "mei",
+        "na",
+        "ni",
+        "o",
+        "pa",
+        "qin",
+        "ren",
+        "shi",
+        "shui",
+        "si",
+        "suo",
+        "ta",
+        "tian",
+        "wo",
+        "xia",
+        "xin",
+        "yi",
+        "yu",
+        "zai",
+        "zhe",
+        "zhi",
+        "zhong",
+        "zi",
+        "zuo",
+    }
+    base = [syllable for syllable in sorted(table._syllables) if syllable in wanted]
+    if len(base) != len(wanted):
+        missing = wanted - set(base)
+        raise ValueError(f"the fixture asks about non-syllables: {sorted(missing)}")
+    spans.extend(base)
+    # The abbreviation layer: every prefix of the common syllables that is not
+    # itself a whole syllable, so the cost-0 self entry is exercised both ways.
+    spans.extend(
+        sorted(
+            {
+                syllable[:length]
+                for syllable in base
+                for length in range(1, len(syllable))
+                if syllable[:length] not in table._syllables
+            }
+        )
+    )
+    # One-edit typos: an adjacent slip at the head of every base syllable, then
+    # a second one whose kind rotates so transposition, omission and doubling
+    # each appear across the set.
+    kinds = ("transposition", "omission", "doubling")
+    for index, syllable in enumerate(base):
+        spans.append(model._neighbours[syllable[0]][0] + syllable[1:])
+        if len(syllable) < 2:
+            continue
+        kind = kinds[index % 3]
+        if kind == "transposition":
+            spans.append(syllable[1] + syllable[0] + syllable[2:])
+        elif kind == "omission":
+            spans.append(syllable[1:])
+        else:
+            spans.append(syllable + syllable[-1])
+    # Two-edit typos: an adjacent slip at the head followed by an omission at
+    # the tail, on a rotating third of the longer syllables.
+    for index, syllable in enumerate(base):
+        if len(syllable) >= 3 and index % 3 == 0:
+            slipped = model._neighbours[syllable[0]][0] + syllable[1:]
+            spans.append(slipped[:-1])
+    # Fuzzy swaps, both directions of every pair a base syllable admits.
+    for syllable in base:
+        initial, final = model.initial_of(syllable), model.final_of(syllable)
+        for pair in model._fuzzy_pairs:
+            if pair.where == "initial" and initial == pair.frm:
+                spans.append(pair.to + syllable[len(pair.frm) :])
+            if pair.where == "final" and final == pair.frm:
+                spans.append(syllable[: -len(pair.frm)] + pair.to)
+    return tuple(dict.fromkeys(spans))
+
+
+def write_corrections_fixture(table: CorrectionTable, out: Path) -> int:
+    """Write the shared ``corrections`` fixture and return the span count.
+
+    The file is the contract the Rust test (#104) pins its own implementation
+    against: one sorted span per line-entry with its ``[(syllable, cost)]``
+    list, floats at full precision, so a regenerated file either agrees bit for
+    bit or the change was real.
+    """
+    rows = {
+        span: [[syllable, cost] for syllable, cost in table.corrections(span)]
+        for span in corrections_fixture_spans(table)
+    }
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(
+        json.dumps(rows, ensure_ascii=False, indent=1, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return len(rows)
 
 
 def _mapping(value: object, where: str) -> dict[str, object]:

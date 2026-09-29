@@ -93,15 +93,7 @@ def initialise(
         len(vocab),
         emit_ids,
     )
-    result = model.load_state_dict(_weights(encoder_state, init_encoder), strict=False)
-    if result.unexpected_keys:
-        raise ValueError(
-            f"{init_encoder} holds weights the e2e model has no use for: "
-            f"{result.unexpected_keys[:4]}"
-        )
-    added = [name for name in result.missing_keys if not name.startswith("decoder.")]
-    if added:
-        raise ValueError(f"{init_encoder} left encoder-side parameters uninitialised: {added[:4]}")
+    model.load_resumed(_weights(encoder_state, init_encoder), init_encoder)
     # The loaded buffers replace the lexicon's own tables: a character table
     # that drifted since route A trained would otherwise run against a stale
     # homophone set without a word.
@@ -162,7 +154,7 @@ def load_model(
     """The e2e checkpoint at *path*: the model it describes, and the step it left at."""
     state = torch.load(path, map_location="cpu", weights_only=False)
     model = from_checkpoint(state, lexicon, bert_config=bert_config)
-    model.load_state_dict(_weights(state, path), strict=True)
+    model.load_resumed(_weights(state, path), path)
     model.to(device).eval()
     return model, int(state["step"])
 
@@ -253,7 +245,8 @@ def e2e(
     # real world of `world_size * virtual` ranks would have built.
     virtual = training.virtual_ranks
     total_world = world.world_size * virtual
-    builders = [vocabularies.builder(augmentation, training.seed) for _ in range(virtual)]
+    augmented = augmentation or Augmentation()
+    builders = [vocabularies.builder(augmented, training.seed) for _ in range(virtual)]
     lanes = [
         (
             vocabularies.stream(
@@ -263,10 +256,15 @@ def e2e(
                 world.rank * virtual + index,
                 total_world,
             ),
-            vocabularies.collator(context_dropout, max_context_tokens, training.seed),
+            vocabularies.collator(
+                context_dropout, max_context_tokens, training.seed, typos=augmented.typos
+            ),
         )
         for index in range(virtual)
     ]
+    # Frozen while the noise model is off, so the fill tower stays exactly the
+    # pre-letter one and the ONNX export's span_ids-only graph still describes it.
+    model.letter_encoder.requires_grad_(augmented.typos)
 
     paths.out.mkdir(parents=True, exist_ok=True)
     with MetricLog(paths.out / "metrics.jsonl") as provenance:
@@ -297,11 +295,16 @@ def e2e(
             build_counts.update(builder.counts.as_dict())
         return paused_run(segment, losses, model.gates(), dict(build_counts), world)
     evaluation = held_out_examples(
-        paths, vocabularies.builder(augmentation, training.seed + 1), slices
+        paths, vocabularies.builder(augmented, training.seed + 1), slices
     )
     device = world.device
-    with_context = evaluate(model, evaluation, tokenizer, device, training.token_budget, True)
-    without_context = evaluate(model, evaluation, tokenizer, device, training.token_budget, False)
+    candidates = vocabularies.candidate_space(augmented.typos)
+    with_context = evaluate(
+        model, evaluation, tokenizer, device, training.token_budget, True, candidates
+    )
+    without_context = evaluate(
+        model, evaluation, tokenizer, device, training.token_budget, False, candidates
+    )
     result = RunResult(
         metrics=segment.metrics,
         first_loss=losses[0],

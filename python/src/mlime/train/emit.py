@@ -42,7 +42,7 @@ from typing import Any
 import torch
 
 from mlime.logging import log
-from mlime.train.lexicon import Lexicon
+from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.model import RouteAConfig, RouteAModel
 from mlime.train.samples import (
     DEFAULT_CONTEXT_TOKENS,
@@ -284,7 +284,7 @@ def load_model(
     route = RouteAConfig(**state["route_a"])
     bert = BertConfig.from_pretrained(route.base_model)
     model = RouteAModel.from_config(bert, lexicon, route)
-    model.load_state_dict(state["model"], strict=True)
+    model.load_resumed(state["model"], checkpoint)
     model.to(device)
     model.eval()
     step = int(state["step"])
@@ -320,7 +320,7 @@ def emit(
     model, route, step = load_model(checkpoint, lexicon, device)
     collator = Collator(
         tokenizer,
-        lexicon.candidate_mask,
+        CandidateSpace(spans, lexicon.candidate_mask),
         context_dropout=0.0 if with_context else 1.0,
         max_context_tokens=max_context_tokens,
     )
