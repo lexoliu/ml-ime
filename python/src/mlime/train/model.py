@@ -429,7 +429,9 @@ class RouteAModel(nn.Module):
         the old sum.
         """
         words: torch.Tensor = self.fill.embeddings.word_embeddings(batch.input_ids)
-        spans = self.span_embeddings(batch.span_ids) + self.letter_encoder(batch.span_letters)
+        spans: torch.Tensor = self.span_embeddings(batch.span_ids) + self.letter_encoder(
+            batch.span_letters
+        )
         return words + spans * batch.span_positions[..., None]
 
     def encode(self, batch: Batch) -> torch.Tensor:
