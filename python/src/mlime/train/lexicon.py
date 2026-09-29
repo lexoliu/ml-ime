@@ -228,16 +228,10 @@ class CandidateSpace:
                 # admits it.
                 full = self.table.costs(span)
                 for index, prior in costs.items():
-                    costs[index] = min(
-                        (
-                            prior,
-                            *(
-                                cost
-                                for syllable in self._readings(index)
-                                if (cost := full.get(syllable)) is not None
-                            ),
-                        )
-                    )
+                    reached = [
+                        full[syllable] for syllable in self._readings(index) if syllable in full
+                    ]
+                    costs[index] = min((prior, *reached))
                 # The span's own readings pay nothing -- they were never
                 # widened.
                 for index in self._own(span):
