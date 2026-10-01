@@ -15,10 +15,11 @@ mod candidates;
 mod emissions;
 mod score;
 
-pub use beam::{BeamOptions, Hypothesis, Record, decode_many};
+pub use beam::{BeamOptions, Breakdown, Hypothesis, Record, decode_many, decode_many_stats};
 pub use candidates::{CandidatePath, Candidates};
 pub use emissions::{
     EmissionError, Emittable, LatticePath, LatticeRecord, ScoreRecord, Scored, Weighted,
+    lattice_paths,
 };
 pub use score::{Asked, Both, Emission, History, MAX_HISTORY, NoTransition, Transition, Uniform};
 
@@ -419,4 +420,5 @@ mod tests {
             DecodeError::NoSegmentations
         );
     }
+
 }

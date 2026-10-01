@@ -175,6 +175,24 @@ pub trait Transition {
     /// log probability or any other quantity where larger is better.
     fn score(&self, state: &Self::State, candidate: CharId) -> f32;
 
+    /// `out[i] += weight * score(state, allowed[i])`, fused in place.
+    ///
+    /// One call scores a beam's whole candidate list: a model whose per-pair
+    /// probe walks a sorted structure merges the sorted `allowed` against
+    /// its row instead of probing per pair; the default scores them one by
+    /// one. Either way the added term is `weight * score` per candidate —
+    /// `weight` composes multiplicatively into combined models, so
+    /// `score_many(state, 1.0, ..)` agrees with `score` bit for bit.
+    ///
+    /// `out` must hold exactly `allowed.len()` accumulators, zeroed before
+    /// the first model's pass.
+    fn score_many(&self, state: &Self::State, weight: f32, allowed: &[CharId], out: &mut [f32]) {
+        debug_assert_eq!(out.len(), allowed.len());
+        for (slot, &candidate) in out.iter_mut().zip(allowed.iter()) {
+            *slot += weight * self.score(state, candidate);
+        }
+    }
+
     /// Score of the sequence ending after *state*.
     ///
     /// Without this a decoder is free to end anywhere, and a reading that trails
@@ -196,6 +214,15 @@ pub trait Transition {
     /// that gathers per candidate may return only what was asked, and then
     /// `score`/`finish` of anything else is a bug in the caller.
     fn advance(&self, steps: &[(&Self::State, CharId, Asked<'_>)]) -> Vec<Self::State>;
+
+    /// The form of *state* a state cache retains between decodes.
+    ///
+    /// The default is the state itself. A model whose produced states are
+    /// rows of one shared step buffer returns a copy that holds only its own
+    /// row, so a cached entry does not pin the batch it came from.
+    fn compact(&self, state: &Self::State) -> Self::State {
+        state.clone()
+    }
 }
 
 /// A shared reference to a model is the model: every method borrows it, so a
@@ -213,12 +240,20 @@ impl<T: Transition + ?Sized> Transition for &T {
         (**self).score(state, candidate)
     }
 
+    fn score_many(&self, state: &Self::State, weight: f32, allowed: &[CharId], out: &mut [f32]) {
+        (**self).score_many(state, weight, allowed, out);
+    }
+
     fn finish(&self, state: &Self::State) -> f32 {
         (**self).finish(state)
     }
 
     fn advance(&self, steps: &[(&Self::State, CharId, Asked<'_>)]) -> Vec<Self::State> {
         (**self).advance(steps)
+    }
+
+    fn compact(&self, state: &Self::State) -> Self::State {
+        (**self).compact(state)
     }
 }
 
@@ -261,6 +296,19 @@ impl<A: Transition, B: Transition> Transition for Both<A, B> {
             + self.second_weight * self.second.score(&state.1, candidate)
     }
 
+    /// `out[i] += weight * (w1*s1[i] + w2*s2[i])`, written as two
+    /// accumulate passes so no second buffer is needed: at `weight == 1`
+    /// the sum is `w1*s1 + w2*s2` exactly as `score` forms it — the
+    /// `+0` accumulator start adds nothing — while any other `weight`
+    /// folds into each side's own weight first, which is the same
+    /// product up to one rounding.
+    fn score_many(&self, state: &Self::State, weight: f32, allowed: &[CharId], out: &mut [f32]) {
+        self.first
+            .score_many(&state.0, self.first_weight * weight, allowed, out);
+        self.second
+            .score_many(&state.1, self.second_weight * weight, allowed, out);
+    }
+
     fn finish(&self, state: &Self::State) -> f32 {
         self.first_weight * self.first.finish(&state.0)
             + self.second_weight * self.second.finish(&state.1)
@@ -280,6 +328,10 @@ impl<A: Transition, B: Transition> Transition for Both<A, B> {
             .into_iter()
             .zip(self.second.advance(&second))
             .collect()
+    }
+
+    fn compact(&self, state: &Self::State) -> Self::State {
+        (self.first.compact(&state.0), self.second.compact(&state.1))
     }
 }
 

@@ -277,6 +277,34 @@ class Block(nn.Module):
         )
         return self.merge(x, attended.view(q.shape)), k, v
 
+    def attend_pages(
+        self,
+        x: torch.Tensor,
+        gathered_keys: torch.Tensor,
+        gathered_values: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """One new position ``x [rows, 1, H]`` against gathered prefix pages and itself.
+
+        ``gathered_keys``/``gathered_values`` are the row's history already in
+        attention order, ``[rows, heads, T, head_dim]`` — the step graph
+        gathers them from the resident page pool by index, so a row's prefix
+        can share nodes with every other row's. ``mask [rows, T + 1]`` marks
+        the real positions; the new position's own key/value, appended here,
+        is always real and arrives already in the mask. Returns the output
+        and the new position's key/value ``[rows, heads, 1, head_dim]`` — the
+        page the row's produced state owns.
+        """
+        q, k, v = self.split(x)
+        keys = torch.cat([gathered_keys, k], dim=2)
+        values = torch.cat([gathered_values, v], dim=2)
+        scores = (q @ keys.transpose(-1, -2)).masked_fill(
+            mask.logical_not().view(x.shape[0], 1, 1, -1),
+            torch.tensor(float("-inf"), dtype=q.dtype),
+        ) / torch.tensor(math.sqrt(self.head_dim), dtype=q.dtype)
+        attended = torch.softmax(scores, dim=-1) @ values
+        return self.merge(x, attended), k, v
+
 
 class TransformerCharLm(CharLm):
     """Embedding plus learned positions, pre-norm blocks, tied output.
@@ -448,6 +476,117 @@ class Restricted(nn.Module):
         full = torch.full((batch, self.model.embed.num_embeddings), self.UNREACHABLE)
         index = self.keep.unsqueeze(0).expand(batch, -1)
         return full.scatter(1, index, kept)
+
+
+class PagedStepModule(nn.Module):
+    """The step graph with the beam's history addressed by page index.
+
+    The transformer's key/value cache lives in the resident pool
+    ``keys``/``values`` ``[pages, layers, heads, head_dim]``, one page per
+    position kept contiguous so the host writes a produced row in a single
+    copy; a beam state is its prefix's page ids, not a row of KV.
+    ``token [rows]`` is each produced beam's next character, ``page_row
+    [rows, T]`` its prefix's page ids zero-padded on the right (page zero is
+    the pool's always-masked scratch), ``mask [rows, T]`` the real history
+    positions — ``page_row``'s non-zero entries for a paged row, the first
+    ``depth`` for a row source — and ``candidates [rows, K]`` the ids its
+    produced state will be scored on. Rows that cannot be paged — a state
+    whose pages were never claimed — name a scratch row instead:
+    ``state_keys``/``state_values`` ``[residents, layers, heads, T,
+    head_dim]`` hold one all-zero row in the common case, and ``source_row
+    [rows]`` is -1 for a paged row and the scratch index for a row source.
+
+    The output ``candidate_log_probs [rows, K]`` is the log-softmax
+    gathered at each row's candidates — the only tensor that crosses the
+    bus — and ``next_keys``/``next_values`` ``[rows, layers, heads,
+    head_dim]`` are the produced rows' own positions: the host writes each
+    into the page slot its state's prefix names, so a step moves indices
+    and one page per produced state, never a row of history.
+    """
+
+    def __init__(self, model: CharLm, keep: torch.Tensor | None = None):
+        super().__init__()
+        self.model = model
+        self.restricted = Restricted(model, keep)
+
+    def forward(
+        self,
+        token: torch.Tensor,
+        page_row: torch.Tensor,
+        mask: torch.Tensor,
+        candidates: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        state_keys: torch.Tensor,
+        state_values: torch.Tensor,
+        source_row: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        model = self.model
+        if not isinstance(model, TransformerCharLm):
+            raise TypeError("the paged step is the transformer's graph")
+        rows, pages = token.shape[0], page_row.shape[1]
+        from_rows = source_row >= 0
+        # The new position attends itself; its mask slot is always real.
+        mask = torch.cat([mask, torch.ones(rows, 1, dtype=torch.bool)], dim=-1)
+        x = model.embed_at(token.unsqueeze(1), mask.sum(-1) - 1)
+        gathered = page_row.reshape(-1)
+        # One gather per tensor over the page axis, then the layer axis
+        # permuted out: `paged_k[:, layer]` is the [rows, heads, T,
+        # head_dim] the per-layer `keys[layer].index_select` produced under
+        # the [layers, pages, ..] order.
+        paged_k = (
+            keys.index_select(0, gathered)
+            .view(rows, pages, *keys.shape[1:])
+            .permute(0, 2, 3, 1, 4)
+        )
+        paged_v = (
+            values.index_select(0, gathered)
+            .view(rows, pages, *values.shape[1:])
+            .permute(0, 2, 3, 1, 4)
+        )
+        new_keys, new_values = [], []
+        for layer, block in enumerate(model.layers()):
+            row_k = state_keys.index_select(0, source_row.clamp(0))[:, layer]
+            gk = torch.where(from_rows.view(rows, 1, 1, 1), row_k, paged_k[:, layer])
+            row_v = state_values.index_select(0, source_row.clamp(0))[:, layer]
+            gv = torch.where(from_rows.view(rows, 1, 1, 1), row_v, paged_v[:, layer])
+            x, k, v = block.attend_pages(x, gk, gv, mask)
+            new_keys.append(k)
+            new_values.append(v)
+        features: torch.Tensor = model.norm(x).squeeze(1)
+        next_keys = torch.stack(new_keys, dim=1).squeeze(3)
+        next_values = torch.stack(new_values, dim=1).squeeze(3)
+        return (
+            self.restricted(features).gather(1, candidates),
+            next_keys,
+            next_values,
+        )
+
+
+class PagedPrefillModule(nn.Module):
+    """The prefill graph in the pages layout.
+
+    ``tokens [1, T], candidates [1, K] -> (candidate_log_probs,
+    prefix_keys, prefix_values)``. The context's key/value cache comes out
+    one position per row — ``[T, layers, heads, head_dim]`` — so the host
+    writes each position into its own page slot: the radix tree's shared
+    root is the prelude's chain of pages, and no prefix padding or mask
+    exists anywhere.
+    """
+
+    def __init__(self, model: CharLm, keep: torch.Tensor | None = None):
+        super().__init__()
+        self.model = model
+        self.restricted = Restricted(model, keep)
+
+    def forward(self, tokens: torch.Tensor, candidates: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        features, prefix, _ = self.model.prefill(tokens)
+        gathered = self.restricted(features).gather(1, candidates)
+        # [1, layers, heads, T, head_dim] -> [T, layers, heads, head_dim].
+        pages = tuple(
+            tensor.squeeze(0).permute(2, 0, 1, 3).contiguous() for tensor in prefix
+        )
+        return (gathered, *pages)
 
 
 class ResidentStepModule(nn.Module):

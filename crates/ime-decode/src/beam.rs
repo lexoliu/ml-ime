@@ -2,9 +2,11 @@
 
 use crate::candidates::{CandidatePath, Candidates};
 use crate::score::{Asked, Emission, History, MAX_HISTORY, Transition};
+use hashbrown::hash_map::Entry;
+use hashbrown::{HashMap, HashSet};
 use ime_pinyin::{CharId, Lexicon};
-use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::num::NonZeroUsize;
+use std::time::Instant;
 
 /// How wide the search is and how it trades segmentation against language model.
 #[derive(Clone, Debug)]
@@ -48,11 +50,33 @@ impl Default for BeamOptions {
     }
 }
 
+/// Where `decode_many`'s host time goes, accumulated across calls — the
+/// `advance` calls themselves are timed by the transition's own counters;
+/// this is the CPU work around them.
+#[derive(Clone, Debug, Default)]
+pub struct Breakdown {
+    /// Nanos inside candidate expansion: the emission and transition score
+    /// calls, `relax`, and the history-merge index.
+    pub expand_ns: u64,
+    /// Nanos inside survivor selection: the guard passes, the partition,
+    /// and the head sort.
+    pub select_ns: u64,
+    /// Nanos finishing: `Transition::finish`, reconstruction, `keep_diverse`.
+    pub finish_ns: u64,
+    /// (beam, character) pairs scored during expansion — the candidate
+    /// count the scores paid.
+    pub expanded: u64,
+}
+
 /// One decoded sentence.
 #[derive(Clone, Debug)]
 pub struct Hypothesis {
     chars: Vec<CharId>,
     score: f32,
+    /// The running score at each position: `steps[k - 1]` is the score of the
+    /// hypothesis's first `k` characters — emissions and transitions up to that
+    /// position, before the end-of-sequence term and the segmentation penalty.
+    steps: Vec<f32>,
     path: usize,
 }
 
@@ -61,6 +85,14 @@ impl Hypothesis {
     #[must_use]
     pub fn chars(&self) -> &[CharId] {
         &self.chars
+    }
+
+    /// The running score, one entry per position, same order as [`chars`].
+    ///
+    /// [`chars`]: Self::chars
+    #[must_use]
+    pub fn steps(&self) -> &[f32] {
+        &self.steps
     }
 
     /// Total score: emissions, transitions, the end-of-sequence term, and the
@@ -108,11 +140,6 @@ struct Marks {
 }
 
 impl Marks {
-    /// The character the lineage took at the *index*-th guarded position.
-    fn get(self, index: usize) -> Option<CharId> {
-        self.chars.get(index).copied().flatten()
-    }
-
     /// The marks of a survivor just emitted at a newly guarded position:
     /// every survivor's own character is its lineage there.
     fn pushed(self, ch: CharId) -> Self {
@@ -218,6 +245,7 @@ impl<S> Worker<'_, S> {
         transition: &T,
         options: &BeamOptions,
         index: &mut HashMap<(History, Marks), usize>,
+        breakdown: &mut Breakdown,
     ) -> Vec<Candidate>
     where
         E: Emission,
@@ -226,18 +254,29 @@ impl<S> Worker<'_, S> {
         let position = self.history.len();
         let allowed = &self.reading.positions()[position];
         let typo_weight = options.typo_weight;
-        let mut next: Vec<Candidate> = Vec::with_capacity(allowed.len());
+        let mut next: Vec<Candidate> = Vec::with_capacity(allowed.len() * self.latest.len().max(1));
         index.clear();
+        let tick = Instant::now();
+        // The emission term reads no beam state: score each admitted
+        // character once. The transition term is the whole candidate list in
+        // one `score_many` call per beam — a model with sorted-row lookups
+        // merges over `allowed` instead of probing per pair.
+        let emitted: Vec<f32> = allowed
+            .iter()
+            .map(|&ch| emission.score(self.path, position, ch))
+            .collect();
+        let mut scored = vec![0.0f32; allowed.len()];
         if position == 0 {
-            for (slot, &ch) in allowed.iter().enumerate() {
-                let score = emission.score(self.path, 0, ch) + transition.score(&self.start, ch)
-                    - priced(typo_weight, self.reading.prior(0, slot));
+            transition.score_many(&self.start, 1.0, allowed, &mut scored);
+            for (slot, ((&ch, &emit), &trans)) in
+                allowed.iter().zip(&emitted).zip(&scored).enumerate()
+            {
                 relax(
                     &mut next,
                     index,
                     Candidate {
                         history: History::START.extended(ch).truncated(T::HISTORY),
-                        score,
+                        score: emit + trans - priced(typo_weight, self.reading.prior(0, slot)),
                         ch,
                         parent: 0,
                         marks: Marks::default(),
@@ -246,17 +285,18 @@ impl<S> Worker<'_, S> {
             }
         } else {
             for (parent, beam) in self.latest.iter().enumerate() {
-                for (slot, &ch) in allowed.iter().enumerate() {
-                    let score = beam.candidate.score
-                        + emission.score(self.path, position, ch)
-                        + transition.score(&beam.state, ch)
-                        - priced(typo_weight, self.reading.prior(position, slot));
+                scored.fill(0.0);
+                transition.score_many(&beam.state, 1.0, allowed, &mut scored);
+                for (slot, ((&ch, &emit), &trans)) in
+                    allowed.iter().zip(&emitted).zip(&scored).enumerate()
+                {
                     relax(
                         &mut next,
                         index,
                         Candidate {
                             history: beam.candidate.history.extended(ch).truncated(T::HISTORY),
-                            score,
+                            score: beam.candidate.score + emit + trans
+                                - priced(typo_weight, self.reading.prior(position, slot)),
                             ch,
                             parent,
                             marks: beam.candidate.marks,
@@ -265,7 +305,11 @@ impl<S> Worker<'_, S> {
                 }
             }
         }
-        next.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
+        breakdown.expand_ns += u64::try_from(tick.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        breakdown.expanded +=
+            u64::try_from(allowed.len() * if position == 0 { 1 } else { self.latest.len() })
+                .unwrap_or(u64::MAX);
+        let tick = Instant::now();
         let (keep, guarded_here) = self.reserve(&next, options);
         let mut chosen = Vec::with_capacity(keep.len());
         for index in keep {
@@ -275,32 +319,81 @@ impl<S> Worker<'_, S> {
             }
             chosen.push(candidate);
         }
+        breakdown.select_ns += u64::try_from(tick.elapsed().as_nanos()).unwrap_or(u64::MAX);
         chosen
     }
 
-    /// Which entries of the score-ordered *next* survive: each guarded
-    /// position's covered characters first, then score order to the beam
-    /// width. Returns the chosen indices and whether this position declared
-    /// its own guard, so the caller can mark every survivor's lineage.
+    /// Which entries of *next* survive: each guarded position's covered
+    /// characters first, then selection order (score, then relax order) to
+    /// the beam width. The order's few taken entries reach the head through
+    /// a partition, not a full sort of every relaxed pair. Returns the
+    /// chosen indices and whether this position declared its own guard, so
+    /// the caller can mark every survivor's lineage.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one survivor selection is a straight-line sequence: guard picks, a declared guard, then the fill"
+    )]
     fn reserve(&mut self, next: &[Candidate], options: &BeamOptions) -> (Vec<usize>, bool) {
         let width = options.beam_width.get();
         let gap = options.diversity_gap;
         let covered = options.diversity_chars;
+        // The selection order: score, then relax order, so every position's
+        // sorted prefix is uniquely defined. The guard picks and the fill
+        // below read exactly what a full sort in it would list; the tail
+        // never pays for one — a partition moves the few the beam takes to
+        // the head, and only the head is sorted.
+        let before = |a: usize, b: usize| {
+            next[b]
+                .score
+                .total_cmp(&next[a].score)
+                .then(a.cmp(&b))
+                .is_lt()
+        };
+        // The best index per guard slot's character — but only when this
+        // worker already carries guards; an unguarded worker never reads
+        // `first_of`, so the pass is skipped then rather than built and
+        // ignored. "Best" is the first in selection order, so the guard
+        // picks below match what a scan over the sorted `next` found.
+        let first_of: HashMap<(usize, CharId), usize> = if self.guarded.is_empty() {
+            HashMap::new()
+        } else {
+            let mut first_of = HashMap::new();
+            for (index, candidate) in next.iter().enumerate() {
+                for guard in 0..usize::from(candidate.marks.len) {
+                    if let Some(ch) = candidate.marks.chars[guard] {
+                        match first_of.entry((guard, ch)) {
+                            Entry::Vacant(slot) => {
+                                slot.insert(index);
+                            }
+                            Entry::Occupied(mut slot) => {
+                                if before(index, *slot.get()) {
+                                    slot.insert(index);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            first_of
+        };
+        let mut keep: Vec<usize> = Vec::new();
+        let mut kept: Vec<bool> = vec![false; next.len()];
         // Existing guards: the best lineage of each covered character keeps
         // its slot, however far it has slipped in score order.
-        let mut keep: Vec<usize> = Vec::new();
-        let mut kept: HashSet<usize> = HashSet::new();
         for (guard, chars) in self.guarded.iter().enumerate() {
             for &ch in chars {
-                if let Some(index) = next.iter().position(|c| c.marks.get(guard) == Some(ch))
-                    && kept.insert(index)
+                if let Some(&index) = first_of.get(&(guard, ch))
+                    && !kept[index]
                 {
+                    kept[index] = true;
                     keep.push(index);
                 }
             }
         }
         // This position's own guard: declared when a runner-up character is
-        // close enough that the position is a coin toss the score lost.
+        // close enough that the position is a coin toss the score lost. The
+        // best index per character is built only when the declaration is
+        // still possible — most positions never declare one.
         let mut guarded_here = false;
         if !next.is_empty()
             && gap > 0.0
@@ -308,52 +401,91 @@ impl<S> Worker<'_, S> {
             && self.guarded.len() < MAX_GUARDED
             && keep.len() + covered <= width
         {
-            let winner = next[0];
-            if let Some(runner_up) = next.iter().find(|c| c.ch != winner.ch)
-                && winner.score - runner_up.score <= gap
-            {
-                let mut chars: Vec<CharId> = Vec::with_capacity(covered);
-                for (index, candidate) in next.iter().enumerate() {
-                    if chars.contains(&candidate.ch) {
-                        continue;
+            let mut first_char: HashMap<CharId, usize> = HashMap::new();
+            for (index, candidate) in next.iter().enumerate() {
+                match first_char.entry(candidate.ch) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(index);
                     }
-                    chars.push(candidate.ch);
-                    if kept.insert(index) {
-                        keep.push(index);
-                    }
-                    if chars.len() == covered {
-                        break;
+                    Entry::Occupied(mut slot) => {
+                        if before(index, *slot.get()) {
+                            slot.insert(index);
+                        }
                     }
                 }
-                self.guarded.push(chars);
+            }
+            // The best index per character in selection order — what the
+            // first `covered` distinct characters of the sorted `next` are.
+            let mut chars: Vec<usize> = first_char.values().copied().collect();
+            chars
+                .sort_unstable_by(|&a, &b| next[b].score.total_cmp(&next[a].score).then(a.cmp(&b)));
+            let winner = next[chars[0]];
+            let runner_up = chars
+                .iter()
+                .map(|&index| next[index])
+                .find(|candidate| candidate.ch != winner.ch);
+            if let Some(runner_up) = runner_up
+                && winner.score - runner_up.score <= gap
+            {
+                self.guarded.push(
+                    chars
+                        .iter()
+                        .take(covered)
+                        .map(|&index| next[index].ch)
+                        .collect(),
+                );
+                for &index in chars.iter().take(covered) {
+                    if !kept[index] {
+                        kept[index] = true;
+                        keep.push(index);
+                    }
+                }
                 guarded_here = true;
             }
         }
+        for &index in keep.get(width.min(keep.len())..).unwrap_or(&[]) {
+            kept[index] = false;
+        }
         keep.truncate(width);
-        kept = keep.iter().copied().collect();
-        for index in 0..next.len() {
-            if keep.len() == width {
-                break;
-            }
-            if kept.insert(index) {
-                keep.push(index);
+        if keep.len() < width && !next.is_empty() {
+            // Fill in selection order: the kept entries inside the head make
+            // the prefix the fill draws on `keep.len() + width` deep.
+            let head = (keep.len() + width).min(next.len());
+            let mut order: Vec<usize> = (0..next.len()).collect();
+            order.select_nth_unstable_by(head - 1, |&a, &b| {
+                next[b].score.total_cmp(&next[a].score).then(a.cmp(&b))
+            });
+            order[..head]
+                .sort_unstable_by(|&a, &b| next[b].score.total_cmp(&next[a].score).then(a.cmp(&b)));
+            for index in order[..head].iter().copied() {
+                if keep.len() == width {
+                    break;
+                }
+                if !kept[index] {
+                    kept[index] = true;
+                    keep.push(index);
+                }
             }
         }
         (keep, guarded_here)
     }
 
     /// Follow the backpointers from a finished beam to the start of the
-    /// sequence.
-    fn reconstruct(&self, slot: usize) -> Vec<CharId> {
+    /// sequence, collecting each position's running score alongside its
+    /// character.
+    fn reconstruct(&self, slot: usize) -> (Vec<CharId>, Vec<f32>) {
         let mut chars = Vec::with_capacity(self.history.len());
+        let mut steps = Vec::with_capacity(self.history.len());
         let mut current = slot;
         for level in self.history.iter().rev() {
             let candidate = level[current];
             chars.push(candidate.ch);
+            steps.push(candidate.score);
             current = candidate.parent;
         }
         chars.reverse();
-        chars
+        steps.reverse();
+        (chars, steps)
     }
 }
 
@@ -382,14 +514,55 @@ impl<S> Worker<'_, S> {
 ///
 /// If the transition model does not return one state per step, which is a bug
 /// in the model, not an error in the input.
-#[expect(
-    clippy::panic_in_result_fn,
-    reason = "the only panic is the contract on Transition::advance, a bug in the model rather than bad input"
-)]
 pub fn decode_many<E, T>(
     records: &[Record<'_, E>],
     transition: &T,
     options: &BeamOptions,
+) -> Result<Vec<Vec<Hypothesis>>, crate::DecodeError>
+where
+    E: Emission,
+    T: Transition,
+{
+    decode_many_stats(records, transition, options, &mut Breakdown::default())
+}
+
+/// [`decode_many`], accumulating its host-side breakdown into *breakdown*
+/// — expansion, selection, and the finish pass, so the decode's cost split
+/// survives beyond the one call. `Transition::advance`'s own time is not
+/// here; the transition's `Timed` wrapper carries it.
+///
+/// # Errors
+///
+/// As [`decode_many`].
+///
+/// # Panics
+///
+/// As [`decode_many`].
+pub fn decode_many_stats<E, T>(
+    records: &[Record<'_, E>],
+    transition: &T,
+    options: &BeamOptions,
+    breakdown: &mut Breakdown,
+) -> Result<Vec<Vec<Hypothesis>>, crate::DecodeError>
+where
+    E: Emission,
+    T: Transition,
+{
+    run(records, transition, options, breakdown)
+}
+
+/// The [`decode_many_stats`] body: the lockstep expansion loop.
+///
+/// [`decode_many_stats`]: crate::decode_many_stats
+#[expect(
+    clippy::panic_in_result_fn,
+    reason = "as decode_many — the panic is the contract on Transition::advance"
+)]
+fn run<E, T>(
+    records: &[Record<'_, E>],
+    transition: &T,
+    options: &BeamOptions,
+    breakdown: &mut Breakdown,
 ) -> Result<Vec<Vec<Hypothesis>>, crate::DecodeError>
 where
     E: Emission,
@@ -439,7 +612,8 @@ where
         // shape a single-record search has; then every survivor's step goes
         // on the batch's one list, each worker's as a contiguous run in
         // worker order -- the guarantee `Transition::advance` is built on.
-        let mut steps: Vec<(&T::State, CharId, Asked<'_>)> = Vec::new();
+        let mut steps: Vec<(&T::State, CharId, Asked<'_>)> =
+            Vec::with_capacity(workers.len() * options.beam_width.get());
         let mut chosen: Vec<Vec<Candidate>> = Vec::with_capacity(workers.len());
         for worker in workers.iter_mut().filter(|worker| worker.pending()) {
             let next = worker.survivors(
@@ -447,6 +621,7 @@ where
                 transition,
                 options,
                 &mut index,
+                breakdown,
             );
             // The states this step produces stand one position ahead: they
             // will be scored on that position's candidates, or finished when
@@ -493,7 +668,10 @@ where
         debug_assert!(states.next().is_none(), "every advanced state lands");
     }
 
-    Ok(finish(&workers, records.len(), transition, options))
+    let tick = Instant::now();
+    let out = finish(&workers, records.len(), transition, options);
+    breakdown.finish_ns += u64::try_from(tick.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    Ok(out)
 }
 
 /// Fold finished workers into one ranked hypothesis list per record.
@@ -516,10 +694,14 @@ fn finish<T: Transition>(
             .map(|(slot, beam)| (slot, beam.candidate.score + transition.finish(&beam.state)))
             .collect();
         finished.sort_unstable_by(|a, b| b.1.total_cmp(&a.1));
-        merged[worker.record].extend(finished.into_iter().map(|(slot, score)| Hypothesis {
-            chars: worker.reconstruct(slot),
-            score: score - penalty,
-            path: worker.path,
+        merged[worker.record].extend(finished.into_iter().map(|(slot, score)| {
+            let (chars, steps) = worker.reconstruct(slot);
+            Hypothesis {
+                chars,
+                score: score - penalty,
+                steps,
+                path: worker.path,
+            }
         }));
     }
     merged
@@ -541,7 +723,7 @@ fn finish<T: Transition>(
 /// unchanged Viterbi result.
 fn keep_diverse(hypotheses: &mut [Hypothesis], top_k: usize) -> Vec<Hypothesis> {
     hypotheses.sort_unstable_by(|a, b| b.score.total_cmp(&a.score));
-    let mut seen: HashSet<&[CharId]> = HashSet::new();
+    let mut seen: HashSet<&[CharId]> = HashSet::default();
     let mut unique: Vec<usize> = Vec::new();
     for (index, hypothesis) in hypotheses.iter().enumerate() {
         if seen.insert(hypothesis.chars.as_slice()) {
@@ -558,7 +740,7 @@ fn keep_diverse(hypotheses: &mut [Hypothesis], top_k: usize) -> Vec<Hypothesis> 
     // positions win: the first characters of a sentence are where the reader's
     // priors are weakest.
     let winner = &hypotheses[first].chars;
-    let mut covered: HashSet<usize> = HashSet::new();
+    let mut covered: HashSet<usize> = HashSet::default();
     let mut winners: Vec<(usize, usize)> = Vec::new();
     for &index in unique.iter().skip(1) {
         let chars = &hypotheses[index].chars;
@@ -588,7 +770,7 @@ fn keep_diverse(hypotheses: &mut [Hypothesis], top_k: usize) -> Vec<Hypothesis> 
     winners.truncate(top_k - 1);
 
     let mut keep: Vec<usize> = Vec::with_capacity(top_k);
-    let mut kept: HashSet<usize> = HashSet::with_capacity(top_k);
+    let mut kept: HashSet<usize> = HashSet::default();
     keep.push(first);
     kept.insert(first);
     for &(_, index) in &winners {

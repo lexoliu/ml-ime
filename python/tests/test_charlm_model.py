@@ -3,7 +3,7 @@ agree with torch, and a stream of batches resumes from a saved position."""
 
 import json
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import onnx
@@ -174,7 +174,7 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
     export_onnx(checkpoint, tmp_path / "export", restrict)
     manifest = json.loads((tmp_path / "export" / "charlm.json").read_text())
     assert manifest["arch"] == arch
-    assert manifest["layout"] == "resident-candidates"
+    assert manifest["layout"] == "resident-pages"
     assert manifest["dtype"] == "float32"
     assert manifest["restricted_to"] == 5  # four characters plus <eos>
     weights = manifest["weights"]
@@ -213,27 +213,32 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
     )
     by_name = dict(zip((o.name for o in prefill.get_outputs()), outputs, strict=True))
     prefix = {name: by_name[name] for name in manifest["prefix"]}
-    mask = _prefix_mask(by_name)
-    indices = {
-        "source_row": np.arange(2, dtype=np.int64),
-        **_worker_index(prefix),
-    }
-    state = {name: np.repeat(by_name[name], 2, axis=0) for name in manifest["state"]}
-    for position in range(2):
-        token = np.array([beam[position] for beam in beams], dtype=np.int64)
-        outputs = step.run(
-            None,
-            {
-                "token": token,
-                "candidates": np.tile(whole, (2, 1)),
-                **prefix,
-                **indices,
-                **mask,
-                **state,
-            },
-        )
-        log_probs = outputs[0]
-        state = dict(zip(manifest["state"], outputs[1:], strict=True))
+    if prefix:
+        log_probs = _paged_walk(manifest, step, by_name, beams, whole)[-1]
+    else:
+        mask = _prefix_mask(by_name)
+        indices = {
+            "source_row": np.arange(2, dtype=np.int64),
+            **_worker_index(prefix),
+        }
+        state = {
+            name: np.repeat(by_name[name], 2, axis=0) for name in manifest["state"]
+        }
+        for position in range(2):
+            token = np.array([beam[position] for beam in beams], dtype=np.int64)
+            outputs = step.run(
+                None,
+                {
+                    "token": token,
+                    "candidates": np.tile(whole, (2, 1)),
+                    **prefix,
+                    **indices,
+                    **mask,
+                    **state,
+                },
+            )
+            log_probs = outputs[0]
+            state = dict(zip(manifest["state"], outputs[1:], strict=True))
     from mlime.train.charlm import load_model
 
     model, _, _ = load_model(checkpoint, torch.device("cpu"))
@@ -263,6 +268,60 @@ def _worker_index(prefix: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     return {"prefix_row": np.zeros(1, dtype=np.int64)}
 
 
+def _paged_walk(
+    manifest: dict[str, Any],
+    step: ort.InferenceSession,
+    by_name: dict[str, np.ndarray],
+    beams: tuple[list[int], ...],
+    whole: np.ndarray,
+) -> list[np.ndarray]:
+    """Drive a pages-layout step graph: the prelude's prefix tensors sit in
+    the resident pool behind page zero (the always-masked scratch), and every
+    produced row's ``next_*`` tensors land as fresh pages its chain names.
+    Returns the per-position ``candidate_log_probs`` rows."""
+    prefix_name, state_names = manifest["prefix"][0], manifest["state"]
+    prelude_len = by_name[prefix_name].shape[0]
+    layers, heads, head_dim = by_name[prefix_name].shape[1:]
+    pool = {
+        name: np.concatenate(
+            [np.zeros((1, layers, heads, head_dim), dtype=by_name[pname].dtype), by_name[pname]],
+            axis=0,
+        )
+        for name, pname in zip(state_names, manifest["prefix"], strict=True)
+    }
+    chains = [list(range(1, prelude_len + 1)) for _ in beams]
+    rows = []
+    for position in range(len(beams[0])):
+        width = max(len(chain) for chain in chains)
+        page_row = np.array(
+            [chain + [0] * (width - len(chain)) for chain in chains], dtype=np.int64
+        )
+        outputs = step.run(
+            None,
+            {
+                "token": np.array([beam[position] for beam in beams], dtype=np.int64),
+                "page_row": page_row,
+                "mask": page_row != 0,
+                "candidates": np.tile(whole, (len(beams), 1)),
+                **pool,
+                "state_keys": np.zeros(
+                    (1, layers, heads, width, head_dim), dtype=pool[state_names[0]].dtype
+                ),
+                "state_values": np.zeros(
+                    (1, layers, heads, width, head_dim), dtype=pool[state_names[0]].dtype
+                ),
+                "source_row": np.full(len(beams), -1, dtype=np.int64),
+            },
+        )
+        rows.append(outputs[0])
+        first_new = pool[state_names[0]].shape[0]
+        for i, chain in enumerate(chains):
+            chain.append(first_new + i)
+        for name, nexts in zip(state_names, outputs[1:], strict=True):
+            pool[name] = np.concatenate([pool[name], nexts], axis=0)
+    return rows
+
+
 def _run_export(dir: Path) -> list[np.ndarray]:
     """The ``candidate_log_probs`` rows of an export over the fixture prelude
     and two beams, the whole alphabet asked so they are full rows."""
@@ -277,14 +336,17 @@ def _run_export(dir: Path) -> list[np.ndarray]:
     )
     by_name = dict(zip((o.name for o in prefill.get_outputs()), outputs, strict=True))
     prefix = {name: by_name[name] for name in manifest["prefix"]}
+    rows = [by_name["candidate_log_probs"]]
+    beams = (_tokens("我", "吗"), _tokens("你", "好"))
+    if prefix:
+        rows.extend(_paged_walk(manifest, step, by_name, beams, whole))
+        return rows
     mask = _prefix_mask(by_name)
     indices = {
         "source_row": np.arange(2, dtype=np.int64),
         **_worker_index(prefix),
     }
     state = {name: np.repeat(by_name[name], 2, axis=0) for name in manifest["state"]}
-    rows = [by_name["candidate_log_probs"]]
-    beams = (_tokens("我", "吗"), _tokens("你", "好"))
     for position in range(len(beams[0])):
         token = np.array([beam[position] for beam in beams], dtype=np.int64)
         outputs = step.run(
@@ -386,43 +448,56 @@ def test_int8_scores_do_not_depend_on_batchmates(tmp_path: Path) -> None:
             strict=True,
         )
     )
-    prefix = {name: by_name[name] for name in manifest["prefix"]}
-    mask = _prefix_mask(by_name)
+    state_names = manifest["state"]
+    prefix_name = manifest["prefix"][0]
+    prelude_len = by_name[prefix_name].shape[0]
+    layers, heads, head_dim = by_name[prefix_name].shape[1:]
+    pool = {
+        name: np.concatenate(
+            [np.zeros((1, layers, heads, head_dim), dtype=by_name[pname].dtype), by_name[pname]],
+            axis=0,
+        )
+        for name, pname in zip(state_names, manifest["prefix"], strict=True)
+    }
 
-    # 128 residents of equal time: each its own first character, advanced alone.
-    first = (_tokens(*CHARS) * 17)[:128]
-    residents: dict[str, list[np.ndarray]] = {name: [] for name in manifest["state"]}
-    for token in first:
+    def advance(chains: list[list[int]], tokens: list[int]) -> np.ndarray:
+        width = max(len(chain) for chain in chains)
+        page_row = np.array(
+            [chain + [0] * (width - len(chain)) for chain in chains], dtype=np.int64
+        )
         outputs = run(
             {
-                "token": np.array([token], dtype=np.int64),
-                "source_row": np.zeros(1, dtype=np.int64),
-                "candidates": np.tile(whole, (1, 1)),
-                **prefix,
-                **_worker_index(prefix),
-                **mask,
-                **{name: by_name[name] for name in manifest["state"]},
+                "token": np.array(tokens, dtype=np.int64),
+                "page_row": page_row,
+                "mask": page_row != 0,
+                "candidates": np.tile(whole, (len(chains), 1)),
+                **pool,
+                "state_keys": np.zeros(
+                    (1, layers, heads, width, head_dim), dtype=pool[state_names[0]].dtype
+                ),
+                "state_values": np.zeros(
+                    (1, layers, heads, width, head_dim), dtype=pool[state_names[0]].dtype
+                ),
+                "source_row": np.full(len(chains), -1, dtype=np.int64),
             }
         )
-        for name, tensor in zip(manifest["state"], outputs[1:], strict=True):
-            residents[name].append(tensor)
-    state128 = {name: np.concatenate(rows, axis=0) for name, rows in residents.items()}
-    target = _tokens("我")[0]
-
-    def advance(rows: int) -> np.ndarray:
-        outputs = run(
-            {
-                "token": np.array([target, *(_tokens(*CHARS) * 17)[: rows - 1]], dtype=np.int64),
-                "source_row": np.arange(rows, dtype=np.int64),
-                "candidates": np.tile(whole, (rows, 1)),
-                **prefix,
-                "prefix_row": np.zeros(rows, dtype=np.int64),
-                **mask,
-                **state128,
-            }
-        )
+        first_new = pool[state_names[0]].shape[0]
+        for i, chain in enumerate(chains):
+            chain.append(first_new + i)
+        for name, nexts in zip(state_names, outputs[1:], strict=True):
+            pool[name] = np.concatenate([pool[name], nexts], axis=0)
         return outputs[0]
 
-    solo = advance(1)[0]
-    batched = advance(128)[0]
+    # 128 residents of equal time: each its own page chain over the prelude,
+    # advanced alone on its own first character.
+    first = (_tokens(*CHARS) * 17)[:128]
+    chains: list[list[int]] = []
+    for token in first:
+        chain = list(range(1, prelude_len + 1))
+        advance([chain], [token])
+        chains.append(chain)
+    target = _tokens("我")[0]
+
+    solo = advance([chains[0].copy()], [target])[0]
+    batched = advance(chains, [target, *(_tokens(*CHARS) * 17)[:127]])[0]
     np.testing.assert_array_equal(solo, batched, err_msg="int8 scores move with the batch")

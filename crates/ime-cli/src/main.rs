@@ -4,6 +4,7 @@ mod corpus;
 mod engine;
 mod g2p;
 mod neural;
+mod replay;
 mod synth;
 
 use anyhow::{Context as _, Result};
@@ -36,10 +37,6 @@ struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
-#[expect(
-    clippy::large_enum_variant,
-    reason = "FusedEval holds the whole search configuration inline; boxing it to shrink the enum costs an indirection per parse"
-)]
 enum Command {
     /// Estimate a Kneser-Ney trigram from a plain text corpus.
     TrainNgram {
@@ -60,6 +57,15 @@ enum Command {
         pinyin: String,
         #[command(flatten)]
         search: SearchArgs,
+    },
+    /// Rewrite a postcard `train-ngram` model in the memory-mappable layout.
+    PackNgram {
+        /// A model written by `train-ngram`.
+        #[arg(long)]
+        model: PathBuf,
+        /// Where to write the mapped model.
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Fetch and prepare the internet-authentic corpus sources.
     Corpus {
@@ -205,6 +211,12 @@ enum Command {
         #[command(flatten)]
         search: SearchArgs,
     },
+    /// Replay an evaluation slice through the session API, one keystroke at a
+    /// time, and measure per-keystroke latency.
+    Replay {
+        #[command(flatten)]
+        args: replay::ReplayArgs,
+    },
 }
 
 /// The search knobs, shared by every command that decodes.
@@ -290,16 +302,19 @@ struct CandidateList {
     candidates: Vec<Candidate>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    // `ort` forwards the runtime's logging to `tracing` at TRACE, so
-    // `--ort-verbose` raises the `ort` target; RUST_LOG still wins when set.
+/// `ort` forwards the runtime's logging to `tracing` at TRACE, so
+/// `--ort-verbose` raises the `ort` target; `RUST_LOG` still wins when set.
+fn init_tracing(command: &Command) {
     let ort_trace = matches!(
-        &cli.command,
+        command,
         Command::FusedEval {
             ort_verbose: true,
             ..
+        } | Command::Replay {
+            args: replay::ReplayArgs {
+                ort_verbose: true,
+                ..
+            },
         }
     );
     tracing_subscriber::fmt()
@@ -310,9 +325,16 @@ async fn main() -> Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    init_tracing(&cli.command);
 
     match cli.command {
         Command::TrainNgram { corpus, out } => train_ngram(&corpus, &out),
+        Command::PackNgram { model, out } => pack_ngram(&model, &out),
         Command::Decode {
             model,
             pinyin,
@@ -389,6 +411,7 @@ async fn main() -> Result<()> {
                 search: &search,
             })
         }
+        Command::Replay { args } => replay::run(&args),
         Command::Corpus { command } => corpus::run(command).await,
         Command::G2p { command } => g2p::run(command).await,
         Command::Synth { command } => synth::run(command).await,
@@ -432,6 +455,26 @@ fn train_ngram(corpus: &Path, out: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Rewrite a postcard model in the mapped layout `--model` detects.
+fn pack_ngram(model: &Path, out: &Path) -> Result<()> {
+    let (_, lexicon) = tables()?;
+    let model = load_ngram(model, &lexicon)?;
+    model
+        .write_mapped(out)
+        .with_context(|| format!("could not write the mapped model to {}", out.display()))?;
+    let size = fs::metadata(out)
+        .map(|entry| entry.len())
+        .unwrap_or_default();
+    info!(
+        bytes = size,
+        trigrams = model.trigram_types(),
+        bigrams = model.bigram_types(),
+        path = %out.display(),
+        "wrote the mapped model"
+    );
+    Ok(())
+}
+
 fn load_baseline(model: &Path, search: &SearchArgs) -> Result<Baseline> {
     let (table, lexicon) = tables()?;
     let model = load_ngram(model, &lexicon)?;
@@ -466,10 +509,8 @@ fn decode(model: &Path, pinyin: &str, search: &SearchArgs) -> Result<()> {
 
 /// Load a trained n-gram against the generated tables.
 fn load_ngram(path: &Path, lexicon: &Lexicon) -> Result<NgramModel> {
-    let bytes = fs::read(path)
-        .with_context(|| format!("could not read the model at {}", path.display()))?;
-    let model = NgramModel::from_bytes(&bytes, lexicon)
-        .context("the model does not match this character lexicon")?;
+    let model = NgramModel::open(path, lexicon)
+        .with_context(|| format!("could not load the model at {}", path.display()))?;
     info!(
         vocabulary = model.vocabulary_size(),
         trigrams = model.trigram_types(),
@@ -542,6 +583,13 @@ impl FusedRun<'_> {
             intra_threads,
             width: self.search.beam_width,
             verbose_logging: self.ort_verbose,
+            // The state cache is the session API's; fused-eval decodes
+            // unwrapped. The pages layout's pool is a state's residency
+            // rather than that cache — a zero bound keeps no page at all
+            // and `start` could not place the context — so the eval runs
+            // on the same page budget the replay defaults to.
+            cache_rows: 4096,
+            metal_weights: ime_lm::MetalWeights::Auto,
         })
     }
 

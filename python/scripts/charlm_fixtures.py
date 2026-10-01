@@ -153,63 +153,89 @@ def _expected(export: Path) -> dict[str, object]:
     # checked against.
     prefill_full = run_prefill(whole.reshape(1, -1))["candidate_log_probs"][0]
 
+    step_inputs = {item.name for item in step.get_inputs()}
+    paged = "page_row" in step_inputs
+    if paged:
+        # The pages layout: the prefill emits one position per row, the
+        # host writes each into a pool page, and every beam's prefix is
+        # its chain of page ids. The beams share the prelude's pages.
+        pk = by_name[manifest["prefix"][0]]
+        layers, prelude_len = pk.shape[1], pk.shape[0]
+        pool = {
+            name: np.zeros((64, layers, *pk.shape[2:]), dtype=pk.dtype)
+            for name in manifest["state"]
+        }
+        pool["keys"][1 : prelude_len + 1] = by_name["prefix_keys"]
+        pool["values"][1 : prelude_len + 1] = by_name["prefix_values"]
+        free_page = prelude_len + 1
+        chains = [list(range(1, prelude_len + 1)) for _ in BEAMS]
+    else:
+        state = {
+            name: np.repeat(by_name[name], len(BEAMS), axis=0)
+            for name in manifest["state"]
+        }
+
     def run_step(
         token: np.ndarray,
-        requests: tuple[tuple[str, bool], ...],
-        prefix: dict[str, np.ndarray],
-        indices: dict[str, np.ndarray],
-        mask: dict[str, np.ndarray],
-        state: dict[str, np.ndarray],
-        candidates: np.ndarray | None = None,
-    ) -> list[np.ndarray]:
-        if candidates is None:
-            candidates, _ = _gathered(requests)
-        outputs: list[np.ndarray] = step.run(
-            None,
-            {
-                "token": token,
-                "candidates": candidates,
-                **prefix,
-                **indices,
-                **mask,
-                **state,
-            },
-        )
-        return outputs
+        candidates: np.ndarray,
+    ) -> dict[str, np.ndarray]:
+        if paged:
+            width = max(len(chain) for chain in chains)
+            page_row = np.zeros((len(chains), width), dtype=np.int64)
+            mask = np.zeros((len(chains), width), dtype=bool)
+            for row, chain in enumerate(chains):
+                page_row[row, : len(chain)] = chain
+                mask[row, : len(chain)] = True
+            outputs = step.run(
+                None,
+                {
+                    "token": token,
+                    "page_row": page_row,
+                    "mask": mask,
+                    "candidates": candidates,
+                    **pool,
+                    "state_keys": np.zeros(
+                        (1, layers, pk.shape[2], width, pk.shape[3]), dtype=pk.dtype
+                    ),
+                    "state_values": np.zeros(
+                        (1, layers, pk.shape[2], width, pk.shape[3]), dtype=pk.dtype
+                    ),
+                    "source_row": np.full(len(chains), -1, dtype=np.int64),
+                },
+            )
+        else:
+            outputs = step.run(
+                None,
+                {
+                    "token": token,
+                    "candidates": candidates,
+                    "source_row": np.arange(len(BEAMS), dtype=np.int64),
+                    **state,
+                },
+            )
+        return dict(zip((o.name for o in step.get_outputs()), outputs, strict=True))
 
-    prefix = {name: by_name[name] for name in manifest["prefix"]}
-    # The prefill emits the mask row with the padded prefix rows; the step
-    # reads it as the resident slot's mask.
-    mask = {"prefix_mask": by_name["prefix_mask"]} if prefix else {}
-    # The resident state buffer holds one row per beam, each beam's row its
-    # index; the resident prefix and mask are the single worker's slot.
-    state = {name: np.repeat(by_name[name], len(BEAMS), axis=0) for name in manifest["state"]}
-    rows = np.arange(len(BEAMS), dtype=np.int64)
-    indices = (
-        {"source_row": rows, "prefix_row": np.zeros(1, dtype=np.int64)}
-        if prefix
-        else {"source_row": rows}
-    )
     steps = []
     full = []
     for position in range(len(BEAMS[0])):
         token = np.array([index[beam[position]] for beam in BEAMS], dtype=np.int64)
         requests = STEP_ASKED[position]
-        outputs = run_step(token, requests, prefix, indices, mask, state)
-        steps.append([_asked(*asked, outputs[0][row]) for row, asked in enumerate(requests)])
+        candidates, _ = _gathered(requests)
+        outputs = run_step(token, candidates)
+        gathered = outputs["candidate_log_probs"]
+        steps.append([_asked(*asked, gathered[row]) for row, asked in enumerate(requests)])
         # The same step again with the whole alphabet asked: its columns are
         # the row a full-vocabulary export would have returned.
-        whole_row = run_step(
-            token,
-            requests,
-            prefix,
-            indices,
-            mask,
-            state,
-            candidates=np.tile(whole, (len(requests), 1)),
-        )[0]
+        whole_row = run_step(token, np.tile(whole, (len(requests), 1)))["candidate_log_probs"]
         full.append(whole_row.tolist())
-        state = dict(zip(manifest["state"], outputs[1:], strict=True))
+        if paged:
+            for row, chain in enumerate(chains):
+                for name in manifest["state"]:
+                    pool[name][free_page] = outputs[f"next_{name}"][row]
+                chain.append(free_page)
+                free_page += 1
+        else:
+            state = {name: outputs[f"next_{name}"] for name in manifest["state"]}
     return {
         "arch": manifest["arch"],
         "context": CONTEXT,
