@@ -69,5 +69,7 @@ panic_in_result_fn = "deny"
 # instructions (vpdpwssd) and SIGILLs on x86-64 CPUs without AVX-VNNI
 # (#98). The next commit on ort's main line only swaps the binaries to
 # ONNX Runtime 1.30.0, whose upstream build puts the VNNI kernels in their
-# own translation unit. Patching ort-sys alone keeps ort's rc.13 API.
-ort-sys = { git = "https://github.com/pykeio/ort", rev = "6d7c231c3430026bd5e8262fc8d74e2307512ab1" }
+# own translation unit. Patching ort-sys alone keeps ort's rc.13 API. The
+# 1.30.0 archives were re-published on 2026-09-29 with new hashes, so the
+# pin follows the ort-sys commit that carries them.
+ort-sys = { git = "https://github.com/pykeio/ort", rev = "d1e45b7eb2664025c878afcd2b1c69a4810bfb9b" }

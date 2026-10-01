@@ -2599,7 +2599,7 @@ dependencies = [
 [[package]]
 name = "ort-sys"
 version = "2.0.0-rc.13"
-source = "git+https://github.com/pykeio/ort?rev=6d7c231c3430026bd5e8262fc8d74e2307512ab1#6d7c231c3430026bd5e8262fc8d74e2307512ab1"
+source = "git+https://github.com/pykeio/ort?rev=d1e45b7eb2664025c878afcd2b1c69a4810bfb9b#d1e45b7eb2664025c878afcd2b1c69a4810bfb9b"
 dependencies = [
  "glob",
  "hmac-sha256",
