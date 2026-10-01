@@ -46,6 +46,8 @@ from mlime.train.charlm_model import (
     DEFAULT_CONTEXT_CHARS,
     CharLm,
     CharLmConfig,
+    PagedPrefillModule,
+    PagedStepModule,
     PrefillModule,
     ResidentStepModule,
     build,
@@ -752,38 +754,41 @@ def export_onnx(
 ) -> tuple[Path, Path]:
     """Write the step graph, the prefill graph and their manifest for the Rust decoder.
 
-    ``charlm.onnx`` takes ``token [rows]`` and ``source_row [rows]`` -- each
-    beam's next character and the row of the resident state buffers
-    (``keys``/``values``, or the LSTM's ``hidden``/``cell``) it continues
-    from -- then ``candidates [rows, K]`` (int64, padded with a column the
-    host ignores): the alphabet ids each produced state will be scored on
-    at its next position, ``<eos>`` included where its path can end there.
-    Where the model has a prefix, ``prefix_row [workers]`` and the
-    resident prefix buffers ``prefix_keys``/``prefix_values``
-    ``[slots, layers, heads, T, head_dim]`` with ``prefix_mask
-    ``[slots, T]`` marking real positions. The graph gathers the rows the
-    batch names, gathers the log-softmax (float32, normalised over the
-    alphabet, or over the characters of *restrict* plus ``<eos>`` when
-    given) at the candidates each row named, and returns
-    ``candidate_log_probs [rows, K]`` -- the only tensor that crosses the
-    bus -- plus the ``next_*`` state tensors the caller binds over fresh
-    buffers, so the beam reorder stays on the device and only tokens,
-    indices and candidate log-probabilities ever cross.
+    The transformer's ``charlm.onnx`` runs the pages layout: ``token
+    [rows]`` each beam's next character, ``page_row [rows, T]`` its
+    prefix's page ids into the resident ``keys``/``values`` pool
+    ``[pages, layers, heads, head_dim]`` (page zero a masked scratch),
+    ``mask [rows, T]`` its real positions, and ``candidates [rows, K]``
+    the alphabet ids its produced state will be scored on at its next
+    position (``<eos>`` included where its path can end there, a
+    throwaway id as padding). A state that could not claim pages reads
+    the scratch rows ``state_keys``/``state_values`` through
+    ``source_row`` (-1 for a paged row). The graph gathers each row's
+    history by index, gathers the log-softmax (float32, normalised over
+    the alphabet, or over the characters of *restrict* plus ``<eos>``
+    when given) at the candidates each row named, and returns
+    ``candidate_log_probs [rows, K]`` -- the only tensor that crosses
+    the bus -- plus ``next_keys``/``next_values`` ``[rows, layers,
+    heads, head_dim]``, the produced rows' own positions the host writes
+    into their claimed pages in a single contiguous copy per tensor. A
+    step moves indices and one page per produced state; no row of
+    history ever crosses the host boundary.
     ``prefill.onnx`` takes ``tokens [1, T]`` and the first position's
-    ``candidates [1, K]``, and returns the same ``candidate_log_probs``,
-    the prefix tensors already left-padded to a resident slot's width
-    with the ``prefix_mask`` row that marks their real positions, and the
-    state tensors to start from -- its outputs are bound over the slot's
-    rows, so a ``start`` moves no bytes itself. The manifest's ``rows``
+    ``candidates [1, K]``, and returns the same ``candidate_log_probs``
+    plus the prefix tensors one position per row ``[T, layers, heads,
+    head_dim]``: the host writes each position into its own page, so a
+    ``start`` claims the prelude's pages and moves no rows. The LSTM has
+    no pages: its step graph is ``(token, source_row, candidates,
+    hidden, cell)`` over resident rows and its prefill emits
+    ``(candidate_log_probs, hidden, cell)``. The manifest's ``rows``
     record what one slot row of each prefix and state buffer is shaped
-    as, which is what the resident pool allocates.
-    The prefix and index inputs exist only where the model has a prefix: the
-    LSTM's step graph is ``(token, source_row, candidates, hidden, cell)``.
+    as -- the transformer's state rows marking the pages axis with a
+    zero -- which is what the resident pool allocates.
     ``charlm.json`` names the tensors and holds the alphabet in id order;
     its ``layout`` records the step graph's layout
-    (``"resident-candidates"``), which ``ime-lm`` refuses to open without,
-    and its ``dtype`` the element type the resident buffers and the states
-    exchange.
+    (``"resident-pages"``), which ``ime-lm`` refuses to open without,
+    and its ``dtype`` the element type the resident buffers and the
+    states exchange.
     The graphs' initializers live in an external weights file beside the
     graphs -- ``charlm.weights``, shared when the step and prefill
     initializers coincide, otherwise one file per graph -- which the manifest's
@@ -815,96 +820,139 @@ def export_onnx(
         _, prefix, state = model.prefill(prelude)
     # Example inputs of two workers at width two with two characters in the
     # state, so every dynamic axis -- slots, workers, rows, time -- is
-    # exercised. The resident buffers stand in for what the Rust side binds:
-    # two prefix slots holding one prelude each, four state rows, and the
-    # index tensors naming which of them each beam continues from.
-    module = ResidentStepModule(model, keep)
+    # exercised. Under the pages layout the resident buffers stand in for
+    # what the Rust side binds instead: the page pool, the scratch rows a
+    # page claim could not cover, and the index tensors naming each beam's
+    # prefix pages and source.
+    paged = model.config.arch == "transformer"
+    if paged:
+        module: nn.Module = PagedStepModule(model, keep)
+    else:
+        module = ResidentStepModule(model, keep)
     with torch.no_grad():
         four = torch.tensor([SEP] * 4)
-        source_row = torch.arange(4, dtype=torch.long)
         # The candidates the produced rows would be scored on; any in-range
         # ids trace the same gather, so a fixed row of specials stands in.
         candidates = torch.tensor([[BOS, SEP, EOS, UNK]] * 4)
-        state_buffers = tuple(tensor.expand(4, *tensor.shape[1:]).contiguous() for tensor in state)
-        prefix_buffers: tuple[torch.Tensor, ...] = ()
-        index_args: tuple[torch.Tensor, ...] = ()
-        if model.config.arch == "transformer":
-            prefix_buffers = tuple(
-                tensor.expand(2, *tensor.shape[1:]).contiguous() for tensor in prefix
+        if paged:
+            # Example: four beams sharing two context pages plus one page
+            # each, one row-sourced state, and a padded page row, so every
+            # dynamic axis -- rows, pages, scratch rows, time -- is
+            # exercised. Page zero is the pool's masked scratch.
+            layers, heads, head_dim = (
+                model.config.layers,
+                model.config.heads,
+                model.config.hidden // model.config.heads,
             )
-            index_args = (
-                torch.arange(2, dtype=torch.long),
-                torch.ones(2, prefix[0].shape[3], dtype=torch.bool),
+            pool = tuple(
+                torch.zeros(8, layers, heads, head_dim, dtype=state[0].dtype) for _ in state_names
             )
-        # Two passes grow the example's state buffers to a real time axis.
-        for _ in range(2):
-            args = (
+            page_row = torch.tensor([[1, 2, 3], [1, 2, 4], [0, 0, 0], [1, 2, 0]])
+            mask = torch.tensor([[1, 1, 1], [1, 1, 1], [1, 1, 0], [1, 1, 0]], dtype=torch.bool)
+            state_buffers = tuple(
+                torch.zeros(2, layers, heads, 3, head_dim, dtype=tensor.dtype) for tensor in state
+            )
+            source_row = torch.tensor([-1, -1, 0, -1])
+            step_inputs = (
                 four,
-                source_row,
+                page_row,
+                mask,
                 candidates,
-                *prefix_buffers,
-                *index_args,
+                *pool,
                 *state_buffers,
+                source_row,
             )
-            _, *state_buffers = module(*args)
+        else:
+            source_row = torch.arange(4, dtype=torch.long)
+            state_buffers = tuple(
+                tensor.expand(4, *tensor.shape[1:]).contiguous() for tensor in state
+            )
+            prefix_buffers: tuple[torch.Tensor, ...] = ()
+            index_args: tuple[torch.Tensor, ...] = ()
+            # Two passes grow the example's state buffers to a real time axis.
+            for _ in range(2):
+                args = (
+                    four,
+                    source_row,
+                    candidates,
+                    *prefix_buffers,
+                    *index_args,
+                    *state_buffers,
+                )
+                _, *state_buffers = module(*args)
+            step_inputs = (four, source_row, candidates, *state_buffers)
     axes: dict[str, dict[int, str]] = {
         "token": {0: "rows"},
         "source_row": {0: "rows"},
         "candidates": {0: "rows", 1: "candidates"},
         "candidate_log_probs": {0: "rows", 1: "candidates"},
     }
-    for name in (*state_names, *next_names):
-        axes[name] = {0: "residents"}
-    extra_names: list[str] = []
-    if model.config.arch == "transformer":
-        # The resident prefix buffers are [slots, layers, heads, time,
-        # head_dim] and the mask [slots, time]; the workers axis is its own
-        # symbol, so one worker and a lockstep batch both feed the same
-        # graph.
-        for name in prefix_names:
-            axes[name] = {0: "slots", 3: f"{name}_time"}
+    input_names: list[str]
+    if paged:
+        # The resident pool is [pages, layers, heads, head_dim]: a page's
+        # per-position slices contiguous, the page axis marked by its own
+        # symbol. The scratch row buffers keep the old [residents, layers,
+        # heads, time, head_dim] shape for states a page claim could not
+        # cover.
+        for name in state_names:
+            axes[name] = {0: "pages"}
+        for name in next_names:
+            axes[name] = {0: "rows"}
+        for name in ("state_keys", "state_values"):
+            axes[name] = {0: "residents", 3: f"{name}_time"}
+        axes["page_row"] = {0: "rows", 1: "pages_row"}
+        axes["mask"] = {0: "rows", 1: "mask_time"}
+        input_names = [
+            "token",
+            "page_row",
+            "mask",
+            "candidates",
+            *state_names,
+            "state_keys",
+            "state_values",
+            "source_row",
+        ]
+    else:
         for name in (*state_names, *next_names):
-            axes.setdefault(name, {})[3] = f"{name}_time"
-        extra_names = ["prefix_row", "prefix_mask"]
-        axes["prefix_row"] = {0: "workers"}
-        axes["prefix_mask"] = {0: "slots", 1: "prefix_mask_time"}
+            axes[name] = {0: "residents"}
+        input_names = ["token", "source_row", "candidates", *state_names]
     step_graph = out_dir / "charlm.onnx"
     torch.onnx.export(
         module,
-        (four, source_row, candidates, *prefix_buffers, *index_args, *state_buffers),
+        step_inputs,
         str(step_graph),
-        input_names=[
-            "token",
-            "source_row",
-            "candidates",
-            *prefix_names,
-            *extra_names,
-            *state_names,
-        ],
+        input_names=input_names,
         output_names=["candidate_log_probs", *next_names],
         dynamic_axes=axes,
         opset_version=17,
         dynamo=False,
     )
     prefill_graph = out_dir / "prefill.onnx"
-    mask_names = ["prefix_mask"] if prefix_names else []
-    torch.onnx.export(
-        PrefillModule(model, keep),
-        (prelude, torch.tensor([[BOS, SEP, EOS, UNK]])),
-        str(prefill_graph),
-        input_names=["tokens", "candidates"],
-        output_names=["candidate_log_probs", *prefix_names, *mask_names, *state_names],
-        dynamic_axes={
+    if paged:
+        prefill_module: nn.Module = PagedPrefillModule(model, keep)
+        prefill_outputs = ["candidate_log_probs", *prefix_names]
+        prefill_axes = {
             "tokens": {1: "length"},
             "candidates": {1: "candidates"},
             "candidate_log_probs": {1: "candidates"},
-            **{
-                name: {**axes[name], 0: "batch"}
-                for name in (*prefix_names, *state_names)
-                if name in axes
-            },
-            **{name: {0: "batch"} for name in mask_names},
-        },
+            **{name: {0: "prelude"} for name in prefix_names},
+        }
+    else:
+        prefill_module = PrefillModule(model, keep)
+        prefill_outputs = ["candidate_log_probs", *state_names]
+        prefill_axes = {
+            "tokens": {1: "length"},
+            "candidates": {1: "candidates"},
+            "candidate_log_probs": {1: "candidates"},
+            **{name: {**axes[name], 0: "batch"} for name in state_names if name in axes},
+        }
+    torch.onnx.export(
+        prefill_module,
+        (prelude, torch.tensor([[BOS, SEP, EOS, UNK]])),
+        str(prefill_graph),
+        input_names=["tokens", "candidates"],
+        output_names=prefill_outputs,
+        dynamic_axes=prefill_axes,
         opset_version=17,
         dynamo=False,
     )
@@ -921,14 +969,20 @@ def export_onnx(
                 "context_chars": model.config.context_chars,
                 "prefix": list(prefix_names),
                 "state": list(state_names),
-                "layout": "resident-candidates",
+                "layout": "resident-pages",
                 "dtype": "float16" if quantize == "fp16" else "float32",
                 "rows": {
-                    "prefix": [
-                        [*tensor.shape[1:3], model.config.context_chars + 2, tensor.shape[4]]
-                        for tensor in prefix
+                    # One slot row per buffer: a transformer's prefix page is
+                    # one position's [layers, heads, head_dim]; its resident
+                    # pool is [pages, layers, heads, head_dim] with the pages
+                    # axis unbound. The LSTM keeps its [layers, hidden] row.
+                    "prefix": [[*list(tensor.shape[1:3]), tensor.shape[4]] for tensor in prefix],
+                    "state": [
+                        [0, tensor.shape[1], tensor.shape[2], tensor.shape[4]]
+                        if paged
+                        else list(tensor.shape[1:])
+                        for tensor in state
                     ],
-                    "state": [list(tensor.shape[1:]) for tensor in state],
                 },
                 "specials": {"pad": PAD, "bos": BOS, "eos": EOS, "sep": SEP, "unk": UNK},
                 "restricted_to": None if keep is None else int(keep.numel()),

@@ -235,6 +235,34 @@ impl Segmentation {
     pub const fn cost(&self) -> f32 {
         self.cost
     }
+
+    /// The reading that walks *parts* in order: how the session cuts the input
+    /// at `'` boundaries, each piece segmented alone and the pieces joined.
+    /// The segments are re-offset against the pieces' letters read as one
+    /// string, so the result reads exactly like a single lattice's reading.
+    ///
+    /// Cost is the parts' sum, which ranks two joined readings the way their
+    /// pieces' own costs rank them.
+    #[must_use]
+    pub fn concat(parts: &[&Segmentation]) -> Self {
+        let mut segments = Vec::with_capacity(parts.iter().map(|part| part.len()).sum());
+        let mut cost = 0.0f32;
+        let mut base = 0u32;
+        for part in parts {
+            let mut end = 0u32;
+            for segment in part.segments() {
+                end = segment.end;
+                segments.push(Segment {
+                    start: segment.start + base,
+                    end: segment.end + base,
+                    readings: segment.readings().clone(),
+                });
+            }
+            cost += part.cost;
+            base += end;
+        }
+        Self { segments, cost }
+    }
 }
 
 /// Every way the typed string can be cut into character positions.

@@ -8,8 +8,10 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+bytemuck.workspace = true
 ime-decode.workspace = true
 ime-pinyin.workspace = true
+memmap2.workspace = true
 postcard.workspace = true
 serde.workspace = true
 thiserror.workspace = true

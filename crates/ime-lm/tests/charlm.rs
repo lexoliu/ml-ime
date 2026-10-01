@@ -457,3 +457,318 @@ fn int8_scores_do_not_depend_on_batchmates() {
         }
     }
 }
+
+/// A paged state's scores must not depend on pool pressure: advancing the
+/// same character history under a pool too small for the live set — every
+/// later claim a reclaim or a degrade to `Pending` — must score, bit for
+/// bit, what a roomy pool's fresh prefill-plus-advance of that history
+/// does. The replay's 0-mismatch gate is this identity at record scale;
+/// this is the per-step assert of it.
+#[test]
+fn reclaimed_pages_score_like_a_roomy_pool() {
+    let dir = fixture_dir();
+    let lexicon = lexicon(&dir);
+    let arch = "transformer";
+
+    let mut tight = shape();
+    tight.cache_rows = 16;
+    let mut roomy = shape();
+    roomy.cache_rows = 4096;
+    let tight_lm = CharLm::open(&dir.join(arch), &lexicon, tight).expect("the fixture opens");
+    let roomy_lm = CharLm::open(&dir.join(arch), &lexicon, roomy).expect("the fixture opens");
+
+    let ids: Vec<_> = lexicon
+        .characters()
+        .iter()
+        .map(|&ch| lexicon.id_of(ch).expect("the lexicon indexes itself"))
+        .collect();
+    // The fixture alphabet is eight characters; the context's prelude plus
+    // a step of claims already overruns the tight pool, so every later
+    // claim is a reclaim or a degrade.
+    let context: String = lexicon.characters().iter().collect();
+    let tokens: Vec<_> = lexicon.characters()[..8]
+        .iter()
+        .map(|&ch| lexicon.id_of(ch).expect("the lexicon indexes itself"))
+        .collect();
+
+    let asked = Asked {
+        candidates: &ids,
+        eos: false,
+    };
+    let mut tight_beams = vec![tight_lm.start(Some(&context), &asked)];
+    let mut roomy_beams = vec![roomy_lm.start(Some(&context), &asked)];
+    for step in 0..6 {
+        let (a, b) = (
+            tokens[step % tokens.len()],
+            tokens[(step + 3) % tokens.len()],
+        );
+        let produced_t =
+            tight_lm.advance(&[(&tight_beams[0], a, asked), (&tight_beams[0], b, asked)]);
+        let produced_r =
+            roomy_lm.advance(&[(&roomy_beams[0], a, asked), (&roomy_beams[0], b, asked)]);
+        assert_eq!(produced_t.len(), produced_r.len());
+        for (beam, (tight_state, roomy_state)) in produced_t.iter().zip(&produced_r).enumerate() {
+            for &ch in &ids {
+                assert_eq!(
+                    tight_lm.score(tight_state, ch).to_bits(),
+                    roomy_lm.score(roomy_state, ch).to_bits(),
+                    "step {step}, beam {beam}: pool pressure moved a score"
+                );
+            }
+        }
+        tight_beams = produced_t;
+        roomy_beams = produced_r;
+    }
+}
+
+/// The product shape is one session per pool: a lone `CharLm` driven
+/// through a fixture sentence of `start`s and chained `advance`s must
+/// never degrade a produced state to `Pending`. The replay regressed
+/// exactly here — a second session sharing the pool starved the gate's
+/// resolves — so the lone-session invariant gets its own assert.
+#[test]
+fn a_lone_session_materialises_no_pending_rows() {
+    let dir = fixture_dir();
+    let lexicon = lexicon(&dir);
+    let arch = "transformer";
+    let mut roomy = shape();
+    roomy.cache_rows = 4096;
+    let lm = CharLm::open(&dir.join(arch), &lexicon, roomy).expect("the fixture opens");
+
+    let ids: Vec<_> = lexicon
+        .characters()
+        .iter()
+        .map(|&ch| lexicon.id_of(ch).expect("the lexicon indexes itself"))
+        .collect();
+    let asked = Asked {
+        candidates: &ids,
+        eos: false,
+    };
+    // A fixture sentence: a context of the whole alphabet, then chained
+    // advances that keep every produced state alive — the working set one
+    // session's decode actually holds.
+    let alphabet: Vec<char> = lexicon.characters().to_vec();
+    let context: String = alphabet.iter().collect();
+    let tokens: Vec<_> = alphabet[..8]
+        .iter()
+        .map(|&ch| lexicon.id_of(ch).expect("the lexicon indexes itself"))
+        .collect();
+    let mut beams = Vec::new();
+    for shift in 0..8 {
+        let ctx: String = (0..16)
+            .map(|i| alphabet[(i + shift) % alphabet.len()])
+            .collect();
+        beams.push(lm.start(Some(&ctx), &asked));
+    }
+    assert!(!context.is_empty());
+    for step in 0..12 {
+        let (a, b) = (
+            tokens[step % tokens.len()],
+            tokens[(step + 3) % tokens.len()],
+        );
+        let mut next = Vec::new();
+        for beam in &beams {
+            let produced = lm.advance(&[(beam, a, asked), (beam, b, asked)]);
+            for state in &produced {
+                assert!(
+                    !state.is_pending(),
+                    "step {step}: a lone session's produced state went Pending"
+                );
+            }
+            next.extend(produced);
+        }
+        // Keep the frontier bounded like a beam does: the newest rows of
+        // every chain stay live, the rest drop dead-leaf-reclaimable.
+        beams = next.split_off(next.len().saturating_sub(64));
+    }
+    let (mat_ns, mat_rows) = lm.bk_mat();
+    assert_eq!(
+        (mat_rows, mat_ns),
+        (0, 0),
+        "a lone session materialised pending rows"
+    );
+    assert!(
+        lm.cache_stats().is_some_and(|stats| stats.live > 0),
+        "no pool node was ever claimed — the fixture exercised nothing"
+    );
+}
+
+/// A `Pending` state — one whose claims failed because every page in the
+/// pool is live — feeds its chain through the scratch generation instead
+/// of the paged gather, and the scratch write must land each position's
+/// `[H, D]` slice where the graph's `[slots, L, H, T, D]` layout reads it.
+/// Context nodes are unstealable (`ch: None` skips the sweep), so enough
+/// 62-character contexts pin the floored pool shut and starts go Pending.
+#[test]
+fn pending_states_score_like_resident_pages() {
+    let dir = fixture_dir();
+    let lexicon = lexicon(&dir);
+    let arch = "transformer";
+
+    let mut starved = shape();
+    starved.cache_rows = 1;
+    let mut roomy = shape();
+    roomy.cache_rows = 4096;
+    let starved_lm = CharLm::open(&dir.join(arch), &lexicon, starved).expect("the fixture opens");
+    let roomy_lm = CharLm::open(&dir.join(arch), &lexicon, roomy).expect("the fixture opens");
+
+    let ids: Vec<_> = lexicon
+        .characters()
+        .iter()
+        .map(|&ch| lexicon.id_of(ch).expect("the lexicon indexes itself"))
+        .collect();
+    let asked = Asked {
+        candidates: &ids,
+        eos: false,
+    };
+    // ~29 unstealable pages per context against a 1,024-page pool —
+    // and under the fixture's 32-position ceiling — the thirty-sixth
+    // context onward leaves starts with unresolved tips.
+    let alphabet: Vec<char> = lexicon.characters().to_vec();
+    let context = |shift: usize| -> String {
+        (0..29)
+            .map(|i| alphabet[(i + shift) % alphabet.len()])
+            .collect()
+    };
+    let mut starved_states = Vec::new();
+    let mut roomy_states = Vec::new();
+    for shift in 0..40 {
+        let ctx = context(shift);
+        starved_states.push(starved_lm.start(Some(&ctx), &asked));
+        roomy_states.push(roomy_lm.start(Some(&ctx), &asked));
+    }
+    assert!(
+        starved_states.iter().any(LmState::is_pending),
+        "1,200 pages of context resolved anyway — the scratch path went unexercised"
+    );
+
+    for (index, (starved_state, roomy_state)) in
+        starved_states.iter().zip(&roomy_states).enumerate()
+    {
+        let ch = ids[index % ids.len()];
+        let produced_s = starved_lm.advance(&[(starved_state, ch, asked)]);
+        let produced_r = roomy_lm.advance(&[(roomy_state, ch, asked)]);
+        assert_eq!(produced_s.len(), produced_r.len());
+        for (beam, (s, r)) in produced_s.iter().zip(&produced_r).enumerate() {
+            for &cand in &ids {
+                assert_eq!(
+                    starved_lm.score(s, cand).to_bits(),
+                    roomy_lm.score(r, cand).to_bits(),
+                    "context {index}, beam {beam}: a pending input moved a score"
+                );
+            }
+        }
+    }
+}
+
+/// The control the pending test is meaningless without: two different
+/// histories advanced by the same character must score differently —
+/// proof the fixture's logits read the cache bytes at all.
+#[test]
+fn history_changes_scores() {
+    let dir = fixture_dir();
+    let lexicon = lexicon(&dir);
+    let arch = "transformer";
+    let mut roomy = shape();
+    roomy.cache_rows = 4096;
+    let roomy_lm = CharLm::open(&dir.join(arch), &lexicon, roomy).expect("the fixture opens");
+
+    let ids: Vec<_> = lexicon
+        .characters()
+        .iter()
+        .map(|&ch| lexicon.id_of(ch).expect("the lexicon indexes itself"))
+        .collect();
+    let asked = Asked {
+        candidates: &ids,
+        eos: false,
+    };
+    let alphabet: Vec<char> = lexicon.characters().to_vec();
+    let a_ctx: String = alphabet[..3].iter().collect();
+    let b_ctx: String = alphabet[..3].iter().rev().collect();
+    let a = roomy_lm.start(Some(&a_ctx), &asked);
+    let b = roomy_lm.start(Some(&b_ctx), &asked);
+    let ch = ids[0];
+    let pa = roomy_lm.advance(&[(&a, ch, asked)]);
+    let pb = roomy_lm.advance(&[(&b, ch, asked)]);
+    assert!(
+        ids.iter()
+            .any(|&cand| roomy_lm.score(&pa[0], cand).to_bits()
+                != roomy_lm.score(&pb[0], cand).to_bits()),
+        "the fixture's logits ignore history — cache-content tests are vacuous"
+    );
+}
+
+/// `advance` on one `CharLm` from several threads at once — the CPU
+/// `sections` path's shape — must score bit for bit what the same calls
+/// do serially. A scratch generation shared across threads or a reclaim
+/// racing a resolve would interleave writes and flip a score, so the run
+/// pushes both: `Pending` inputs against a starved pool, and claims on a
+/// pool under eviction pressure.
+#[test]
+fn concurrent_advances_score_like_serial_ones() {
+    const THREADS: usize = 4;
+    let dir = fixture_dir();
+    let lexicon = lexicon(&dir);
+    let arch = "transformer";
+
+    let mut tight = shape();
+    tight.cache_rows = 1;
+    let lm = CharLm::open(&dir.join(arch), &lexicon, tight).expect("the fixture opens");
+
+    let ids: Vec<_> = lexicon
+        .characters()
+        .iter()
+        .map(|&ch| lexicon.id_of(ch).expect("the lexicon indexes itself"))
+        .collect();
+    let asked = Asked {
+        candidates: &ids,
+        eos: false,
+    };
+    // Thirty-eight contexts of ~29 unstealable pages each overfill the
+    // 1,024-page floored pool, so some starts go `Pending` — the states a
+    // `step_pages` call writes through the scratch generation.
+    let alphabet: Vec<char> = lexicon.characters().to_vec();
+    let context = |shift: usize| -> String {
+        (0..29)
+            .map(|i| alphabet[(i + shift) % alphabet.len()])
+            .collect()
+    };
+    let states: Vec<LmState> = (0..38)
+        .map(|shift| lm.start(Some(&context(shift)), &asked))
+        .collect();
+    assert!(
+        states.iter().any(LmState::is_pending),
+        "the pool resolved every context — the scratch path went unexercised"
+    );
+    // One mixed call: `Path` and `Pending` rows in a single step, so the
+    // call both reads pages and materialises scratch slots.
+    let steps: Vec<(&LmState, ime_pinyin::CharId, Asked<'_>)> = states
+        .iter()
+        .enumerate()
+        .map(|(i, state)| (state, ids[i % ids.len()], asked))
+        .collect();
+    let score_bits = |produced: &[LmState]| -> Vec<u32> {
+        produced
+            .iter()
+            .flat_map(|state| {
+                ids.iter()
+                    .map(|&cand| lm.score(state, cand).to_bits())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    };
+    let serial = score_bits(&lm.advance(&steps));
+    std::thread::scope(|scope| {
+        let mut joins = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            joins.push(scope.spawn(|| score_bits(&lm.advance(&steps))));
+        }
+        for (thread, join) in joins.into_iter().enumerate() {
+            let parallel = join.join().expect("a concurrent advance panicked");
+            assert_eq!(
+                parallel, serial,
+                "thread {thread}: a concurrent advance moved a score"
+            );
+        }
+    });
+}

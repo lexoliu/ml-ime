@@ -8,6 +8,7 @@ authors.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+hashbrown.workspace = true
 ime-pinyin.workspace = true
 serde.workspace = true
 serde_json.workspace = true

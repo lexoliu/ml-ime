@@ -103,6 +103,11 @@ fn args() -> (PathBuf, usize, SessionShape) {
             intra_threads,
             width: NonZeroUsize::new(BEAM).expect("BEAM is not zero"),
             verbose_logging,
+            metal_weights: ime_lm::MetalWeights::Auto,
+            // A paged export keeps every live state in the pool — the
+            // prelude's own positions included — so it needs a working
+            // page budget, not zero.
+            cache_rows: 4096,
         },
     )
 }

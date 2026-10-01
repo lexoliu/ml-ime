@@ -59,9 +59,14 @@ pub struct Expected {
     pub full: Vec<Vec<Vec<f32>>>,
 }
 
-/// `tests/fixtures/` beside this crate.
+/// `tests/fixtures/` beside this crate — or wherever `CHARLM_FIXTURES`
+/// points, so a shipped test binary can run on a machine whose checkout
+/// path differs from the build machine's.
 pub fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+    std::env::var_os("CHARLM_FIXTURES").map_or_else(
+        || Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"),
+        PathBuf::from,
+    )
 }
 
 /// The fixture lexicon, from the `char_pinyin.tsv` committed beside the

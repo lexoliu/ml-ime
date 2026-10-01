@@ -133,6 +133,19 @@ impl Default for SessionShape {
     }
 }
 
+/// The context tower's output for one context, kept for reuse.
+///
+/// It encodes only the context's text, so a session whose context is
+/// unchanged across keystrokes computes it once: [`RouteA::context`] makes
+/// one, [`RouteA::emission_with`] consumes it.
+#[derive(Clone, Debug)]
+pub struct EncodedContext {
+    /// The tower's last hidden state, `[tokens, hidden]` flattened.
+    hidden: Vec<f32>,
+    /// The attention mask the fill decoder reads alongside.
+    mask: Vec<i64>,
+}
+
 /// Route A's towers, loaded from an `mlime export route-a` directory.
 ///
 /// One `RouteA` serves every decoding thread at once: the graphs' weights
@@ -185,6 +198,11 @@ impl RouteA {
     /// If the directory is missing files, the manifest is malformed or names
     /// another layout, a weights file disagrees with the manifest, the
     /// tokenizer cannot be read, or ONNX Runtime refuses a graph.
+    ///
+    /// # Panics
+    ///
+    /// If a weights map the open walk just inserted is absent again — a bug,
+    /// not a state the caller can recover.
     pub fn open(dir: &Path, shape: SessionShape) -> Result<Self, NeuralError> {
         let manifest = read_manifest(dir)?;
         if manifest.context_tokens < 3 {
@@ -220,14 +238,15 @@ impl RouteA {
             weights_map(&mut maps, dir, &context_table.file)?,
             context_table,
         )?;
-        let fill_map = weights_map(&mut maps, dir, &fill_table.file)?;
-        let fill_initializers = shared_values(fill_map, fill_table)?;
+        let fill_initializers =
+            shared_values(weights_map(&mut maps, dir, &fill_table.file)?, fill_table)?;
         // The mask is registered as an initializer with the fill sessions, but
         // the table it answers -- the lattice's candidates -- needs the bytes
-        // themselves: reading them out of the same mapping keeps the file's
+        // themselves: reading them out of the same bytes keeps the file's
         // bits authoritative.
         let mask = read_mask(
-            fill_map,
+            maps.get(&fill_table.file)
+                .expect("the fill weights map was opened above"),
             fill_table,
             &manifest.candidate_mask,
             manifest.spans.len(),
@@ -310,6 +329,45 @@ impl RouteA {
         corrections: Option<&CorrectionTable>,
         with_context: bool,
     ) -> Result<Vec<Vec<Vec<f32>>>, NeuralError> {
+        let context = match record.context.as_deref().filter(|_| with_context) {
+            Some(text) => Some(self.context(text)?),
+            None => None,
+        };
+        self.emission_with(record, corrections, context.as_ref())
+    }
+
+    /// The context tower's output for *text*: its hidden states and the
+    /// mask that attends them. The output depends only on the context, so a
+    /// caller whose context survives the next keystroke encodes it once --
+    /// the session keeps it across `key()` calls and hands it back through
+    /// [`RouteA::emission_with`].
+    ///
+    /// # Errors
+    ///
+    /// If the tokenizer fails on *text* or ONNX Runtime fails the forward.
+    pub fn context(&self, text: &str) -> Result<EncodedContext, NeuralError> {
+        let (ids, mask) = self.encode_context(text)?;
+        Ok(EncodedContext {
+            hidden: self.context_hidden(&ids, &mask)?,
+            mask,
+        })
+    }
+
+    /// The fill decoder over every reading of *record*, against an
+    /// [`EncodedContext`] already computed: `None` runs the gate zeroed, the
+    /// `context off` score file's live twin. This is [`RouteA::emission`]
+    /// with the context tower's step taken outside. *corrections* is the
+    /// same typo noise model [`RouteA::emission`] takes.
+    ///
+    /// # Errors
+    ///
+    /// As [`RouteA::emission`]'s, minus the tokenizer's.
+    pub fn emission_with(
+        &self,
+        record: &LatticeRecord,
+        corrections: Option<&CorrectionTable>,
+        context: Option<&EncodedContext>,
+    ) -> Result<Vec<Vec<Vec<f32>>>, NeuralError> {
         if record.paths.is_empty() {
             return Err(NeuralError::Malformed {
                 record: record.record,
@@ -329,12 +387,12 @@ impl RouteA {
         // The context tower once per record; a gated-off context is a zeros
         // row, bitwise equivalent to encoding the sentinels and multiplying
         // the gate by zero.
-        let context = record.context.as_deref().filter(|_| with_context);
+        let gated_hidden = vec![0.0; self.hidden];
+        let gated_mask = [0i64];
         let (hidden_state, context_mask) = if let Some(context) = context {
-            let (ids, mask) = self.encode_context(context)?;
-            (self.context_hidden(&ids, &mask)?, mask)
+            (context.hidden.as_slice(), context.mask.as_slice())
         } else {
-            (vec![0.0; self.hidden], vec![0i64])
+            (gated_hidden.as_slice(), gated_mask.as_slice())
         };
         let context_tokens = context_mask.len();
 
@@ -343,9 +401,9 @@ impl RouteA {
         for row in 0..rows {
             context_rows
                 [row * context_tokens * self.hidden..(row + 1) * context_tokens * self.hidden]
-                .copy_from_slice(&hidden_state);
+                .copy_from_slice(hidden_state);
             context_masks[row * context_tokens..(row + 1) * context_tokens]
-                .copy_from_slice(&context_mask);
+                .copy_from_slice(context_mask);
         }
         let has = vec![if context.is_some() { 1.0f32 } else { 0.0f32 }; rows];
 
@@ -380,22 +438,7 @@ impl RouteA {
             });
         }
 
-        let emissions_len = self.emissions.len();
-        let mut scores = Vec::with_capacity(rows);
-        for (row, positions) in asked.iter().enumerate() {
-            let mut positions_scores = Vec::with_capacity(positions.len());
-            for (position, emissions) in positions.iter().enumerate() {
-                let base = (row * width + position + 1) * emissions_len;
-                positions_scores.push(
-                    emissions
-                        .iter()
-                        .map(|&emission| log_probs[base + emission])
-                        .collect(),
-                );
-            }
-            scores.push(positions_scores);
-        }
-        Ok(scores)
+        Ok(asked_scores(&asked, log_probs, width, self.emissions.len()))
     }
 
     /// The fill graph's inputs for *record*: the `[CLS, MASK x n, SEP]`
@@ -599,6 +642,32 @@ impl RouteA {
         }
         Ok(hidden.to_vec())
     }
+}
+
+/// The per-position candidate scores out of the flat `[rows, width, E]`
+/// log-prob table — the slot after `position` is the MASK cell the graph
+/// scores, so the offset is `(row * width + position + 1) * E`.
+fn asked_scores(
+    asked: &[Vec<Vec<usize>>],
+    log_probs: &[f32],
+    width: usize,
+    emissions_len: usize,
+) -> Vec<Vec<Vec<f32>>> {
+    let mut scores = Vec::with_capacity(asked.len());
+    for (row, positions) in asked.iter().enumerate() {
+        let mut positions_scores = Vec::with_capacity(positions.len());
+        for (position, emissions) in positions.iter().enumerate() {
+            let base = (row * width + position + 1) * emissions_len;
+            positions_scores.push(
+                emissions
+                    .iter()
+                    .map(|&emission| log_probs[base + emission])
+                    .collect(),
+            );
+        }
+        scores.push(positions_scores);
+    }
+    scores
 }
 
 /// Read *dir*'s `route-a.json` and refuse the manifest shapes this build
@@ -1197,7 +1266,7 @@ fn shared_value<T: PrimitiveTensorElementType + std::fmt::Debug>(
 /// The `candidate_mask` bytes out of the fill weights file: *name* must be
 /// the one boolean tensor shaped `[spans, emissions]`.
 fn read_mask(
-    map: &Mmap,
+    map: &[u8],
     table: &WeightsFile,
     name: &str,
     spans: usize,

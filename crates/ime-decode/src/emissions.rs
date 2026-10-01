@@ -30,7 +30,7 @@
 
 use crate::candidates::Candidates;
 use crate::score::Emission;
-use ime_pinyin::{CharId, Lexicon};
+use ime_pinyin::{CharId, Lexicon, Segmentation};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -201,6 +201,42 @@ pub struct LatticeRecord {
     pub context: Option<String>,
     /// The readings, in the order [`Candidates::paths`] holds them.
     pub paths: Vec<LatticePath>,
+}
+
+/// The paths one lattice record holds: which span each position is and which
+/// emittable characters it asks about, in lattice order. This is what
+/// `emit-lattice` writes and what a live emission consumes, so both sides
+/// come from this one derivation.
+#[must_use]
+pub fn lattice_paths(
+    pinyin: &str,
+    segmentations: &[Segmentation],
+    candidates: &Candidates,
+    emittable: &Emittable,
+    lexicon: &Lexicon,
+) -> Vec<LatticePath> {
+    segmentations
+        .iter()
+        .zip(candidates.paths())
+        .map(|(segmentation, reading)| LatticePath {
+            spans: segmentation
+                .segments()
+                .iter()
+                .map(|segment| pinyin[segment.start()..segment.end()].to_owned())
+                .collect(),
+            candidates: reading
+                .positions()
+                .iter()
+                .map(|allowed| {
+                    emittable
+                        .restrict(allowed)
+                        .iter()
+                        .map(|id| lexicon.character(*id))
+                        .collect()
+                })
+                .collect(),
+        })
+        .collect()
 }
 
 /// The model's answer for one evaluation record.
