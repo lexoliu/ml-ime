@@ -535,9 +535,7 @@ class PagedStepModule(nn.Module):
         # head_dim] the per-layer `keys[layer].index_select` produced under
         # the [layers, pages, ..] order.
         paged_k = (
-            keys.index_select(0, gathered)
-            .view(rows, pages, *keys.shape[1:])
-            .permute(0, 2, 3, 1, 4)
+            keys.index_select(0, gathered).view(rows, pages, *keys.shape[1:]).permute(0, 2, 3, 1, 4)
         )
         paged_v = (
             values.index_select(0, gathered)
@@ -583,9 +581,7 @@ class PagedPrefillModule(nn.Module):
         features, prefix, _ = self.model.prefill(tokens)
         gathered = self.restricted(features).gather(1, candidates)
         # [1, layers, heads, T, head_dim] -> [T, layers, heads, head_dim].
-        pages = tuple(
-            tensor.squeeze(0).permute(2, 0, 1, 3).contiguous() for tensor in prefix
-        )
+        pages = tuple(tensor.squeeze(0).permute(2, 0, 1, 3).contiguous() for tensor in prefix)
         return (gathered, *pages)
 
 

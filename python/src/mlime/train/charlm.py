@@ -845,16 +845,12 @@ def export_onnx(
                 model.config.hidden // model.config.heads,
             )
             pool = tuple(
-                torch.zeros(8, layers, heads, head_dim, dtype=state[0].dtype)
-                for _ in state_names
+                torch.zeros(8, layers, heads, head_dim, dtype=state[0].dtype) for _ in state_names
             )
             page_row = torch.tensor([[1, 2, 3], [1, 2, 4], [0, 0, 0], [1, 2, 0]])
-            mask = torch.tensor(
-                [[1, 1, 1], [1, 1, 1], [1, 1, 0], [1, 1, 0]], dtype=torch.bool
-            )
+            mask = torch.tensor([[1, 1, 1], [1, 1, 1], [1, 1, 0], [1, 1, 0]], dtype=torch.bool)
             state_buffers = tuple(
-                torch.zeros(2, layers, heads, 3, head_dim, dtype=tensor.dtype)
-                for tensor in state
+                torch.zeros(2, layers, heads, 3, head_dim, dtype=tensor.dtype) for tensor in state
             )
             source_row = torch.tensor([-1, -1, 0, -1])
             step_inputs = (
@@ -980,9 +976,7 @@ def export_onnx(
                     # one position's [layers, heads, head_dim]; its resident
                     # pool is [pages, layers, heads, head_dim] with the pages
                     # axis unbound. The LSTM keeps its [layers, hidden] row.
-                    "prefix": [
-                        [*list(tensor.shape[1:3]), tensor.shape[4]] for tensor in prefix
-                    ],
+                    "prefix": [[*list(tensor.shape[1:3]), tensor.shape[4]] for tensor in prefix],
                     "state": [
                         [0, tensor.shape[1], tensor.shape[2], tensor.shape[4]]
                         if paged

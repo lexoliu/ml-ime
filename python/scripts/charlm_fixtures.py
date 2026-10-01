@@ -170,10 +170,7 @@ def _expected(export: Path) -> dict[str, object]:
         free_page = prelude_len + 1
         chains = [list(range(1, prelude_len + 1)) for _ in BEAMS]
     else:
-        state = {
-            name: np.repeat(by_name[name], len(BEAMS), axis=0)
-            for name in manifest["state"]
-        }
+        state = {name: np.repeat(by_name[name], len(BEAMS), axis=0) for name in manifest["state"]}
 
     def run_step(
         token: np.ndarray,

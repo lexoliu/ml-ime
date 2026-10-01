@@ -221,9 +221,7 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
             "source_row": np.arange(2, dtype=np.int64),
             **_worker_index(prefix),
         }
-        state = {
-            name: np.repeat(by_name[name], 2, axis=0) for name in manifest["state"]
-        }
+        state = {name: np.repeat(by_name[name], 2, axis=0) for name in manifest["state"]}
         for position in range(2):
             token = np.array([beam[position] for beam in beams], dtype=np.int64)
             outputs = step.run(
