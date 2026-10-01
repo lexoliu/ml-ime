@@ -20,11 +20,15 @@ ime-g2p = { path = "crates/ime-g2p" }
 ime-corpus = { path = "crates/ime-corpus" }
 ime-synth = { path = "crates/ime-synth" }
 ime-lm = { path = "crates/ime-lm" }
+ime-session = { path = "crates/ime-session" }
 
 anyhow = "1.0.104"
+hashbrown = "0.15.5"
+libc = "0.2"
 async-openai = { version = "0.41.3", features = ["chat-completion"] }
 askama = "0.16.0"
 blake2 = "0.11.0"
+bytemuck = "1.25.2"
 clap = { version = "4.6.6", features = ["derive"] }
 const-hex = "1.19.1"
 csv = "1.4.0"

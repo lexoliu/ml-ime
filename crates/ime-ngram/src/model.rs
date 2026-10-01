@@ -1,6 +1,9 @@
 //! The trained model: three interpolated levels and the lookups over them.
 
+use std::path::Path;
+
 use crate::NgramError;
+use crate::mapped;
 use crate::table::ProbTable;
 use ime_decode::{Asked, Transition};
 use ime_pinyin::{CharId, Lexicon};
@@ -117,6 +120,27 @@ impl NgramModel {
     #[must_use]
     pub fn trigram_types(&self) -> usize {
         self.trigram.len()
+    }
+
+    /// The lexicon's characters in vocabulary order.
+    pub(crate) fn vocabulary(&self) -> &[char] {
+        &self.vocabulary
+    }
+
+    /// The unigram level's probabilities, indexed by token.
+    pub(crate) fn unigram(&self) -> &[f32] {
+        &self.unigram
+    }
+
+    /// The bigram level's backoff weights, indexed by the preceding token.
+    pub(crate) fn bigram_backoff(&self) -> &[f32] {
+        &self.bigram_backoff
+    }
+
+    /// The keyed tables: bigram, trigram backoff and trigram, in the order
+    /// the mapped layout stores them.
+    pub(crate) fn tables(&self) -> [&ProbTable; 3] {
+        [&self.bigram, &self.trigram_backoff, &self.trigram]
     }
 
     /// How many bigrams the corpus contained, as distinct types.
@@ -248,6 +272,66 @@ impl NgramModel {
         postcard::to_stdvec(self).map_err(NgramError::Encode)
     }
 
+    /// Load a model from disk, whichever layout the file holds.
+    ///
+    /// A file that opens with the mapped layout's magic is memory-mapped: its
+    /// tables point into the page cache rather than the heap. Anything else
+    /// is read and decoded as the postcard serialisation
+    /// [`NgramModel::from_bytes`] has always loaded.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be read, is neither layout, or fails the lexicon
+    /// check [`NgramModel::from_bytes`] applies.
+    pub fn open(path: &Path, lexicon: &Lexicon) -> Result<Self, NgramError> {
+        if mapped::is_mapped(path) {
+            return mapped::open_file(path, lexicon);
+        }
+        let bytes = std::fs::read(path).map_err(NgramError::Io)?;
+        Self::from_bytes(&bytes, lexicon)
+    }
+
+    /// Write the model in the memory-mappable layout [`NgramModel::open`]
+    /// reads. The postcard `ngram.bin` is the trainer's interchange format;
+    /// this is the one a session should load, since its tables never touch
+    /// the heap.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be written.
+    pub fn write_mapped(&self, path: &Path) -> Result<(), NgramError> {
+        mapped::write(self, path)
+    }
+
+    /// The check `from_bytes` and `open` share: the model's vocabulary must
+    /// be this lexicon, in this order, and its dense arrays must agree.
+    pub(crate) fn check_lexicon(&self, lexicon: &Lexicon) -> Result<(), NgramError> {
+        if self.vocabulary.len() != lexicon.len() {
+            return Err(NgramError::LexiconSize {
+                model: self.vocabulary.len(),
+                lexicon: lexicon.len(),
+            });
+        }
+        if self.unigram.len() != lexicon.len() + Token::RESERVED as usize
+            || self.bigram_backoff.len() != self.unigram.len()
+        {
+            return Err(NgramError::Corrupt);
+        }
+        for (index, expected) in self.vocabulary.iter().enumerate() {
+            let id = lexicon.id_of(*expected).ok_or(NgramError::LexiconContent {
+                index,
+                ch: *expected,
+            })?;
+            if id.index() != index {
+                return Err(NgramError::LexiconContent {
+                    index,
+                    ch: *expected,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// Load a model and check it against the lexicon it will be used with.
     ///
     /// The check is not a formality: a `CharId` means nothing on its own, so a
@@ -260,29 +344,7 @@ impl NgramModel {
     /// different lexicon.
     pub fn from_bytes(bytes: &[u8], lexicon: &Lexicon) -> Result<Self, NgramError> {
         let model: Self = postcard::from_bytes(bytes).map_err(NgramError::Decode)?;
-        if model.vocabulary.len() != lexicon.len() {
-            return Err(NgramError::LexiconSize {
-                model: model.vocabulary.len(),
-                lexicon: lexicon.len(),
-            });
-        }
-        if model.unigram.len() != lexicon.len() + Token::RESERVED as usize
-            || model.bigram_backoff.len() != model.unigram.len()
-        {
-            return Err(NgramError::Corrupt);
-        }
-        for (index, expected) in model.vocabulary.iter().enumerate() {
-            let id = lexicon.id_of(*expected).ok_or(NgramError::LexiconContent {
-                index,
-                ch: *expected,
-            })?;
-            if id.index() != index {
-                return Err(NgramError::LexiconContent {
-                    index,
-                    ch: *expected,
-                });
-            }
-        }
+        model.check_lexicon(lexicon)?;
         Ok(model)
     }
 }
@@ -302,6 +364,35 @@ impl Transition for NgramModel {
 
     fn score(&self, state: &Context, candidate: CharId) -> f32 {
         self.probability_at(state, Token::of(candidate)).ln()
+    }
+
+    /// The whole candidate list against one context: `allowed` arrives
+    /// sorted, so every candidate's bigram key shares the `previous` row and
+    /// its trigram key the `(before, previous)` row — each table is walked
+    /// once with a forward cursor instead of a binary search per pair. Over
+    /// the mapped table that turns ~22 cold page touches per pair into one
+    /// lower-bound plus adjacent entries per beam.
+    fn score_many(&self, state: &Context, weight: f32, allowed: &[CharId], out: &mut [f32]) {
+        let base = self.base();
+        let bigram_prefix = u64::from(state.previous.0) * base;
+        let mut bigram = self.bigram.row(bigram_prefix);
+        let pair = state
+            .trigram_backoff
+            .map(|backoff| (backoff, self.pack2(state.before, state.previous) * base));
+        let mut trigram = pair.map(|(_, prefix)| self.trigram.row(prefix));
+        for (slot, &candidate) in out.iter_mut().zip(allowed.iter()) {
+            let token = Token::of(candidate);
+            let level1 = self.unigram[token.index()];
+            let level2 = bigram.at(bigram_prefix + u64::from(token.0)).unwrap_or(0.0)
+                + state.bigram_backoff * level1;
+            let p = match (pair, &mut trigram) {
+                (Some((backoff, prefix)), Some(row)) => {
+                    row.at(prefix + u64::from(token.0)).unwrap_or(0.0) + backoff * level2
+                }
+                _ => level2,
+            };
+            *slot += weight * p.ln();
+        }
     }
 
     fn finish(&self, state: &Context) -> f32 {

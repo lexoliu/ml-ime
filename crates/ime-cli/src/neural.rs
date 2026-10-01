@@ -29,8 +29,8 @@ use blake2::{Blake2b, Digest as _, digest::consts::U8};
 use clap::{Args, ValueEnum};
 use flate2::read::MultiGzDecoder;
 use ime_decode::{
-    BeamOptions, Both, Candidates, Emission, Emittable, Hypothesis, LatticePath, LatticeRecord,
-    NoTransition, Record, ScoreRecord, Scored, Transition, Uniform, Weighted, decode_many,
+    BeamOptions, Both, Candidates, Emission, Emittable, Hypothesis, LatticeRecord, NoTransition,
+    Record, ScoreRecord, Scored, Transition, Uniform, Weighted, decode_many, lattice_paths,
 };
 use ime_eval::{EvalRecord, EvalSet, Observation, Report, Slice};
 use ime_lm::CharLm;
@@ -66,7 +66,7 @@ pub enum SliceArg {
 
 impl SliceArg {
     /// The evaluation crate's own name for this slice.
-    const fn slice(self) -> Slice {
+    pub(crate) const fn slice(self) -> Slice {
         match self {
             Self::All => Slice::All,
             Self::Dev => Slice::Dev,
@@ -75,7 +75,7 @@ impl SliceArg {
     }
 
     /// How the slice is spelled in the report.
-    const fn label(self) -> &'static str {
+    pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::All => "all",
             Self::Dev => "dev",
@@ -116,6 +116,10 @@ pub enum BackendArg {
     Webgpu,
     /// NVIDIA's CUDA provider, if the build carries `gpu-cuda`.
     Cuda,
+    /// Hand-encoded Metal kernels for the LM step — macOS only. The towers
+    /// stay on their own backend; only the character LM switches.
+    #[cfg(target_os = "macos")]
+    Metal,
 }
 
 impl BackendArg {
@@ -126,16 +130,41 @@ impl BackendArg {
             Self::Coreml => ime_lm::Backend::CoreMl,
             Self::Webgpu => ime_lm::Backend::WebGpu,
             Self::Cuda => ime_lm::Backend::Cuda,
+            #[cfg(target_os = "macos")]
+            Self::Metal => ime_lm::Backend::Metal,
         }
     }
 
-    /// The towers crate's name for this backend.
+    /// The towers crate's name for this backend — the towers run on ONNX
+    /// Runtime everywhere, so `--backend metal` leaves them on the CPU.
     pub const fn neural_backend(self) -> ime_neural::Backend {
         match self {
             Self::Cpu => ime_neural::Backend::Cpu,
             Self::Coreml => ime_neural::Backend::CoreMl,
             Self::Webgpu => ime_neural::Backend::WebGpu,
             Self::Cuda => ime_neural::Backend::Cuda,
+            #[cfg(target_os = "macos")]
+            Self::Metal => ime_neural::Backend::Cpu,
+        }
+    }
+}
+
+/// A `--metal-weights` answer, translated to [`ime_lm::MetalWeights`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default, ValueEnum)]
+pub enum MetalWeightsArg {
+    /// The export's own dtype.
+    #[default]
+    Auto,
+    /// fp16 packed weights — dequantized or cast at load.
+    F16,
+}
+
+impl MetalWeightsArg {
+    /// The model crate's name for this precision.
+    pub const fn weights(self) -> ime_lm::MetalWeights {
+        match self {
+            Self::Auto => ime_lm::MetalWeights::Auto,
+            Self::F16 => ime_lm::MetalWeights::F16,
         }
     }
 }
@@ -181,41 +210,6 @@ impl Emissions for NoEmissions {
     ) -> Result<Uniform> {
         Ok(Uniform)
     }
-}
-
-/// The paths one lattice record holds: which span each position is and which
-/// emittable characters it asks about, in lattice order. This is what
-/// `emit-lattice` writes and what the live emission consumes, so both names
-/// come from the same derivation.
-fn lattice_paths(
-    pinyin: &str,
-    segmentations: &[Segmentation],
-    candidates: &Candidates,
-    emittable: &Emittable,
-    lexicon: &Lexicon,
-) -> Vec<LatticePath> {
-    segmentations
-        .iter()
-        .zip(candidates.paths())
-        .map(|(segmentation, reading)| LatticePath {
-            spans: segmentation
-                .segments()
-                .iter()
-                .map(|segment| pinyin[segment.start()..segment.end()].to_owned())
-                .collect(),
-            candidates: reading
-                .positions()
-                .iter()
-                .map(|allowed| {
-                    emittable
-                        .restrict(allowed)
-                        .iter()
-                        .map(|id| lexicon.character(*id))
-                        .collect()
-                })
-                .collect(),
-        })
-        .collect()
 }
 
 /// The model's log probabilities, computed live by the exported towers.
@@ -1683,14 +1677,14 @@ fn write_dump(dir: &Path, section: &Section) -> Result<()> {
 }
 
 /// Read an evaluation set off disk.
-fn load_set(path: &Path) -> Result<EvalSet> {
+pub(crate) fn load_set(path: &Path) -> Result<EvalSet> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("could not read the eval set at {}", path.display()))?;
     EvalSet::parse(&source).context("the eval set is malformed")
 }
 
 /// Read the characters the model can score.
-fn load_emittable(path: &Path, lexicon: &Lexicon) -> Result<Emittable> {
+pub(crate) fn load_emittable(path: &Path, lexicon: &Lexicon) -> Result<Emittable> {
     let source = fs::read_to_string(path)
         .with_context(|| format!("could not read the emittable set at {}", path.display()))?;
     let emittable = Emittable::parse(&source, lexicon)

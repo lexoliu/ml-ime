@@ -1,9 +1,9 @@
 //! `ort`'s per-copy identity sessions -- one `+NEW Session` per
 //! `copy_into`, ~22 MB of CUDA EP state apiece -- were what drained the
 //! T4's 15 GB inside the first `start`. The resident path opens no session
-//! a run: the two graph sessions plus the two copiers a pool growth needs
-//! (the float dtype's, the bool mask's) are the whole count, whether 70
-//! `start`s grow the pool or two hundred `start`/`advance` rounds follow.
+//! a run: on the host-resident backends even a pool growth is a `memcpy`,
+//! so the two graph sessions are the whole count, whether 70 `start`s grow
+//! the pool or two hundred `start`/`advance` rounds follow.
 //!
 //! This test is its own binary, so a single global subscriber counts
 //! `+NEW Session` events process-wide with no thread filter: `fmt`'s
@@ -90,7 +90,8 @@ fn starts_and_steps_do_not_open_new_sessions() {
         eos: true,
     };
 
-    // Past the pool's starting capacity of 64, so `grow` runs its copiers.
+    // Past the pool's starting capacity of 64, so `grow` runs — on the
+    // host-resident backend its copies are `memcpy`s, no copier session.
     let mut states: Vec<LmState> = (0..70)
         .map(|_| model.start(Some(&context), &asked))
         .collect();
@@ -105,7 +106,7 @@ fn starts_and_steps_do_not_open_new_sessions() {
 
     assert_eq!(
         sessions.0.load(Ordering::Relaxed),
-        4,
-        "prefill + step + the two copiers are the whole count"
+        2,
+        "prefill + step are the whole count on a host-resident backend"
     );
 }

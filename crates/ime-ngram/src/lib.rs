@@ -10,6 +10,7 @@
 //! a neural emission model it is the term that repairs what a
 //! non-autoregressive decoder cannot say.
 
+mod mapped;
 mod model;
 mod table;
 mod train;
@@ -80,6 +81,9 @@ pub enum NgramError {
     /// The file decoded, but its tables do not agree with each other.
     #[error("the model file is internally inconsistent")]
     Corrupt,
+    /// The model file could not be read or written.
+    #[error("could not read or write the model file")]
+    Io(#[source] std::io::Error),
     /// The model could not be serialised.
     #[error("could not serialise the model")]
     Encode(#[source] postcard::Error),
@@ -274,6 +278,74 @@ mod tests {
                 model.probability(&chars(context), current).ok()
             );
         }
+    }
+
+    #[test]
+    fn the_mapped_layout_scores_like_the_postcard_one() {
+        let (_, lexicon) = fixture();
+        let model = trained(&lexicon);
+        let postcard_path =
+            std::env::temp_dir().join(format!("ime-ngram-model-{}.bin", std::process::id()));
+        let mapped_path =
+            std::env::temp_dir().join(format!("ime-ngram-model-{}.mmap", std::process::id()));
+        std::fs::write(
+            &postcard_path,
+            model.to_bytes().expect("the model serialises"),
+        )
+        .expect("the postcard file writes");
+        // `open` reads the postcard file as it always has.
+        let loaded = NgramModel::open(&postcard_path, &lexicon).expect("the postcard file loads");
+        loaded
+            .write_mapped(&mapped_path)
+            .expect("the mapped file writes");
+        let mapped = NgramModel::open(&mapped_path, &lexicon).expect("the mapped file loads");
+        assert_eq!(mapped.vocabulary_size(), model.vocabulary_size());
+        assert_eq!(mapped.trigram_types(), model.trigram_types());
+        assert_eq!(mapped.bigram_types(), model.bigram_types());
+        // Every table level gets exercised: contexts covering bigram hits,
+        // trigram hits, misses and the end of a line, over the corpus's own
+        // characters and pairs.
+        let chars_of: Vec<char> = CORPUS.lines().flat_map(str::chars).collect();
+        for pair in chars_of.windows(2).step_by(7) {
+            for current in chars_of.iter().step_by(97) {
+                assert_eq!(
+                    mapped.probability(pair, *current).map(f32::to_bits).ok(),
+                    model.probability(pair, *current).map(f32::to_bits).ok(),
+                    "P({current:?}|{:?})",
+                    String::from_iter(pair)
+                );
+            }
+            for current in chars_of.iter().step_by(97) {
+                assert_eq!(
+                    mapped
+                        .probability(&pair[..1], *current)
+                        .map(f32::to_bits)
+                        .ok(),
+                    model
+                        .probability(&pair[..1], *current)
+                        .map(f32::to_bits)
+                        .ok()
+                );
+            }
+            assert_eq!(
+                mapped.end_probability(pair).map(f32::to_bits).ok(),
+                model.end_probability(pair).map(f32::to_bits).ok()
+            );
+        }
+        std::fs::remove_file(&postcard_path).ok();
+        std::fs::remove_file(&mapped_path).ok();
+    }
+
+    #[test]
+    fn a_mapped_file_that_is_not_a_model_is_rejected() {
+        let (_, lexicon) = fixture();
+        let path = std::env::temp_dir().join(format!("ime-ngram-junk-{}.mmap", std::process::id()));
+        std::fs::write(&path, b"MGNMgarbage").expect("the junk file writes");
+        assert!(matches!(
+            NgramModel::open(&path, &lexicon),
+            Err(NgramError::Corrupt | NgramError::LexiconSize { .. })
+        ));
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

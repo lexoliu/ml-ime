@@ -79,8 +79,16 @@ macOS VM:
 
 int8 is about 1.7 times slower than fp32 on this CPU. At one sentence the
 batch is at most eight readings, and dequantization costs more than NEON fp32
-matrix multiplication saves. For the input method, fp32 is the export to use
-on Apple CPU.
+matrix multiplication saves.
+
+The M1 disagrees. The same session on a Mac mini's M1 (the keystroke harness
+of `notes/keystroke-latency.md`, `--incremental`, 4 threads) prices the fill
+tower at 26.0 ms per keystroke under int8 against 68.2 ms under fp32 — int8 is
+2.6 times *faster* on the M1, and the int8 session's whole-keystroke cost is
+522 ms median / 1,757 ms p95. The VM's CPU and the M1 measure the two exports
+in opposite orders; which is right is a property of the silicon, not of the
+export, so both stay in the tree. For the input method — which is an M1 — the
+export to use on Apple CPU is int8.
 
 ## Reproduce
 
