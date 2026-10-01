@@ -2499,16 +2499,18 @@ impl CharLm {
         // claimed from the same list. A row-mode export (the LSTM) gets the
         // whole-row store only when the caller sizes it.
         if model.paged {
-            let mut pool = PagePool::new(dtype, shape.cache_rows.max(1024), &model.rows.state)?;
+            let pool = PagePool::new(dtype, shape.cache_rows.max(1024), &model.rows.state)?;
+            // On Metal the pool's pages live in the step's own buffers.
             #[cfg(target_os = "macos")]
-            if let Some(metal) = &model.metal {
-                pool.metal = Some(
+            let pool = PagePool {
+                metal: model.metal.as_ref().map(|metal| {
                     metal
                         .lock()
                         .expect("the metal step is not poisoned")
-                        .pool_buffers(),
-                );
-            }
+                        .pool_buffers()
+                }),
+                ..pool
+            };
             model.cache = Some(Cache::Pages(pool));
         } else if shape.cache_rows > 0 {
             model.cache = Some(Cache::Rows(CachePool::new(dtype, shape.cache_rows)));
