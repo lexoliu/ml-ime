@@ -75,7 +75,7 @@ mod tests {
     #[test]
     fn han_characters_keeps_order_and_duplicates() {
         assert_eq!(han_characters("中，中a国"), vec!['中', '中', '国']);
-        assert!(han_characters("abc, 123").is_empty());
+        assert_eq!(han_characters("abc, 123"), Vec::<char>::new());
     }
 
     #[test]

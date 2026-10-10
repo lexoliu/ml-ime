@@ -249,10 +249,16 @@ mod tests {
 
     #[test]
     fn a_line_that_is_not_a_bold_term_followed_by_a_colon_is_not_an_entry() {
-        assert!(entries("=== 谐音 ===").is_empty());
-        assert!(entries("很多网络用语的使用相当普及。").is_empty());
-        assert!(entries("*'''没有冒号''' 后面直接是解释").is_empty());
-        assert!(entries("*'''空解释'''：").is_empty());
+        assert_eq!(entries("=== 谐音 ==="), Vec::<WikiEntry>::new());
+        assert_eq!(
+            entries("很多网络用语的使用相当普及。"),
+            Vec::<WikiEntry>::new()
+        );
+        assert_eq!(
+            entries("*'''没有冒号''' 后面直接是解释"),
+            Vec::<WikiEntry>::new()
+        );
+        assert_eq!(entries("*'''空解释'''："), Vec::<WikiEntry>::new());
     }
 
     #[test]

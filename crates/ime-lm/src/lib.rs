@@ -1200,7 +1200,7 @@ impl CachePool {
         };
         if self
             .budget
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |b| b.checked_sub(1))
             .is_err()
         {
             cgen.free
