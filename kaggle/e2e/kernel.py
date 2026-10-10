@@ -172,6 +172,7 @@ REQUIREMENTS = (
     "polars",
     "structlog",
     "opencc",
+    "rapidfuzz",
     "regex",
     "typer",
     "transformers>=5.16",
