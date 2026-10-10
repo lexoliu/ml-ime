@@ -400,7 +400,7 @@ mod tests {
         let mut abbrev = Vec::new();
         lexicon.mask_into(table.exact_range("zhong").expect("zhong"), &mut full);
         lexicon.mask_into(table.prefix_range("z"), &mut abbrev);
-        assert!(!full.is_empty());
+        assert!(!full.is_empty(), "zhong admits characters");
         assert!(
             abbrev.len() > full.len() * 10,
             "abbreviation should blow the candidate set up: {} vs {}",

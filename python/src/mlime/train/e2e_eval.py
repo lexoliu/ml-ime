@@ -10,7 +10,10 @@ Each record's lattice lists one path per segmentation of its keystrokes, and
 per position the characters that span admits. The encoder reads every path's
 typed spans once; each path is then decoded autoregressively against its own
 encoder output, sixteen beams wide, candidates restricted to the admitted
-characters and renormalised. The surviving hypotheses merge over the record's
+characters and renormalised. Paths of one length are searched together --
+across records -- so the step runs over hundreds of beam rows at once rather
+than sixteen; batching changes the arithmetic's shape, not what any one path
+computes. The surviving hypotheses merge over the record's
 paths -- a hypothesis is a full sentence, and where two segmentations of one
 sentence meet, the higher sum of step log-probabilities wins. That merge is
 what turns "the lattice's best reading" into "the model's best answer".
@@ -25,8 +28,10 @@ digest in :mod:`mlime.gui`, verified byte for byte against the Rust oracle.
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+import time
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from itertools import batched
 from pathlib import Path
 from typing import Any
 
@@ -52,66 +57,125 @@ from mlime.train.spans import SpanVocab
 DEFAULT_BEAM_WIDTH = 16
 DEFAULT_TOP_K = 8
 
+#: Records decoded between two writes of the dump: the progress a stopped run keeps.
+DEFAULT_RECORDS_PER_CHUNK = 256
+
 #: The fixed-point scale the reciprocal ranks accumulate in, as in Rust.
 RANK_SCALE = 1 << 20
 
 
-def decode_path(
-    model: E2EModel,
-    span_vectors: torch.Tensor,
-    candidates: Sequence[torch.Tensor],
-    beam_width: int,
-) -> list[tuple[list[int], float]]:
-    """Beam-search one lattice path; return emission-index hypotheses and scores.
+#: Beam rows times positions one decode batch may hold: the key/value cache
+#: grows with both, so a batch of long paths carries fewer of them.
+DEFAULT_ROW_POSITIONS = 16384
 
-    ``span_vectors [n, enc]`` is the encoder's hidden state at each of the
-    path's typed positions and ``candidates`` the emission indices each admits.
-    The beam state is the decoder's key/value cache, so the step is the same
-    arithmetic training ran, advanced one position at a time. A position that
-    admits nothing kills the path -- the beam cannot complete a sentence
-    through it -- which is what an empty hypothesis list means here.
+
+@dataclass(frozen=True)
+class Lane:
+    """One lattice path ready to decode: whose it is, what the encoder said, what it admits.
+
+    ``vectors [n, enc]`` is the encoder's hidden state at the path's typed
+    positions and ``candidates`` one ``[E]`` bool row per position, the
+    emission indices that position's span admits.
     """
-    if any(candidates_for.numel() == 0 for candidates_for in candidates):
-        return []
+
+    owner: int
+    vectors: torch.Tensor
+    candidates: torch.Tensor
+
+    @property
+    def length(self) -> int:
+        """The number of typed positions."""
+        return int(self.vectors.shape[0])
+
+
+def decode_lanes(
+    model: E2EModel, lanes: Sequence[Lane], beam_width: int
+) -> list[list[tuple[list[int], float]]]:
+    """Beam-search equally long lanes together; each lane's hypotheses and scores.
+
+    Every lane owns a block of ``beam_width`` rows from the first step, the
+    unused ones at a score of minus infinity, so the row layout never changes
+    and the encoder keys and values are expanded once. The candidate
+    restriction is a mask over the full emittable row followed by the
+    log-softmax -- the same renormalisation over the admitted characters a
+    one-path search computes over its gathered columns. Rows still at minus
+    infinity when the path ends are slots the lattice never filled and are
+    dropped, so a lane admitting fewer than ``beam_width`` sentences returns
+    fewer.
+    """
+    length = lanes[0].length
+    if any(lane.length != length for lane in lanes):
+        raise ValueError("decode_lanes takes lanes of one length; bucket them first")
     decoder = model.decoder
-    encoder_kv = [cross.kv(span_vectors.unsqueeze(0)) for cross in decoder.gated_layers()]
+    device = decoder.emit_ids.device
+    count, width = len(lanes), beam_width
+    rows = count * width
+    vectors = torch.stack([lane.vectors for lane in lanes]).to(device)
+    masks = torch.stack([lane.candidates for lane in lanes]).to(device)
+    emittable = masks.shape[-1]
+    everything = torch.arange(emittable, device=device)
+    lane_of_row = torch.arange(count, device=device).repeat_interleave(width)
+    encoder_kv = [
+        tuple(part.repeat_interleave(width, dim=0) for part in cross.kv(vectors))
+        for cross in decoder.gated_layers()
+    ]
     layers, heads = decoder.reader.config.layers, decoder.reader.config.heads
     head_dim = decoder.reader.config.hidden // heads
-    device = span_vectors.device
-    keys = torch.zeros(1, layers, heads, 0, head_dim, device=device)
+    keys = torch.zeros(rows, layers, heads, 0, head_dim, device=device)
     values = keys.clone()
-    scores = torch.zeros(1, device=device)
-    sequences: list[list[int]] = [[]]
-    tokens = torch.full((1,), BOS, dtype=torch.long, device=device)
-    for position, admitted in enumerate(candidates):
+    scores = torch.full((count, width), float("-inf"), device=device)
+    scores[:, 0] = 0.0
+    tokens = torch.full((rows,), BOS, dtype=torch.long, device=device)
+    block = torch.arange(count, device=device).unsqueeze(1) * width
+    parents: list[torch.Tensor] = []
+    choices: list[torch.Tensor] = []
+    for position in range(length):
         logits, (keys, values) = decoder.step(
             tokens,
-            span_vectors[position].expand(len(sequences), -1),
+            vectors[lane_of_row, position],
             (keys, values),
-            encoder_kv,
-            candidates=admitted.to(device),
+            encoder_kv,  # type: ignore[arg-type]
+            candidates=everything,
         )
-        log_probs = logits.log_softmax(dim=-1)
-        total = scores.unsqueeze(1) + log_probs
-        keep = min(beam_width, total.numel())
-        top = total.flatten().topk(keep)
-        parents = top.indices // admitted.numel()
-        choices = top.indices % admitted.numel()
-        emitted = admitted.to(device)[choices]
-        parent_list = parents.tolist()
-        sequences = [
-            sequences[parent] + [int(emitted[index])] for index, parent in enumerate(parent_list)
-        ]
+        admitted = masks[lane_of_row, position]
+        log_probs = logits.float().masked_fill(~admitted, float("-inf")).log_softmax(dim=-1)
+        total = (scores.reshape(rows, 1) + log_probs).reshape(count, width * emittable)
+        top = total.topk(width, dim=1)
+        parent = top.indices // emittable
+        choice = top.indices % emittable
+        source = (block + parent).reshape(rows)
+        keys, values = keys[source], values[source]
+        tokens = decoder.emit_ids[choice.reshape(rows)]
         scores = top.values
-        keys, values = keys[parents], values[parents]
-        tokens = decoder.emit_ids[emitted]
-    return list(zip(sequences, scores.tolist(), strict=True))
+        parents.append(parent)
+        choices.append(choice)
+
+    # Plain lists: the walk back reads one element at a time, which a tensor
+    # charges a dispatch for.
+    parent_steps: list[list[list[int]]] = torch.stack(parents).tolist()
+    choice_steps: list[list[list[int]]] = torch.stack(choices).tolist()
+    final: list[list[float]] = scores.tolist()
+    decoded: list[list[tuple[list[int], float]]] = []
+    for lane in range(count):
+        hypotheses = []
+        for beam, score in enumerate(final[lane]):
+            if score == float("-inf"):
+                continue
+            sequence = []
+            row = beam
+            for position in range(length - 1, -1, -1):
+                sequence.append(choice_steps[position][lane][row])
+                row = parent_steps[position][lane][row]
+            sequence.reverse()
+            hypotheses.append((sequence, score))
+        decoded.append(hypotheses)
+    return decoded
 
 
 @torch.no_grad()
-def decode_record(
+def decode_records(
     model: E2EModel,
-    record: LatticeRecord,
+    records: Sequence[LatticeRecord],
     lexicon: Lexicon,
     spans: SpanVocab,
     index: CandidateIndex,
@@ -120,15 +184,18 @@ def decode_record(
     token_budget: int,
     beam_width: int,
     top_k: int,
-) -> list[tuple[str, float]]:
-    """A record's best hypotheses over all its lattice paths, best first.
+    row_positions: int = DEFAULT_ROW_POSITIONS,
+) -> list[list[tuple[str, float]]]:
+    """Each record's best hypotheses over all its lattice paths, best first.
 
-    One encoder pass covers every reading of the record; each reading's beam
-    then walks it position by position. Hypotheses colliding on text keep the
-    higher score -- identical sentences from different segmentations are one
-    answer, as the fused search also says.
+    The encoder reads every path of every record in token-budget batches; the
+    paths are then bucketed by length and searched together, as many a batch
+    as *row_positions* allows. A path with a position that admits nothing
+    cannot complete a sentence and is not searched. Hypotheses colliding on
+    text keep the higher score -- identical sentences from different
+    segmentations are one answer, as the fused search also says.
     """
-    examples = [example for _, example in examples_for(record, spans)]
+    examples = [example for record in records for _, example in examples_for(record, spans)]
     hidden: dict[str, torch.Tensor] = {}
     for group in token_budget_batches(iter(examples), token_budget, collator.max_context_tokens):
         batch = collator(group).to(device)
@@ -137,20 +204,37 @@ def decode_record(
         for row, example in enumerate(group):
             hidden[example.id] = encoded[row, 1 : len(example) + 1]
 
-    merged: dict[str, float] = {}
-    for path_index, path in enumerate(record.paths):
-        example_id = f"{record.record}:{path_index}"
-        span_vectors = hidden[example_id]
-        admitted = [
-            index.resolve(spans.id(span), candidates)
-            for span, candidates in zip(path.spans, path.candidates, strict=True)
-        ]
-        for sequence, score in decode_path(model, span_vectors, admitted, beam_width):
-            text = "".join(lexicon.characters[emission] for emission in sequence)
-            if score > merged.get(text, float("-inf")):
-                merged[text] = score
-    ranked = sorted(merged.items(), key=lambda pair: pair[1], reverse=True)
-    return ranked[:top_k]
+    by_length: dict[int, list[Lane]] = {}
+    for owner, record in enumerate(records):
+        for path_index, path in enumerate(record.paths):
+            admitted = [
+                index.resolve(spans.id(span), candidates)
+                for span, candidates in zip(path.spans, path.candidates, strict=True)
+            ]
+            if any(indices.numel() == 0 for indices in admitted):
+                continue
+            mask = torch.zeros(len(admitted), lexicon.size, dtype=torch.bool)
+            for position, indices in enumerate(admitted):
+                mask[position, indices] = True
+            lane = Lane(owner, hidden[f"{record.record}:{path_index}"], mask)
+            by_length.setdefault(lane.length, []).append(lane)
+
+    merged: list[dict[str, float]] = [{} for _ in records]
+    for length, lanes in sorted(by_length.items()):
+        per_batch = max(1, row_positions // (beam_width * length))
+        for start in range(0, len(lanes), per_batch):
+            batch_lanes = lanes[start : start + per_batch]
+            for lane, hypotheses in zip(
+                batch_lanes, decode_lanes(model, batch_lanes, beam_width), strict=True
+            ):
+                found = merged[lane.owner]
+                for sequence, score in hypotheses:
+                    text = "".join(lexicon.characters[emission] for emission in sequence)
+                    if score > found.get(text, float("-inf")):
+                        found[text] = score
+    return [
+        sorted(found.items(), key=lambda pair: pair[1], reverse=True)[:top_k] for found in merged
+    ]
 
 
 @dataclass(frozen=True)
@@ -263,21 +347,25 @@ def evaluate(
     lexicon: Lexicon,
     spans: SpanVocab,
     slice_: str,
+    dump: Path,
     dev_share: float = DEV_SHARE,
     beam_width: int = DEFAULT_BEAM_WIDTH,
     top_k: int = DEFAULT_TOP_K,
     with_context: bool = True,
     token_budget: int = 8192,
     max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
-    dump: Path | None = None,
+    records_per_chunk: int = DEFAULT_RECORDS_PER_CHUNK,
+    row_positions: int = DEFAULT_ROW_POSITIONS,
 ) -> list[tuple[str, Report]]:
     """Decode *lattice*'s records of *slice_* and report the same way ime-eval does.
 
     Returns ``(name, report)`` pairs: the chosen slice's report alone, unless
     the run covered every record -- then dev, test and all, since the three
-    cost one decode. *dump* writes every decoded record's hypotheses as JSON
+    cost one decode. Every decoded record's hypotheses go to *dump* as JSON
     Lines in the ``fused-eval --dump`` shape, so the rescore and generate
-    tooling reads them unchanged.
+    tooling reads them unchanged. The dump is also the run's progress: started
+    again on the same dump, the evaluation folds the records already there and
+    decodes only the rest.
     """
     if slice_ not in ("dev", "test", "all"):
         raise ValueError(f"slice {slice_!r} is not one of 'dev', 'test', 'all'")
@@ -304,22 +392,43 @@ def evaluate(
     names = ("dev", "test", "all") if slice_ == "all" else (slice_,)
     reports = {name: Report(top_k) for name in names}
 
-    decoded = 0
-    sink = dump.open("w", encoding="utf-8") if dump is not None else None
-    try:
+    def fold(record: int, hypotheses: Sequence[str]) -> None:
+        observation = Observation.new(eval_rows[record][1], hypotheses, top_k)
+        if "all" in reports:
+            reports["all"].fold(observation)
+            reports["dev" if is_dev[record] else "test"].fold(observation)
+        else:
+            reports[slice_].fold(observation)
+
+    done = resume_dump(dump)
+    for record, hypotheses in done.items():
+        if record not in chosen:
+            raise ValueError(
+                f"{dump} holds record {record}, which slice {slice_!r} does not; "
+                "it was written by a different evaluation"
+            )
+        fold(record, hypotheses)
+
+    def pending() -> Iterator[LatticeRecord]:
         for record in read_lattice(lattice):
-            if record.record not in chosen:
+            if record.record not in chosen or record.record in done:
                 continue
-            pinyin, text, context = eval_rows[record.record]
+            pinyin, _, context = eval_rows[record.record]
             if pinyin != record.pinyin or (context or None) != (record.context or None):
                 raise ValueError(
                     f"record {record.record}: the lattice and the eval set disagree "
                     f"({record.pinyin!r} / {record.context!r} vs {pinyin!r} / {context!r}); "
                     "they were not written for the same run"
                 )
-            hypotheses = decode_record(
+            yield record
+
+    decoded = 0
+    started = time.monotonic()
+    with dump.open("a", encoding="utf-8") as sink:
+        for chunk in batched(pending(), records_per_chunk):
+            results = decode_records(
                 model,
-                record,
+                chunk,
                 lexicon,
                 spans,
                 index,
@@ -328,35 +437,29 @@ def evaluate(
                 token_budget,
                 beam_width,
                 top_k,
+                row_positions,
             )
-            texts = [hypothesis for hypothesis, _ in hypotheses]
-            observation = Observation.new(text, texts, top_k)
-            if "all" in reports:
-                reports["all"].fold(observation)
-                reports["dev" if is_dev[record.record] else "test"].fold(observation)
-            else:
-                reports[slice_].fold(observation)
-            if sink is not None:
+            for decoded_record, found in zip(chunk, results, strict=True):
+                fold(decoded_record.record, [text for text, _ in found])
                 sink.write(
                     json.dumps(
                         {
-                            "record": record.record,
-                            "text": text,
-                            "hypotheses": [
-                                {"text": hypothesis, "score": score}
-                                for hypothesis, score in hypotheses
-                            ],
+                            "record": decoded_record.record,
+                            "text": eval_rows[decoded_record.record][1],
+                            "hypotheses": [{"text": text, "score": score} for text, score in found],
                         },
                         ensure_ascii=False,
                     )
                     + "\n"
                 )
-            decoded += 1
-            if decoded % 200 == 0:
-                log.debug("records decoded", records=decoded)
-    finally:
-        if sink is not None:
-            sink.close()
+            sink.flush()
+            decoded += len(chunk)
+            log.info(
+                "records decoded",
+                records=decoded,
+                resumed=len(done),
+                records_per_second=round(decoded / (time.monotonic() - started), 2),
+            )
 
     log.info(
         "e2e evaluation finished",
@@ -364,8 +467,32 @@ def evaluate(
         step=step,
         lattice=str(lattice),
         slice=slice_,
-        records=decoded,
+        records=decoded + len(done),
+        resumed=len(done),
         with_context=with_context,
         beam_width=beam_width,
     )
     return [(name, reports[name]) for name in names]
+
+
+def resume_dump(dump: Path) -> dict[int, list[str]]:
+    """The records an earlier run of this evaluation already wrote to *dump*.
+
+    A run stopped mid-write leaves a last line without its newline; that line
+    is cut off here, so the record it was writing is decoded again rather than
+    folded from half a line.
+    """
+    if not dump.exists():
+        return {}
+    data = dump.read_bytes()
+    complete = data[: data.rfind(b"\n") + 1]
+    if len(complete) != len(data):
+        dump.write_bytes(complete)
+    done: dict[int, list[str]] = {}
+    for line in complete.decode("utf-8").splitlines():
+        raw: dict[str, Any] = json.loads(line)
+        record = int(raw["record"])
+        if record in done:
+            raise ValueError(f"{dump} holds record {record} twice")
+        done[record] = [str(hypothesis["text"]) for hypothesis in raw["hypotheses"]]
+    return done

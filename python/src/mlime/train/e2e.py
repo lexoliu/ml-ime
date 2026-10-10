@@ -289,10 +289,10 @@ def e2e(
 
     segment = train(model, lanes, training, paths.out, world, resume, run_config=run_config)
     losses = step_losses(segment.metrics)
+    build_counts: Counter[str] = Counter()
+    for builder in builders:
+        build_counts.update(builder.counts.as_dict())
     if not segment.finished:
-        build_counts: Counter[str] = Counter()
-        for builder in builders:
-            build_counts.update(builder.counts.as_dict())
         return paused_run(segment, losses, model.gates(), dict(build_counts), world)
     evaluation = held_out_examples(
         paths, vocabularies.builder(augmented, training.seed + 1), slices
@@ -330,7 +330,7 @@ def e2e(
                 accuracy_without_context=without_context.rate,
                 scored_characters=with_context.scored,
                 gates=result.gates,
-                build_counts=builder.counts.as_dict(),
+                build_counts=dict(build_counts),
             )
     log.info(
         "e2e run finished",

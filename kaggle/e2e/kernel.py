@@ -15,8 +15,11 @@ name under /kaggle/input; a mount without them is a configuration error, not
 something to initialise around.
 
 A segment that finishes the run evaluates it on every `lattice*.jsonl` in the
-assets mount with `mlime eval e2e`, context on and off, and writes each
-record's hypotheses and the report alongside the checkpoint.
+assets mount with `mlime eval e2e`, context on and off, one evaluation per GPU
+at a time, and writes each record's hypotheses and the report alongside the
+checkpoint. A segment that mounts a run whose training already finished --
+`run/checkpoint-final.pt` in its output, the evaluation having stopped before
+its report -- evaluates that checkpoint and trains nothing.
 
 For a smoke run -- the few-minute rate check that the cost estimate is made
 from -- set `SMOKE_STEPS` nonzero: the kernel times each entry of
@@ -31,8 +34,10 @@ import shutil
 import subprocess
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
+from queue import Empty, SimpleQueue
 
 INPUTS = Path("/kaggle/input")
 WORKING = Path("/kaggle/working")
@@ -908,6 +913,71 @@ def resume_candidates():
     return found
 
 
+def finished_checkpoint():
+    """The final checkpoint of a mounted run that finished training, or None.
+
+    Two such mounts would be two finished runs, and which one to evaluate is
+    not this kernel's to guess.
+    """
+    found = locate_all("run/checkpoint-final.pt", "run-config.json")
+    if len(found) > 1:
+        raise RuntimeError(f"{len(found)} finished runs are mounted: {found}")
+    return found[0] / "run" / "checkpoint-final.pt" if found else None
+
+
+def evaluate_lattices(checkpoint, assets, char_table, env):
+    """`mlime eval e2e` over every lattice, context on and off, one per GPU at a time.
+
+    Each worker owns one GPU and takes the next section off a shared queue,
+    so a slow section -- the abbreviated lattice admits seven times the
+    candidates of the full one -- does not leave the other GPU idle.
+    """
+    lattices = sorted(assets.glob("lattice*.jsonl"))
+    if not lattices:
+        raise FileNotFoundError(f"no lattice*.jsonl under {assets}")
+    sections = SimpleQueue()
+    for lattice in lattices:
+        suffix = lattice.stem[len("lattice"):]
+        eval_set = assets / f"eval3{suffix}.jsonl"
+        if not eval_set.is_file():
+            raise FileNotFoundError(
+                f"no eval set at {eval_set} for {lattice.name}; the two come in pairs"
+            )
+        for context in (True, False):
+            sections.put((lattice, eval_set, context))
+
+    def worker(gpu):
+        worker_env = {**env, "CUDA_VISIBLE_DEVICES": str(gpu)}
+        evaluated = {}
+        while True:
+            try:
+                lattice, eval_set, context = sections.get_nowait()
+            except Empty:
+                return evaluated
+            name = f"{lattice.stem}-context-{'on' if context else 'off'}"
+            dump = WORKING / f"e2e-{name}.jsonl"
+            report = WORKING / f"e2e-{name}-report.txt"
+            code, elapsed = run(
+                eval_argv(checkpoint, lattice, eval_set, dump, report, char_table, context),
+                worker_env,
+                str(WORKING / f"eval-{name}.log"),
+            )
+            if code != 0:
+                raise RuntimeError(f"evaluating {name} on GPU {gpu} failed")
+            evaluated[name] = {
+                "bytes": dump.stat().st_size,
+                "seconds": round(elapsed, 1),
+                "gpu": gpu,
+            }
+
+    gpus = gpu_count()
+    evaluated = {}
+    with ThreadPoolExecutor(gpus) as pool:
+        for part in pool.map(worker, range(gpus)):
+            evaluated.update(part)
+    return evaluated
+
+
 def previous_segment():
     """The newest resumable checkpoint mounted, or None for a run not started.
 
@@ -1021,6 +1091,21 @@ def main():
         smoke(char_table, WORKING / "run", init_files, env)
         return
 
+    final = finished_checkpoint()
+    if final is not None:
+        print(f"evaluating the finished run at {final}; nothing to train", flush=True)
+        summary = {
+            "segment": SEGMENT,
+            "evaluated_checkpoint": str(final),
+            "finished": True,
+            "evaluated": evaluate_lattices(final, assets, char_table, env),
+        }
+        (WORKING / "run-summary.json").write_text(
+            json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+        )
+        print(json.dumps(summary, indent=2), flush=True)
+        return
+
     previous = previous_segment()
     if previous is None:
         counts_path = WORKING / "batch-counts.json"
@@ -1116,29 +1201,7 @@ def main():
         checkpoint = out / "checkpoint-final.pt"
         if not checkpoint.is_file():
             raise RuntimeError("the run finished without writing a final checkpoint")
-        lattices = sorted(assets.glob("lattice*.jsonl"))
-        if not lattices:
-            raise FileNotFoundError(f"no lattice*.jsonl under {assets}")
-        evaluated = {}
-        for lattice in lattices:
-            suffix = lattice.stem[len("lattice"):]
-            eval_set = assets / f"eval3{suffix}.jsonl"
-            if not eval_set.is_file():
-                raise FileNotFoundError(
-                    f"no eval set at {eval_set} for {lattice.name}; the two come in pairs"
-                )
-            for context in (True, False):
-                name = f"{lattice.stem}-context-{'on' if context else 'off'}"
-                dump = WORKING / f"e2e-{name}.jsonl"
-                report = WORKING / f"e2e-{name}-report.txt"
-                code, elapsed = run(
-                    eval_argv(checkpoint, lattice, eval_set, dump, report, char_table, context),
-                    env,
-                    str(WORKING / f"eval-{name}.log"),
-                )
-                if code != 0:
-                    raise RuntimeError(f"evaluating {lattice.name} with context {name} failed")
-                evaluated[name] = {"bytes": dump.stat().st_size, "seconds": round(elapsed, 1)}
+        evaluated = evaluate_lattices(checkpoint, assets, char_table, env)
         summary["evaluated"] = evaluated
         summary["held_out"] = records_of(out / "metrics.jsonl", "summary")[-1]
 

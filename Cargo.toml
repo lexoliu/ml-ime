@@ -7,7 +7,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/lexoliu/ml-ime"
 authors = ["Lexo Liu <me@lexo.cool>"]
-rust-version = "1.90"
+rust-version = "1.95"
 
 [workspace.dependencies]
 ime-pinyin = { path = "crates/ime-pinyin" }

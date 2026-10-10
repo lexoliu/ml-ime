@@ -550,7 +550,7 @@ mod tests {
         for input in ["zzz", "qqq", "xyzw", "bpmf"] {
             let lattice = SegmentLattice::build(input, &table, &options)
                 .unwrap_or_else(|e| panic!("{input} should read: {e}"));
-            assert!(!lattice.k_best(&options).is_empty());
+            assert!(!lattice.k_best(&options).is_empty(), "{input} segments");
         }
     }
 

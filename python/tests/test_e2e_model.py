@@ -32,8 +32,9 @@ from mlime.train.e2e_eval import (
     RANK_SCALE,
     Observation,
     Report,
-    decode_record,
+    decode_records,
     read_eval_records,
+    resume_dump,
 )
 from mlime.train.e2e_model import E2EConfig, E2EModel, emittable_ids
 from mlime.train.emit import CandidateIndex, LatticePath, LatticeRecord
@@ -420,13 +421,20 @@ def test_an_overfit_model_resolves_the_pronoun(spans: SpanVocab, tmp_path: Path)
         optimiser.step()
 
     model.eval()
-    index = CandidateIndex(lexicon)
-    for record, (text, _, _) in zip(
-        pronoun_lattice(spans, lexicon), PRONOUN_SENTENCES, strict=True
-    ):
-        hypotheses = decode_record(
-            model, record, lexicon, spans, index, collator, torch.device("cpu"), 4096, 16, 8
-        )
+    records = list(pronoun_lattice(spans, lexicon))
+    decoded = decode_records(
+        model,
+        records,
+        lexicon,
+        spans,
+        CandidateIndex(lexicon),
+        collator,
+        torch.device("cpu"),
+        4096,
+        16,
+        8,
+    )
+    for hypotheses, (text, _, _) in zip(decoded, PRONOUN_SENTENCES, strict=True):
         assert hypotheses
         assert hypotheses[0][0] == text
 
@@ -440,27 +448,10 @@ def test_decode_returns_ranked_hypotheses_within_top_k(
 ) -> None:
     model = tiny_e2e(lexicon, reader_vocab, e2e_config).eval()
     collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
-    record = LatticeRecord(
-        record=0,
-        pinyin="woaibeijing",
-        context=None,
-        paths=(
-            LatticePath(
-                spans=("wo", "ai", "bei", "jing"),
-                candidates=tuple(
-                    "".join(
-                        character
-                        for character in lexicon.characters
-                        if lexicon.admits(spans.id(span), character)
-                    )
-                    for span in ("wo", "ai", "bei", "jing")
-                ),
-            ),
-        ),
-    )
-    hypotheses = decode_record(
+    record = admitting_record(0, "woaibeijing", (("wo", "ai", "bei", "jing"),), lexicon, spans)
+    (hypotheses,) = decode_records(
         model,
-        record,
+        [record],
         lexicon,
         spans,
         CandidateIndex(lexicon),
@@ -474,6 +465,91 @@ def test_decode_returns_ranked_hypotheses_within_top_k(
     scores = [score for _, score in hypotheses]
     assert scores == sorted(scores, reverse=True)
     assert all(len(text) == 4 for text, _ in hypotheses)
+
+
+def admitting_record(
+    number: int,
+    pinyin: str,
+    readings: tuple[tuple[str, ...], ...],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+) -> LatticeRecord:
+    """A lattice record whose every position admits all the lexicon allows there."""
+    return LatticeRecord(
+        record=number,
+        pinyin=pinyin,
+        context=None,
+        paths=tuple(
+            LatticePath(
+                spans=reading,
+                candidates=tuple(
+                    "".join(
+                        character
+                        for character in lexicon.characters
+                        if lexicon.admits(spans.id(span), character)
+                    )
+                    for span in reading
+                ),
+            )
+            for reading in readings
+        ),
+    )
+
+
+def test_decoding_records_together_is_decoding_each_alone(
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    tokenizer: StubTokenizer,
+    reader_vocab: CharVocab,
+    e2e_config: E2EConfig,
+) -> None:
+    model = tiny_e2e(lexicon, reader_vocab, e2e_config).eval()
+    collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
+    records = [
+        admitting_record(
+            0,
+            "woaibeijing",
+            (("wo", "ai", "bei", "jing"), ("wo", "ai", "bei", "ji", "n", "g")),
+            lexicon,
+            spans,
+        ),
+        admitting_record(1, "woai", (("wo", "ai"),), lexicon, spans),
+        admitting_record(2, "beijingwo", (("bei", "jing", "wo"),), lexicon, spans),
+    ]
+
+    def decode(batch: list[LatticeRecord], row_positions: int) -> list[list[tuple[str, float]]]:
+        return decode_records(
+            model,
+            batch,
+            lexicon,
+            spans,
+            CandidateIndex(lexicon),
+            collator,
+            torch.device("cpu"),
+            4096,
+            16,
+            8,
+            row_positions,
+        )
+
+    alone = [decode([record], 16384)[0] for record in records]
+    for together in (decode(records, 16384), decode(records, 1)):
+        for single, joint in zip(alone, together, strict=True):
+            assert [text for text, _ in joint] == [text for text, _ in single]
+            assert [score for _, score in joint] == pytest.approx(
+                [score for _, score in single], abs=1e-4
+            )
+
+
+def test_a_resumed_dump_drops_the_half_written_line(tmp_path: Path) -> None:
+    dump = tmp_path / "dump.jsonl"
+    whole = json.dumps({"record": 3, "text": "我", "hypotheses": [{"text": "我", "score": -0.1}]})
+    dump.write_text(whole + "\n" + '{"record": 4, "te', encoding="utf-8")
+    assert resume_dump(dump) == {3: ["我"]}
+    assert dump.read_text(encoding="utf-8") == whole + "\n"
+    dump.write_text(whole + "\n" + whole + "\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="twice"):
+        resume_dump(dump)
 
 
 def test_a_checkpoint_round_trips_and_a_route_a_one_is_refused(

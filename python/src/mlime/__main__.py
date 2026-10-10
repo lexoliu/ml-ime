@@ -961,7 +961,15 @@ def eval_e2e(
     context: bool = typer.Option(True, help="Let the encoder read each record's context"),
     token_budget: int = typer.Option(8192, help="Padded positions per encoder forward"),
     dump: Path = typer.Option(
-        None, help="Where each record's hypotheses go, as fused-eval --dump JSON Lines"
+        ...,
+        help="Where each record's hypotheses go, as fused-eval --dump JSON Lines; "
+        "a run started again on the same dump continues where it stopped",
+    ),
+    records_per_chunk: int = typer.Option(
+        256, help="Records decoded between two writes of the dump"
+    ),
+    row_positions: int = typer.Option(
+        16384, help="Beam rows times positions one decode batch may hold"
     ),
     out: Path = typer.Option(None, help="Where the report text goes"),
     verbose: bool = VERBOSE,
@@ -994,6 +1002,8 @@ def eval_e2e(
         with_context=context,
         token_budget=token_budget,
         dump=dump,
+        records_per_chunk=records_per_chunk,
+        row_positions=row_positions,
     )
     rendered = "\n\n".join(f"slice: {name}\n{report.render()}" for name, report in reports)
     typer.echo(rendered)

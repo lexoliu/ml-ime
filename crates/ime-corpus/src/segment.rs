@@ -144,8 +144,8 @@ mod tests {
 
     #[test]
     fn a_unit_with_no_han_at_all_yields_nothing() {
-        assert!(runs("hello, world!").is_empty());
-        assert!(runs("").is_empty());
+        assert_eq!(runs("hello, world!"), Vec::<(&str, &str)>::new());
+        assert_eq!(runs(""), Vec::<(&str, &str)>::new());
     }
 
     #[test]
