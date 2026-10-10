@@ -170,8 +170,11 @@ RESUME_MARKERS = ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
 
 REQUIREMENTS = (
     "polars",
+    "pydantic-settings",
+    "pypinyin",
     "structlog",
     "opencc",
+    "rapidfuzz",
     "regex",
     "typer",
     "transformers>=5.16",
