@@ -9,14 +9,20 @@ log-probabilities -- no trigram, no fusion weight, nothing external.
 Each record's lattice lists one path per segmentation of its keystrokes, and
 per position the characters that span admits. The encoder reads every path's
 typed spans once; each path is then decoded autoregressively against its own
-encoder output, sixteen beams wide, candidates restricted to the admitted
-characters and renormalised. Paths of one length are searched together --
-across records -- so the step runs over hundreds of beam rows at once rather
-than sixteen; batching changes the arithmetic's shape, not what any one path
-computes. The surviving hypotheses merge over the record's
-paths -- a hypothesis is a full sentence, and where two segmentations of one
-sentence meet, the higher sum of step log-probabilities wins. That merge is
-what turns "the lattice's best reading" into "the model's best answer".
+encoder output, sixteen beams wide, the search restricted to the admitted
+characters but each step scored by its log-probability over the whole
+emittable set. Renormalising over the admitted characters instead makes the
+scores of two segmentations incomparable: a narrow span such as ``o`` admits a
+handful of characters, so splitting ``zao`` into ``za o`` costs nearly
+nothing, and the over-segmented reading wins (on the full-pinyin dev slice,
+69.88% top-1 renormalised against 73.90% over the emittable set). Paths of one
+length are searched together -- across records -- so the step runs over
+hundreds of beam rows at once rather than sixteen; batching changes the
+arithmetic's shape, not what any one path computes. The surviving hypotheses
+merge over the record's paths -- a hypothesis is a full sentence, and where
+two segmentations of one sentence meet, the higher sum of step
+log-probabilities wins. That merge is what turns "the lattice's best reading"
+into "the model's best answer".
 
 The report counts what ``ime-eval`` counts and means the same by it: sentence
 top-1 and top-8, character accuracy against the expected text position by
@@ -95,10 +101,10 @@ def decode_lanes(
 
     Every lane owns a block of ``beam_width`` rows from the first step, the
     unused ones at a score of minus infinity, so the row layout never changes
-    and the encoder keys and values are expanded once. The candidate
-    restriction is a mask over the full emittable row followed by the
-    log-softmax -- the same renormalisation over the admitted characters a
-    one-path search computes over its gathered columns. Rows still at minus
+    and the encoder keys and values are expanded once. Each step's scores are
+    log-probabilities over the full emittable row, and the candidate
+    restriction masks the characters the position does not admit afterwards,
+    so a path's score is comparable with another segmentation's. Rows still at minus
     infinity when the path ends are slots the lattice never filled and are
     dropped, so a lane admitting fewer than ``beam_width`` sentences returns
     fewer.
@@ -138,7 +144,7 @@ def decode_lanes(
             candidates=everything,
         )
         admitted = masks[lane_of_row, position]
-        log_probs = logits.float().masked_fill(~admitted, float("-inf")).log_softmax(dim=-1)
+        log_probs = logits.float().log_softmax(dim=-1).masked_fill(~admitted, float("-inf"))
         total = (scores.reshape(rows, 1) + log_probs).reshape(count, width * emittable)
         top = total.topk(width, dim=1)
         parent = top.indices // emittable
