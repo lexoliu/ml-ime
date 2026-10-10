@@ -560,7 +560,7 @@ fn a_lone_session_materialises_no_pending_rows() {
             .collect();
         beams.push(lm.start(Some(&ctx), &asked));
     }
-    assert!(!context.is_empty());
+    assert_ne!(context, "");
     for step in 0..12 {
         let (a, b) = (
             tokens[step % tokens.len()],
