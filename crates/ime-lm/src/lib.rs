@@ -54,13 +54,14 @@ use ime_decode::{Asked, BeamOptions, MAX_HISTORY, Transition};
 use ime_pinyin::{CharId, Lexicon};
 use memmap2::Mmap;
 use ort::AsPointer;
+use ort::environment::Environment;
 use ort::ep::ExecutionProviderDispatch;
 use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::builder::{GraphOptimizationLevel, PrepackedWeights};
 use ort::session::{IoBinding, Session};
 use ort::value::{
-    DynTensor, DynValue, Outlet, PrimitiveTensorElementType, Shape, SymbolicDimensions, Tensor,
-    TensorElementType, TensorRefMut, ValueType,
+    DynTensor, DynTensorValueType, DynValue, Outlet, PrimitiveTensorElementType, Shape,
+    SymbolicDimensions, Tensor, TensorElementType, TensorRefMut, ValueType,
 };
 use serde::Deserialize;
 use std::cell::RefCell;
@@ -263,10 +264,13 @@ struct GraphSessions {
     initializers: Vec<(String, Arc<DynValue>)>,
     /// How the sessions are built.
     shape: SessionShape,
+    /// The ONNX Runtime environment every session is created in.
+    environment: Environment,
 }
 
 impl GraphSessions {
     fn new(
+        environment: &Environment,
         graph: PathBuf,
         initializers: Vec<(String, Arc<DynValue>)>,
         shape: SessionShape,
@@ -278,6 +282,7 @@ impl GraphSessions {
             prepacked: (dtype == ModelDtype::Float32).then(PrepackedWeights::new),
             initializers,
             shape,
+            environment: environment.clone(),
         }
     }
 
@@ -290,6 +295,7 @@ impl GraphSessions {
     fn session(&self) -> Result<&RefCell<BoundSession>, LmError> {
         self.by_thread.get_or_try(|| {
             let session = open_session(
+                &self.environment,
                 &self.path,
                 self.prepacked.as_ref(),
                 &self.initializers,
@@ -543,14 +549,6 @@ impl ModelDtype {
     }
 }
 
-/// The tensor's shape, or an error when *value* is not a tensor.
-fn value_shape(value: &DynValue) -> Result<Shape, LmError> {
-    let ValueType::Tensor { shape, .. } = value.dtype() else {
-        return Err(ort::Error::new("a state or prefix value is not a tensor").into());
-    };
-    Ok(shape.clone())
-}
-
 /// The tensors one step produced — every `next_*` output — kept on the
 /// session's device.
 ///
@@ -561,7 +559,7 @@ fn value_shape(value: &DynValue) -> Result<Shape, LmError> {
 struct Generation {
     /// The step's `next_*` outputs in the manifest's `state` order, each
     /// `[rows, *row shape]` on the session's device.
-    tensors: Vec<DynValue>,
+    tensors: Vec<DynTensor>,
 }
 
 /// A state's own row: which generation's tensors hold it and its index on
@@ -628,11 +626,11 @@ struct Resident {
 struct WorkerBufs {
     /// The `prefix_*` buffers, one per manifest name: `[slots, *row]` with
     /// the row's time axis grown to the widest prelude.
-    prefix: Vec<DynValue>,
+    prefix: Vec<DynTensor>,
     /// `prefix_mask`, `[slots, prelude width]`: `false` under the padding,
     /// `true` under the positions a prelude filled. `None` on a model without
     /// prefix tensors (the LSTM).
-    mask: Option<DynValue>,
+    mask: Option<DynTensor>,
     /// Generation zero: the state rows every beam of a slot starts from.
     /// `start` writes each state tensor's row of a slot once, and a beam's
     /// first `advance` gathers it by `source_row`.
@@ -664,6 +662,8 @@ struct DeviceEnv {
     /// How the thread's sessions are built — the copiers take the same
     /// backend and thread shape.
     shape: SessionShape,
+    /// The environment the copier sessions are created in.
+    environment: Environment,
     /// Whether the resident buffers are plain heap — the CPU and Core ML
     /// paths, where a copy is a `memcpy` and the copier session is skipped.
     host_resident: bool,
@@ -685,7 +685,8 @@ impl DeviceEnv {
     /// The copier for *ty*, opened on first use.
     fn copier(&mut self, ty: TensorElementType) -> Result<&mut Copier, LmError> {
         if !self.copiers.iter().any(|copier| copier.ty == ty) {
-            self.copiers.push(Copier::open(ty, self.shape)?);
+            self.copiers
+                .push(Copier::open(&self.environment, ty, self.shape)?);
         }
         Ok(self
             .copiers
@@ -700,7 +701,12 @@ impl DeviceEnv {
     /// otherwise carry whatever bytes the allocator recycled into
     /// `probs @ values`: a pad's scores mask to 0 exactly, but
     /// `0 * NaN = NaN`.
-    fn zero(&mut self, ty: TensorElementType, dst: &DynValue, count: usize) -> Result<(), LmError> {
+    fn zero(
+        &mut self,
+        ty: TensorElementType,
+        dst: &DynTensor,
+        count: usize,
+    ) -> Result<(), LmError> {
         let element_size = match ty {
             TensorElementType::Float32 => size_of::<f32>(),
             TensorElementType::Float16 => size_of::<f16>(),
@@ -731,16 +737,15 @@ impl DeviceEnv {
         // provider, so the `Identity` runs where the buffer lives.
         match ty {
             TensorElementType::Float32 => {
-                let src = Tensor::from_array((vec![dim(count)], vec![0.0_f32; count]))?.into_dyn();
+                let src = Tensor::from_array((vec![dim(count)], vec![0.0_f32; count]))?.upcast();
                 device_copy::<f32>(self, &src, 0, dst, 0, count)
             }
             TensorElementType::Float16 => {
-                let src =
-                    Tensor::from_array((vec![dim(count)], vec![f16::ZERO; count]))?.into_dyn();
+                let src = Tensor::from_array((vec![dim(count)], vec![f16::ZERO; count]))?.upcast();
                 device_copy::<f16>(self, &src, 0, dst, 0, count)
             }
             TensorElementType::Bool => {
-                let src = Tensor::from_array((vec![dim(count)], vec![false; count]))?.into_dyn();
+                let src = Tensor::from_array((vec![dim(count)], vec![false; count]))?.upcast();
                 device_copy::<bool>(self, &src, 0, dst, 0, count)
             }
             other => unreachable!("{other:?} was refused above"),
@@ -767,7 +772,11 @@ impl Copier {
     /// Open the flat-tensor copy session for *ty*: `Identity` over a
     /// one-dimensional input of any length, registered with *shape*'s
     /// backend so it runs where the buffers live.
-    fn open(ty: TensorElementType, shape: SessionShape) -> Result<Self, LmError> {
+    fn open(
+        environment: &Environment,
+        ty: TensorElementType,
+        shape: SessionShape,
+    ) -> Result<Self, LmError> {
         let mut graph = ort::editor::Graph::new()?;
         let flat = || ValueType::Tensor {
             ty,
@@ -788,7 +797,7 @@ impl Copier {
             ort::editor::Model::new([ort::editor::Opset::new(ort::editor::ONNX_DOMAIN, 17)?])?;
         model.add_graph(graph)?;
         let providers = shape.backend.providers()?;
-        let mut builder = session_builder(shape)?;
+        let mut builder = session_builder(environment, shape)?;
         if !providers.is_empty() {
             builder = builder
                 .with_execution_providers(providers)
@@ -1144,7 +1153,7 @@ impl CachePool {
             let mut shape = Vec::with_capacity(row.len() + 1);
             shape.push(i64::from(slots));
             shape.extend_from_slice(row);
-            tensors.push(DynTensor::new(&env.allocator, dtype.element(), shape)?.into_dyn());
+            tensors.push(DynTensor::new(&env.allocator, dtype.element(), shape)?);
         }
         Ok(CacheGen {
             tensors: Arc::new(Generation { tensors }),
@@ -1169,7 +1178,7 @@ impl CachePool {
         };
         let mut key = Vec::with_capacity(state_row.generation.tensors.len());
         for tensor in &state_row.generation.tensors {
-            key.push(value_shape(tensor).ok()?[1..].into());
+            key.push(tensor.shape()[1..].into());
         }
         let (cgen, slot) = {
             let mut gens = self.gens.lock().expect("the cache pool is not poisoned");
@@ -1216,7 +1225,7 @@ impl CachePool {
                 let span = elements(&key[index]);
                 copy_span(
                     env,
-                    tensor_element(src)?,
+                    *src.data_type(),
                     src,
                     usize::try_from(state_row.index).expect("a row index fits usize") * span,
                     dst,
@@ -1295,7 +1304,7 @@ struct PagePool {
     /// The pool buffers, allocated on the first environment that runs a
     /// paged step; `None` until then. `Arc`d because an ort value clone is
     /// a deep copy — sharing the tensors themselves is the whole point.
-    bufs: Mutex<Option<Arc<Vec<DynValue>>>>,
+    bufs: Mutex<Option<Arc<Vec<DynTensor>>>>,
     /// Page indices open for a claim — index zero is the masked scratch
     /// page and is never handed out.
     free: Arc<Mutex<Vec<u32>>>,
@@ -1397,15 +1406,14 @@ impl PagePool {
     /// would only mask anyway — on any backend, since an arena-recycled or
     /// device allocator hands uninitialised memory that a masked read can
     /// still carry into `probs @ values` as NaN.
-    fn bufs(&self, env: &mut DeviceEnv) -> Result<Arc<Vec<DynValue>>, LmError> {
+    fn bufs(&self, env: &mut DeviceEnv) -> Result<Arc<Vec<DynTensor>>, LmError> {
         let mut bufs = self.bufs.lock().expect("the page pool is not poisoned");
         if let Some(bufs) = &*bufs {
             return Ok(Arc::clone(bufs));
         }
         let mut tensors = Vec::with_capacity(self.rows.len());
         for row in &self.rows {
-            let tensor =
-                DynTensor::new(&env.allocator, self.dtype.element(), row.to_vec())?.into_dyn();
+            let tensor = DynTensor::new(&env.allocator, self.dtype.element(), row.to_vec())?;
             env.zero(self.dtype.element(), &tensor, elements(row))?;
             tensors.push(tensor);
         }
@@ -1572,7 +1580,7 @@ impl PagePool {
     fn write_page(
         &self,
         env: &mut DeviceEnv,
-        row: &DynValue,
+        row: &DynTensor,
         row_index: u32,
         page: u32,
         index: usize,
@@ -1590,7 +1598,7 @@ impl PagePool {
         }
         let bufs = self.bufs(env)?;
         let dst = &bufs[index];
-        let ty = tensor_element(row)?;
+        let ty = *row.data_type();
         let row_index = usize::try_from(row_index).expect("a row index fits usize");
         let page = usize::try_from(page).expect("a page index fits usize");
         copy_span(
@@ -1739,7 +1747,7 @@ impl PagePool {
                 row[3],
             ];
             let count = elements(&shape);
-            let tensor = DynTensor::new(&env.allocator, self.dtype.element(), shape)?.into_dyn();
+            let tensor = DynTensor::new(&env.allocator, self.dtype.element(), shape)?;
             env.zero(self.dtype.element(), &tensor, count)?;
             tensors.push(tensor);
         }
@@ -1767,8 +1775,8 @@ impl PagePool {
         chain.reverse();
         let bufs = self.bufs(env)?;
         let slot = usize::try_from(slot).expect("a scratch slot fits usize");
-        let seq = usize::try_from(value_shape(&scratch.tensors[0])?[3])
-            .expect("a scratch width fits usize");
+        let seq =
+            usize::try_from(scratch.tensors[0].shape()[3]).expect("a scratch width fits usize");
         let row_elems = self.layers * self.heads * seq * self.head_dim;
         // The scratch rows are `[slots, layers, heads, T, head_dim]`: a
         // position's `[heads, head_dim]` slice is *not* contiguous (heads
@@ -1777,7 +1785,7 @@ impl PagePool {
         for node in &chain {
             let position = usize::try_from(node.depth).expect("a depth fits usize") - 1;
             for (index, dst) in scratch.tensors.iter().enumerate() {
-                let ty = tensor_element(&bufs[index])?;
+                let ty = *bufs[index].data_type();
                 for layer in 0..self.layers {
                     let src = self.slice_at(node, layer);
                     for head in 0..self.heads {
@@ -1800,7 +1808,7 @@ impl PagePool {
             let row_index = usize::try_from(tip.index).expect("a row index fits usize");
             for (index, dst) in scratch.tensors.iter().enumerate() {
                 let src = &tip.generation.tensors[index];
-                let ty = tensor_element(src)?;
+                let ty = *src.data_type();
                 for layer in 0..self.layers {
                     for head in 0..self.heads {
                         copy_span(
@@ -1862,12 +1870,12 @@ impl Resident {
             return Ok(());
         }
         let capacity = 64;
-        let resident = |env: &mut DeviceEnv, row: &[i64]| -> Result<DynValue, LmError> {
+        let resident = |env: &mut DeviceEnv, row: &[i64]| -> Result<DynTensor, LmError> {
             let mut shape = Vec::with_capacity(row.len() + 1);
             shape.push(dim(capacity));
             shape.extend_from_slice(row);
             let count = elements(&shape);
-            let tensor = DynTensor::new(&env.allocator, dtype.element(), shape)?.into_dyn();
+            let tensor = DynTensor::new(&env.allocator, dtype.element(), shape)?;
             env.zero(dtype.element(), &tensor, count)?;
             Ok(tensor)
         };
@@ -1879,8 +1887,7 @@ impl Resident {
             None
         } else {
             let shape = [dim(capacity), dim(prelude_width)];
-            let tensor =
-                DynTensor::new(&env.allocator, TensorElementType::Bool, shape.to_vec())?.into_dyn();
+            let tensor = DynTensor::new(&env.allocator, TensorElementType::Bool, shape.to_vec())?;
             env.zero(TensorElementType::Bool, &tensor, capacity * prelude_width)?;
             Some(tensor)
         };
@@ -1918,18 +1925,18 @@ impl Resident {
         let bufs = self.bufs.as_mut().ok_or_else(|| {
             ort::Error::new("the resident pool has no buffers to grow".to_owned())
         })?;
-        let enlarge = |env: &mut DeviceEnv, old: &DynValue| -> Result<DynValue, LmError> {
-            let mut shape = value_shape(old)?.to_vec();
+        let enlarge = |env: &mut DeviceEnv, old: &DynTensor| -> Result<DynTensor, LmError> {
+            let mut shape = old.shape().to_vec();
             shape[0] = dim(capacity);
             let ValueType::Tensor { ty, .. } = old.dtype() else {
                 return Err(ort::Error::new("a resident buffer is not a tensor".to_owned()).into());
             };
             let count = elements(&shape);
-            let tensor = DynTensor::new(&env.allocator, *ty, shape)?.into_dyn();
+            let tensor = DynTensor::new(&env.allocator, *ty, shape)?;
             env.zero(*ty, &tensor, count)?;
             Ok(tensor)
         };
-        let mut pairs: Vec<(&DynValue, DynValue)> = Vec::new();
+        let mut pairs: Vec<(&DynTensor, DynTensor)> = Vec::new();
         for old in bufs.prefix.iter().chain(&bufs.gen0.tensors) {
             pairs.push((old, enlarge(env, old)?));
         }
@@ -1942,7 +1949,7 @@ impl Resident {
             };
             copy_span(env, *ty, src, 0, dst, 0, used * elements(&shape[1..]))?;
         }
-        let dsts: Vec<DynValue> = pairs.into_iter().map(|(_, dst)| dst).collect();
+        let dsts: Vec<DynTensor> = pairs.into_iter().map(|(_, dst)| dst).collect();
         let mut dsts = dsts.into_iter();
         bufs.prefix = dsts.by_ref().take(bufs.prefix.len()).collect();
         bufs.gen0 = Arc::new(Generation {
@@ -1961,28 +1968,27 @@ impl Resident {
 /// A `Tensor<T>` view over *slot*'s `[1, *row]` row inside the resident
 /// buffer *buf* — see [`tensor_view`], which this is a thin wrapper on.
 fn row_view<T: PrimitiveTensorElementType + Debug>(
-    buf: &DynValue,
+    allocator: &Allocator,
+    buf: &DynTensor,
     slot: u32,
     row: &[i64],
 ) -> Result<Tensor<T>, LmError> {
     let mut shape = Vec::with_capacity(row.len() + 1);
     shape.push(1);
     shape.extend_from_slice(row);
-    tensor_view::<T>(buf, slot as usize * elements(row), &shape)
+    tensor_view::<T>(allocator, buf, slot as usize * elements(row), &shape)
 }
 
 /// A `Tensor<T>` view over *shape*-sized memory inside the resident buffer
-/// *buf*, starting *offset* elements in, labelled with the buffer's real
-/// [`MemoryInfo`].
+/// *buf*, which *allocator* made, starting *offset* elements in, labelled
+/// with the buffer's real [`MemoryInfo`].
 ///
-/// `TensorRefMut::from_raw` cannot be used here: it calls
-/// `MemoryInfo::to_owned`, which in this `ort` release unconditionally
-/// rewrites the info to CPU — a device buffer labelled CPU is then written
-/// with a host `memcpy` into the device pointer, which faults. The view is
-/// built through `ort::api` instead, so the runtime and its bound outputs
-/// see the device the buffer really sits on.
+/// The view is an owned `Tensor<T>` because `IoBinding::bind_output` takes
+/// one; it holds *allocator* the way the buffer does, and dropping it
+/// releases the view, not the buffer.
 fn tensor_view<T: PrimitiveTensorElementType + Debug>(
-    buf: &DynValue,
+    allocator: &Allocator,
+    buf: &DynTensor,
     offset: usize,
     shape: &[i64],
 ) -> Result<Tensor<T>, LmError> {
@@ -2018,18 +2024,24 @@ fn tensor_view<T: PrimitiveTensorElementType + Debug>(
     }
     let value = NonNull::new(value)
         .ok_or_else(|| ort::Error::new("the view came back without a value".to_owned()))?;
-    // Safety: `value` is a valid OrtValue the call just created, and it is
-    // not a session output — dropping it releases the view, not the buffer.
-    Ok(unsafe { Tensor::from_ptr(value, None) })
+    // Safety: `value` is a valid OrtValue the call just created over memory
+    // *allocator* made, and it is not a session output — dropping it
+    // releases the view, not the buffer.
+    Ok(unsafe { Tensor::from_ptr(value, Some(allocator)) })
 }
 
 /// A `[1, *row]` view of *slot*'s row inside *buf*, element-typed to the
 /// model's dtype — what a bound prefill output lands in.
-fn resident_view(buf: &DynValue, slot: u32, dtype: ModelDtype) -> Result<DynValue, LmError> {
-    let row = value_shape(buf)?[1..].to_vec();
+fn resident_view(
+    allocator: &Allocator,
+    buf: &DynTensor,
+    slot: u32,
+    dtype: ModelDtype,
+) -> Result<DynTensor, LmError> {
+    let row = buf.shape()[1..].to_vec();
     Ok(match dtype {
-        ModelDtype::Float32 => row_view::<f32>(buf, slot, &row)?.into_dyn(),
-        ModelDtype::Float16 => row_view::<f16>(buf, slot, &row)?.into_dyn(),
+        ModelDtype::Float32 => row_view::<f32>(allocator, buf, slot, &row)?.upcast(),
+        ModelDtype::Float16 => row_view::<f16>(allocator, buf, slot, &row)?.upcast(),
     })
 }
 
@@ -2039,9 +2051,9 @@ fn resident_view(buf: &DynValue, slot: u32, dtype: ModelDtype) -> Result<DynValu
 fn copy_span(
     env: &mut DeviceEnv,
     ty: TensorElementType,
-    src: &DynValue,
+    src: &DynTensor,
     src_off: usize,
-    dst: &DynValue,
+    dst: &DynTensor,
     dst_off: usize,
     count: usize,
 ) -> Result<(), LmError> {
@@ -2062,9 +2074,9 @@ fn copy_span(
 /// The element-typed form of [`copy_span`].
 fn copy_flat_typed<T: PrimitiveTensorElementType + Debug>(
     env: &mut DeviceEnv,
-    src: &DynValue,
+    src: &DynTensor,
     src_off: usize,
-    dst: &DynValue,
+    dst: &DynTensor,
     dst_off: usize,
     count: usize,
 ) -> Result<(), LmError> {
@@ -2100,17 +2112,17 @@ fn copy_flat_typed<T: PrimitiveTensorElementType + Debug>(
 /// memcpy.
 fn device_copy<T: PrimitiveTensorElementType + Debug>(
     env: &mut DeviceEnv,
-    src: &DynValue,
+    src: &DynTensor,
     src_off: usize,
-    dst: &DynValue,
+    dst: &DynTensor,
     dst_off: usize,
     count: usize,
 ) -> Result<(), LmError> {
     // Safety: the views span `count` elements at each buffer's offset, which
     // the caller bounds — `grow` within the fresh buffer's full extent,
     // `store` within both rows — and the copier only ever reads the source.
-    let src = tensor_view::<T>(src, src_off, &[dim(count)])?;
-    let dst = tensor_view::<T>(dst, dst_off, &[dim(count)])?;
+    let src = tensor_view::<T>(&env.allocator, src, src_off, &[dim(count)])?;
+    let dst = tensor_view::<T>(&env.allocator, dst, dst_off, &[dim(count)])?;
     let copier = env.copier(T::into_tensor_element_type())?;
     copier.binding.clear();
     copier.binding.bind_input("src", &src)?;
@@ -2122,14 +2134,6 @@ fn device_copy<T: PrimitiveTensorElementType + Debug>(
     binding.synchronize_outputs()?;
     binding.clear();
     Ok(())
-}
-
-/// The tensor's element type, or an error when *value* is not a tensor.
-fn tensor_element(value: &DynValue) -> Result<TensorElementType, LmError> {
-    let ValueType::Tensor { ty, .. } = value.dtype() else {
-        return Err(ort::Error::new("a state or prefix value is not a tensor").into());
-    };
-    Ok(*ty)
 }
 
 /// A trained character language model, ready to score.
@@ -2327,7 +2331,8 @@ impl CharLm {
     }
 
     /// Open the model in *dir* (`charlm.json`, `prefill.onnx`, `charlm.onnx`)
-    /// for *lexicon*, its sessions built to *shape*.
+    /// for *lexicon*, its sessions created in *environment* and built to
+    /// *shape*.
     ///
     /// # Errors
     ///
@@ -2346,7 +2351,12 @@ impl CharLm {
         clippy::too_many_lines,
         reason = "session construction is one ordered pass over the manifest's tensors"
     )]
-    pub fn open(dir: &Path, lexicon: &Lexicon, shape: SessionShape) -> Result<Self, LmError> {
+    pub fn open(
+        environment: &Environment,
+        dir: &Path,
+        lexicon: &Lexicon,
+        shape: SessionShape,
+    ) -> Result<Self, LmError> {
         let manifest = read_manifest(dir)?;
         let alphabet: HashMap<char, u32> = (0u32..)
             .zip(&manifest.chars)
@@ -2444,12 +2454,14 @@ impl CharLm {
         let mut model = Self {
             backend,
             prefill_sessions: GraphSessions::new(
+                environment,
                 dir.join("prefill.onnx"),
                 prefill_initializers,
                 ort_shape,
                 dtype,
             ),
             step_sessions: GraphSessions::new(
+                environment,
                 dir.join("charlm.onnx"),
                 step_initializers,
                 ort_shape,
@@ -2556,6 +2568,7 @@ impl CharLm {
                 device,
                 host,
                 shape: self.step_sessions.shape,
+                environment: self.step_sessions.environment.clone(),
                 host_resident: matches!(backend, Backend::Cpu | Backend::CoreMl),
                 copiers: Vec::new(),
                 scratch: None,
@@ -2692,7 +2705,8 @@ impl CharLm {
                 prefix_outs.push(
                     outputs
                         .remove(name.as_str())
-                        .expect("the prefill graph returns every prefix output"),
+                        .expect("the prefill graph returns every prefix output")
+                        .downcast::<DynTensorValueType>()?,
                 );
             }
             (prefix_outs, probs)
@@ -2710,7 +2724,7 @@ impl CharLm {
         let mut leaf = Arc::clone(&pool.root);
         let mut desc = Arc::clone(&self.root_path);
         let mut tips = Vec::new();
-        let positions = usize::try_from(value_shape(&prefix_outs.tensors[0])?[0])
+        let positions = usize::try_from(prefix_outs.tensors[0].shape()[0])
             .expect("a prelude length fits usize");
         for position in 0..positions {
             let Some(slot) = pool.claim() else {
@@ -2809,20 +2823,20 @@ impl CharLm {
         for (index, name) in self.prefix.iter().enumerate() {
             binding.bind_output(
                 name.as_str(),
-                resident_view(&bufs.prefix[index], slot, self.dtype)?,
+                resident_view(&env.allocator, &bufs.prefix[index], slot, self.dtype)?,
             )?;
         }
         if let Some(mask) = &bufs.mask {
-            let width = value_shape(mask)?[1];
+            let width = mask.shape()[1];
             binding.bind_output(
                 "prefix_mask",
-                row_view::<bool>(mask, slot, &[width])?.into_dyn(),
+                row_view::<bool>(&env.allocator, mask, slot, &[width])?.into_dyn(),
             )?;
         }
         for (index, name) in self.state.iter().enumerate() {
             binding.bind_output(
                 name.as_str(),
-                resident_view(&bufs.gen0.tensors[index], slot, self.dtype)?,
+                resident_view(&env.allocator, &bufs.gen0.tensors[index], slot, self.dtype)?,
             )?;
         }
         binding.bind_output_to_device("candidate_log_probs", &env.host)?;
@@ -2836,8 +2850,10 @@ impl CharLm {
     /// output, the only thing the bus ever carries.
     fn host_f32(&self, value: &DynValue, phase: Phase) -> Result<Vec<f32>, LmError> {
         debug_assert!(
-            value.memory_info().is_cpu_accessible(),
-            "log_probs is bound to host memory"
+            value
+                .downcast_ref::<DynTensorValueType>()
+                .is_ok_and(|tensor| tensor.memory_info().is_cpu_accessible()),
+            "log_probs is a tensor bound to host memory"
         );
         let (shape, data) = value.try_extract_tensor::<f32>()?;
         self.bus
@@ -2958,7 +2974,8 @@ impl CharLm {
             tensors.push(
                 outputs
                     .remove(format!("next_{name}").as_str())
-                    .expect("the step graph returns every next_ output"),
+                    .expect("the step graph returns every next_ output")
+                    .downcast::<DynTensorValueType>()?,
             );
         }
         let next = Arc::new(Generation { tensors });
@@ -3155,7 +3172,8 @@ impl CharLm {
             tensors.push(
                 outputs
                     .remove(format!("next_{name}").as_str())
-                    .expect("the step graph returns every next_ output"),
+                    .expect("the step graph returns every next_ output")
+                    .downcast::<DynTensorValueType>()?,
             );
         }
         let next = Arc::new(Generation { tensors });
@@ -3355,12 +3373,12 @@ impl CharLm {
                     [dim(rows), dim(pool.layers), dim(pool.width)],
                     metal.next_k(rows).to_vec(),
                 ))?
-                .into_dyn(),
+                .upcast(),
                 Tensor::from_array((
                     [dim(rows), dim(pool.layers), dim(pool.width)],
                     metal.next_v(rows).to_vec(),
                 ))?
-                .into_dyn(),
+                .upcast(),
             ],
         });
         drop(metal);
@@ -3597,8 +3615,11 @@ impl Transition for CharLm {
 /// reservation, which measured both slower and ~150 MB heavier here than
 /// letting each buffer come and go. `Level2` keeps every fusion the step
 /// graph benefits from and measured a hair faster than `Level3`.
-fn session_builder(shape: SessionShape) -> ort::Result<ort::session::builder::SessionBuilder> {
-    let mut builder = Session::builder()?
+fn session_builder(
+    environment: &Environment,
+    shape: SessionShape,
+) -> ort::Result<ort::session::builder::SessionBuilder> {
+    let mut builder = Session::builder(environment)?
         .with_optimization_level(GraphOptimizationLevel::Level2)?
         .with_memory_pattern(false)?
         .with_parallel_execution(false)?
@@ -3614,13 +3635,14 @@ fn session_builder(shape: SessionShape) -> ort::Result<ort::session::builder::Se
 /// container the matrices MLAS pre-packs go into, shared by every session of
 /// the graph so the packing happens once rather than per session.
 fn open_session(
+    environment: &Environment,
     graph: &Path,
     weights: Option<&PrepackedWeights>,
     initializers: &[(String, Arc<DynValue>)],
     shape: SessionShape,
 ) -> Result<Session, LmError> {
     let providers = shape.backend.providers()?;
-    let mut builder = session_builder(shape)?;
+    let mut builder = session_builder(environment, shape)?;
     if let Some(weights) = weights {
         builder = builder
             .with_prepacked_weights(weights)
@@ -3752,9 +3774,11 @@ fn shared_value<T: ort::value::PrimitiveTensorElementType + std::fmt::Debug>(
     let ort_ptr = NonNull::new(AsPointer::ptr(&*view).cast_mut())
         .ok_or_else(|| mismatched(format!("{} has no underlying OrtValue", tensor.name)))?;
     // `from_raw` borrowed only in the type: the `OrtValue` is ours. Hand its
-    // ownership to a `DynValue` that every session shares.
+    // ownership to a `DynValue` that every session shares. The mapping is
+    // host memory, the CPU allocator's device, and the value never frees it:
+    // dropping it releases the `OrtValue` alone.
     std::mem::forget(view);
-    let value = unsafe { DynValue::from_ptr(ort_ptr, None) };
+    let value = unsafe { DynValue::from_ptr(ort_ptr, Some(&Allocator::default())) };
     values.push((tensor.name.clone(), Arc::new(value)));
     Ok(())
 }

@@ -19,6 +19,7 @@ use ime_g2p::outcome::{Annotator as _, Outcome, compare};
 use ime_g2p::text::han_characters;
 use ime_g2p::typing::{DEFAULT_ABBREVIATE_SYLLABLE, Typing, TypingStyle};
 use ime_g2p::{DataLayout, report};
+use ort::environment::Environment;
 use std::io::{BufRead as _, BufReader, BufWriter, Write as _};
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -57,16 +58,18 @@ impl ModelArgs {
         }
     }
 
-    fn converter(&self) -> Result<Converter> {
+    fn converter(&self, environment: &Environment) -> Result<Converter> {
         Ok(Converter::load(
+            environment,
             &self.model_dir()?,
             &self.tokenizer_path()?,
             self.batch_size,
         )?)
     }
 
-    fn annotator(&self) -> Result<G2pwAnnotator> {
+    fn annotator(&self, environment: &Environment) -> Result<G2pwAnnotator> {
         Ok(G2pwAnnotator::new(
+            environment,
             &self.model_dir()?,
             &self.tokenizer_path()?,
             self.batch_size,
@@ -377,7 +380,8 @@ fn split_reachable(
 
 async fn probe(sentence: &str, model: &ModelArgs) -> Result<()> {
     let settings = LlmSettings::load()?;
-    let g2pw = model.annotator()?;
+    let environment = ort::init().build()?;
+    let g2pw = model.annotator(&environment)?;
     let llm = LlmAnnotator::new(&settings, 1);
     let batch = [sentence.to_owned()];
     let (first, second) = tokio::join!(g2pw.annotate(&batch), llm.annotate(&batch));
@@ -438,7 +442,8 @@ async fn run_annotate(
         model = %settings.model,
         "annotating"
     );
-    let g2pw = model.annotator()?;
+    let environment = ort::init().build()?;
+    let g2pw = model.annotator(&environment)?;
     let llm = LlmAnnotator::new(&settings, concurrency);
     let counts = annotate(
         samples,
@@ -486,7 +491,8 @@ fn run_g2pw(input: &Path, out: &Path, limit: Option<usize>, model: &ModelArgs) -
     }
     info!(sentences = texts.len(), "read the parity input");
 
-    let mut converter = model.converter()?;
+    let environment = ort::init().build()?;
+    let mut converter = model.converter(&environment)?;
     let predictions = converter.convert(&texts)?;
     let mut handle = BufWriter::new(
         std::fs::File::create(out)

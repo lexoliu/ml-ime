@@ -34,6 +34,7 @@ ime-pinyin.workspace = true
 ime-session.workspace = true
 ime-synth.workspace = true
 libc.workspace = true
+ort.workspace = true
 rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
