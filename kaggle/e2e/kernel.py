@@ -41,6 +41,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -692,6 +693,105 @@ class GpuSampler:
         return out
 
 
+class CpuSampler:
+    """Every process's CPU time, per thread, sampled from `/proc` beside a run.
+
+    The T4 machines have four cores for two training processes, each with a
+    main thread that launches the device work and a producer thread that
+    collates, plus the segmenter they talk to. A card idling because its
+    launcher waits for a core shows up here and nowhere in the device's own
+    numbers. Each sample is the machine's busy and total jiffies and every
+    thread's cumulative user+system ticks; :meth:`usage` differences two of
+    them.
+    """
+
+    def __init__(self, interval=2.0):
+        self._interval = interval
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self.samples = []
+
+    @staticmethod
+    def _machine():
+        fields = [int(v) for v in Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]]
+        idle = fields[3] + fields[4]
+        return sum(fields) - idle, sum(fields)
+
+    @staticmethod
+    def _threads():
+        ticks = {}
+        for task in Path("/proc").glob("[0-9]*/task/[0-9]*/stat"):
+            try:
+                text = task.read_text()
+            except OSError:  # the thread ended between the glob and the read
+                continue
+            rest = text[text.rindex(")") + 2 :].split()
+            pid, tid = int(task.parts[2]), int(task.parts[4])
+            ticks[(pid, tid)] = int(rest[11]) + int(rest[12])
+        return ticks
+
+    @staticmethod
+    def _command(pid):
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return "?"
+        words = [w for w in raw.decode(errors="replace").split("\0") if w]
+        return " ".join(Path(w).name if i == 0 else w for i, w in enumerate(words[:4]))
+
+    def _run(self):
+        while not self._stopped.is_set():
+            busy, total = self._machine()
+            self.samples.append((time.time(), busy, total, self._threads()))
+            self._stopped.wait(self._interval)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self._stopped.set()
+        self._thread.join()
+        return False
+
+    def usage(self, since=None, until=None, top=8):
+        """Machine busy percent and the busiest processes' cores over a window.
+
+        A process's cores split into its main thread's and the rest's: the
+        main thread is the one that launches device work.
+        """
+        inside = [
+            s
+            for s in self.samples
+            if (since is None or s[0] >= since) and (until is None or s[0] <= until)
+        ]
+        if len(inside) < 2:
+            return {"busy_percent": None, "samples": len(inside), "processes": []}
+        (t0, busy0, total0, threads0), (t1, busy1, total1, threads1) = inside[0], inside[-1]
+        hertz = os.sysconf("SC_CLK_TCK")
+        seconds = t1 - t0
+        processes = {}
+        for (pid, tid), ticks in threads1.items():
+            used = (ticks - threads0.get((pid, tid), ticks)) / hertz / seconds
+            entry = processes.setdefault(pid, {"main": 0.0, "other": 0.0})
+            entry["main" if tid == pid else "other"] += used
+        busiest = sorted(processes.items(), key=lambda kv: -(kv[1]["main"] + kv[1]["other"]))
+        return {
+            "busy_percent": round(100 * (busy1 - busy0) / (total1 - total0), 1),
+            "cores": os.cpu_count(),
+            "samples": len(inside),
+            "processes": [
+                {
+                    "pid": pid,
+                    "command": self._command(pid),
+                    "main_cores": round(used["main"], 2),
+                    "other_cores": round(used["other"], 2),
+                }
+                for pid, used in busiest[:top]
+            ],
+        }
+
+
 def steps_per_second(steps):
     """Steps/s from the step records' own clock: last minus first over the span."""
     if len(steps) < 2:
@@ -742,7 +842,10 @@ def smoke_run(char_table, start, segmenter, env, name, token_budget, options, st
     )
     # A recompile inside the window costs about a minute of an idle card;
     # dynamo's reason for each lands in the log beside the step that paid it.
-    with GpuSampler(WORKING / f"smoke-{name}-gpu.csv") as sampler:
+    with (
+        GpuSampler(WORKING / f"smoke-{name}-gpu.csv") as sampler,
+        CpuSampler() as processor,
+    ):
         code, seconds = run(argv, {**env, "TORCH_LOGS": "recompiles"}, str(log_file))
     text = log_file.read_text(encoding="utf-8")
     profiles = profile_phases(text)
@@ -750,13 +853,11 @@ def smoke_run(char_table, start, segmenter, env, name, token_budget, options, st
     # cut the sampler's log, so warm-up -- and the compilation inside it --
     # does not dilute the number the utilisation floor reads.
     bounds = [p["window"] for p in profiles.values() if len(p.get("window") or []) == 2]
-    if bounds:
-        gpu_mean = sampler.means(
-            since=min(bound[0] for bound in bounds),
-            until=max(bound[1] for bound in bounds),
-        )
-    else:
-        gpu_mean = sampler.means()
+    window = (
+        {"since": min(b[0] for b in bounds), "until": max(b[1] for b in bounds)} if bounds else {}
+    )
+    gpu_mean = sampler.means(**window)
+    cpu_usage = processor.usage(**window)
     entry = {
         "name": name,
         "token_budget": token_budget,
@@ -765,6 +866,7 @@ def smoke_run(char_table, start, segmenter, env, name, token_budget, options, st
         "compile": options.get("compile", False),
         "seconds": round(seconds, 1),
         "gpu_mean": gpu_mean,
+        "cpu": cpu_usage,
         "peak_bytes_per_rank": {
             str(rank): size for rank, size in sorted(peak_memory(text).items())
         },
