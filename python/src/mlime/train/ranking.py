@@ -20,15 +20,17 @@ from __future__ import annotations
 import random
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
+import torch.utils.checkpoint
 
 from mlime.train.charlm_vocab import BOS
 from mlime.train.e2e_model import E2EModel, RankingConfig
 from mlime.train.e2e_search import Lane, decode_lanes
 from mlime.train.model import RouteAOutput, mark_dynamic, restricted_cross_entropy
 from mlime.train.samples import IGNORE_INDEX, Batch, Collator, TrainingExample
-from mlime.train.segmenter import Segmentations
+from mlime.train.segmenter import Segmentations, Segmenter
 from mlime.train.spans import SpanVocab
 
 
@@ -93,10 +95,24 @@ class RankCollator:
     context-dropout coin is the wrapped collator's, thrown once per example.
     """
 
-    def __init__(self, collator: Collator, segment: Segmentations, spans: SpanVocab):
+    def __init__(
+        self,
+        collator: Collator,
+        segment: Segmentations,
+        spans: SpanVocab,
+        ranking: RankingConfig,
+    ):
         self.collator = collator
         self.segment = segment
         self.spans = spans
+        self.ranking = ranking
+
+    @classmethod
+    def launch(
+        cls, collator: Collator, segmenter: Path, spans: SpanVocab, ranking: RankingConfig
+    ) -> RankCollator:
+        """A collator reading keystrokes through a running *segmenter* binary."""
+        return cls(collator, Segmenter(segmenter, ranking.segmentations), spans, ranking)
 
     @property
     def rng(self) -> random.Random:
@@ -108,6 +124,25 @@ class RankCollator:
         """The wrapped collator's context budget, which batching reads."""
         return self.collator.max_context_tokens
 
+    def readings(self, example: TrainingExample) -> list[tuple[int, tuple[str, ...]]]:
+        """The segmenter's readings of *example* other than its gold one, by rank."""
+        return [
+            (index, reading)
+            for index, reading in enumerate(self.segment("".join(example.spans)))
+            if reading != example.spans
+        ]
+
+    def rows(self, example: TrainingExample) -> int:
+        """Every row *example* costs: its readings, and at most the paths it ranks.
+
+        A step runs the fill tower over each reading and the decoder over each
+        ranked path, at the same width; the paths are the gold one, the gold
+        sentence on another reading, and up to ``negatives`` others -- no more
+        than the beam can have found on the readings.
+        """
+        readings = 1 + len(self.readings(example))
+        return readings + 2 + min(self.ranking.negatives, self.ranking.beam * readings)
+
     def __call__(self, examples: Sequence[TrainingExample]) -> RankBatch:
         """Collate *examples* with every reading of each."""
         rows: list[TrainingExample] = []
@@ -116,9 +151,7 @@ class RankCollator:
         for owner, example in enumerate(examples):
             gold_rows.append(len(rows))
             rows.append(example)
-            for index, reading in enumerate(self.segment("".join(example.spans))):
-                if reading == example.spans:
-                    continue
+            for index, reading in self.readings(example):
                 rows.append(
                     TrainingExample(
                         id=f"{example.id}:{index}",
@@ -255,8 +288,8 @@ class RankingE2EModel(E2EModel):
         # `decoder.reader.project` as unused). Dropping them recasts with grad.
         torch.clear_autocast_cache()
         items = select_items(batch, found, ranking.negatives)
-        paths, logits = self.path_scores(spans, items.rows, items.sequences)
-        length = logits.shape[1]
+        paths, projected = self.path_scores(spans, items.rows, items.sequences)
+        length = projected.shape[1]
 
         device = spans.device
         slots = torch.tensor(items.slots, dtype=torch.long).to(device, non_blocking=True)
@@ -276,7 +309,9 @@ class RankingE2EModel(E2EModel):
         positions = rows.scored
         owners = torch.tensor(batch.owners, dtype=torch.long).to(device, non_blocking=True)
         region = owners[positions // width] * length + positions % width - 1
-        decoder_logits = logits.reshape(-1, logits.shape[-1]).index_select(0, region)
+        decoder_logits = (
+            projected.reshape(-1, projected.shape[-1]).index_select(0, region) @ self._emitted().T
+        )
         candidates = self.candidates_at(rows, positions)
         targets = rows.targets.reshape(-1).index_select(0, positions)
         encoder_logits = self.head.decoder(
@@ -304,14 +339,19 @@ class RankingE2EModel(E2EModel):
     def path_scores(
         self, spans: torch.Tensor, rows: Sequence[int], sequences: Sequence[tuple[int, ...]]
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Each sentence's path score on its row, teacher-forced; and the step logits.
+        """Each sentence's path score on its row, teacher-forced; and the step features.
 
         ``spans [R, S, H]`` is the encoder's output at every row's typed
         positions; sentence *i* reads row ``rows[i]`` and says ``sequences[i]``
         in emission indices, one per typed position. Its score is what the
         search sums for it: each step's log-probability over the whole
-        emittable set. The logits come back ``[I, T, E]`` for the per-position
-        loss.
+        emittable set. The projected features come back ``[I, T, D]`` for the
+        per-position loss, which takes its own logits at the gold positions.
+
+        The whole-alphabet logits exist only a chunk of steps at a time and
+        are recomputed in backward rather than kept: a step needs its own
+        logit and the normaliser, not the seven thousand others, and keeping
+        them would hold more than the decoder's own activations do.
         """
         decoder = self.decoder
         device = spans.device
@@ -321,18 +361,47 @@ class RankingE2EModel(E2EModel):
         for item, sequence in enumerate(sequences):
             padded[item, : len(sequence)] = torch.tensor(sequence, dtype=torch.long)
             steps[item, : len(sequence)] = True
+        # The real steps' flat indices and owners, found on the host so the
+        # device never reports a count back.
+        taken = steps.reshape(-1).nonzero().squeeze(1)
+        owner = taken // length
         said = padded.to(device, non_blocking=True)
-        steps = steps.to(device, non_blocking=True)
+        mask = steps.to(device, non_blocking=True)
         read = torch.tensor(rows, dtype=torch.long).to(device, non_blocking=True)
 
         reader_ids = decoder.emit_ids[said]
         previous = torch.cat([torch.full_like(reader_ids[:, :1], BOS), reader_ids[:, :-1]], dim=1)
-        features = decoder(previous, spans[read, :length], steps)
+        features = decoder(previous, spans[read, :length], mask)
         reader = decoder.reader
-        emitted = reader.embed.weight.index_select(0, decoder.emit_ids)
-        logits: torch.Tensor = reader.project(reader.dropout(features)) @ emitted.T
-        stepped = logits.float().log_softmax(dim=-1).gather(-1, said.unsqueeze(-1)).squeeze(-1)
-        return stepped.masked_fill(~steps, 0.0).sum(dim=1), logits
+        projected: torch.Tensor = reader.project(reader.dropout(features))
+        flat = projected.reshape(-1, projected.shape[-1]).index_select(
+            0, taken.to(device, non_blocking=True)
+        )
+        targets = said.reshape(-1).index_select(0, taken.to(device, non_blocking=True))
+        emitted = self._emitted()
+        stepped = torch.cat(
+            [
+                torch.as_tensor(
+                    torch.utils.checkpoint.checkpoint(
+                        _step_log_probabilities,
+                        flat[start : start + STEP_CHUNK],
+                        emitted,
+                        targets[start : start + STEP_CHUNK],
+                        use_reentrant=False,
+                    )
+                )
+                for start in range(0, flat.shape[0], STEP_CHUNK)
+            ]
+        )
+        paths = torch.zeros(len(sequences), dtype=stepped.dtype, device=device).index_add(
+            0, owner.to(device, non_blocking=True), stepped
+        )
+        return paths, projected
+
+    def _emitted(self) -> torch.Tensor:
+        """``[E, D]``: the reader's embedding row of each emittable character."""
+        decoder = self.decoder
+        return decoder.reader.embed.weight.index_select(0, decoder.emit_ids)
 
     def _admitted(self, rows: Batch) -> torch.Tensor:
         """``[R, S, E]``: what each typed position of each row admits.
@@ -348,3 +417,18 @@ class RankingE2EModel(E2EModel):
         spare = ids.masked_fill(~listed, emittable)
         admitted = torch.zeros((*ids.shape[:2], emittable + 1), dtype=torch.bool, device=ids.device)
         return admitted.scatter_(2, spare, True)[..., :emittable]
+
+
+#: Steps whose whole-alphabet logits exist at once in :meth:`RankingE2EModel.path_scores`:
+#: 2048 of them over 7,322 characters is 90 MiB in fp32, beside activations of
+#: gigabytes.
+STEP_CHUNK = 2048
+
+
+def _step_log_probabilities(
+    features: torch.Tensor, emitted: torch.Tensor, targets: torch.Tensor
+) -> torch.Tensor:
+    """Each step's log-probability of its own character over the emittable set."""
+    logits = (features @ emitted.T).float()
+    said = logits.gather(1, targets.unsqueeze(1)).squeeze(1)
+    return said - logits.logsumexp(dim=1)

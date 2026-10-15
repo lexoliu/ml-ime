@@ -40,7 +40,6 @@ from mlime.train.run import (
     step_losses,
 )
 from mlime.train.samples import DEFAULT_CONTEXT_TOKENS, Augmentation, BatchCollator
-from mlime.train.segmenter import Segmenter
 
 
 def _record(state: dict[str, Any], key: str, path: Path | str) -> dict[str, Any]:
@@ -290,9 +289,7 @@ def e2e(
         )
         if ranking is None or segmenter is None:
             return collator
-        return RankCollator(
-            collator, Segmenter(segmenter, ranking.segmentations), vocabularies.spans
-        )
+        return RankCollator.launch(collator, segmenter, vocabularies.spans, ranking)
 
     lanes = [
         (

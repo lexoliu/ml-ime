@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import random
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Protocol
@@ -538,6 +538,10 @@ class BatchCollator(Protocol):
         """The context budget batching is grouped under."""
         ...
 
+    def rows(self, example: TrainingExample) -> int:
+        """Rows at the fill width *example* costs a step, which batching weighs it by."""
+        ...
+
     def __call__(self, examples: Sequence[TrainingExample]) -> StepBatch:
         """Collate one group of examples."""
         ...
@@ -571,6 +575,10 @@ class Collator:
         self.context_dropout = context_dropout
         self.max_context_tokens = max_context_tokens
         self.rng = random.Random(seed)
+
+    def rows(self, example: TrainingExample) -> int:
+        """One: an example is one row of the fill tower."""
+        return 1
 
     def __call__(self, examples: Sequence[TrainingExample]) -> Batch:
         """Collate *examples*, keeping each one's context with probability 1-p."""
@@ -700,6 +708,7 @@ def token_budget_batches(
     examples: Iterator[TrainingExample],
     budget: int,
     max_context_tokens: int = 0,
+    rows: Callable[[TrainingExample], int] | None = None,
 ) -> Iterator[list[TrainingExample]]:
     """Group *examples* so one step's padded cost stays under *budget*.
 
@@ -717,21 +726,31 @@ def token_budget_batches(
 
     A *max_context_tokens* of zero means the contexts are not encoded at all,
     which is the case wherever only the fill tower is under test.
+
+    *rows* is how many rows at the fill width an example costs; one each when
+    it is not given. The ranking loss (#116) types an example every way its
+    keystrokes read and decodes several sentences on them, so one example
+    there is a dozen rows, and how many varies with the keystrokes: a budget
+    over its examples alone would let a batch of long full-pinyin sentences run
+    to twice the rows of the batch beside it.
     """
     if budget <= 0:
         raise ValueError(f"the token budget must be positive, got {budget}")
     batch: list[TrainingExample] = []
-    fill = context = 0
+    fill = context = filled = 0
     for example in examples:
+        cost = 1 if rows is None else rows(example)
         wide = max(fill, len(example) + 2)
         deep = max(context, _context_width(example, max_context_tokens))
-        if batch and (wide + deep) * (len(batch) + 1) > budget:
+        if batch and wide * (filled + cost) + deep * (len(batch) + 1) > budget:
             yield batch
             batch = []
+            filled = 0
             wide = len(example) + 2
             deep = _context_width(example, max_context_tokens)
         batch.append(example)
         fill, context = wide, deep
+        filled += cost
     if batch:
         yield batch
 

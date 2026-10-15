@@ -312,6 +312,28 @@ def test_a_batch_with_no_context_tower_pays_for_the_fill_alone(
     assert max(len(group) for group in groups) == 10
 
 
+def test_an_example_costs_every_row_it_is_collated_into(
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
+) -> None:
+    """A collator that makes three fill rows of an example pays for all three."""
+    builder = SampleBuilder(lexicon, spans, arbitration, ALWAYS_FULL)
+    kept = [
+        example
+        for example in (
+            builder.build(_sample("我爱北京", context="北" * 40), ["wo", "ai", "bei", "jing"], 0)
+            for _ in range(20)
+        )
+        if example is not None
+    ]
+    groups = list(
+        token_budget_batches(iter(kept), budget=72, max_context_tokens=16, rows=lambda _: 3)
+    )
+    assert sum(len(group) for group in groups) == len(kept)
+    # Three rows of six fill positions and sixteen of context: two examples
+    # are 68 positions, three would be 102.
+    assert {len(group) for group in groups} == {2}
+
+
 def test_the_context_kept_is_the_end_of_it() -> None:
     """The cursor sits after the context, so its last characters are the useful ones."""
     assert context_tail("一二三四五六", 5) == "四五六"

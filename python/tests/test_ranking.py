@@ -14,7 +14,7 @@ from __future__ import annotations
 import json
 import stat
 import sys
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -63,7 +63,25 @@ def rank_batch(lexicon: Lexicon, spans: SpanVocab, tokenizer: StubTokenizer) -> 
     first = example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing"))
     first = type(first)(**{**vars(first), "context": "北京"})
     second = example(spans, lexicon, "钟爱北京", ("zhong", "ai", "bei", "jing"))
-    return RankCollator(collator, lambda keys: READINGS[keys], spans)([first, second])
+    return RankCollator(collator, lambda keys: READINGS[keys], spans, RANKING)([first, second])
+
+
+def test_an_example_costs_its_readings_and_the_paths_it_ranks(
+    lexicon: Lexicon, spans: SpanVocab, tokenizer: StubTokenizer
+) -> None:
+    collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
+    typed = example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing"))
+    two = RankCollator(collator, lambda keys: READINGS[keys], spans, RANKING)
+    # Two readings, then the gold path, the gold sentence on the other
+    # reading and four negatives.
+    assert two.rows(typed) == 2 + 2 + 4
+    one = RankCollator(collator, lambda keys: [typed.spans], spans, RANKING)
+    assert one.rows(typed) == 1 + 2 + 4
+    narrow = replace(RANKING, beam=1, negatives=8)
+    # One reading under a beam of one finds one sentence at most.
+    assert (
+        RankCollator(collator, lambda keys: [typed.spans], spans, narrow).rows(typed) == 1 + 2 + 1
+    )
 
 
 def test_the_batch_leads_with_gold_and_runs_one_context_per_example(
@@ -241,7 +259,7 @@ def test_a_resumed_ranking_run_is_the_run_that_was_not_interrupted(
             short_corpus[0], short_corpus[1], SampleBuilder(lexicon, spans, arbitration, seed=1)
         )
         collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
-        return stream, RankCollator(collator, greedy_readings(spans), spans)
+        return stream, RankCollator(collator, greedy_readings(spans), spans, RANKING)
 
     def losses(metrics: Path) -> list[float]:
         return [

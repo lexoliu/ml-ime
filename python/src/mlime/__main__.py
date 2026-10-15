@@ -23,6 +23,7 @@ from mlime.data import DataLayout
 from mlime.logging import configure
 
 if TYPE_CHECKING:  # the training modules pull in torch; --help must not
+    from mlime.train.e2e_model import RankingConfig
     from mlime.train.run import RunPaths, Slices
 
 app = typer.Typer(help="ml-ime data pipeline", no_args_is_help=True)
@@ -71,6 +72,22 @@ TOKEN_BUDGET = typer.Option(
     8192, "--token-budget", help="Padded positions per step, both towers together"
 )
 SEED = typer.Option(0, "--seed", help="Augmentation and initialisation seed")
+RANKING = typer.Option(
+    False,
+    "--ranking/--no-ranking",
+    help="Add the sequence-level ranking loss over each example's segmentations (#116)",
+)
+SEGMENTER = typer.Option(
+    None, help="The ime-segment binary the ranking loss reads segmentations from"
+)
+RANK_SEGMENTATIONS = typer.Option(
+    None, help="Readings of each example's keystrokes to rank over (default 8)"
+)
+RANK_BEAM = typer.Option(None, help="Beam width of the negative search (default 4)")
+RANK_NEGATIVES = typer.Option(
+    None, help="Negatives each example ranks the gold sentence against (default 8)"
+)
+RANK_WEIGHT = typer.Option(None, help="Weight of the ranking loss inside the total (default 1.0)")
 
 
 @app.callback()
@@ -366,6 +383,29 @@ def route_a_paths(
     )
 
 
+def ranking_settings(
+    ranking: bool,
+    segmentations: int | None,
+    beam: int | None,
+    negatives: int | None,
+    weight: float | None,
+) -> RankingConfig | None:
+    """The ranking loss's settings from its switch and its ``--rank-*`` knobs."""
+    from mlime.train.e2e_model import RankingConfig
+
+    if not ranking:
+        if any(value is not None for value in (segmentations, beam, negatives, weight)):
+            raise typer.BadParameter("the --rank-* options set the ranking loss; pass --ranking")
+        return None
+    default = RankingConfig()
+    return RankingConfig(
+        segmentations=default.segmentations if segmentations is None else segmentations,
+        beam=default.beam if beam is None else beam,
+        negatives=default.negatives if negatives is None else negatives,
+        weight=default.weight if weight is None else weight,
+    )
+
+
 def route_a_slices(
     data_dir: Path, train_shard: list[str], held_out_shard: list[str], max_held_out: int = 4096
 ) -> Slices:
@@ -468,24 +508,12 @@ def train_e2e(
         help="A finished e2e checkpoint; a new run starts from its weights, "
         "with a fresh optimiser and schedule",
     ),
-    ranking: bool = typer.Option(
-        False,
-        "--ranking/--no-ranking",
-        help="Add the sequence-level ranking loss over each example's segmentations (#116)",
-    ),
-    segmenter: Path = typer.Option(
-        None, help="The ime-segment binary the ranking loss reads segmentations from"
-    ),
-    rank_segmentations: int = typer.Option(
-        None, help="Readings of each example's keystrokes to rank over (default 8)"
-    ),
-    rank_beam: int = typer.Option(None, help="Beam width of the negative search (default 4)"),
-    rank_negatives: int = typer.Option(
-        None, help="Negatives each example ranks the gold sentence against (default 8)"
-    ),
-    rank_weight: float = typer.Option(
-        None, help="Weight of the ranking loss inside the total (default 1.0)"
-    ),
+    ranking: bool = RANKING,
+    segmenter: Path = SEGMENTER,
+    rank_segmentations: int = RANK_SEGMENTATIONS,
+    rank_beam: int = RANK_BEAM,
+    rank_negatives: int = RANK_NEGATIVES,
+    rank_weight: float = RANK_WEIGHT,
     typos: bool = typer.Option(
         False,
         "--typos/--no-typos",
@@ -562,26 +590,12 @@ def train_e2e(
     import torch
 
     from mlime.train.e2e import e2e
-    from mlime.train.e2e_model import RankingConfig
     from mlime.train.loop import TrainingConfig
     from mlime.train.run import describe_device
     from mlime.train.samples import Augmentation
 
-    knobs = (rank_segmentations, rank_beam, rank_negatives, rank_weight)
-    if not ranking and any(value is not None for value in knobs):
-        raise typer.BadParameter("the --rank-* options set the ranking loss; pass --ranking")
-    default = RankingConfig()
-    ranking_config = (
-        RankingConfig(
-            segmentations=default.segmentations
-            if rank_segmentations is None
-            else rank_segmentations,
-            beam=default.beam if rank_beam is None else rank_beam,
-            negatives=default.negatives if rank_negatives is None else rank_negatives,
-            weight=default.weight if rank_weight is None else rank_weight,
-        )
-        if ranking
-        else None
+    ranking_config = ranking_settings(
+        ranking, rank_segmentations, rank_beam, rank_negatives, rank_weight
     )
     typer.echo(f"device: {describe_device()}")
     try:
@@ -674,6 +688,12 @@ def train_count_batches(
         "and the shard list equal this run's; refused with the differing "
         "fields logged otherwise",
     ),
+    ranking: bool = RANKING,
+    segmenter: Path = SEGMENTER,
+    rank_segmentations: int = RANK_SEGMENTATIONS,
+    rank_beam: int = RANK_BEAM,
+    rank_negatives: int = RANK_NEGATIVES,
+    rank_weight: float = RANK_WEIGHT,
     verbose: bool = VERBOSE,
 ) -> None:
     """Count the steps *epochs* of the training shards come to, for --max-steps.
@@ -681,7 +701,8 @@ def train_count_batches(
     The cosine schedule ends exactly at ``--max-steps``, so the number has to be
     the one the loop will actually reach. This replays the loop's own grouping
     over the same shards at the same epochs and counts the batches; it builds no
-    model and collates nothing.
+    model and collates nothing. A ranking run weighs each example by every
+    row it costs, so its count reads the segmenter the run will read.
     """
     configure(verbose)
     from mlime.train.count import count_batches
@@ -698,6 +719,10 @@ def train_count_batches(
         epochs=epochs,
         accumulate=accumulate,
         reuse_census=reuse_census,
+        ranking=ranking_settings(
+            ranking, rank_segmentations, rank_beam, rank_negatives, rank_weight
+        ),
+        segmenter=segmenter,
     )
     census.write(out)
     typer.echo(

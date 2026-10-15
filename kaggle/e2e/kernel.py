@@ -133,7 +133,8 @@ INIT_DECODER = "charlm-transformer-s1.pt"
 AUX_WEIGHT = 0.3
 
 #: Padded positions per micro-batch per rank, both towers together -- the
-#: largest budget the smoke sweep measured with headroom.
+#: largest budget the smoke sweep measured with headroom. A ranking run counts
+#: every reading's fill row and every ranked path's decoder row in it.
 TOKEN_BUDGET = 8192
 
 #: Kaggle's session cap, and what is kept back from it. `SESSION_SECONDS` is
@@ -365,12 +366,14 @@ def data_argv(char_table, token_budget=TOKEN_BUDGET):
     return argv
 
 
-def count_argv(char_table, out, census=None):
+def count_argv(char_table, out, segmenter, census=None):
     """Replay the batcher over the training shards and write the step budget.
 
     *census* is a mounted count from an earlier run; `count-batches` uses it
     only when every configuration field and the shard list equal this run's
-    and says which field differed otherwise.
+    and says which field differed otherwise. A ranking run's batches weigh
+    each example by every row the ranking step makes of it, so the count
+    reads the staged *segmenter* too.
     """
     argv = [
         sys.executable,
@@ -387,6 +390,7 @@ def count_argv(char_table, out, census=None):
         str(ACCUMULATE),
         "--out",
         str(out),
+        *ranking_argv(segmenter),
     ]
     if census is not None:
         argv += ["--reuse-census", str(census)]
@@ -1206,7 +1210,7 @@ def main():
     if previous is None:
         counts_path = WORKING / "batch-counts.json"
         code, _ = run(
-            count_argv(char_table, counts_path, find_census()),
+            count_argv(char_table, counts_path, segmenter, find_census()),
             env,
             str(WORKING / "count.log"),
         )

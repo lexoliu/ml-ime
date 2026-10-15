@@ -9,18 +9,29 @@ tests hold it to that by counting the same corpus both ways.
 from __future__ import annotations
 
 import json
+import stat
+import sys
 from dataclasses import asdict, replace
 from pathlib import Path
 
 from mlime.train.arbitration import ReadingArbitration
-from mlime.train.count import CENSUS_VERSION, CountSpec, count_batches, matching_census
+from mlime.train.count import (
+    CENSUS_VERSION,
+    CountSpec,
+    census_mismatches,
+    count_batches,
+    matching_census,
+)
+from mlime.train.e2e_model import RankingConfig
 from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.loop import EpochBatches
+from mlime.train.ranking import RankCollator
 from mlime.train.run import RunPaths, Slices, Vocabularies
 from mlime.train.samples import (
     DEFAULT_CONTEXT_TOKENS,
     Augmentation,
     BaseTokenizer,
+    BatchCollator,
     Collator,
     CorpusStream,
     SampleBuilder,
@@ -52,9 +63,17 @@ def batches_in_first_epoch(
     tokenizer: BaseTokenizer,
     rank: int = 0,
     world_size: int = 1,
+    segmenter: Path | None = None,
 ) -> int:
-    """How many batches the loop's own iterator takes from epoch 0 for *rank*."""
+    """How many batches the loop's own iterator takes from epoch 0 for *rank*.
+
+    With a *segmenter*, the loop's collator is the ranking one over it.
+    """
     samples_dir, labels_dir = corpus
+    plain = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
+    collator: BatchCollator = (
+        plain if segmenter is None else RankCollator.launch(plain, segmenter, spans, RANKING)
+    )
     batches = EpochBatches(
         CorpusStream(
             samples_dir,
@@ -63,7 +82,7 @@ def batches_in_first_epoch(
             rank=rank,
             world_size=world_size,
         ),
-        Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)),
+        collator,
         BUDGET,
     )
     taken = 0
@@ -100,6 +119,76 @@ def test_the_count_is_the_number_of_batches_the_loop_would_take(
     assert census.ranks[0].epochs == [taken]
     assert census.steps_for_epochs == taken
     assert census.build_counts["kept"] == 128
+
+
+#: A ranking run small enough that the fixture corpus is still many batches.
+RANKING = RankingConfig(segmentations=4, beam=2, negatives=2, weight=1.0)
+
+
+def two_readings(path: Path, spans: SpanVocab) -> Path:
+    """A segmenter binary reading every keystroke string two ways.
+
+    The first is the longest-span reading of the keys, the second the same
+    spans backwards: not a spelling of the keys, but rows the collator can
+    type, which is all a count and a collation need of them.
+    """
+    path.write_text(
+        f"#!{sys.executable}\n"
+        "import json, sys\n"
+        f"spans = set({json.dumps([span for span in spans if span])})\n"
+        "for line in sys.stdin:\n"
+        "    keys, reading, start = line.strip(), [], 0\n"
+        "    while start < len(keys):\n"
+        "        end = max(e for e in range(start + 1, len(keys) + 1) if keys[start:e] in spans)\n"
+        "        reading.append(keys[start:end])\n"
+        "        start = end\n"
+        "    print(json.dumps([reading, reading[::-1]]), flush=True)\n",
+        encoding="utf-8",
+    )
+    path.chmod(path.stat().st_mode | stat.S_IXUSR)
+    return path
+
+
+def test_a_ranking_count_weighs_each_example_by_every_row_it_costs(
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    segmenter = two_readings(tmp_path / "segment", spans)
+    vocabularies = Vocabularies(
+        spans=spans,
+        tokenizer=tokenizer,
+        lexicon=lexicon,
+        arbitration=arbitration,
+        syllables=frozenset(),
+    )
+    plain = count_batches(
+        vocabularies,
+        census_paths(corpus, tmp_path),
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+    )
+    ranked = count_batches(
+        vocabularies,
+        census_paths(corpus, tmp_path),
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+        ranking=RANKING,
+        segmenter=segmenter,
+    )
+    taken = batches_in_first_epoch(
+        corpus, lexicon, spans, arbitration, tokenizer, segmenter=segmenter
+    )
+    assert ranked.ranks[0].epochs == [taken]
+    assert ranked.steps_for_epochs > plain.steps_for_epochs
+    assert ranked.ranking == asdict(RANKING)
+    assert plain.ranking is None
+    assert census_mismatches(ranked, spec_for(ranking=None)) == ["ranking"]
 
 
 def test_every_rank_is_counted_over_the_shards_it_owns(
@@ -220,6 +309,7 @@ def spec_for(**overrides) -> CountSpec:
         shards=list(SHARDS),
         accumulate=1,
         census_version=CENSUS_VERSION,
+        ranking=None,
     )
     return replace(spec, **overrides)
 

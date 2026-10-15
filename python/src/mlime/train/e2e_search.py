@@ -92,7 +92,15 @@ def decode_lanes(
     carried[0] = 0.0
     layers, heads = decoder.reader.config.layers, decoder.reader.config.heads
     head_dim = decoder.reader.config.hidden // heads
-    keys = torch.zeros(rows, layers, heads, 0, head_dim, device=device)
+    # The cache grows in the dtype the steps compute in: under autocast a
+    # float32 seed would promote every key appended to it, twice the bytes
+    # for the same values.
+    cached = (
+        torch.get_autocast_dtype(device.type)
+        if torch.is_autocast_enabled(device.type)
+        else decoder.reader.embed.weight.dtype
+    )
+    keys = torch.zeros(rows, layers, heads, 0, head_dim, dtype=cached, device=device)
     values = keys.clone()
     scores = torch.full((count, width), float("-inf"), device=device)
     scores[:, 0] = 0.0

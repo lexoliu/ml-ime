@@ -286,7 +286,7 @@ def epoch_groups(
     of the lengths. Counting epoch 0 twice is not counting two epochs.
     """
     stream.set_epoch(epoch)
-    return token_budget_batches(iter(stream), budget, collator.max_context_tokens)
+    return token_budget_batches(iter(stream), budget, collator.max_context_tokens, collator.rows)
 
 
 @dataclass(frozen=True)
