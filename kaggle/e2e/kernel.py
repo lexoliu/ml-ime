@@ -619,10 +619,13 @@ class GpuSampler:
     The check is the driver's, not torch's: a step that leaves the card idle
     while the host collates shows up here even though no device code knows
     about it. 500 ms is fine enough to catch a step boundary and coarse enough
-    to keep the log small.
+    to keep the log small. The samples go to a file: a pipe nobody drains
+    fills after a few minutes and stalls `nvidia-smi`, and every later
+    sample -- the timed window's, after a long compile -- never arrives.
     """
 
-    def __init__(self, interval_ms=500):
+    def __init__(self, log, interval_ms=500):
+        self._log = log
         self._argv = [
             "nvidia-smi",
             "--query-gpu=index,utilization.gpu,memory.used,timestamp",
@@ -634,22 +637,20 @@ class GpuSampler:
         self.samples = {}
 
     def __enter__(self):
-        self._process = subprocess.Popen(
-            self._argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
+        with self._log.open("w", encoding="utf-8") as sink:
+            self._process = subprocess.Popen(
+                self._argv, stdout=sink, stderr=subprocess.DEVNULL
+            )
         return self
 
     def __exit__(self, *_):
         self._process.terminate()
         try:
-            out, _ = self._process.communicate(timeout=15)
+            self._process.wait(timeout=15)
         except subprocess.TimeoutExpired:
             self._process.kill()
-            out, _ = self._process.communicate()
-        for line in out.splitlines():
+            self._process.wait()
+        for line in self._log.read_text(encoding="utf-8").splitlines():
             fields = [field.strip() for field in line.split(",")]
             if len(fields) != 4:
                 continue
@@ -686,6 +687,7 @@ class GpuSampler:
                 "memory_mib": round(sum(m for _, m in rows) / len(rows))
                 if rows
                 else None,
+                "samples": len(rows),
             }
         return out
 
@@ -740,7 +742,7 @@ def smoke_run(char_table, start, segmenter, env, name, token_budget, options, st
     )
     # A recompile inside the window costs about a minute of an idle card;
     # dynamo's reason for each lands in the log beside the step that paid it.
-    with GpuSampler() as sampler:
+    with GpuSampler(WORKING / f"smoke-{name}-gpu.csv") as sampler:
         code, seconds = run(argv, {**env, "TORCH_LOGS": "recompiles"}, str(log_file))
     text = log_file.read_text(encoding="utf-8")
     profiles = profile_phases(text)
