@@ -19,11 +19,12 @@
 //! D]` — where a pending state's history was materialised; `-1` reads the
 //! page pool.
 //!
-//! Weights are resident `MTLBuffer`s in a uniform `[in, out]` view: the int8
-//! export's `onnx::MatMul_*_int8` tensors already carry that layout with a
-//! per-out-column fp32 scale, and the fp32 export's `model.*` weights
-//! (`[out, in]`, torch's) are transposed at pack time. Activations and the
-//! page pool stay fp32 end to end.
+//! Weights are resident `MTLBuffer`s in a uniform `[in, out]` view — the
+//! layout both exports store their `onnx::MatMul_*` tensors in, the int8
+//! export's with a per-out-column fp32 scale. A restricted export's tied
+//! head covers only its kept ids: the embedding lookup then reads
+//! `model.embed.weight`, and a candidate is mapped to its kept column on
+//! upload. Activations and the page pool stay fp32 end to end.
 //!
 //! The matmuls are the tiled `lm_mm` kernel — a threadgroup owns a
 //! [32 x 64] output tile, stages the A and W panels in threadgroup memory,
@@ -42,6 +43,10 @@ use metal::{
 use std::time::Instant;
 
 use crate::{LmError, MetalWeights, WeightDtype, WeightTensor, WeightsFile, dim};
+
+/// The candidate column a restricted export's dropped id maps to — the
+/// kernel's `UNKEPT`, scored `UNREACHABLE` as the graph scores it.
+const UNKEPT: u32 = u32::MAX;
 
 /// The transformer config the kernels are compiled for — checked against the
 /// manifest's row shapes at open, since the source has them as #defines.
@@ -518,12 +523,17 @@ kernel void lm_attn(
     a16[(ulong)row * HID + head * HD + d2 + 1u] = half(a1);
 }
 
-// log-softmax over the vocab, then gather the row's K candidates.
+// log-softmax over the head's columns, then gather the row's K candidates.
+// A candidate is a column index; UNKEPT names an id outside a restricted
+// export's kept alphabet, which scores UNREACHABLE as the graph does.
+constant uint UNKEPT = 0xFFFFFFFFu;
+constant float UNREACHABLE = -1.0e9f;
+
 kernel void lm_head_logp(
-    device const float* logits [[buffer(0)]],   // [rows, V]
-    device const uint*  cand   [[buffer(1)]],   // [rows, K]
+    device const float* logits [[buffer(0)]],   // [rows, C]
+    device const uint*  cand   [[buffer(1)]],   // [rows, K] column indices
     device float*       out    [[buffer(2)]],   // [rows, K]
-    constant uint&      vocab  [[buffer(3)]],
+    constant uint&      columns [[buffer(3)]],
     constant uint&      count  [[buffer(4)]],
     uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_position_in_threadgroup]])
@@ -531,8 +541,8 @@ kernel void lm_head_logp(
     const uint row = tgid;
     threadgroup float tg_red[HID];
     float m = -INFINITY;
-    for (uint v = tid; v < vocab; v += HID) {
-        m = max(m, logits[row * vocab + v]);
+    for (uint v = tid; v < columns; v += HID) {
+        m = max(m, logits[row * columns + v]);
     }
     tg_red[tid] = m;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -542,8 +552,8 @@ kernel void lm_head_logp(
     }
     const float mx = tg_red[0];
     float sum = 0.0f;
-    for (uint v = tid; v < vocab; v += HID) {
-        sum += exp(logits[row * vocab + v] - mx);
+    for (uint v = tid; v < columns; v += HID) {
+        sum += exp(logits[row * columns + v] - mx);
     }
     tg_red[tid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -554,7 +564,7 @@ kernel void lm_head_logp(
     const float lse = mx + log(tg_red[0]);
     for (uint i = tid; i < count; i += HID) {
         const uint c = cand[row * count + i];
-        out[row * count + i] = logits[row * vocab + c] - lse;
+        out[row * count + i] = c == UNKEPT ? UNREACHABLE : logits[row * columns + c] - lse;
     }
 }
 
@@ -569,6 +579,11 @@ template [[host_name("lm_embed_f16")]] kernel void lm_embed<0, 0>(
     device const float*, device const float*, constant uint&,
     device half*, device atomic_float*, uint, uint, uint, uint);
 template [[host_name("lm_embed_f32")]] kernel void lm_embed<2, 2>(
+    device float*, device const void*, device const float*, device const float*,
+    device const uint*, device const uint*, device const void*,
+    device const float*, device const float*, constant uint&,
+    device half*, device atomic_float*, uint, uint, uint, uint);
+template [[host_name("lm_embed_f32_i8")]] kernel void lm_embed<2, 1>(
     device float*, device const void*, device const float*, device const float*,
     device const uint*, device const uint*, device const void*,
     device const float*, device const float*, constant uint&,
@@ -1020,7 +1035,7 @@ enum WeightKind {
     F16,
     /// `onnx::MatMul_*_int8` `[in, out]` i8 + a per-out fp32 scale.
     Int8,
-    /// `model.*` fp32, transposed to `[in, out]` at pack.
+    /// `onnx::MatMul_*` `[in, out]` fp32.
     Float32,
 }
 
@@ -1217,6 +1232,13 @@ fn transposed_f32(src: &[f32], out: usize, inner: usize) -> Vec<f32> {
         }
     }
     dst
+}
+
+/// fp32 values cast to fp16 bytes in the same order.
+fn f16_of_f32(src: &[f32]) -> Vec<u8> {
+    src.iter()
+        .flat_map(|&value| half::f16::from_f32(value).to_le_bytes())
+        .collect()
 }
 
 /// *src* `[out, in]` fp32 transposed and cast into `[in, out]` fp16 bytes.
@@ -1427,13 +1449,23 @@ pub struct MetalStep {
     logp: Buffer,
     /// `(rows, width, count)` the scratch/output buffers were sized for.
     scratch_shape: (usize, usize, usize),
-    /// Embedding + tied head table `[H, V]` in the weights' dtype.
+    /// The embedding lookup's table `[H, V]` — the tied head's own
+    /// buffer over a whole alphabet, the export's `model.embed.weight`
+    /// under a restriction.
     w_embed: Buffer,
-    /// `embed_f16` — the same table as fp16 `[V, H]` for `lm_sm` and the
-    /// `lm_mm` head matmul.
-    embed_f16: Option<Buffer>,
-    /// Its per-out scale, or the one-element dummy when the dtype is f32.
+    /// Its per-out scale, or the one-element dummy when it has none.
     s_embed: Buffer,
+    /// The tied head's table `[H, C]` in the weights' dtype — `C` the
+    /// alphabet, or a restricted export's kept columns.
+    w_tied: Buffer,
+    /// As `s_embed`, for `w_tied`.
+    s_tied: Buffer,
+    /// `w_tied` as fp16 `[C, H]` for `lm_sm`.
+    tied_f16: Option<Buffer>,
+    /// A candidate id's column in the tied head under a restriction —
+    /// `UNKEPT` for an id it dropped; `None` when the head covers the
+    /// whole alphabet and an id is its own column.
+    kept_column: Option<Vec<u32>>,
     /// `input.weight` `[H, H]` (transposed `[in, out]`), same dtype.
     w_in: Buffer,
     /// As `s_embed`.
@@ -1522,13 +1554,15 @@ pub struct MetalStep {
     last_profile: Vec<(String, f64, u64)>,
     /// The last `step`'s host/GPU wall split — [`Self::timing`].
     last_timing: StepTiming,
-    /// `layers`/`heads`/`head_dim`/`vocab`/`hidden`/`ff` of the manifest —
+    /// `layers`/`heads`/`head_dim`/`hidden`/`ff` of the manifest —
     /// asserted equal to the kernel's compile-time values.
     layers: usize,
     /// As `layers`.
     hidden: usize,
-    /// As `layers`.
-    vocab: usize,
+    /// The alphabet's size — the embedding table's rows.
+    alphabet: usize,
+    /// The tied head's columns — the alphabet, or the kept ids.
+    columns: usize,
     /// `ff` — the feed-forward width the manifest recorded.
     feedforward: usize,
 }
@@ -1553,21 +1587,9 @@ impl MetalStep {
         table: &WeightsFile,
         map: &[u8],
         weights: MetalWeights,
+        alphabet: usize,
+        kept: Option<&[u32]>,
     ) -> Result<Self, LmError> {
-        type LayerWeights<'t> = (
-            Buffer,
-            Buffer,
-            Buffer,
-            Buffer,
-            Buffer,
-            usize,
-            Vec<(
-                &'t WeightTensor,
-                &'t WeightTensor,
-                &'t WeightTensor,
-                &'t WeightTensor,
-            )>,
-        );
         let mismatched = |reason: String| LmError::Weights {
             path: table.file.clone().into(),
             reason,
@@ -1627,9 +1649,9 @@ impl MetalStep {
                 scale.map_or_else(|| dummy.clone(), |s| buffer_of(&device, s)),
             )
         };
-        // A matmul tensor's `[in, out]` bytes: int8 already carries them;
-        // fp32 comes as torch's `[out, in]` and transposes at pack; fp16
-        // converts either to the same packed `[in, out]` layout.
+        // A matmul tensor's packed `[in, out]` bytes — the layout both
+        // exports store their matmuls in: int8 with its per-out scale,
+        // fp32 as is, fp16 converted from either.
         let matrix = |tensor: &WeightTensor,
                       inner: usize,
                       out: usize|
@@ -1674,20 +1696,16 @@ impl MetalStep {
                         ))
                     }
                     WeightDtype::Float32 => {
-                        if tensor.shape != vec![dim(out), dim(inner)] {
+                        if tensor.shape != vec![dim(inner), dim(out)] {
                             return Err(mismatched(format!(
-                                "{} is {:?}, not [{out}, {inner}]",
+                                "{} is {:?}, not [{inner}, {out}]",
                                 tensor.name, tensor.shape
                             )));
                         }
                         Ok((
                             buffer_of(
                                 &device,
-                                &transposed_f16(
-                                    f32s(tensor_bytes(map, table, tensor)?),
-                                    out,
-                                    inner,
-                                ),
+                                &f16_of_f32(f32s(tensor_bytes(map, table, tensor)?)),
                             ),
                             dummy.clone(),
                         ))
@@ -1701,127 +1719,138 @@ impl MetalStep {
                     if tensor.dtype != WeightDtype::Float32 {
                         return Err(mismatched(format!("{} is not float32", tensor.name)));
                     }
-                    if tensor.shape != vec![dim(out), dim(inner)] {
+                    if tensor.shape != vec![dim(inner), dim(out)] {
                         return Err(mismatched(format!(
-                            "{} is {:?}, not [{out}, {inner}]",
+                            "{} is {:?}, not [{inner}, {out}]",
                             tensor.name, tensor.shape
                         )));
                     }
                     Ok((
-                        buffer_of_f32(
-                            &device,
-                            &transposed_f32(f32s(tensor_bytes(map, table, tensor)?), out, inner),
-                        ),
+                        buffer_of_f32(&device, f32s(tensor_bytes(map, table, tensor)?)),
                         dummy.clone(),
                     ))
                 }
             }
         };
-        // The int8 export names its matmuls `onnx::MatMul_<id>_int8`: the
-        // first by id is the input projection, each block then adds its four
-        // in order (qkv, out, ff.0, ff.2), and the last is the tied table.
-        // `cold` collects the int8 tables' map ranges — they are read into
-        // buffers and repacks below, and the mmap pages are advised cold
-        // before the struct returns so they stop occupying the resident set.
+        // Both exports name their matmuls `onnx::MatMul_<id>` — suffixed
+        // `_int8`, with an `_scale` companion, when quantized — and store
+        // them `[in, out]`. The first by id is the input projection, each
+        // block then adds its four in order (qkv, out, ff.0, ff.2), and the
+        // last is the tied head's table: the whole alphabet's, or a
+        // restricted export's kept columns. `cold` collects the map ranges
+        // read into buffers and repacks below; the mmap pages are advised
+        // cold before the struct returns so they stop occupying the
+        // resident set.
         let mut cold: Vec<(u64, u64)> = Vec::new();
-        let (w_embed, s_embed, w_in, s_in, b_in, vocab, by_layer): LayerWeights<'_> = if i8_layout {
-            let mut mats: Vec<&WeightTensor> = table
-                .tensors
-                .iter()
-                .filter(|t| t.dtype == WeightDtype::Int8)
-                .collect();
-            mats.sort_by_key(|t| {
-                t.name
-                    .strip_prefix("onnx::MatMul_")
-                    .and_then(|n| n.strip_suffix("_int8"))
-                    .and_then(|n| n.parse::<u64>().ok())
-                    .unwrap_or(u64::MAX)
-            });
-            if mats.len() != 1 + 4 * layers + 1 {
-                return Err(mismatched(format!(
-                    "expected {} int8 matmuls, found {}",
-                    2 + 4 * layers,
-                    mats.len()
-                )));
-            }
-            cold.extend(mats.iter().map(|t| (t.offset, t.length)));
-            let embed = mats[1 + 4 * layers];
-            if embed.shape.len() != 2 || embed.shape[0] != dim(hidden) {
-                return Err(mismatched(format!(
-                    "the tied embed is {:?}, not [{hidden}, vocab]",
-                    embed.shape
-                )));
-            }
-            let vocab = usize::try_from(embed.shape[1])
-                .map_err(|_| mismatched("the embed's vocab axis is negative".to_owned()))?;
-            let (w_embed, s_embed) = matrix(embed, hidden, vocab)?;
-            let (w_in, s_in) = matrix(mats[0], hidden, hidden)?;
-            let bias = f32s(tensor_bytes(map, table, named("model.input.bias")?)?);
-            if bias.len() != hidden {
-                return Err(mismatched("model.input.bias is not [hidden]".to_owned()));
-            }
-            let mut by_layer = Vec::with_capacity(layers);
-            for block in 0..layers {
-                by_layer.push((
+        let matmul_dtype = if i8_layout {
+            WeightDtype::Int8
+        } else {
+            WeightDtype::Float32
+        };
+        let mut numbered: Vec<(u64, &WeightTensor)> = table
+            .tensors
+            .iter()
+            .filter(|tensor| tensor.dtype == matmul_dtype)
+            .filter_map(|tensor| {
+                let id = tensor.name.strip_prefix("onnx::MatMul_")?;
+                let id = if i8_layout {
+                    id.strip_suffix("_int8")?
+                } else {
+                    id
+                };
+                Some((id.parse::<u64>().ok()?, tensor))
+            })
+            .collect();
+        numbered.sort_by_key(|&(id, _)| id);
+        let mats: Vec<&WeightTensor> = numbered.into_iter().map(|(_, tensor)| tensor).collect();
+        if mats.len() != 2 + 4 * layers {
+            return Err(mismatched(format!(
+                "expected {} matmuls, found {}",
+                2 + 4 * layers,
+                mats.len()
+            )));
+        }
+        cold.extend(mats.iter().map(|tensor| (tensor.offset, tensor.length)));
+        let columns = kept.map_or(alphabet, <[u32]>::len);
+        let tied = mats[1 + 4 * layers];
+        if tied.shape != vec![dim(hidden), dim(columns)] {
+            return Err(mismatched(format!(
+                "the tied head is {:?}, not [{hidden}, {columns}]",
+                tied.shape
+            )));
+        }
+        let (w_tied, s_tied) = matrix(tied, hidden, columns)?;
+        let (w_in, s_in) = matrix(mats[0], hidden, hidden)?;
+        let b_in = f32s(tensor_bytes(map, table, named("model.input.bias")?)?);
+        if b_in.len() != hidden {
+            return Err(mismatched("model.input.bias is not [hidden]".to_owned()));
+        }
+        let b_in = buffer_of_f32(&device, b_in);
+        let by_layer: Vec<[&WeightTensor; 4]> = (0..layers)
+            .map(|block| {
+                [
                     mats[1 + 4 * block],
                     mats[2 + 4 * block],
                     mats[3 + 4 * block],
                     mats[4 + 4 * block],
-                ));
-            }
-            Ok::<_, LmError>((
-                w_embed,
-                s_embed,
-                w_in,
-                s_in,
-                buffer_of_f32(&device, bias),
-                vocab,
-                by_layer,
-            ))
+                ]
+            })
+            .collect();
+        // The embedding lookup reads the whole alphabet: the tied table
+        // itself when it is unrestricted, `model.embed.weight` packed
+        // `[H, V]` when a restriction cut the head to its kept columns —
+        // fp16 for the fp16 step, fp32 otherwise (the int8 step pairs it
+        // with its int8 input projection in `lm_embed_f32_i8`).
+        let (w_embed, s_embed, embed_kernel) = if kept.is_none() {
+            (w_tied.clone(), s_tied.clone(), format!("lm_embed_{suffix}"))
         } else {
             let embed = named("model.embed.weight")?;
-            if embed.shape.len() != 2 || embed.shape[1] != dim(hidden) {
+            if embed.shape != vec![dim(alphabet), dim(hidden)] {
                 return Err(mismatched(format!(
-                    "model.embed.weight is {:?}, not [vocab, {hidden}]",
+                    "model.embed.weight is {:?}, not [{alphabet}, {hidden}]",
                     embed.shape
                 )));
             }
-            let vocab = usize::try_from(embed.shape[0])
-                .map_err(|_| mismatched("the embed's vocab axis is negative".to_owned()))?;
-            let (w_embed, _) = matrix(embed, hidden, vocab)?;
-            let (w_in, _) = matrix(named("model.input.weight")?, hidden, hidden)?;
-            let bias = f32s(tensor_bytes(map, table, named("model.input.bias")?)?);
-            if bias.len() != hidden {
-                return Err(mismatched("model.input.bias is not [hidden]".to_owned()));
+            cold.push((embed.offset, embed.length));
+            let values = f32s(tensor_bytes(map, table, embed)?);
+            match kind {
+                WeightKind::F16 => (
+                    buffer_of(&device, &transposed_f16(values, alphabet, hidden)),
+                    dummy.clone(),
+                    "lm_embed_f16".to_owned(),
+                ),
+                WeightKind::Int8 => (
+                    buffer_of_f32(&device, &transposed_f32(values, alphabet, hidden)),
+                    dummy.clone(),
+                    "lm_embed_f32_i8".to_owned(),
+                ),
+                WeightKind::Float32 => (
+                    buffer_of_f32(&device, &transposed_f32(values, alphabet, hidden)),
+                    dummy.clone(),
+                    "lm_embed_f32".to_owned(),
+                ),
             }
-            let mut by_layer = Vec::with_capacity(layers);
-            for block in 0..layers {
-                by_layer.push((
-                    named(&format!("model.blocks.{block}.qkv.weight"))?,
-                    named(&format!("model.blocks.{block}.out.weight"))?,
-                    named(&format!("model.blocks.{block}.ff.0.weight"))?,
-                    named(&format!("model.blocks.{block}.ff.2.weight"))?,
-                ));
-            }
-            Ok::<_, LmError>((
-                w_embed,
-                dummy.clone(),
-                w_in,
-                dummy.clone(),
-                buffer_of_f32(&device, bias),
-                vocab,
-                by_layer,
-            ))
-        }?;
-        // The weight stack's axes follow the source layout, not the packed
-        // kind: int8 tensors are `[in, out]`, fp32 torch's `[out, in]`.
-        let ff0 = by_layer[0].2;
-        let feedforward = match ff0.dtype {
-            WeightDtype::Int8 => usize::try_from(ff0.shape[1])
-                .map_err(|_| mismatched("the ff.0 out axis is negative".to_owned()))?,
-            _ => usize::try_from(ff0.shape[0])
-                .map_err(|_| mismatched("the ff.0 out axis is negative".to_owned()))?,
         };
+        // A candidate id's column in the tied head: the id itself over the
+        // whole alphabet, its index in the kept ids under a restriction,
+        // `UNKEPT` for an id the restriction dropped.
+        let kept_column = kept
+            .map(|kept| {
+                let mut column = vec![UNKEPT; alphabet];
+                for (index, &id) in kept.iter().enumerate() {
+                    let slot = usize::try_from(id)
+                        .ok()
+                        .and_then(|id| column.get_mut(id))
+                        .ok_or_else(|| {
+                            mismatched(format!("the kept id {id} is outside the alphabet"))
+                        })?;
+                    *slot = u32::try_from(index).expect("a kept column fits u32");
+                }
+                Ok::<_, LmError>(column)
+            })
+            .transpose()?;
+        let feedforward = usize::try_from(by_layer[0][2].shape[1])
+            .map_err(|_| mismatched("the ff.0 out axis is negative".to_owned()))?;
         if feedforward != FF {
             return Err(mismatched(format!(
                 "the kernels are compiled for feed-forward {FF}; the manifest gives {feedforward}"
@@ -1829,10 +1858,11 @@ impl MetalStep {
         }
         // The per-layer packs: every weight stacks its layers contiguously,
         // the kernel's `(layer * HID + i)` stride reaching into them.
-        // `lm_sm` binds the fp16 [N, K] pack — built whenever the table
-        // is int8 (values carried as fp16, scale folded later) or f16
-        // (transposed); fp32 keeps the tiled kernel.
-        let sm_pack = i8_layout || kind == WeightKind::F16;
+        // `lm_sm` binds the fp16 [N, K] pack — built whenever the packed
+        // table is int8 (values carried as fp16, scale folded later) or
+        // f16 (transposed); fp32 keeps the tiled kernel.
+        let sm_pack = kind != WeightKind::Float32;
+        let i8_packed = kind == WeightKind::Int8;
         let mut qkv_w = Vec::new();
         let mut qkv_f16 = Vec::new();
         let mut qkv_s = Vec::new();
@@ -1854,7 +1884,7 @@ impl MetalStep {
         // op family — collected as the repacks fold the LN weights in.
         let mut cc_qkv = Vec::new();
         let mut cc_ff0 = Vec::new();
-        for (block, (qkv, out, ff0, ff2)) in by_layer.iter().enumerate() {
+        for (block, &[qkv, out, ff0, ff2]) in by_layer.iter().enumerate() {
             // The norms come first — the repacks fold their weights into
             // the consuming op's table.
             for name in ["norm1.weight", "norm1.bias", "norm2.weight", "norm2.bias"] {
@@ -1872,7 +1902,7 @@ impl MetalStep {
                     &w,
                     hidden,
                     3 * hidden,
-                    i8_layout,
+                    i8_packed,
                     Some((&ln[lb..lb + hidden], &ln[lb + hidden..lb + 2 * hidden])),
                 )
             } else {
@@ -1886,7 +1916,7 @@ impl MetalStep {
             qkv_s.push(s);
             let (w, s) = matrix(out, hidden, hidden)?;
             out_f16.push(if sm_pack {
-                nk_repacked_f16(&device, &w, hidden, hidden, i8_layout, None).0
+                nk_repacked_f16(&device, &w, hidden, hidden, i8_packed, None).0
             } else {
                 None
             });
@@ -1899,7 +1929,7 @@ impl MetalStep {
                     &w,
                     hidden,
                     feedforward,
-                    i8_layout,
+                    i8_packed,
                     Some((
                         &ln[lb + 2 * hidden..lb + 3 * hidden],
                         &ln[lb + 3 * hidden..lb + 4 * hidden],
@@ -1916,7 +1946,7 @@ impl MetalStep {
             ff0_s.push(s);
             let (w, s) = matrix(ff2, feedforward, hidden)?;
             ff2_f16.push(if sm_pack {
-                nk_repacked_f16(&device, &w, feedforward, hidden, i8_layout, None).0
+                nk_repacked_f16(&device, &w, feedforward, hidden, i8_packed, None).0
             } else {
                 None
             });
@@ -1964,10 +1994,10 @@ impl MetalStep {
             }
             Some(concat(&slabs))
         };
-        // The `lm_sm` tables: fp16 `[N, K]` per family — and the embed's
-        // tied table for the head.
-        let embed_f16 = if sm_pack {
-            nk_repacked_f16(&device, &w_embed, hidden, vocab, i8_layout, None).0
+        // The `lm_sm` tables: fp16 `[N, K]` per family — and the tied
+        // table for the head.
+        let tied_f16 = if sm_pack {
+            nk_repacked_f16(&device, &w_tied, hidden, columns, i8_packed, None).0
         } else {
             None
         };
@@ -1978,7 +2008,7 @@ impl MetalStep {
         // The packed `[K, N]` slabs survive only when a repack failed —
         // otherwise `lm_sm` owns every matmul and a four-byte dummy stands in.
         let keep_w = !sm_pack
-            || embed_f16.is_none()
+            || tied_f16.is_none()
             || wh_qkv.is_none()
             || wh_out.is_none()
             || wh_ff0.is_none()
@@ -2040,7 +2070,7 @@ impl MetalStep {
         Ok(Self {
             device: device.clone(),
             queue: device.new_command_queue(),
-            p_embed: pipeline(&format!("lm_embed_{suffix}"))?,
+            p_embed: pipeline(&embed_kernel)?,
             p_mm: pipeline(&format!("lm_mm_{suffix}"))?,
             p_mm_f32: pipeline("lm_mm_f32")?,
             p_sm: {
@@ -2091,9 +2121,12 @@ impl MetalStep {
             next_v: device.new_buffer(4, MTLResourceOptions::StorageModeShared),
             logp: device.new_buffer(4, MTLResourceOptions::StorageModeShared),
             scratch_shape: (0, 0, 0),
-            embed_f16,
             w_embed,
             s_embed,
+            w_tied,
+            s_tied,
+            tied_f16,
+            kept_column,
             w_in,
             s_in,
             b_in,
@@ -2155,7 +2188,8 @@ impl MetalStep {
             last_timing: StepTiming::default(),
             layers,
             hidden,
-            vocab,
+            alphabet,
+            columns,
             feedforward,
         })
     }
@@ -2301,11 +2335,11 @@ impl MetalStep {
         srow: &[i32],
         depths: &[u32],
         cand: &[u32],
-        width: usize,
         count: usize,
+        width: usize,
         slots: usize,
     ) {
-        self.step_inner(token, pages, mask, srow, depths, cand, width, count, slots);
+        self.step_inner(token, pages, mask, srow, depths, cand, count, width, slots);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2386,9 +2420,20 @@ impl MetalStep {
         fill(&self.depths, unsafe {
             std::slice::from_raw_parts(depths.as_ptr().cast::<u8>(), depths.len() * 4)
         });
-        fill(&self.cand, unsafe {
-            std::slice::from_raw_parts(cand.as_ptr().cast::<u8>(), cand.len() * 4)
-        });
+        match &self.kept_column {
+            None => fill(&self.cand, unsafe {
+                std::slice::from_raw_parts(cand.as_ptr().cast::<u8>(), cand.len() * 4)
+            }),
+            Some(column) => {
+                // Safety: `ensure` sized `cand` for `rows * count` u32s.
+                let dst = unsafe {
+                    std::slice::from_raw_parts_mut(self.cand.contents().cast::<u32>(), cand.len())
+                };
+                for (slot, &id) in dst.iter_mut().zip(cand) {
+                    *slot = column[id as usize];
+                }
+            }
+        }
     }
 
     /// The `MmSpec` for an op — every field the `lm_mm` ABI takes.
@@ -2553,7 +2598,7 @@ impl MetalStep {
             },
             Op::MmHeadMat => MmSpec {
                 pipe: &self.p_mm,
-                wh: self.embed_f16.as_ref(),
+                wh: self.tied_f16.as_ref(),
                 a16: &self.x16,
                 cc: &self.dummy,
                 cc_off: 0,
@@ -2561,9 +2606,9 @@ impl MetalStep {
                 a: &self.g_y,
                 ln: &self.dummy,
                 ln_off: 0,
-                w: &self.w_embed,
+                w: &self.w_tied,
                 w_off: 0,
-                s: &self.s_embed,
+                s: &self.s_tied,
                 s_off: 0,
                 bias: &self.dummy,
                 bias_off: 0,
@@ -2573,9 +2618,9 @@ impl MetalStep {
                 out3: &self.dummy,
                 flags: sc,
                 k: hidden32,
-                n: u32::try_from(self.vocab).expect("the vocab fits u32"),
+                n: u32::try_from(self.columns).expect("the head's columns fit u32"),
                 lda: hidden32,
-                ldn: u32::try_from(self.vocab).expect("the vocab fits u32"),
+                ldn: u32::try_from(self.columns).expect("the head's columns fit u32"),
                 layer: 0,
             },
             _ => unreachable!("only the Mm ops reach mm_spec"),
@@ -2689,8 +2734,8 @@ impl MetalStep {
                 enc.set_buffer(6, Some(&self.w_in), 0);
                 enc.set_buffer(7, Some(&self.s_in), 0);
                 enc.set_buffer(8, Some(&self.b_in), 0);
-                let vocab = u32::try_from(self.vocab).expect("the vocab fits u32");
-                enc.set_bytes(9, 4, std::ptr::from_ref(&vocab).cast());
+                let alphabet = u32::try_from(self.alphabet).expect("the alphabet fits u32");
+                enc.set_bytes(9, 4, std::ptr::from_ref(&alphabet).cast());
                 enc.set_buffer(10, Some(&self.x16), 0);
                 enc.set_buffer(11, Some(&self.st), 0);
                 enc.dispatch_thread_groups(
@@ -2723,9 +2768,9 @@ impl MetalStep {
                 enc.set_buffer(0, Some(&self.logits), 0);
                 enc.set_buffer(1, Some(&self.cand), 0);
                 enc.set_buffer(2, Some(&self.logp), 0);
-                let vocab = u32::try_from(self.vocab).expect("the vocab fits u32");
+                let columns = u32::try_from(self.columns).expect("the head's columns fit u32");
                 let count32 = u32::try_from(ctx.count).expect("a candidate count fits u32");
-                enc.set_bytes(3, 4, std::ptr::from_ref(&vocab).cast());
+                enc.set_bytes(3, 4, std::ptr::from_ref(&columns).cast());
                 enc.set_bytes(4, 4, std::ptr::from_ref(&count32).cast());
                 enc.dispatch_thread_groups(
                     MTLSize::new(rows64, 1, 1),
@@ -2841,7 +2886,7 @@ impl MetalStep {
     fn op_weight_bytes(&self, op: Op, _ctx: &StepCtx) -> u64 {
         let h = u64::try_from(self.hidden).expect("the hidden size fits u64");
         let f = u64::try_from(self.feedforward).expect("the ff width fits u64");
-        let v = u64::try_from(self.vocab).expect("the vocab fits u64");
+        let v = u64::try_from(self.columns).expect("the head's columns fit u64");
         // The fp16 [N, K] repack is the weight table whenever it exists.
         let repack =
             |f16_tab: &Option<Buffer>| -> u64 { f16_tab.as_ref().map_or(self.w_elem, |_| 2) };
@@ -2850,7 +2895,7 @@ impl MetalStep {
             Op::MmOut(_) => repack(&self.wh_out),
             Op::MmFfn0(_) => repack(&self.wh_ff0),
             Op::MmFfn2(_) => repack(&self.wh_ff2),
-            Op::MmHeadMat => repack(&self.embed_f16),
+            Op::MmHeadMat => repack(&self.tied_f16),
             _ => self.w_elem,
         };
         match op {
@@ -2927,7 +2972,7 @@ impl MetalStep {
         self.g_qkv = zero(&self.device, r * 3 * self.hidden * 4);
         self.g_ff = zero(&self.device, r * self.feedforward * 4);
         self.g_y = zero(&self.device, r * self.hidden * 4);
-        self.logits = zero(&self.device, r * self.vocab * 4);
+        self.logits = zero(&self.device, r * self.columns * 4);
         self.g_sc = zero(&self.device, r * HEADS * (w + 1) * 4);
         self.next_k = zero(&self.device, r * self.layers * self.hidden * 4);
         self.next_v = zero(&self.device, r * self.layers * self.hidden * 4);

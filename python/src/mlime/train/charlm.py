@@ -985,7 +985,7 @@ def export_onnx(
                     ],
                 },
                 "specials": {"pad": PAD, "bos": BOS, "eos": EOS, "sep": SEP, "unk": UNK},
-                "restricted_to": None if keep is None else int(keep.numel()),
+                "kept": None if keep is None else [int(i) for i in keep.tolist()],
                 "weights": weights,
                 "chars": list(vocab.chars),
             },
