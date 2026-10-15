@@ -122,15 +122,18 @@ def decode_lanes(
             torch._dynamo.maybe_mark_dynamic(tensor, 0)
         for tensor in (keys, values):
             torch._dynamo.maybe_mark_dynamic(tensor, (0, 3))
-        logits = decoder.step(
+        at = positions[position]
+        logits, (new_keys, new_values) = decoder.step(
             tokens,
             span_vector,
-            positions[position],
+            at,
             (keys, values),
             encoder_kv,  # type: ignore[arg-type]
             encoder_mask,
             candidates=everything,
         )
+        keys.index_copy_(3, at.view(1), new_keys)
+        values.index_copy_(3, at.view(1), new_values)
         admitted = masks[lane_of_row, position]
         log_probs = logits.float().log_softmax(dim=-1).masked_fill(~admitted, float("-inf"))
         if ragged:

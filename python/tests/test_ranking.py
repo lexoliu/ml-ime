@@ -181,11 +181,13 @@ def test_a_compiled_step_stops_compiling_once_warm(lexicon: Lexicon, spans: Span
             for owner, pick in enumerate(picks)
         ]
 
-    # Ragged and even, each at two lengths: a first trace whose sizes happen
-    # to equal another dimension's is specialised to them, and the second
-    # length makes the graph general. Then new rows, lengths and caches.
-    warming = [batch(0, 1), batch(5, 0), batch(1, 6), batch(3, 3)]
-    warm = [batch(2, 3, 4, 1), batch(0, 3, 6), batch(4, 4, 2), batch(4, 4), batch(6, 6, 6)]
+    # Ragged and even, each at two lengths, three lanes apiece: sizes that
+    # equal another dimension of the tiny model on the first trace (two
+    # layers, four heads) would be guarded equal to it, and a run's first
+    # batches do not have such coincidences to offer. Then new rows,
+    # lengths, and the coincident sizes themselves.
+    warming = [batch(2, 3, 1), batch(5, 0, 3), batch(3, 3, 3), batch(2, 4, 2)]
+    warm = [batch(0, 1), batch(6, 6), batch(2, 3, 4, 1), batch(5, 5, 5, 5, 5), batch(0, 0, 0, 0)]
     torch._dynamo.reset()
     with torch.no_grad():
         eager = [decode_lanes(model, lanes, 4) for lanes in warming + warm]

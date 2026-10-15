@@ -11,15 +11,12 @@ itself.
 
 from __future__ import annotations
 
-import functools
 from collections import Counter
-from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
 
 import torch
-import torch.fx.experimental._config
 from transformers import BertConfig
 
 from mlime.data.shards import shard_paths
@@ -189,30 +186,14 @@ def compile_modules(model: E2EModel, mode: str) -> None:
     a position, and eager dispatch of those took longer than the card took
     to run them.
     """
-    model.encode = _compiled(model.encode, mode)  # type: ignore[method-assign]
-    model.decoder.forward = _compiled(model.decoder.forward, mode)  # type: ignore[method-assign]
-    model.decoder.step = _compiled(model.decoder.step, mode)  # type: ignore[method-assign]
+    model.encode = torch.compile(model.encode, dynamic=True, mode=mode)  # type: ignore[method-assign]
+    model.decoder.forward = torch.compile(  # type: ignore[method-assign]
+        model.decoder.forward, dynamic=True, mode=mode
+    )
+    model.decoder.step = torch.compile(  # type: ignore[method-assign]
+        model.decoder.step, dynamic=True, mode=mode
+    )
     log.info("towers and decoder compiled", mode=mode)
-
-
-def _compiled(function: Callable[..., Any], mode: str) -> Callable[..., Any]:
-    """*function* compiled with every dimension its own, as dynamic as it varies.
-
-    Dynamo's duck sizing gives two dimensions one symbol when they are equal
-    on the first trace -- a search over two lanes in a two-layer decoder, a
-    reading as long as the head count -- and the graph is then guarded on
-    that coincidence: the next batch recompiles, and enough of them reach
-    the recompile limit, past which the call runs eager for good.
-    """
-    compiled = torch.compile(function, dynamic=True, mode=mode)
-
-    @functools.wraps(function)
-    def call(*args: Any, **kwargs: Any) -> Any:
-        # `patch` is installed on the config module at import; its stub lacks it.
-        with torch.fx.experimental._config.patch(use_duck_shape=False):  # type: ignore[attr-defined]
-            return compiled(*args, **kwargs)
-
-    return call
 
 
 def e2e(

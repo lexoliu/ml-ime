@@ -302,14 +302,17 @@ def test_the_step_path_matches_the_teacher_forced_path(
         values = keys.clone()
         got = []
         for position in range(n):
-            step_logits = decoder.step(
+            at = torch.tensor(position)
+            step_logits, (new_keys, new_values) = decoder.step(
                 tokens[:, position],
                 spans_v[position].unsqueeze(0),
-                torch.tensor(position),
+                at,
                 (keys, values),
                 encoder_kv,
                 candidates=candidates[position],
             )
+            keys.index_copy_(3, at.view(1), new_keys)
+            values.index_copy_(3, at.view(1), new_values)
             got.append(step_logits[0])
         for position, (g, w) in enumerate(zip(got, wanted, strict=True)):
             assert torch.allclose(g, w, atol=1e-5), f"position {position} differs"
