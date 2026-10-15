@@ -2165,7 +2165,11 @@ mod tests {
         assert!(dev > 0 && dev < total, "the fixture must split");
         let table = SyllableTable::load();
         let lm_lexicon = Lexicon::parse(&lexicon, &table).expect("the fixture lexicon parses");
+        let environment = ort::init()
+            .build()
+            .expect("the test builds its environment");
         let lm = CharLm::open(
+            &environment,
             &fixtures.join("transformer"),
             &lm_lexicon,
             ime_lm::SessionShape::default(),

@@ -74,13 +74,17 @@ fn metal_step_matches_cpu_at_every_row_tile() {
             .expect("needs a resident-pages int8 export: set CHARLM_LM_DIR"),
     );
     let lexicon = Lexicon::load(&SyllableTable::load()).expect("the lexicon loads");
+    let environment = ort::init()
+        .build()
+        .expect("the test builds its environment");
     let shape = |backend| SessionShape {
         backend,
         ..SessionShape::default()
     };
-    let cpu = CharLm::open(&dir, &lexicon, shape(Backend::Cpu)).expect("the cpu backend opens");
-    let metal =
-        CharLm::open(&dir, &lexicon, shape(Backend::Metal)).expect("the metal backend opens");
+    let cpu = CharLm::open(&environment, &dir, &lexicon, shape(Backend::Cpu))
+        .expect("the cpu backend opens");
+    let metal = CharLm::open(&environment, &dir, &lexicon, shape(Backend::Metal))
+        .expect("the metal backend opens");
 
     let chars: Vec<char> = "的一了是我不在人们有来他这上着个地到大里说就去子得也和那要下看天时过出小么起你都把好还多没为又可家学只以主会样年想生同老中十从自面前头道它后然走很像见两用她国动进成回什边作对开而己些现山民候经发工向事命给长水几义三声于高手知理眼志点心战二问清身方空写等入死由平员客关先义军文世些边光即今从黑联步至".chars().collect();
     let ids: Vec<CharId> = chars

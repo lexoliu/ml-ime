@@ -8,6 +8,9 @@
 //! generated tables, and the emittable restriction is the fixture's nine
 //! characters.
 
+mod common;
+
+use common::environment;
 use ime_decode::{
     BeamOptions, Candidates, Emittable, LatticeRecord, NoTransition, Record, Scored, Weighted,
     decode_many, lattice_paths,
@@ -136,8 +139,8 @@ where
 #[test]
 fn replay_equals_full_decode() {
     let dir = fixture_dir();
-    let towers =
-        RouteA::open(&dir.join("fp32"), SessionShape::default()).expect("the fixture towers open");
+    let towers = RouteA::open(environment(), &dir.join("fp32"), SessionShape::default())
+        .expect("the fixture towers open");
     let table = SyllableTable::load();
     let lexicon = lexicon();
     let emittable = emittable(&dir, &lexicon);
@@ -162,8 +165,8 @@ fn replay_equals_full_decode() {
 #[test]
 fn apostrophe_is_a_boundary() {
     let dir = fixture_dir();
-    let towers =
-        RouteA::open(&dir.join("fp32"), SessionShape::default()).expect("the fixture towers open");
+    let towers = RouteA::open(environment(), &dir.join("fp32"), SessionShape::default())
+        .expect("the fixture towers open");
     let table = SyllableTable::load();
     let lexicon = lexicon();
     let emittable = emittable(&dir, &lexicon);
@@ -195,8 +198,8 @@ fn apostrophe_is_a_boundary() {
 #[test]
 fn select_consumes_and_commits_to_context() {
     let dir = fixture_dir();
-    let towers =
-        RouteA::open(&dir.join("fp32"), SessionShape::default()).expect("the fixture towers open");
+    let towers = RouteA::open(environment(), &dir.join("fp32"), SessionShape::default())
+        .expect("the fixture towers open");
     let table = SyllableTable::load();
     let lexicon = lexicon();
     let emittable = emittable(&dir, &lexicon);
@@ -222,8 +225,8 @@ fn select_consumes_and_commits_to_context() {
 #[test]
 fn prefix_commit_leaves_rest_pending() {
     let dir = fixture_dir();
-    let towers =
-        RouteA::open(&dir.join("fp32"), SessionShape::default()).expect("the fixture towers open");
+    let towers = RouteA::open(environment(), &dir.join("fp32"), SessionShape::default())
+        .expect("the fixture towers open");
     let table = SyllableTable::load();
     let lexicon = lexicon();
     let emittable = emittable(&dir, &lexicon);
@@ -253,8 +256,8 @@ fn prefix_commit_leaves_rest_pending() {
 #[test]
 fn prefix_candidates_at_syllable_boundaries() {
     let dir = fixture_dir();
-    let towers =
-        RouteA::open(&dir.join("fp32"), SessionShape::default()).expect("the fixture towers open");
+    let towers = RouteA::open(environment(), &dir.join("fp32"), SessionShape::default())
+        .expect("the fixture towers open");
     let table = SyllableTable::load();
     let lexicon = lexicon();
     let emittable = emittable(&dir, &lexicon);

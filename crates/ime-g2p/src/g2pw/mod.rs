@@ -19,6 +19,7 @@ use crate::error::{Error, Result};
 use crate::outcome::{Annotator, Outcome, Reading, Refusal};
 use crate::text::is_han;
 use features::{Features, features};
+use ort::environment::Environment;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor;
@@ -113,14 +114,20 @@ pub struct Converter {
 }
 
 impl Converter {
-    /// Load the model, its tables and the BERT tokenizer.
+    /// Load the model into a session of *environment*, its tables and the
+    /// BERT tokenizer.
     ///
     /// # Errors
     ///
     /// If the model directory does not hold `g2pw.onnx` and the two character
     /// tables, if the tokenizer cannot be read, or if the tables no longer match
     /// the network's label space.
-    pub fn load(model_dir: &Path, tokenizer_path: &Path, batch_size: usize) -> Result<Self> {
+    pub fn load(
+        environment: &Environment,
+        model_dir: &Path,
+        tokenizer_path: &Path,
+        batch_size: usize,
+    ) -> Result<Self> {
         let model = model_dir.join("g2pw.onnx");
         if !model.exists() {
             return Err(Error::Missing {
@@ -136,7 +143,7 @@ impl Converter {
                 path: tokenizer_path.to_owned(),
                 source,
             })?;
-        let session = open_session(&model)?;
+        let session = open_session(environment, &model)?;
         Ok(Self {
             session,
             tokenizer,
@@ -269,8 +276,8 @@ impl Converter {
 
 /// Open the ONNX session with the same options the Python `G2PWConverter` uses:
 /// every graph optimization, sequential execution, two intra-op threads.
-fn open_session(model: &Path) -> ort::Result<Session> {
-    let mut builder = Session::builder()?
+fn open_session(environment: &Environment, model: &Path) -> ort::Result<Session> {
+    let mut builder = Session::builder(environment)?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
         .with_parallel_execution(false)?
         .with_intra_threads(2)?;
@@ -315,13 +322,19 @@ pub struct G2pwAnnotator {
 }
 
 impl G2pwAnnotator {
-    /// Load the model and start its worker thread.
+    /// Load the model into a session of *environment* and start its worker
+    /// thread.
     ///
     /// # Errors
     ///
     /// Whatever [`Converter::load`] refuses on.
-    pub fn new(model_dir: &Path, tokenizer_path: &Path, batch_size: usize) -> Result<Self> {
-        let mut converter = Converter::load(model_dir, tokenizer_path, batch_size)?;
+    pub fn new(
+        environment: &Environment,
+        model_dir: &Path,
+        tokenizer_path: &Path,
+        batch_size: usize,
+    ) -> Result<Self> {
+        let mut converter = Converter::load(environment, model_dir, tokenizer_path, batch_size)?;
         let (sender, mut receiver) = mpsc::unbounded_channel::<Request>();
         let worker = std::thread::Builder::new()
             .name("g2pw".to_owned())

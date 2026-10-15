@@ -5,6 +5,9 @@
 //! lexicon — a real graph with an eight-character alphabet — so the check
 //! runs the real `advance`/`compact` path, not a mock.
 
+mod common;
+
+use common::environment;
 use ime_decode::{BeamOptions, Candidates, Record, Uniform, decode_many};
 use ime_lm::{CharLm, SessionShape};
 use ime_pinyin::{Lexicon, SegmentLattice, SegmentOptions, SyllableTable};
@@ -31,6 +34,7 @@ fn lexicon() -> Lexicon {
 /// The fixture model with a 64-row state cache.
 fn model() -> CharLm {
     CharLm::open(
+        environment(),
         &fixture_dir().join("transformer"),
         &lexicon(),
         SessionShape {

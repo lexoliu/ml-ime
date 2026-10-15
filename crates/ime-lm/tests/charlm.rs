@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{AskedRecord, alphabet, expected, fixture_dir, lexicon, shape};
+use common::{AskedRecord, alphabet, environment, expected, fixture_dir, lexicon, shape};
 use ime_decode::{Asked, Transition};
 use ime_lm::{CharLm, LmState};
 use ime_pinyin::Lexicon;
@@ -53,7 +53,8 @@ fn run(arch: &str, atol: f32) {
     let dir = fixture_dir();
     let lexicon = lexicon(&dir);
     let alphabet = alphabet(&dir, arch);
-    let model = CharLm::open(&dir.join(arch), &lexicon, shape()).expect("the fixture opens");
+    let model =
+        CharLm::open(environment(), &dir.join(arch), &lexicon, shape()).expect("the fixture opens");
     let expected = expected(&dir, arch);
     assert_eq!(expected.beams.len(), 2, "the fixture has two beams");
 
@@ -170,8 +171,8 @@ fn run(arch: &str, atol: f32) {
 fn transformer_rows_from_different_records_match_solo_runs() {
     let dir = fixture_dir();
     let lexicon = lexicon(&dir);
-    let model =
-        CharLm::open(&dir.join("transformer"), &lexicon, shape()).expect("the fixture opens");
+    let model = CharLm::open(environment(), &dir.join("transformer"), &lexicon, shape())
+        .expect("the fixture opens");
     let expected = expected(&dir, "transformer");
 
     // A second prelude half as long, so its row of the batch is padded.
@@ -246,7 +247,8 @@ fn transformer_rows_from_different_records_match_solo_runs() {
 fn an_unasked_candidate_panics() {
     let dir = fixture_dir();
     let lexicon = lexicon(&dir);
-    let model = CharLm::open(&dir.join("lstm"), &lexicon, shape()).expect("the fixture opens");
+    let model = CharLm::open(environment(), &dir.join("lstm"), &lexicon, shape())
+        .expect("the fixture opens");
     let expected = expected(&dir, "lstm");
     let ids = expected.start.ids(&lexicon);
     let asked = Asked {
@@ -266,7 +268,8 @@ fn an_unasked_candidate_panics() {
 fn an_unasked_eos_panics() {
     let dir = fixture_dir();
     let lexicon = lexicon(&dir);
-    let model = CharLm::open(&dir.join("lstm"), &lexicon, shape()).expect("the fixture opens");
+    let model = CharLm::open(environment(), &dir.join("lstm"), &lexicon, shape())
+        .expect("the fixture opens");
     let expected = expected(&dir, "lstm");
     let ids = expected.start.ids(&lexicon);
     let asked = Asked {
@@ -311,7 +314,7 @@ fn a_manifest_of_another_layout_is_refused() {
         .expect("the manifest is written");
         // `open` must refuse at the manifest, before the graphs -- absent in
         // the temp dir -- are ever read.
-        match CharLm::open(&temp, &lexicon, shape()) {
+        match CharLm::open(environment(), &temp, &lexicon, shape()) {
             Err(error @ ime_lm::LmError::Layout { .. }) => {
                 let message = error.to_string();
                 assert!(
@@ -344,7 +347,7 @@ fn cuda_backend_fails_where_cuda_cannot_initialise() {
         backend: ime_lm::Backend::Cuda,
         ..ime_lm::SessionShape::default()
     };
-    match CharLm::open(&dir.join("lstm"), &lexicon, shape) {
+    match CharLm::open(environment(), &dir.join("lstm"), &lexicon, shape) {
         Err(ime_lm::LmError::Provider { backend, .. }) => {
             assert_eq!(backend, ime_lm::Backend::Cuda);
         }
@@ -386,8 +389,8 @@ fn int8_scores_do_not_depend_on_batchmates() {
     let dir = fixture_dir();
     let lexicon = lexicon(&dir);
     for arch in ["transformer-int8", "lstm-int8"] {
-        let model =
-            CharLm::open(&dir.join(arch), &lexicon, shape()).expect("the int8 fixture opens");
+        let model = CharLm::open(environment(), &dir.join(arch), &lexicon, shape())
+            .expect("the int8 fixture opens");
         let expected = expected(&dir, arch);
         let ids = expected.steps[0][0].ids(&lexicon);
         let asked = Asked {
@@ -474,8 +477,10 @@ fn reclaimed_pages_score_like_a_roomy_pool() {
     tight.cache_rows = 16;
     let mut roomy = shape();
     roomy.cache_rows = 4096;
-    let tight_lm = CharLm::open(&dir.join(arch), &lexicon, tight).expect("the fixture opens");
-    let roomy_lm = CharLm::open(&dir.join(arch), &lexicon, roomy).expect("the fixture opens");
+    let tight_lm =
+        CharLm::open(environment(), &dir.join(arch), &lexicon, tight).expect("the fixture opens");
+    let roomy_lm =
+        CharLm::open(environment(), &dir.join(arch), &lexicon, roomy).expect("the fixture opens");
 
     let ids: Vec<_> = lexicon
         .characters()
@@ -533,7 +538,8 @@ fn a_lone_session_materialises_no_pending_rows() {
     let arch = "transformer";
     let mut roomy = shape();
     roomy.cache_rows = 4096;
-    let lm = CharLm::open(&dir.join(arch), &lexicon, roomy).expect("the fixture opens");
+    let lm =
+        CharLm::open(environment(), &dir.join(arch), &lexicon, roomy).expect("the fixture opens");
 
     let ids: Vec<_> = lexicon
         .characters()
@@ -609,8 +615,10 @@ fn pending_states_score_like_resident_pages() {
     starved.cache_rows = 1;
     let mut roomy = shape();
     roomy.cache_rows = 4096;
-    let starved_lm = CharLm::open(&dir.join(arch), &lexicon, starved).expect("the fixture opens");
-    let roomy_lm = CharLm::open(&dir.join(arch), &lexicon, roomy).expect("the fixture opens");
+    let starved_lm =
+        CharLm::open(environment(), &dir.join(arch), &lexicon, starved).expect("the fixture opens");
+    let roomy_lm =
+        CharLm::open(environment(), &dir.join(arch), &lexicon, roomy).expect("the fixture opens");
 
     let ids: Vec<_> = lexicon
         .characters()
@@ -671,7 +679,8 @@ fn history_changes_scores() {
     let arch = "transformer";
     let mut roomy = shape();
     roomy.cache_rows = 4096;
-    let roomy_lm = CharLm::open(&dir.join(arch), &lexicon, roomy).expect("the fixture opens");
+    let roomy_lm =
+        CharLm::open(environment(), &dir.join(arch), &lexicon, roomy).expect("the fixture opens");
 
     let ids: Vec<_> = lexicon
         .characters()
@@ -713,7 +722,8 @@ fn concurrent_advances_score_like_serial_ones() {
 
     let mut tight = shape();
     tight.cache_rows = 1;
-    let lm = CharLm::open(&dir.join(arch), &lexicon, tight).expect("the fixture opens");
+    let lm =
+        CharLm::open(environment(), &dir.join(arch), &lexicon, tight).expect("the fixture opens");
 
     let ids: Vec<_> = lexicon
         .characters()

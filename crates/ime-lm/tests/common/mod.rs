@@ -1,14 +1,29 @@
-//! Helpers shared by the `ime-lm` integration tests: the fixture directory,
-//! the fixture lexicon, the session shape the fixtures were recorded at, and
-//! what `charlm_fixtures.py` recorded from the exported graphs.
+//! Helpers shared by the `ime-lm` integration tests: the ONNX Runtime
+//! environment, the fixture directory, the fixture lexicon, the session shape
+//! the fixtures were recorded at, and what `charlm_fixtures.py` recorded from
+//! the exported graphs.
 
 use ime_lm::SessionShape;
 use ime_pinyin::{CharId, Lexicon, SyllableTable};
+use ort::environment::Environment;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// The test binary's ONNX Runtime environment. ONNX Runtime allows one
+/// environment per process and the harness runs every test of a binary in
+/// one process, so the tests share it.
+pub fn environment() -> &'static Environment {
+    static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
+    ENVIRONMENT.get_or_init(|| {
+        ort::init()
+            .build()
+            .expect("the test binary builds its only environment")
+    })
+}
 
 /// One request `charlm_fixtures.py` drove a `start` or `advance` row with,
 /// and the gathered scores it answered.

@@ -226,7 +226,10 @@ fn main() {
                 .expect("the lexicon indexes itself")
         })
         .collect();
-    let model = CharLm::open(&dir, &lexicon, shape).expect("the export opens");
+    let environment = ort::init()
+        .build()
+        .expect("the process builds its only environment");
+    let model = CharLm::open(&environment, &dir, &lexicon, shape).expect("the export opens");
     let total = THREADS * RECORDS;
     tracing::info!(
         threads = THREADS,

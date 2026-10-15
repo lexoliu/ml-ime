@@ -13,7 +13,7 @@
 
 mod common;
 
-use common::{expected, fixture_dir, lexicon, shape};
+use common::{environment, expected, fixture_dir, lexicon, shape};
 use ime_decode::{Asked, Transition};
 use ime_lm::{CharLm, LmState};
 use std::fmt;
@@ -78,8 +78,8 @@ fn starts_and_steps_do_not_open_new_sessions() {
 
     let dir = fixture_dir();
     let lexicon = lexicon(&dir);
-    let model =
-        CharLm::open(&dir.join("transformer"), &lexicon, shape()).expect("the fixture opens");
+    let model = CharLm::open(environment(), &dir.join("transformer"), &lexicon, shape())
+        .expect("the fixture opens");
     let character = lexicon
         .id_of(lexicon.characters()[0])
         .expect("the lexicon indexes itself");
