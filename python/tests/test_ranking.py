@@ -289,3 +289,29 @@ def test_the_segmenter_speaks_one_line_each_way(tmp_path: Path) -> None:
     dead = script(tmp_path / "dead", "import sys\nsys.exit(4)\n")
     with pytest.raises(RuntimeError, match=r"exited \(4\)"):
         Segmenter(dead, 8)("woai")
+
+
+def test_every_parameter_learns_under_autocast(
+    lexicon: Lexicon, spans: SpanVocab, tokenizer: StubTokenizer
+) -> None:
+    """The search's gradient-free casts must not stand in for the scored path's.
+
+    Autocast caches the low-precision copy of a weight within its region; a
+    copy first made under ``no_grad`` carries no graph, and a later use that
+    found it in the cache would cut the weight out of the loss -- which DDP
+    reports as a parameter that received no gradient. Torch builds whose
+    cache keeps such copies (the Kaggle image's) fail this without the
+    forward's cache clear; newer ones do not cache them at all.
+    """
+    model = ranking_model(lexicon).train()
+    batch = rank_batch(lexicon, spans, tokenizer)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        loss = model(batch).loss
+    assert loss is not None
+    loss.backward()
+    missing = [
+        name
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad and parameter.grad is None and "letter_encoder" not in name
+    ]
+    assert missing == []

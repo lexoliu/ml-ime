@@ -249,6 +249,11 @@ class RankingE2EModel(E2EModel):
                 ranking.beam,
             )
         decoder.train(training)
+        # Autocast caches each weight's low-precision cast for the rest of its
+        # region, and the casts the search just made carry no graph: reused
+        # below, they would cut the head out of the loss (DDP then reports
+        # `decoder.reader.project` as unused). Dropping them recasts with grad.
+        torch.clear_autocast_cache()
         items = select_items(batch, found, ranking.negatives)
         paths, logits = self.path_scores(spans, items.rows, items.sequences)
         length = logits.shape[1]
