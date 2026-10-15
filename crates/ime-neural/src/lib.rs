@@ -37,8 +37,9 @@ use ime_decode::{Candidates, EmissionError, Emittable, LatticeRecord, Scored};
 use ime_pinyin::CorrectionTable;
 use memmap2::Mmap;
 use ort::AsPointer;
+use ort::environment::Environment;
 use ort::ep::ExecutionProviderDispatch;
-use ort::memory::{AllocationDevice, AllocatorType, MemoryInfo, MemoryType};
+use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
 use ort::session::Session;
 use ort::session::builder::{GraphOptimizationLevel, PrepackedWeights};
 use ort::value::{DynValue, Outlet, PrimitiveTensorElementType, Shape, Tensor, TensorRefMut};
@@ -190,8 +191,8 @@ pub struct RouteA {
 }
 
 impl RouteA {
-    /// Open the export *dir* holds, refusing anything that does not describe
-    /// the towers this build drives.
+    /// Open the export *dir* holds in sessions of *environment*, refusing
+    /// anything that does not describe the towers this build drives.
     ///
     /// # Errors
     ///
@@ -203,7 +204,11 @@ impl RouteA {
     ///
     /// If a weights map the open walk just inserted is absent again — a bug,
     /// not a state the caller can recover.
-    pub fn open(dir: &Path, shape: SessionShape) -> Result<Self, NeuralError> {
+    pub fn open(
+        environment: &Environment,
+        dir: &Path,
+        shape: SessionShape,
+    ) -> Result<Self, NeuralError> {
         let manifest = read_manifest(dir)?;
         if manifest.context_tokens < 3 {
             return Err(NeuralError::ManifestShape {
@@ -259,12 +264,14 @@ impl RouteA {
         // so int8 sessions each pack their own.
         let shareable = manifest.quantize.is_none();
         let context_sessions = GraphSessions::new(
+            environment,
             dir.join(&manifest.graphs.context),
             context_initializers,
             shape,
             shareable,
         );
         let fill_sessions = GraphSessions::new(
+            environment,
             dir.join(&manifest.graphs.fill),
             fill_initializers,
             shape,
@@ -736,10 +743,13 @@ struct GraphSessions {
     initializers: Vec<(String, Arc<DynValue>)>,
     /// How the sessions are built.
     shape: SessionShape,
+    /// The ONNX Runtime environment every session is created in.
+    environment: Environment,
 }
 
 impl GraphSessions {
     fn new(
+        environment: &Environment,
         graph: PathBuf,
         initializers: Vec<(String, Arc<DynValue>)>,
         shape: SessionShape,
@@ -751,6 +761,7 @@ impl GraphSessions {
             prepacked: shareable.then(PrepackedWeights::new),
             initializers,
             shape,
+            environment: environment.clone(),
         }
     }
 
@@ -762,6 +773,7 @@ impl GraphSessions {
     fn session(&self) -> Result<&RefCell<Session>, NeuralError> {
         self.by_thread.get_or_try(|| {
             Ok(RefCell::new(open_session(
+                &self.environment,
                 &self.path,
                 self.prepacked.as_ref(),
                 &self.initializers,
@@ -1256,9 +1268,11 @@ fn shared_value<T: PrimitiveTensorElementType + std::fmt::Debug>(
     let ort_ptr = NonNull::new(AsPointer::ptr(&*view).cast_mut())
         .ok_or_else(|| mismatched(format!("{} has no underlying OrtValue", tensor.name)))?;
     // `from_raw` borrowed only in the type: the `OrtValue` is ours. Hand its
-    // ownership to a `DynValue` that every session shares.
+    // ownership to a `DynValue` that every session shares. The mapping is
+    // host memory, the CPU allocator's device, and the value never frees it:
+    // dropping it releases the `OrtValue` alone.
     std::mem::forget(view);
-    let value = unsafe { DynValue::from_ptr(ort_ptr, None) };
+    let value = unsafe { DynValue::from_ptr(ort_ptr, Some(&Allocator::default())) };
     values.push((tensor.name.clone(), Arc::new(value)));
     Ok(())
 }
@@ -1313,8 +1327,11 @@ fn read_mask(
 /// activations into one reservation, which measured both slower and ~150 MB
 /// heavier on `ime-lm` than letting each buffer come and go. `Level2` keeps
 /// every fusion the fill graph benefits from.
-fn session_builder(shape: SessionShape) -> ort::Result<ort::session::builder::SessionBuilder> {
-    let mut builder = Session::builder()?
+fn session_builder(
+    environment: &Environment,
+    shape: SessionShape,
+) -> ort::Result<ort::session::builder::SessionBuilder> {
+    let mut builder = Session::builder(environment)?
         .with_optimization_level(GraphOptimizationLevel::Level2)?
         .with_memory_pattern(false)?
         .with_parallel_execution(false)?
@@ -1330,13 +1347,14 @@ fn session_builder(shape: SessionShape) -> ort::Result<ort::session::builder::Se
 /// container the matrices MLAS pre-packs go into, shared by every session of
 /// the graph so the packing happens once rather than per session.
 fn open_session(
+    environment: &Environment,
     graph: &Path,
     weights: Option<&PrepackedWeights>,
     initializers: &[(String, Arc<DynValue>)],
     shape: SessionShape,
 ) -> Result<Session, NeuralError> {
     let providers = shape.backend.providers()?;
-    let mut builder = session_builder(shape)?;
+    let mut builder = session_builder(environment, shape)?;
     if let Some(weights) = weights {
         builder = builder
             .with_prepacked_weights(weights)

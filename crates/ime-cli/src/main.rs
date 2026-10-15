@@ -626,17 +626,18 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
         .model
         .map(|path| load_ngram(path, &lexicon))
         .transpose()?;
+    let environment = ort::init().build()?;
     let lm = run
         .lm
         .map(|dir| {
-            CharLm::open(dir, &lexicon, run.session_shape()?)
+            CharLm::open(&environment, dir, &lexicon, run.session_shape()?)
                 .with_context(|| format!("could not open the character model in {}", dir.display()))
         })
         .transpose()?;
     let towers = run
         .route_a
         .map(|dir| {
-            RouteA::open(dir, run.neural_shape()?)
+            RouteA::open(&environment, dir, run.neural_shape()?)
                 .with_context(|| format!("could not open the route A export in {}", dir.display()))
         })
         .transpose()?;

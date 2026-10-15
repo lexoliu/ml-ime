@@ -10,9 +10,23 @@
 use ime_decode::{Candidates, Emission, Emittable, LatticeRecord};
 use ime_neural::{RouteA, SessionShape};
 use ime_pinyin::{Lexicon, SegmentLattice, SegmentOptions, SyllableTable};
+use ort::environment::Environment;
 use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+/// The test binary's ONNX Runtime environment. ONNX Runtime allows one
+/// environment per process and the harness runs every test of a binary in
+/// one process, so the tests share it.
+fn environment() -> &'static Environment {
+    static ENVIRONMENT: OnceLock<Environment> = OnceLock::new();
+    ENVIRONMENT.get_or_init(|| {
+        ort::init()
+            .build()
+            .expect("the test binary builds its only environment")
+    })
+}
 
 /// `tests/fixtures/` beside this crate.
 fn fixture_dir() -> PathBuf {
@@ -167,8 +181,8 @@ fn the_exported_towers_reproduce_the_recorded_tables() {
         } else {
             INT8_ATOL
         };
-        let model =
-            RouteA::open(&dir.join(variant), SessionShape::default()).expect("the fixture opens");
+        let model = RouteA::open(environment(), &dir.join(variant), SessionShape::default())
+            .expect("the fixture opens");
         for with_context in [true, false] {
             for record in &records {
                 let want = expected
@@ -204,8 +218,8 @@ fn scored_attaches_the_table_to_the_lattice() {
     let emittable = emittable(&dir, &lexicon);
     let records = lattice(&dir);
     let expected = expected(&dir);
-    let model =
-        RouteA::open(&dir.join("fp32"), SessionShape::default()).expect("the fixture opens");
+    let model = RouteA::open(environment(), &dir.join("fp32"), SessionShape::default())
+        .expect("the fixture opens");
     let floor = -30.0f32;
 
     for record in &records {
