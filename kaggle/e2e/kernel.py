@@ -71,7 +71,9 @@ SMOKE_WARMUP_CAP = 30
 
 #: The configurations the smoke times against each other at `TOKEN_BUDGET`:
 #: prefetch and compile on throughout, accumulate 2 against accumulate 4.
-#: Accumulate 2 then also runs at `SMOKE_WIDE_BUDGET`.
+#: Accumulate 2 then also runs at `SMOKE_WIDE_BUDGET`. An entry may set
+#: `nproc` below `WORLD` to time the same step without its peers -- what the
+#: world costs each rank -- and is then shown but never recommended.
 SMOKE_CONFIGS = (
     ("compile-acc2", {"prefetch": True, "accumulate": 2, "compile": True}),
     ("compile-acc4", {"prefetch": True, "accumulate": 4, "compile": True}),
@@ -85,7 +87,7 @@ SMOKE_TRACE_STEPS = 0
 
 #: The wider budget accumulate-2 gets a timed run at. The gate is that run's
 #: own timed peak: a 60-step probe was shown to under-report what a long
-#: segment sees, so it no longer stands in.
+#: segment sees, so it no longer stands in. None skips the wide run.
 SMOKE_WIDE_BUDGET = 12288
 
 #: A configuration is safe while its timed peak stays at or under this share of
@@ -632,13 +634,28 @@ class GpuSampler:
     to keep the log small. The samples go to a file: a pipe nobody drains
     fills after a few minutes and stalls `nvidia-smi`, and every later
     sample -- the timed window's, after a long compile -- never arrives.
+
+    Beside utilisation it reads what can slow a busy card down: the SM
+    clock, the temperature, the power draw and the driver's throttle-reason
+    bits, since two T4s working side by side share one chassis's cooling.
     """
+
+    FIELDS = (
+        "index",
+        "timestamp",
+        "utilization.gpu",
+        "memory.used",
+        "clocks.sm",
+        "temperature.gpu",
+        "power.draw",
+        "clocks_throttle_reasons.active",
+    )
 
     def __init__(self, log, interval_ms=500):
         self._log = log
         self._argv = [
             "nvidia-smi",
-            "--query-gpu=index,utilization.gpu,memory.used,timestamp",
+            f"--query-gpu={','.join(self.FIELDS)}",
             "--format=csv,noheader,nounits",
             "-lms",
             str(interval_ms),
@@ -648,12 +665,15 @@ class GpuSampler:
 
     def __enter__(self):
         with self._log.open("w", encoding="utf-8") as sink:
-            self._process = subprocess.Popen(
-                self._argv, stdout=sink, stderr=subprocess.DEVNULL
-            )
+            self._process = subprocess.Popen(self._argv, stdout=sink, stderr=subprocess.DEVNULL)
         return self
 
     def __exit__(self, *_):
+        if self._process.poll() is not None:
+            raise RuntimeError(
+                f"nvidia-smi exited {self._process.returncode} before the run did: "
+                f"{' '.join(self._argv)}"
+            )
         self._process.terminate()
         try:
             self._process.wait(timeout=15)
@@ -661,42 +681,53 @@ class GpuSampler:
             self._process.kill()
             self._process.wait()
         for line in self._log.read_text(encoding="utf-8").splitlines():
-            fields = [field.strip() for field in line.split(",")]
-            if len(fields) != 4:
+            fields = dict(zip(self.FIELDS, (f.strip() for f in line.split(",")), strict=False))
+            if len(fields) != len(self.FIELDS):
                 continue
-            gpu, util, memory = int(fields[0]), int(fields[1]), int(fields[2])
-            epoch = datetime.strptime(fields[3], "%Y/%m/%d %H:%M:%S.%f").timestamp()
-            self.samples.setdefault(
-                gpu, {"utilization": [], "memory_mib": [], "times": []}
+            self.samples.setdefault(int(fields["index"]), []).append(
+                {
+                    "time": datetime.strptime(
+                        fields["timestamp"], "%Y/%m/%d %H:%M:%S.%f"
+                    ).timestamp(),
+                    "utilization": int(fields["utilization.gpu"]),
+                    "memory_mib": int(fields["memory.used"]),
+                    "sm_mhz": int(fields["clocks.sm"]),
+                    "celsius": int(fields["temperature.gpu"]),
+                    "watts": float(fields["power.draw"]),
+                    "throttle": fields["clocks_throttle_reasons.active"],
+                }
             )
-            self.samples[gpu]["utilization"].append(util)
-            self.samples[gpu]["memory_mib"].append(memory)
-            self.samples[gpu]["times"].append(epoch)
         return False
 
     def means(self, since=None, until=None):
-        """Mean utilisation and memory per GPU over the samples in the window.
+        """Per GPU over the samples in the window: means, the peak temperature,
+        and how often each throttle-reason mask was active.
 
         ``since``/``until`` are wall-clock epochs -- the profile record's
         ``window`` bounds -- so a run's mean covers its timed steps only, not
         the warm-up its compilation idles through.
         """
         out = {}
-        for gpu, v in sorted(self.samples.items()):
+        for gpu, samples in sorted(self.samples.items()):
             rows = [
-                (u, m)
-                for t, u, m in zip(
-                    v["times"], v["utilization"], v["memory_mib"], strict=True
-                )
-                if (since is None or t >= since) and (until is None or t <= until)
+                r
+                for r in samples
+                if (since is None or r["time"] >= since) and (until is None or r["time"] <= until)
             ]
+
+            def mean(key, digits, rows=rows):
+                return round(sum(r[key] for r in rows) / len(rows), digits) if rows else None
+
+            throttles = {}
+            for r in rows:
+                throttles[r["throttle"]] = throttles.get(r["throttle"], 0) + 1
             out[str(gpu)] = {
-                "utilization": round(sum(u for u, _ in rows) / len(rows), 1)
-                if rows
-                else None,
-                "memory_mib": round(sum(m for _, m in rows) / len(rows))
-                if rows
-                else None,
+                "utilization": mean("utilization", 1),
+                "memory_mib": mean("memory_mib", 0),
+                "sm_mhz": mean("sm_mhz", 0),
+                "watts": mean("watts", 1),
+                "max_celsius": max((r["celsius"] for r in rows), default=None),
+                "throttle_share": {k: round(n / len(rows), 3) for k, n in throttles.items()},
                 "samples": len(rows),
             }
         return out
@@ -849,6 +880,7 @@ def smoke_run(char_table, start, segmenter, env, name, token_budget, options, st
         max_held_out=256,
         prefetch=options.get("prefetch", False),
         accumulate=options.get("accumulate", 1),
+        nproc=options.get("nproc", WORLD),
         profile_steps=timed,
         trace_steps=SMOKE_TRACE_STEPS,
         compile=options.get("compile", False),
@@ -880,6 +912,7 @@ def smoke_run(char_table, start, segmenter, env, name, token_budget, options, st
         "prefetch": options.get("prefetch", False),
         "accumulate": options.get("accumulate", 1),
         "compile": options.get("compile", False),
+        "nproc": options.get("nproc", WORLD),
         "seconds": round(seconds, 1),
         "gpu_mean": gpu_mean,
         "cpu": cpu_usage,
@@ -994,25 +1027,30 @@ def smoke(char_table, start, segmenter, env):
         peak = peak_of(entry)
         return peak is not None and peak <= ceiling
 
-    wide = smoke_run(
-        char_table,
-        start,
-        segmenter,
-        env,
-        f"compile-acc2-{SMOKE_WIDE_BUDGET}",
-        SMOKE_WIDE_BUDGET,
-        {"prefetch": True, "accumulate": 2, "compile": True},
-        SMOKE_WARMUP_CAP + SMOKE_STEPS,
-        SMOKE_STEPS,
-    )
-    entries.append(wide)
+    if SMOKE_WIDE_BUDGET is not None:
+        entries.append(
+            smoke_run(
+                char_table,
+                start,
+                segmenter,
+                env,
+                f"compile-acc2-{SMOKE_WIDE_BUDGET}",
+                SMOKE_WIDE_BUDGET,
+                {"prefetch": True, "accumulate": 2, "compile": True},
+                SMOKE_WARMUP_CAP + SMOKE_STEPS,
+                SMOKE_STEPS,
+            )
+        )
     measured = [entry for entry in entries if entry["status"] == "ok"]
 
     # A run counts toward the recommendation only when it finished inside the
     # memory ceiling -- the wide run's timed peak is the gate, so a peak over
-    # the share still shows in the table but cannot be recommended.
+    # the share still shows in the table but cannot be recommended -- and ran
+    # in the world the segment trains in.
     for entry in entries:
-        entry["counted"] = entry["status"] == "ok" and peak_ok(entry)
+        entry["counted"] = (
+            entry["status"] == "ok" and peak_ok(entry) and entry["nproc"] == WORLD
+        )
 
     summary = {
         "segment": SEGMENT,
