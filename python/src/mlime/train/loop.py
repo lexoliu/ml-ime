@@ -938,6 +938,11 @@ def train(
             model,
             device_ids=[world.local_rank] if device.type == "cuda" else None,
             find_unused_parameters=False,
+            # Every buffer is a constant each rank builds identically from the
+            # lexicon. Broadcasting them -- for running statistics this model
+            # does not have -- copies megabytes from rank 0 at every forward
+            # and makes each micro-batch wait for the slowest rank's last one.
+            broadcast_buffers=False,
         )
     optimiser = torch.optim.AdamW(
         model.parameter_groups(config.base_lr, config.new_lr),
