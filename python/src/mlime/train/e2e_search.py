@@ -92,26 +92,40 @@ def decode_lanes(
     carried[0] = 0.0
     layers, heads = decoder.reader.config.layers, decoder.reader.config.heads
     head_dim = decoder.reader.config.hidden // heads
-    # The cache grows in the dtype the steps compute in: under autocast a
-    # float32 seed would promote every key appended to it, twice the bytes
-    # for the same values.
+    # The cache holds the whole path from the start, in the dtype the steps
+    # compute in: under autocast a float32 cache would hold every key at
+    # twice the bytes for the same values.
     cached = (
         torch.get_autocast_dtype(device.type)
         if torch.is_autocast_enabled(device.type)
         else decoder.reader.embed.weight.dtype
     )
-    keys = torch.zeros(rows, layers, heads, 0, head_dim, dtype=cached, device=device)
-    values = keys.clone()
+    keys = torch.zeros(rows, layers, heads, length, head_dim, dtype=cached, device=device)
+    values = torch.zeros_like(keys)
     scores = torch.full((count, width), float("-inf"), device=device)
     scores[:, 0] = 0.0
     tokens = torch.full((rows,), BOS, dtype=torch.long, device=device)
     block = torch.arange(count, device=device).unsqueeze(1) * width
+    positions = torch.arange(length, device=device)
     parents: list[torch.Tensor] = []
     choices: list[torch.Tensor] = []
+    # Rows, length and span count change with every search; marked here, a
+    # compiled step's first graph is the dynamic one.
+    for tensor in (lane_of_row, *(part for pair in encoder_kv for part in pair)):
+        torch._dynamo.maybe_mark_dynamic(tensor, 0)
+    for pair in encoder_kv:
+        for part in pair:
+            torch._dynamo.maybe_mark_dynamic(part, 2)
     for position in range(length):
-        logits, (keys, values) = decoder.step(
+        span_vector = vectors[lane_of_row, position]
+        for tensor in (tokens, span_vector):
+            torch._dynamo.maybe_mark_dynamic(tensor, 0)
+        for tensor in (keys, values):
+            torch._dynamo.maybe_mark_dynamic(tensor, (0, 3))
+        logits = decoder.step(
             tokens,
-            vectors[lane_of_row, position],
+            span_vector,
+            positions[position],
             (keys, values),
             encoder_kv,  # type: ignore[arg-type]
             encoder_mask,

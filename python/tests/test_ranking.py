@@ -151,6 +151,57 @@ def test_ragged_lanes_search_as_each_lane_alone(lexicon: Lexicon, spans: SpanVoc
         )
 
 
+def test_a_compiled_step_stops_compiling_once_warm(lexicon: Lexicon, spans: SpanVocab) -> None:
+    """The compiled search equals the eager one, and new shapes add no graphs.
+
+    Each new cache length would otherwise be a new specialisation, and past
+    dynamo's recompile limit the step falls back to eager for the rest of
+    the run -- the dispatch cost compiling it was for.
+    """
+    from torch._dynamo.utils import counters
+
+    from mlime.train.e2e import compile_modules
+
+    model = ranking_model(lexicon).eval()
+    torch.manual_seed(1)
+    width = TINY.hidden_size
+    readings = [
+        ("wo", "ai", "bei", "jing"),
+        ("zhong", "ai"),
+        ("bei", "jing", "wo", "ai", "zhong"),
+        ("wo", "ai", "bei"),
+        ("zhong", "ai", "bei", "jing", "wo"),
+        ("wo", "ai", "bei", "jing", "zhong", "ai"),
+        ("bei", "jing"),
+    ]
+
+    def batch(*picks: int) -> list[Lane]:
+        return [
+            admitted_lane(lexicon, spans, owner, readings[pick], width)
+            for owner, pick in enumerate(picks)
+        ]
+
+    # Ragged and even, each at two lengths: a first trace whose sizes happen
+    # to equal another dimension's is specialised to them, and the second
+    # length makes the graph general. Then new rows, lengths and caches.
+    warming = [batch(0, 1), batch(5, 0), batch(1, 6), batch(3, 3)]
+    warm = [batch(2, 3, 4, 1), batch(0, 3, 6), batch(4, 4, 2), batch(4, 4), batch(6, 6, 6)]
+    torch._dynamo.reset()
+    with torch.no_grad():
+        eager = [decode_lanes(model, lanes, 4) for lanes in warming + warm]
+        compile_modules(model, "default")
+        compiled = [decode_lanes(model, lanes, 4) for lanes in warming]
+        graphs = counters["stats"]["unique_graphs"]
+        compiled += [decode_lanes(model, lanes, 4) for lanes in warm]
+    assert counters["stats"]["unique_graphs"] == graphs
+    for expected, found in zip(eager, compiled, strict=True):
+        for lane, lane_found in zip(expected, found, strict=True):
+            assert [sequence for sequence, _ in lane] == [sequence for sequence, _ in lane_found]
+            assert [score for _, score in lane] == pytest.approx(
+                [score for _, score in lane_found], abs=1e-4
+            )
+
+
 def test_the_path_score_is_the_search_score(
     lexicon: Lexicon, spans: SpanVocab, tokenizer: StubTokenizer
 ) -> None:

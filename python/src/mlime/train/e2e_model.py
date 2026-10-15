@@ -256,7 +256,9 @@ class Decoder(nn.Module):
             layers.append(layer)
         return layers
 
-    def embed(self, tokens: torch.Tensor, span_vectors: torch.Tensor, first: int) -> torch.Tensor:
+    def embed(
+        self, tokens: torch.Tensor, span_vectors: torch.Tensor, first: int | torch.Tensor
+    ) -> torch.Tensor:
         """``input(embed(token)) + span_input(span) + position``, ``[B, T] -> [B, T, H]``."""
         positions = torch.arange(tokens.shape[1], device=tokens.device) + first
         embedded = (
@@ -304,55 +306,66 @@ class Decoder(nn.Module):
         self,
         tokens: torch.Tensor,
         span_vector: torch.Tensor,
+        position: torch.Tensor,
         state: tuple[torch.Tensor, torch.Tensor],
         encoder_kv: Sequence[tuple[torch.Tensor, torch.Tensor]],
         encoder_mask: torch.Tensor | None = None,
         *,
         candidates: torch.Tensor,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Advance one position: logits over the position's candidates, and the cache.
+    ) -> torch.Tensor:
+        """Advance one position: logits over the position's candidates.
 
         ``tokens [B]`` are the reader ids of each row's previous character
         (``<bos>`` to open a path), ``span_vector [B, enc]`` the encoder vector
-        of the position being predicted, and ``candidates`` the emission
-        indices the position's span admits -- the only logits the search needs
-        and the only ones computed. ``state`` is the key/value cache,
-        ``[B, layers, heads, T, head_dim]`` each, and ``encoder_kv`` the
-        per-block encoder keys and values computed once for the path.
+        of the position being predicted, ``position`` that position as a
+        0-d long tensor, and ``candidates`` the emission indices the
+        position's span admits -- the only logits the search needs and the
+        only ones computed. ``state`` is the key/value cache, ``[B, layers,
+        heads, T, head_dim]`` each over the path's whole length ``T``: the
+        step writes this position's keys and values into it in place and
+        attends to the positions up to it. ``encoder_kv`` holds the per-block
+        encoder keys and values computed once for the path.
+
+        The cache's shape is the path's for every step, so a compiled step is
+        one graph for a whole search rather than one per position.
         """
         keys, values = state
-        x = self.embed(tokens.unsqueeze(1), span_vector.unsqueeze(1), keys.shape[3])
-        new_keys, new_values = [], []
+        x = self.embed(tokens.unsqueeze(1), span_vector.unsqueeze(1), position)
+        reached = torch.arange(keys.shape[3], device=keys.device) <= position
         for layer, (block, cross) in enumerate(
             zip(self.reader.layers(), self.gated_layers(), strict=True)
         ):
-            x, k, v = _attend_step(block, x, keys[:, layer], values[:, layer])
+            x = _attend_step(block, x, keys[:, layer], values[:, layer], position, reached)
             enc_keys, enc_values = encoder_kv[layer]
             x = cross.attend(x, enc_keys, enc_values, encoder_mask)
-            new_keys.append(k)
-            new_values.append(v)
-        keys = torch.cat([keys, torch.stack(new_keys, dim=1)], dim=3)
-        values = torch.cat([values, torch.stack(new_values, dim=1)], dim=3)
         features: torch.Tensor = self.reader.norm(x).squeeze(1)
-        return self.logits_over(features, candidates), (keys, values)
+        return self.logits_over(features, candidates)
 
 
 def _attend_step(
-    block: Block, x: torch.Tensor, keys: torch.Tensor, values: torch.Tensor
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One position of *x* against the block's cache and itself.
+    block: Block,
+    x: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    position: torch.Tensor,
+    reached: torch.Tensor,
+) -> torch.Tensor:
+    """One position of *x* against the block's cache, written there first.
 
     The reader's own :meth:`Block.attend` folds the prefix machinery in for the
     decoder's context prelude; this model has no prelude, so the step is the
     same split/merge arithmetic without it -- the block itself is reused, not
-    copied. Returns the merged output and the new key/value.
+    copied. *keys* and *values* are this block's slice of the cache,
+    ``[B, heads, T, head_dim]``; the new key and value go in at *position*,
+    and the positions past it -- *reached* is false there -- weigh nothing.
     """
     q, k, v = block.split(x)
-    keys = torch.cat([keys, k], dim=2)
-    values = torch.cat([values, v], dim=2)
+    keys.index_copy_(2, position.view(1), k)
+    values.index_copy_(2, position.view(1), v)
     scores = (q @ keys.transpose(-1, -2)) / math.sqrt(block.head_dim)
+    scores = scores.masked_fill(~reached, float("-inf"))
     attended = torch.softmax(scores, dim=-1) @ values
-    return block.merge(x, attended), k, v
+    return block.merge(x, attended)
 
 
 @dataclass(frozen=True)
