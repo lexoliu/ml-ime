@@ -208,6 +208,32 @@ class EncoderAttention(nn.Module):
         result: torch.Tensor = x + self.gate * self.out(merged)
         return result
 
+    def attend_beams(
+        self,
+        x: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """One search step's ``x [L * W, 1, hidden]`` attends to its lanes' encoder.
+
+        The rows are ``L`` lanes of ``W`` beams each, lane-major, and *keys*,
+        *values* ``[L, heads, S, head_dim]`` and *mask* ``[L, S]`` are per lane:
+        a lane's beams fold into one block of queries against its own keys, so
+        no lane's encoder output is copied per beam. One query position
+        against a few dozen spans is a small matrix product; a fused
+        attention kernel tiles it as if it were a long sequence.
+        """
+        lanes, heads, _, head_dim = keys.shape
+        q = self.query(self.norm(x)).view(lanes, -1, heads, head_dim).transpose(1, 2)
+        scores = (q @ keys.transpose(-1, -2)) / math.sqrt(head_dim)
+        if mask is not None:
+            scores = scores.masked_fill(~mask[:, None, None, :], float("-inf"))
+        attended = torch.softmax(scores, dim=-1) @ values
+        merged = attended.transpose(1, 2).reshape(x.shape)
+        result: torch.Tensor = x + self.gate * self.out(merged)
+        return result
+
 
 class Decoder(nn.Module):
     """The reader's transformer plus the wiring that lets it see the encoder.
@@ -324,8 +350,9 @@ class Decoder(nn.Module):
         heads, T, head_dim]`` each over the path's whole length ``T``, holding
         the positions before this one; the step reads it and returns this
         position's keys and values, ``[B, layers, heads, 1, head_dim]``, for
-        the caller to write in. ``encoder_kv`` holds the per-block encoder
-        keys and values computed once for the path.
+        the caller to write in. The rows are lanes of beams, lane-major, and
+        ``encoder_kv`` holds each block's encoder keys and values per lane,
+        ``[lanes, heads, S, head_dim]``, with ``encoder_mask [lanes, S]``.
 
         The cache's shape is the path's for every step, and the step writes
         nothing it is given, so a compiled step is one graph for a whole
@@ -340,7 +367,7 @@ class Decoder(nn.Module):
         ):
             x, k, v = _attend_step(block, x, keys[:, layer], values[:, layer], before)
             enc_keys, enc_values = encoder_kv[layer]
-            x = cross.attend(x, enc_keys, enc_values, encoder_mask)
+            x = cross.attend_beams(x, enc_keys, enc_values, encoder_mask)
             new_keys.append(k)
             new_values.append(v)
         features: torch.Tensor = self.reader.norm(x).squeeze(1)

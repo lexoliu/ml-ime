@@ -46,7 +46,8 @@ def decode_lanes(
 
     Every lane owns a block of ``beam_width`` rows from the first step, the
     unused ones at a score of minus infinity, so the row layout never changes
-    and the encoder keys and values are expanded once. Each step's scores are
+    and a lane's beams read its encoder keys and values as one block, computed
+    once per lane. Each step's scores are
     log-probabilities over the full emittable row, and the candidate
     restriction masks the characters the position does not admit afterwards,
     so a path's score is comparable with another segmentation's. Rows still at minus
@@ -76,16 +77,11 @@ def decode_lanes(
     emittable = masks.shape[-1]
     everything = torch.arange(emittable, device=device)
     lane_of_row = torch.arange(count, device=device).repeat_interleave(width)
-    encoder_kv = [
-        tuple(part.repeat_interleave(width, dim=0) for part in cross.kv(vectors))
-        for cross in decoder.gated_layers()
-    ]
+    encoder_kv = [cross.kv(vectors) for cross in decoder.gated_layers()]
     ragged = min(lengths) != length
     lane_lengths = torch.tensor(lengths, device=device)
     encoder_mask = (
-        (torch.arange(length, device=device) < lane_lengths.unsqueeze(1))[lane_of_row]
-        if ragged
-        else None
+        torch.arange(length, device=device) < lane_lengths.unsqueeze(1) if ragged else None
     )
     # The step an ended row takes: emission 0 for free, everything else barred.
     carried = torch.full((emittable,), float("-inf"), device=device)
@@ -128,7 +124,7 @@ def decode_lanes(
             span_vector,
             at,
             (keys, values),
-            encoder_kv,  # type: ignore[arg-type]
+            encoder_kv,
             encoder_mask,
             candidates=everything,
         )
