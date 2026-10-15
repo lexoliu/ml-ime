@@ -176,7 +176,10 @@ def test_exported_graphs_reproduce_torch(arch: str, tmp_path: Path) -> None:
     assert manifest["arch"] == arch
     assert manifest["layout"] == "resident-pages"
     assert manifest["dtype"] == "float32"
-    assert manifest["restricted_to"] == 5  # four characters plus <eos>
+    # The four characters plus <eos>, as sorted alphabet ids.
+    assert manifest["kept"] == sorted(
+        {VOCAB.index[ch] for ch in CHARS[:4]} | {VOCAB.index["<eos>"]}
+    )
     weights = manifest["weights"]
     # One table shared by both graphs, or one per graph.
     tables = {"step": weights, "prefill": weights} if "file" in weights else weights
