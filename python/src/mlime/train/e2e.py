@@ -189,12 +189,20 @@ def compile_modules(model: E2EModel, mode: str) -> None:
     to run them. It has no backward, so the bucket cut buys nothing and costs
     a compiled call per bucket -- nine a position, whose launches took four
     times the device time they bought on a T4 -- and it is compiled whole.
+
+    Every graph's wrapper -- the code that sizes the buffers and launches the
+    kernels -- is generated as C++ rather than Python. A search position is
+    some four hundred launches, and from Python the host took longer to issue
+    them than the card took to run them: on two T4s the ranking step went from
+    19 to 23.4 examples a second per rank and the cards from 70% to 93% busy.
+    The C++ links against ``libcuda.so``, which the host must provide.
     """
-    model.encode = torch.compile(model.encode, dynamic=True, mode=mode)  # type: ignore[method-assign]
+    options = {**torch._inductor.list_mode_options(mode), "cpp_wrapper": True}
+    model.encode = torch.compile(model.encode, dynamic=True, options=options)  # type: ignore[method-assign]
     model.decoder.forward = torch.compile(  # type: ignore[method-assign]
-        model.decoder.forward, dynamic=True, mode=mode
+        model.decoder.forward, dynamic=True, options=options
     )
-    step = torch.compile(model.decoder.step, dynamic=True, mode=mode)
+    step = torch.compile(model.decoder.step, dynamic=True, options=options)
 
     @functools.wraps(model.decoder.step)
     def whole_step(*args: Any, **kwargs: Any) -> Any:

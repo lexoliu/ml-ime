@@ -36,12 +36,14 @@ subprocess per configuration, and writes the rates, the peaks, the mean GPU
 utilisation and the per-phase timing table to `run-summary.json`.
 """
 
+import ctypes
 import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -345,6 +347,26 @@ def importable_package():
             "the kernel was pushed before the new mlime-src version was attached"
         )
     return root
+
+
+def libcuda_link_dir():
+    """A directory holding `libcuda.so`, for the compiled wrappers' link step.
+
+    The training compiles its graphs' wrappers to C++, which links with
+    `-lcuda`. The image ships the driver only as `libcuda.so.<version>`,
+    found through the loader's path rather than ldconfig's cache, and no
+    unversioned name, so the link fails. The library the loader resolves is
+    linked here under the name the linker asks for.
+    """
+    ctypes.CDLL("libcuda.so.1")
+    with open("/proc/self/maps", encoding="utf-8") as maps:
+        real = next(line.split()[-1] for line in maps if "/libcuda.so." in line)
+    directory = Path(tempfile.gettempdir()) / "libcuda"
+    directory.mkdir(exist_ok=True)
+    link = directory / "libcuda.so"
+    if not link.exists():
+        link.symlink_to(real)
+    return directory
 
 
 def install():
@@ -1357,6 +1379,9 @@ def main():
 
     env = dict(os.environ)
     env["PYTHONPATH"] = str(package_root)
+    env["LIBRARY_PATH"] = os.pathsep.join(
+        filter(None, (str(libcuda_link_dir()), env.get("LIBRARY_PATH")))
+    )
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     sys.path.insert(0, str(package_root))
