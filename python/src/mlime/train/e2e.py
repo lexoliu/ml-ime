@@ -11,6 +11,7 @@ itself.
 
 from __future__ import annotations
 
+import functools
 from collections import Counter
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -177,22 +178,31 @@ def compile_modules(model: E2EModel, mode: str) -> None:
     every checkpoint written or resumed -- untouched. ``encode`` is one compiled
     unit (the towers' real call path loops its layers itself) and the decoder's
     ``forward`` another. ``dynamic=True`` because width and span count change
-    with every batch. Applied before ``train`` wraps the model in DDP -- the
-    compiled calls sit *inside* the wrapped forward, so no
-    ``optimize_ddp`` knob is needed.
+    with every batch. Applied before ``train`` wraps the model in DDP, so the
+    compiled calls run inside the wrapped forward, where dynamo cuts each
+    graph at DDP's gradient buckets: each bucket's allreduce then starts while
+    the rest of backward still runs.
 
     The decoder's ``step`` is the third: the ranking loss's search runs it
     once per position over every reading's beam, about a thousand small ops
     a position, and eager dispatch of those took longer than the card took
-    to run them.
+    to run them. It has no backward, so the bucket cut buys nothing and costs
+    a compiled call per bucket -- nine a position, whose launches took four
+    times the device time they bought on a T4 -- and it is compiled whole.
     """
     model.encode = torch.compile(model.encode, dynamic=True, mode=mode)  # type: ignore[method-assign]
     model.decoder.forward = torch.compile(  # type: ignore[method-assign]
         model.decoder.forward, dynamic=True, mode=mode
     )
-    model.decoder.step = torch.compile(  # type: ignore[method-assign]
-        model.decoder.step, dynamic=True, mode=mode
-    )
+    step = torch.compile(model.decoder.step, dynamic=True, mode=mode)
+
+    @functools.wraps(model.decoder.step)
+    def whole_step(*args: Any, **kwargs: Any) -> Any:
+        # Read when dynamo compiles a frame, which is inside this call.
+        with torch._dynamo.config.patch(optimize_ddp=False):
+            return step(*args, **kwargs)
+
+    model.decoder.step = whole_step  # type: ignore[method-assign]
     log.info("towers and decoder compiled", mode=mode)
 
 

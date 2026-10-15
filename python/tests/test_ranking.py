@@ -11,9 +11,12 @@ sentence ahead of its negatives.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import stat
 import sys
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from dataclasses import asdict, replace
 from pathlib import Path
 
@@ -202,6 +205,57 @@ def test_a_compiled_step_stops_compiling_once_warm(lexicon: Lexicon, spans: Span
             assert [score for _, score in lane] == pytest.approx(
                 [score for _, score in lane_found], abs=1e-4
             )
+
+
+def test_a_compiled_step_inside_ddp_stays_one_graph(
+    lexicon: Lexicon, spans: SpanVocab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The search's step is not cut at DDP's buckets.
+
+    Dynamo splits every graph it compiles inside a DDP forward at the
+    gradient buckets, so each piece's allreduce can start while backward is
+    still running. The step has no backward; split, a position became nine
+    compiled calls, and on a T4 their launches took four times the device
+    time they bought.
+    """
+    from torch._dynamo.utils import counters
+    from torch.nn.parallel import DistributedDataParallel
+
+    from mlime.train.e2e import compile_modules
+
+    width = TINY.hidden_size
+    lanes = [
+        admitted_lane(lexicon, spans, 0, ("wo", "ai", "bei"), width),
+        admitted_lane(lexicon, spans, 1, ("zhong", "ai", "bei", "jing", "wo"), width),
+    ]
+
+    def compiled_graphs(wrap: Callable[[RankingE2EModel], AbstractContextManager[object]]) -> int:
+        """Graphs one search compiles from a cold cache, inside *wrap*'s context."""
+        torch._dynamo.reset()
+        model = ranking_model(lexicon)
+        compile_modules(model, "default")
+        before = counters["aot_autograd"]["total"]
+        with torch.no_grad(), wrap(model):
+            decode_lanes(model, lanes, 4)
+        return int(counters["aot_autograd"]["total"] - before)
+
+    alone = compiled_graphs(lambda _: contextlib.nullcontext())
+    torch.distributed.init_process_group(
+        "gloo", store=torch.distributed.HashStore(), rank=0, world_size=1
+    )
+    try:
+        # Buckets far smaller than any one weight -- the first one too, which
+        # dynamo takes from c10d's default: split, every weight would end a
+        # graph.
+        monkeypatch.setattr(torch.distributed, "_DEFAULT_FIRST_BUCKET_BYTES", 64)
+        inside = compiled_graphs(
+            lambda model: DistributedDataParallel(
+                model, bucket_cap_mb=64 / 2**20
+            )._inside_ddp_forward()
+        )
+        assert inside == alone
+    finally:
+        torch.distributed.destroy_process_group()
 
 
 def test_the_path_score_is_the_search_score(
