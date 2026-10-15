@@ -69,6 +69,31 @@ def _default_reader() -> CharLmConfig:
 
 
 @dataclass(frozen=True)
+class RankingConfig:
+    """The sequence-level ranking loss of #116, and the search that feeds it.
+
+    Each training example is typed every way the segmenter reads its
+    keystrokes -- up to ``segmentations`` readings, the evaluation lattice's
+    own count. A ``beam``-wide search over every reading finds the sentences
+    the model would offer; the ``negatives`` best that are not the gold one
+    are scored against it on the decode's own path score, and the softmax
+    over those scores, weighted by ``weight``, joins the per-position loss.
+    """
+
+    segmentations: int = 8
+    beam: int = 4
+    negatives: int = 8
+    weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        for name in ("segmentations", "beam", "negatives"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"ranking {name} must be positive, got {getattr(self, name)}")
+        if self.weight <= 0.0:
+            raise ValueError(f"the ranking weight must be positive, got {self.weight}")
+
+
+@dataclass(frozen=True)
 class E2EConfig(RouteAConfig):
     """Route A's config, plus what the decoder adds.
 
@@ -83,6 +108,8 @@ class E2EConfig(RouteAConfig):
     decoder: CharLmConfig = field(default_factory=_default_reader)
     #: Weight of the encoder's own restricted loss inside the total.
     aux_weight: float = 0.3
+    #: The sequence-level ranking loss, when the run trains one (#116).
+    ranking: RankingConfig | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -98,6 +125,8 @@ class E2EConfig(RouteAConfig):
         """Rebuild a config from a checkpoint's ``e2e`` record."""
         fields = dict(record)
         fields["decoder"] = CharLmConfig(**fields["decoder"])
+        if fields.get("ranking") is not None:
+            fields["ranking"] = RankingConfig(**fields["ranking"])
         return cls(**fields)
 
 

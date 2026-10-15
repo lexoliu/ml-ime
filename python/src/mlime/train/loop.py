@@ -45,9 +45,10 @@ from mlime.train.lexicon import CandidateSpace
 from mlime.train.model import RouteAConfig, RouteAModel, count_correct
 from mlime.train.samples import (
     BaseTokenizer,
-    Batch,
+    BatchCollator,
     Collator,
     CorpusStream,
+    StepBatch,
     TrainingExample,
     token_budget_batches,
 )
@@ -269,7 +270,7 @@ class Accuracy:
 
 
 def epoch_groups(
-    stream: CorpusStream, collator: Collator, budget: int, epoch: int
+    stream: CorpusStream, collator: BatchCollator, budget: int, epoch: int
 ) -> Iterator[list[TrainingExample]]:
     """The examples of *epoch*, grouped exactly as the steps of that epoch will be.
 
@@ -301,13 +302,13 @@ class Produced:
     writes is the last batch *consumed*, not the last one produced.
     """
 
-    batch: Batch
+    batch: StepBatch
     epoch: int
     index: int
     collator_rng: tuple[Any, ...]
 
 
-class EpochBatches(Iterator[Batch]):
+class EpochBatches(Iterator[StepBatch]):
     """The stream as collated batches, epoch after epoch, and where in it we are.
 
     The position is what makes a run resumable. A rank's batches are its own --
@@ -317,7 +318,7 @@ class EpochBatches(Iterator[Batch]):
     :meth:`skip` walks a fresh stream back to exactly there.
     """
 
-    def __init__(self, stream: CorpusStream, collator: Collator, budget: int):
+    def __init__(self, stream: CorpusStream, collator: BatchCollator, budget: int):
         self.stream = stream
         self.collator = collator
         self.budget = budget
@@ -327,7 +328,7 @@ class EpochBatches(Iterator[Batch]):
         self.index = 0
         self._groups = self._open_epoch()
 
-    def __next__(self) -> Batch:
+    def __next__(self) -> StepBatch:
         return self.produce().batch
 
     def produce(self) -> Produced:
@@ -842,7 +843,7 @@ def evaluate(
 
 def train(
     model: RouteAModel,
-    lanes: Sequence[tuple[CorpusStream, Collator]],
+    lanes: Sequence[tuple[CorpusStream, BatchCollator]],
     config: TrainingConfig,
     out_dir: Path,
     distributed: Distributed | None = None,

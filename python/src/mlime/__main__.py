@@ -463,6 +463,29 @@ def train_e2e(
     aux_weight: float = typer.Option(
         0.3, help="Weight of the encoder head's loss inside the total"
     ),
+    init_e2e: Path = typer.Option(
+        None,
+        help="A finished e2e checkpoint; a new run starts from its weights, "
+        "with a fresh optimiser and schedule",
+    ),
+    ranking: bool = typer.Option(
+        False,
+        "--ranking/--no-ranking",
+        help="Add the sequence-level ranking loss over each example's segmentations (#116)",
+    ),
+    segmenter: Path = typer.Option(
+        None, help="The ime-segment binary the ranking loss reads segmentations from"
+    ),
+    rank_segmentations: int = typer.Option(
+        None, help="Readings of each example's keystrokes to rank over (default 8)"
+    ),
+    rank_beam: int = typer.Option(None, help="Beam width of the negative search (default 4)"),
+    rank_negatives: int = typer.Option(
+        None, help="Negatives each example ranks the gold sentence against (default 8)"
+    ),
+    rank_weight: float = typer.Option(
+        None, help="Weight of the ranking loss inside the total (default 1.0)"
+    ),
     typos: bool = typer.Option(
         False,
         "--typos/--no-typos",
@@ -539,10 +562,27 @@ def train_e2e(
     import torch
 
     from mlime.train.e2e import e2e
+    from mlime.train.e2e_model import RankingConfig
     from mlime.train.loop import TrainingConfig
     from mlime.train.run import describe_device
     from mlime.train.samples import Augmentation
 
+    knobs = (rank_segmentations, rank_beam, rank_negatives, rank_weight)
+    if not ranking and any(value is not None for value in knobs):
+        raise typer.BadParameter("the --rank-* options set the ranking loss; pass --ranking")
+    default = RankingConfig()
+    ranking_config = (
+        RankingConfig(
+            segmentations=default.segmentations
+            if rank_segmentations is None
+            else rank_segmentations,
+            beam=default.beam if rank_beam is None else rank_beam,
+            negatives=default.negatives if rank_negatives is None else rank_negatives,
+            weight=default.weight if rank_weight is None else rank_weight,
+        )
+        if ranking
+        else None
+    )
     typer.echo(f"device: {describe_device()}")
     try:
         result = e2e(
@@ -575,6 +615,9 @@ def train_e2e(
             resume=resume,
             activation_checkpointing=activation_checkpointing,
             run_config=run_config,
+            init_e2e=init_e2e,
+            ranking=ranking_config,
+            segmenter=segmenter,
         )
     except torch.cuda.OutOfMemoryError as error:
         # The sweep that drives this wants the peak recorded even at the crash,

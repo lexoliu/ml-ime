@@ -21,6 +21,14 @@ checkpoint. A segment that mounts a run whose training already finished --
 `run/checkpoint-final.pt` in its output, the evaluation having stopped before
 its report -- evaluates that checkpoint and trains nothing.
 
+A ranking stage (#116) is the same chain with `RANKING` stamped: the first
+segment starts from the finished v1 run mounted with `lexoliu/mlime-e2e-final`
+-- its weights, a fresh optimiser and schedule -- and every segment adds the
+sequence-level ranking loss, reading each example's other segmentations from
+the `ime-segment` binary the package dataset ships. Its one epoch runs over
+`TRAIN_SHARDS`. A finished run is told apart from the v1 run it started from
+by the `ranking` its run-config records.
+
 For a smoke run -- the few-minute rate check that the cost estimate is made
 from -- set `SMOKE_STEPS` nonzero: the kernel times each entry of
 `SMOKE_CONFIGS` for that many steps after a warm-up at `TOKEN_BUDGET`, one
@@ -159,6 +167,23 @@ WORLD = 2
 #: because a Colab VM can die without warning and the interval trio is what
 #: its publisher ships.
 CHECKPOINT_MINUTES = 0
+
+#: The ranking stage of #116: None trains #88's objective from route A and the
+#: reader; a dict of `mlime train e2e --rank-*` settings (`segmentations`,
+#: `beam`, `negatives`, `weight`) starts from the finished v1 run instead and
+#: adds the sequence-level ranking loss. Stamped per push.
+RANKING = None
+
+#: The training shards a run makes its epoch over; None trains on every
+#: mounted shard but the held-out ones. Stamped per push.
+TRAIN_SHARDS = None
+
+#: The (pretrained, new) learning rates; None keeps `mlime train e2e`'s.
+LEARNING_RATES = None
+
+#: The segmenter binary the ranking loss pipes keystrokes through, shipped
+#: inside the package dataset.
+SEGMENTER = "ime-segment"
 
 #: Corrupt each example's typed keystrokes with the shared typo noise model.
 #: Off by default so the running chain stays on clean input until a pushed
@@ -335,6 +360,8 @@ def data_argv(char_table, token_budget=TOKEN_BUDGET):
     ]
     for shard in HELD_OUT:
         argv += ["--held-out-shard", shard]
+    for shard in TRAIN_SHARDS or ():
+        argv += ["--train-shard", shard]
     return argv
 
 
@@ -366,12 +393,29 @@ def count_argv(char_table, out, census=None):
     return argv
 
 
+def start_argv(initials, init_e2e):
+    """Where a new run's weights come from: route A and the reader, or v1's run."""
+    if RANKING is None:
+        return ["--init-encoder", str(initials[0]), "--init-decoder", str(initials[1])]
+    return ["--init-e2e", str(init_e2e)]
+
+
+def ranking_argv(segmenter):
+    """The ranking loss's switches, the same on every segment of a ranking run."""
+    if RANKING is None:
+        return []
+    argv = ["--ranking", "--segmenter", str(segmenter)]
+    for name, value in RANKING.items():
+        argv += [f"--rank-{name}", str(value)]
+    return argv
+
+
 def train_argv(
     char_table,
     out,
     max_steps,
     wall_budget,
-    initials,
+    start,
     resume,
     token_budget,
     max_held_out=4096,
@@ -384,13 +428,16 @@ def train_argv(
     virtual_ranks=1,
     checkpoint_minutes=CHECKPOINT_MINUTES,
     log_every=10,
+    segmenter=None,
 ):
     """The training command the ranks of this segment run.
 
     *nproc* is how many processes the launcher's T4s host and
     *virtual_ranks* how many ranks each one stands for: on Kaggle two
     processes of one rank, on Colab one process of two, and the checkpoint
-    does not know the difference.
+    does not know the difference. *start* is `start_argv`'s for a new run and
+    None for a resumed one; *segmenter* is the staged binary a ranking run
+    reads.
     """
     argv = [
         sys.executable,
@@ -435,8 +482,11 @@ def train_argv(
         argv += ["--wall-budget-seconds", str(wall_budget)]
     if checkpoint_minutes:
         argv += ["--checkpoint-minutes", str(checkpoint_minutes)]
-    if initials is not None:
-        argv += ["--init-encoder", str(initials[0]), "--init-decoder", str(initials[1])]
+    if start is not None:
+        argv += start
+    if LEARNING_RATES is not None:
+        argv += ["--base-lr", str(LEARNING_RATES[0]), "--new-lr", str(LEARNING_RATES[1])]
+    argv += ranking_argv(segmenter)
     if resume is not None:
         argv += ["--resume", str(resume)]
     if ACTIVATION_CHECKPOINTING:
@@ -656,7 +706,7 @@ def gpu_total_bytes():
     )
 
 
-def smoke_run(char_table, init_files, env, name, token_budget, options, steps, timed):
+def smoke_run(char_table, start, segmenter, env, name, token_budget, options, steps, timed):
     """One smoke subprocess: *steps* optimiser steps, the last *timed* measured.
 
     A configuration's run is a process of its own so an OOM neither corrupts
@@ -672,7 +722,7 @@ def smoke_run(char_table, init_files, env, name, token_budget, options, steps, t
         run_dir,
         steps,
         None,
-        init_files,
+        start,
         None,
         token_budget,
         max_held_out=256,
@@ -682,6 +732,7 @@ def smoke_run(char_table, init_files, env, name, token_budget, options, steps, t
         compile=options.get("compile", False),
         compile_mode=options.get("compile_mode", "default"),
         log_every=1,
+        segmenter=segmenter,
     )
     with GpuSampler() as sampler:
         code, seconds = run(argv, env, str(log_file))
@@ -786,7 +837,7 @@ def settings_of(entry):
     }
 
 
-def smoke(char_table, out, init_files, env):
+def smoke(char_table, start, segmenter, env):
     """Time each `SMOKE_CONFIGS` entry at `TOKEN_BUDGET`, then acc2 wide.
 
     The wider run is always accumulate 2 -- the question it answers is memory,
@@ -797,7 +848,8 @@ def smoke(char_table, out, init_files, env):
     entries = [
         smoke_run(
             char_table,
-            init_files,
+            start,
+            segmenter,
             env,
             name,
             TOKEN_BUDGET,
@@ -816,7 +868,8 @@ def smoke(char_table, out, init_files, env):
 
     wide = smoke_run(
         char_table,
-        init_files,
+        start,
+        segmenter,
         env,
         f"compile-acc2-{SMOKE_WIDE_BUDGET}",
         SMOKE_WIDE_BUDGET,
@@ -916,16 +969,50 @@ def resume_candidates():
     return found
 
 
+def finished_runs(ranking):
+    """The final checkpoints of the mounted finished runs that trained *ranking*.
+
+    A run's run-config records its ranking settings, absent on v1's; that is
+    how a ranking stage tells its own finished run from the v1 run it starts
+    from, both mounted at once.
+    """
+    return [
+        mount / "run" / "checkpoint-final.pt"
+        for mount in locate_all("run/checkpoint-final.pt", "run-config.json")
+        if json.loads((mount / "run-config.json").read_text()).get("ranking") == ranking
+    ]
+
+
 def finished_checkpoint():
-    """The final checkpoint of a mounted run that finished training, or None.
+    """The final checkpoint of a mounted run of this kernel's kind, or None.
 
     Two such mounts would be two finished runs, and which one to evaluate is
     not this kernel's to guess.
     """
-    found = locate_all("run/checkpoint-final.pt", "run-config.json")
+    found = finished_runs(RANKING)
     if len(found) > 1:
         raise RuntimeError(f"{len(found)} finished runs are mounted: {found}")
-    return found[0] / "run" / "checkpoint-final.pt" if found else None
+    return found[0] if found else None
+
+
+def ranking_init():
+    """The finished v1 checkpoint a ranking stage starts from; exactly one is mounted."""
+    found = finished_runs(None)
+    if len(found) != 1:
+        raise FileNotFoundError(
+            f"a ranking stage starts from one finished v1 run, found {found}; "
+            f"mounts hold {describe()}"
+        )
+    return found[0]
+
+
+def stage_segmenter():
+    """The package dataset's `ime-segment`, copied out of the read-only mount, executable."""
+    target = WORKING / "bin" / SEGMENTER
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(locate(SEGMENTER) / SEGMENTER, target)
+    target.chmod(0o755)
+    return target
 
 
 def evaluate_lattices(checkpoint, assets, char_table, env):
@@ -1070,7 +1157,6 @@ def main():
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)
     rest_samples, rest_labels = parquet_mounts(REST_MARKER)
     assets = locate("char_pinyin.tsv", "lattice.jsonl")
-    initials = locate(INIT_ENCODER, INIT_DECODER)
     stage_data({"samples": (v1_samples, rest_samples), "labels": (v1_labels, rest_labels)})
     print(
         subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, check=True).stdout,
@@ -1089,9 +1175,16 @@ def main():
     shutil.rmtree(out, ignore_errors=True)
     config_path = WORKING / "run-config.json"
 
+    segmenter = stage_segmenter() if RANKING is not None else None
+
+    def start():
+        if RANKING is not None:
+            return start_argv(None, ranking_init())
+        initials = locate(INIT_ENCODER, INIT_DECODER)
+        return start_argv((initials / INIT_ENCODER, initials / INIT_DECODER), None)
+
     if SMOKE_STEPS:
-        init_files = (initials / INIT_ENCODER, initials / INIT_DECODER)
-        smoke(char_table, WORKING / "run", init_files, env)
+        smoke(char_table, start(), segmenter, env)
         return
 
     final = finished_checkpoint()
@@ -1120,7 +1213,13 @@ def main():
         if code != 0:
             raise RuntimeError("counting the batches failed; its log is in the kernel output")
         counts = json.loads(counts_path.read_text())
-        config = {"max_steps": int(counts["steps_for_epochs"]), "epochs": EPOCHS}
+        config = {
+            "max_steps": int(counts["steps_for_epochs"]),
+            "epochs": EPOCHS,
+            "ranking": RANKING,
+            "train_shards": TRAIN_SHARDS,
+            "learning_rates": LEARNING_RATES,
+        }
         resume = None
     else:
         resume, config = previous["checkpoint"], previous["config"]
@@ -1142,11 +1241,6 @@ def main():
     virtual = world // nproc
     print(f"world of {world}: {nproc} processes x {virtual} virtual ranks", flush=True)
 
-    init_files = (
-        (initials / INIT_ENCODER, initials / INIT_DECODER)
-        if resume is None
-        else None
-    )
     wall_budget = training_budget(
         time.monotonic() - started, config["max_steps"], previous, nproc
     )
@@ -1158,11 +1252,12 @@ def main():
             out,
             config["max_steps"],
             wall_budget,
-            init_files,
+            start() if resume is None else None,
             resume,
             TOKEN_BUDGET,
             nproc=nproc,
             virtual_ranks=virtual,
+            segmenter=segmenter,
         ),
         env,
         str(WORKING / "train.log"),

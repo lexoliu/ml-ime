@@ -433,6 +433,12 @@ class Batch:
     correction-widened set vary per position without a new mask row. ``span_letters
     [B, W, L]`` is the raw keys pressed, ``a``-``z`` as 0-25 and ``LETTER_PAD``
     past each span's length, which is all the letter encoder sees of a typo.
+
+    The context fields hold one row per *context*, not per fill row:
+    ``context_rows [B]`` names the context row each fill row reads. Every
+    example owns its own context in a plain batch, so there it is ``arange``;
+    a ranking batch types one example several ways and runs the context tower
+    once for all of them.
     """
 
     input_ids: torch.Tensor
@@ -444,6 +450,7 @@ class Batch:
     context_ids: torch.Tensor
     context_mask: torch.Tensor
     has_context: torch.Tensor
+    context_rows: torch.Tensor
     candidate_ids: torch.Tensor
     candidate_counts: torch.Tensor
     span_letters: torch.Tensor
@@ -451,7 +458,7 @@ class Batch:
 
     @property
     def size(self) -> int:
-        """Examples in the batch."""
+        """Fill rows in the batch: examples, unless a ranking batch types them several ways."""
         return int(self.input_ids.shape[0])
 
     @property
@@ -482,11 +489,58 @@ class Batch:
             context_ids=self.context_ids.to(device, non_blocking=True),
             context_mask=self.context_mask.to(device, non_blocking=True),
             has_context=self.has_context.to(device, non_blocking=True),
+            context_rows=self.context_rows.to(device, non_blocking=True),
             candidate_ids=self.candidate_ids.to(device, non_blocking=True),
             candidate_counts=self.candidate_counts.to(device, non_blocking=True),
             span_letters=self.span_letters.to(device, non_blocking=True),
             ids=self.ids,
         )
+
+
+class StepBatch(Protocol):
+    """What the training loop reads of a collated step, whatever the model consumes."""
+
+    @property
+    def scored(self) -> torch.Tensor:
+        """The flat indices of the positions the step's per-position loss scores."""
+        ...
+
+    @property
+    def size(self) -> int:
+        """Examples in the step."""
+        ...
+
+    @property
+    def tokens(self) -> int:
+        """Padded fill-tower positions."""
+        ...
+
+    @property
+    def context_tokens(self) -> int:
+        """Padded context-tower positions."""
+        ...
+
+    def to(self, device: torch.device) -> StepBatch:
+        """The same step on *device*."""
+        ...
+
+
+class BatchCollator(Protocol):
+    """What the training loop needs of a collator: a batch, its generator, its budget."""
+
+    @property
+    def rng(self) -> random.Random:
+        """The generator whose state a checkpoint carries."""
+        ...
+
+    @property
+    def max_context_tokens(self) -> int:
+        """The context budget batching is grouped under."""
+        ...
+
+    def __call__(self, examples: Sequence[TrainingExample]) -> StepBatch:
+        """Collate one group of examples."""
+        ...
 
 
 class Collator:
@@ -520,8 +574,27 @@ class Collator:
 
     def __call__(self, examples: Sequence[TrainingExample]) -> Batch:
         """Collate *examples*, keeping each one's context with probability 1-p."""
+        return self.collate(
+            examples, [example.context for example in examples], range(len(examples))
+        )
+
+    def collate(
+        self,
+        examples: Sequence[TrainingExample],
+        contexts: Sequence[str | None],
+        context_rows: Sequence[int],
+    ) -> Batch:
+        """Collate fill rows *examples* over *contexts*, row *i* reading ``context_rows[i]``.
+
+        The dropout coin is thrown once per context, so the rows that share one
+        are all typed with it or all without it.
+        """
         if not examples:
             raise ValueError("cannot collate an empty batch")
+        if len(context_rows) != len(examples):
+            raise ValueError(
+                f"{len(examples)} fill rows but {len(context_rows)} context assignments"
+            )
         width = max(len(example) for example in examples) + 2
         size = len(examples)
         input_ids = torch.full((size, width), self.tokenizer.pad_token_id, dtype=torch.long)
@@ -541,8 +614,6 @@ class Collator:
         candidate_counts = torch.zeros((size, width), dtype=torch.long)
         span_letters = torch.full((size, width, MAX_SPAN_LETTERS), LETTER_PAD, dtype=torch.long)
 
-        contexts: list[str] = []
-        has_context = torch.zeros(size, dtype=torch.float)
         for row, example in enumerate(examples):
             length = len(example)
             input_ids[row, 0] = self.tokenizer.cls_token_id
@@ -578,16 +649,15 @@ class Collator:
             span_ids[row, 1 : length + 1] = row_spans
             span_positions[row, 1 : length + 1] = True
             targets[row, 1 : length + 1] = row_targets
-            keep = example.context is not None and self.rng.random() >= self.context_dropout
-            contexts.append(
-                context_tail(example.context, self.max_context_tokens)
-                if keep and example.context
-                else ""
-            )
-            has_context[row] = 1.0 if keep else 0.0
 
+        kept: list[str] = []
+        has_context = torch.zeros(len(contexts), dtype=torch.float)
+        for index, context in enumerate(contexts):
+            keep = context is not None and self.rng.random() >= self.context_dropout
+            kept.append(context_tail(context, self.max_context_tokens) if keep and context else "")
+            has_context[index] = 1.0 if keep else 0.0
         encoded = self.tokenizer(
-            contexts,
+            kept,
             padding=True,
             truncation=True,
             max_length=self.max_context_tokens,
@@ -610,6 +680,7 @@ class Collator:
             context_ids=encoded["input_ids"],
             context_mask=encoded["attention_mask"],
             has_context=has_context,
+            context_rows=torch.tensor(context_rows, dtype=torch.long),
             candidate_ids=candidate_ids,
             candidate_counts=candidate_counts,
             span_letters=span_letters,

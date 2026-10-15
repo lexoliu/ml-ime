@@ -45,9 +45,9 @@ import torch
 
 from mlime.gui import DEV_SHARE, digest, slice_indices
 from mlime.logging import log
-from mlime.train.charlm_vocab import BOS
 from mlime.train.e2e import load_model
 from mlime.train.e2e_model import E2EModel
+from mlime.train.e2e_search import Lane, decode_lanes
 from mlime.train.emit import CandidateIndex, LatticeRecord, examples_for, read_lattice
 from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.model import mark_dynamic
@@ -73,109 +73,6 @@ RANK_SCALE = 1 << 20
 #: Beam rows times positions one decode batch may hold: the key/value cache
 #: grows with both, so a batch of long paths carries fewer of them.
 DEFAULT_ROW_POSITIONS = 16384
-
-
-@dataclass(frozen=True)
-class Lane:
-    """One lattice path ready to decode: whose it is, what the encoder said, what it admits.
-
-    ``vectors [n, enc]`` is the encoder's hidden state at the path's typed
-    positions and ``candidates`` one ``[E]`` bool row per position, the
-    emission indices that position's span admits.
-    """
-
-    owner: int
-    vectors: torch.Tensor
-    candidates: torch.Tensor
-
-    @property
-    def length(self) -> int:
-        """The number of typed positions."""
-        return int(self.vectors.shape[0])
-
-
-def decode_lanes(
-    model: E2EModel, lanes: Sequence[Lane], beam_width: int
-) -> list[list[tuple[list[int], float]]]:
-    """Beam-search equally long lanes together; each lane's hypotheses and scores.
-
-    Every lane owns a block of ``beam_width`` rows from the first step, the
-    unused ones at a score of minus infinity, so the row layout never changes
-    and the encoder keys and values are expanded once. Each step's scores are
-    log-probabilities over the full emittable row, and the candidate
-    restriction masks the characters the position does not admit afterwards,
-    so a path's score is comparable with another segmentation's. Rows still at minus
-    infinity when the path ends are slots the lattice never filled and are
-    dropped, so a lane admitting fewer than ``beam_width`` sentences returns
-    fewer.
-    """
-    length = lanes[0].length
-    if any(lane.length != length for lane in lanes):
-        raise ValueError("decode_lanes takes lanes of one length; bucket them first")
-    decoder = model.decoder
-    device = decoder.emit_ids.device
-    count, width = len(lanes), beam_width
-    rows = count * width
-    vectors = torch.stack([lane.vectors for lane in lanes]).to(device)
-    masks = torch.stack([lane.candidates for lane in lanes]).to(device)
-    emittable = masks.shape[-1]
-    everything = torch.arange(emittable, device=device)
-    lane_of_row = torch.arange(count, device=device).repeat_interleave(width)
-    encoder_kv = [
-        tuple(part.repeat_interleave(width, dim=0) for part in cross.kv(vectors))
-        for cross in decoder.gated_layers()
-    ]
-    layers, heads = decoder.reader.config.layers, decoder.reader.config.heads
-    head_dim = decoder.reader.config.hidden // heads
-    keys = torch.zeros(rows, layers, heads, 0, head_dim, device=device)
-    values = keys.clone()
-    scores = torch.full((count, width), float("-inf"), device=device)
-    scores[:, 0] = 0.0
-    tokens = torch.full((rows,), BOS, dtype=torch.long, device=device)
-    block = torch.arange(count, device=device).unsqueeze(1) * width
-    parents: list[torch.Tensor] = []
-    choices: list[torch.Tensor] = []
-    for position in range(length):
-        logits, (keys, values) = decoder.step(
-            tokens,
-            vectors[lane_of_row, position],
-            (keys, values),
-            encoder_kv,  # type: ignore[arg-type]
-            candidates=everything,
-        )
-        admitted = masks[lane_of_row, position]
-        log_probs = logits.float().log_softmax(dim=-1).masked_fill(~admitted, float("-inf"))
-        total = (scores.reshape(rows, 1) + log_probs).reshape(count, width * emittable)
-        top = total.topk(width, dim=1)
-        parent = top.indices // emittable
-        choice = top.indices % emittable
-        source = (block + parent).reshape(rows)
-        keys, values = keys[source], values[source]
-        tokens = decoder.emit_ids[choice.reshape(rows)]
-        scores = top.values
-        parents.append(parent)
-        choices.append(choice)
-
-    # Plain lists: the walk back reads one element at a time, which a tensor
-    # charges a dispatch for.
-    parent_steps: list[list[list[int]]] = torch.stack(parents).tolist()
-    choice_steps: list[list[list[int]]] = torch.stack(choices).tolist()
-    final: list[list[float]] = scores.tolist()
-    decoded: list[list[tuple[list[int], float]]] = []
-    for lane in range(count):
-        hypotheses = []
-        for beam, score in enumerate(final[lane]):
-            if score == float("-inf"):
-                continue
-            sequence = []
-            row = beam
-            for position in range(length - 1, -1, -1):
-                sequence.append(choice_steps[position][lane][row])
-                row = parent_steps[position][lane][row]
-            sequence.reverse()
-            hypotheses.append((sequence, score))
-        decoded.append(hypotheses)
-    return decoded
 
 
 @torch.no_grad()
