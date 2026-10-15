@@ -77,6 +77,12 @@ SMOKE_CONFIGS = (
     ("compile-acc4", {"prefetch": True, "accumulate": 4, "compile": True}),
 )
 
+#: Timed steps per smoke configuration to also record as a Chrome trace,
+#: one per rank, copied out as `smoke-<name>-trace-rank<r>.json`. A trace
+#: shows where inside a phase a card idled; each is ~60 MB a step, so it is
+#: off unless a run is being diagnosed.
+SMOKE_TRACE_STEPS = 0
+
 #: The wider budget accumulate-2 gets a timed run at. The gate is that run's
 #: own timed peak: a 60-step probe was shown to under-report what a long
 #: segment sees, so it no longer stands in.
@@ -427,6 +433,7 @@ def train_argv(
     prefetch=PREFETCH,
     accumulate=ACCUMULATE,
     profile_steps=0,
+    trace_steps=0,
     compile=COMPILE,
     compile_mode=COMPILE_MODE,
     nproc=WORLD,
@@ -483,6 +490,8 @@ def train_argv(
         argv += ["--compile", "--compile-mode", str(compile_mode)]
     if profile_steps:
         argv += ["--profile-steps", str(profile_steps)]
+    if trace_steps:
+        argv += ["--trace-steps", str(trace_steps)]
     if wall_budget is not None:
         argv += ["--wall-budget-seconds", str(wall_budget)]
     if checkpoint_minutes:
@@ -710,6 +719,8 @@ class CpuSampler:
         self._stopped = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self.samples = []
+        # Read while the process lives: the report is written after it exits.
+        self._commands = {}
 
     @staticmethod
     def _machine():
@@ -742,7 +753,11 @@ class CpuSampler:
     def _run(self):
         while not self._stopped.is_set():
             busy, total = self._machine()
-            self.samples.append((time.time(), busy, total, self._threads()))
+            threads = self._threads()
+            for pid, _ in threads:
+                if pid not in self._commands:
+                    self._commands[pid] = self._command(pid)
+            self.samples.append((time.time(), busy, total, threads))
             self._stopped.wait(self._interval)
 
     def __enter__(self):
@@ -783,7 +798,7 @@ class CpuSampler:
             "processes": [
                 {
                     "pid": pid,
-                    "command": self._command(pid),
+                    "command": self._commands[pid],
                     "main_cores": round(used["main"], 2),
                     "other_cores": round(used["other"], 2),
                 }
@@ -835,6 +850,7 @@ def smoke_run(char_table, start, segmenter, env, name, token_budget, options, st
         prefetch=options.get("prefetch", False),
         accumulate=options.get("accumulate", 1),
         profile_steps=timed,
+        trace_steps=SMOKE_TRACE_STEPS,
         compile=options.get("compile", False),
         compile_mode=options.get("compile_mode", "default"),
         log_every=1,
@@ -914,6 +930,8 @@ def smoke_run(char_table, start, segmenter, env, name, token_budget, options, st
             entry["first_loss"] = step_records[0]["loss"]
             entry["last_loss"] = step_records[-1]["loss"]
     print(json.dumps(entry), flush=True)
+    for trace in run_dir.glob("trace-rank*.json"):
+        shutil.move(trace, WORKING / f"smoke-{name}-{trace.name}")
     shutil.rmtree(run_dir, ignore_errors=True)
     return entry
 

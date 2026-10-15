@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import random
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -678,6 +679,38 @@ def test_a_profiled_run_writes_the_phase_table(
     assert set(profiled[0]["phases"]) == set(PHASES)
     for phase in profiled[0]["phases"].values():
         assert phase["p95"] >= phase["mean"] >= 0.0
+
+
+def test_a_traced_run_writes_its_first_profiled_steps_as_a_trace(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """The trace holds every phase boundary of the traced steps and none after them."""
+    config = replace(RESUMABLE, max_steps=12, profile_steps=3, trace_steps=2, accumulate=2)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    train(tiny_model(lexicon), [(stream, collator)], config, tmp_path / "run")
+    events = json.loads((tmp_path / "run" / "trace-rank0.json").read_text())["traceEvents"]
+    marks = Counter(e["name"] for e in events if str(e.get("name", "")).startswith("phase."))
+    # Two steps of two micro-batches: each micro-batch marks h2d, forward and
+    # backward; each step marks the rest once.
+    assert marks == {
+        "phase.batch_wait": 2,
+        "phase.h2d": 4,
+        "phase.forward": 4,
+        "phase.backward": 4,
+        "phase.unscale_clip": 2,
+        "phase.optimizer": 2,
+        "phase.agree_log": 2,
+    }
+
+
+def test_a_trace_longer_than_the_profiled_window_is_refused() -> None:
+    with pytest.raises(ValueError, match="trace_steps"):
+        replace(RESUMABLE, profile_steps=1, trace_steps=2)
 
 
 # ---------------------------------------------------------------------------

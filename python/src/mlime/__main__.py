@@ -552,6 +552,11 @@ def train_e2e(
         "--profile-steps",
         help="Steps after warm-up to time per phase; written to stdout and metrics",
     ),
+    trace_steps: int = typer.Option(
+        0,
+        "--trace-steps",
+        help="Of the profiled steps, how many to record as a Chrome trace per rank in --out",
+    ),
     compile: bool = typer.Option(
         False,
         "--compile/--no-compile",
@@ -615,6 +620,7 @@ def train_e2e(
                 accumulate=accumulate,
                 prefetch=prefetch,
                 profile_steps=profile_steps,
+                trace_steps=trace_steps,
                 compile=compile,
                 compile_mode=compile_mode,
                 agree_every=agree_every,

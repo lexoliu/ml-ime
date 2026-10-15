@@ -271,7 +271,7 @@ class RankingE2EModel(E2EModel):
         decoder = self.decoder
         training = decoder.training
         decoder.eval()
-        with torch.no_grad():
+        with torch.no_grad(), torch.profiler.record_function("rank.beam"):
             detached = spans.detach()
             found = decode_lanes(
                 self,
@@ -287,8 +287,10 @@ class RankingE2EModel(E2EModel):
         # below, they would cut the head out of the loss (DDP then reports
         # `decoder.reader.project` as unused). Dropping them recasts with grad.
         torch.clear_autocast_cache()
-        items = select_items(batch, found, ranking.negatives)
-        paths, projected = self.path_scores(spans, items.rows, items.sequences)
+        with torch.profiler.record_function("rank.select_items"):
+            items = select_items(batch, found, ranking.negatives)
+        with torch.profiler.record_function("rank.path_scores"):
+            paths, projected = self.path_scores(spans, items.rows, items.sequences)
         length = projected.shape[1]
 
         device = spans.device
