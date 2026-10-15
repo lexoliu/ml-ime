@@ -453,6 +453,9 @@ struct Manifest {
     weights: WeightsTable,
     specials: Specials,
     chars: Vec<String>,
+    /// The alphabet ids a restricted export normalises its head over,
+    /// sorted; `None` when the head covers the whole alphabet.
+    kept: Option<Vec<u32>>,
 }
 
 /// The manifest's `rows`: each resident buffer's per-slot row shape, in the
@@ -2447,6 +2450,8 @@ impl CharLm {
                 table,
                 map,
                 shape.metal_weights,
+                manifest.chars.len(),
+                manifest.kept.as_deref(),
             )?))
         } else {
             None
