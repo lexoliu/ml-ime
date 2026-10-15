@@ -298,7 +298,7 @@ def test_the_step_path_matches_the_teacher_forced_path(
         encoder_kv = [cross.kv(spans_v.unsqueeze(0)) for cross in decoder.gated_layers()]
         layers, heads = decoder.reader.config.layers, decoder.reader.config.heads
         head_dim = decoder.reader.config.hidden // heads
-        keys = torch.zeros(1, layers, heads, n, head_dim)
+        keys = torch.zeros(layers, 1, heads, n, head_dim)
         values = keys.clone()
         got = []
         for position in range(n):

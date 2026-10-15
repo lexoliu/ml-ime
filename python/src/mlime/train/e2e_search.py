@@ -77,7 +77,11 @@ def decode_lanes(
     emittable = masks.shape[-1]
     everything = torch.arange(emittable, device=device)
     lane_of_row = torch.arange(count, device=device).repeat_interleave(width)
-    encoder_kv = [cross.kv(vectors) for cross in decoder.gated_layers()]
+    # Contiguous once here, or every step's attention copies them into shape.
+    encoder_kv = [
+        (keys.contiguous(), values.contiguous())
+        for keys, values in (cross.kv(vectors) for cross in decoder.gated_layers())
+    ]
     ragged = min(lengths) != length
     lane_lengths = torch.tensor(lengths, device=device)
     encoder_mask = (
@@ -96,7 +100,7 @@ def decode_lanes(
         if torch.is_autocast_enabled(device.type)
         else decoder.reader.embed.weight.dtype
     )
-    keys = torch.zeros(rows, layers, heads, length, head_dim, dtype=cached, device=device)
+    keys = torch.zeros(layers, rows, heads, length, head_dim, dtype=cached, device=device)
     values = torch.zeros_like(keys)
     scores = torch.full((count, width), float("-inf"), device=device)
     scores[:, 0] = 0.0
@@ -117,7 +121,7 @@ def decode_lanes(
         for tensor in (tokens, span_vector):
             torch._dynamo.maybe_mark_dynamic(tensor, 0)
         for tensor in (keys, values):
-            torch._dynamo.maybe_mark_dynamic(tensor, (0, 3))
+            torch._dynamo.maybe_mark_dynamic(tensor, (1, 3))
         at = positions[position]
         logits, (new_keys, new_values) = decoder.step(
             tokens,
@@ -140,7 +144,7 @@ def decode_lanes(
         parent = top.indices // emittable
         choice = top.indices % emittable
         source = (block + parent).reshape(rows)
-        keys, values = keys[source], values[source]
+        keys, values = keys.index_select(1, source), values.index_select(1, source)
         tokens = decoder.emit_ids[choice.reshape(rows)]
         scores = top.values
         parents.append(parent)

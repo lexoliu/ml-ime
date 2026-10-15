@@ -346,13 +346,15 @@ class Decoder(nn.Module):
         of the position being predicted, ``position`` that position as a
         0-d long tensor, and ``candidates`` the emission indices the
         position's span admits -- the only logits the search needs and the
-        only ones computed. ``state`` is the key/value cache, ``[B, layers,
+        only ones computed. ``state`` is the key/value cache, ``[layers, B,
         heads, T, head_dim]`` each over the path's whole length ``T``, holding
         the positions before this one; the step reads it and returns this
-        position's keys and values, ``[B, layers, heads, 1, head_dim]``, for
-        the caller to write in. The rows are lanes of beams, lane-major, and
-        ``encoder_kv`` holds each block's encoder keys and values per lane,
-        ``[lanes, heads, S, head_dim]``, with ``encoder_mask [lanes, S]``.
+        position's keys and values, ``[layers, B, heads, 1, head_dim]``, for
+        the caller to write in. Layers lead so a block's slice is contiguous
+        and its attention reads the cache in place, never through a copy. The
+        rows are lanes of beams, lane-major, and ``encoder_kv`` holds each
+        block's encoder keys and values per lane, ``[lanes, heads, S,
+        head_dim]``, with ``encoder_mask [lanes, S]``.
 
         The cache's shape is the path's for every step, and the step writes
         nothing it is given, so a compiled step is one graph for a whole
@@ -365,15 +367,15 @@ class Decoder(nn.Module):
         for layer, (block, cross) in enumerate(
             zip(self.reader.layers(), self.gated_layers(), strict=True)
         ):
-            x, k, v = _attend_step(block, x, keys[:, layer], values[:, layer], before)
+            x, k, v = _attend_step(block, x, keys[layer], values[layer], before)
             enc_keys, enc_values = encoder_kv[layer]
             x = cross.attend_beams(x, enc_keys, enc_values, encoder_mask)
             new_keys.append(k)
             new_values.append(v)
         features: torch.Tensor = self.reader.norm(x).squeeze(1)
         return self.logits_over(features, candidates), (
-            torch.stack(new_keys, dim=1),
-            torch.stack(new_values, dim=1),
+            torch.stack(new_keys),
+            torch.stack(new_values),
         )
 
 
