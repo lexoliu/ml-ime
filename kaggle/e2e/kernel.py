@@ -738,8 +738,10 @@ def smoke_run(char_table, start, segmenter, env, name, token_budget, options, st
         log_every=1,
         segmenter=segmenter,
     )
+    # A recompile inside the window costs about a minute of an idle card;
+    # dynamo's reason for each lands in the log beside the step that paid it.
     with GpuSampler() as sampler:
-        code, seconds = run(argv, env, str(log_file))
+        code, seconds = run(argv, {**env, "TORCH_LOGS": "recompiles"}, str(log_file))
     text = log_file.read_text(encoding="utf-8")
     profiles = profile_phases(text)
     # GPU means cover the timed window only: the profile record's epoch bounds

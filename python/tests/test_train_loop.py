@@ -720,11 +720,15 @@ def _gloo_rank(
     out_dir: str,
     port: int,
     config: TrainingConfig,
+    early_window: bool = False,
 ) -> None:
     """One process of the two-rank gloo world the virtual-rank tests compare against.
 
     Runs under ``torch.multiprocessing``'s spawn, which starts a fresh
     interpreter: the fixtures are rebuilt inside it rather than pickled over.
+    *early_window* starts rank 1's measurement window after one warm-up
+    step instead of the usual ten, as a compiled rank that stopped
+    recompiling sooner than rank 0 does.
     """
     import os
     import sys
@@ -737,7 +741,11 @@ def _gloo_rank(
 
     from conftest import READINGS, StubTokenizer
 
+    from mlime.train import loop
     from mlime.train.lexicon import build_lexicon
+
+    if early_window and rank == 1:
+        loop.PROFILE_WARMUP_STEPS = 1
     from mlime.train.spans import SpanVocab
 
     spans = SpanVocab.load()
@@ -763,6 +771,7 @@ def _spawn_world(
     config: TrainingConfig,
     out_dir: str,
     resume: Path | None = None,
+    early_window: bool = False,
 ) -> Path:
     """Run *config*'s segment as a two-process gloo world under *out_dir*."""
     import socket
@@ -777,11 +786,34 @@ def _spawn_world(
     target = tmp_path / out_dir
     mp.spawn(
         _gloo_rank,
-        args=(paths, None if resume is None else str(resume), str(target), port, config),
+        args=(
+            paths,
+            None if resume is None else str(resume),
+            str(target),
+            port,
+            config,
+            early_window,
+        ),
         nprocs=2,
         join=True,
     )
     return target
+
+
+def test_a_measured_world_ends_on_rank_zeros_window(
+    corpus: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """Ranks whose windows fill on different steps still leave on the same one.
+
+    A compiled rank warms up on its own recompiles, so its window can fill
+    steps before rank 0's; leaving then would strand rank 0 in the next
+    gradient all-reduce. Rank 0's window decides, and both ranks stop after
+    its ten warm-up steps and two timed ones.
+    """
+    config = replace(RESUMABLE, max_steps=40, profile_steps=2, log_every=1)
+    measured = _spawn_world(corpus, tmp_path, config, "measured", early_window=True)
+    steps = [int(record["step"]) for record in records(measured / "metrics.jsonl", "step")]
+    assert max(steps) == 12
 
 
 def _positions(path: Path) -> list[dict[str, object]]:

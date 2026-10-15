@@ -371,7 +371,12 @@ class RankingE2EModel(E2EModel):
 
         reader_ids = decoder.emit_ids[said]
         previous = torch.cat([torch.full_like(reader_ids[:, :1], BOS), reader_ids[:, :-1]], dim=1)
-        features = decoder(previous, spans[read, :length], mask)
+        read_spans = spans[read, :length]
+        # The compiled decoder sees a new item count and length every step;
+        # marked here, its first compile is the dynamic one (as in `_scored`).
+        for tensor in (previous, read_spans, mask):
+            torch._dynamo.maybe_mark_dynamic(tensor, (0, 1))
+        features = decoder(previous, read_spans, mask)
         reader = decoder.reader
         projected: torch.Tensor = reader.project(reader.dropout(features))
         flat = projected.reshape(-1, projected.shape[-1]).index_select(

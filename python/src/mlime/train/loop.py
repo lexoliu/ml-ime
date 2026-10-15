@@ -1159,7 +1159,10 @@ def train(
                     metrics.write(event="interval", step=step, seconds=round(elapsed, 1))
             # A measurement run ends when its window fills -- a compiled one
             # may warm up late, so its max_steps is a cap, not the target.
-            if profiler.done():
+            # Each rank warms up on its own recompiles, so rank 0's window
+            # decides for all: a rank leaving on its own window would leave
+            # the others in the next gradient all-reduce.
+            if profiler.steps > 0 and agreed(world, int(profiler.done()), device):
                 break
     finally:
         for lane in rank_lanes:
@@ -1257,7 +1260,8 @@ def agreed(world: Distributed, verdict: int, device: torch.device) -> int:
     and the rest are told.
 
     The verdicts: 0 carry on, 1 an interval checkpoint is due, 2 the wall
-    budget is spent.
+    budget is spent. A measurement run asks the same way, every step, whether
+    its timed window is full.
     """
     if world.world_size == 1:
         return verdict
