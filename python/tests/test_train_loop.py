@@ -40,6 +40,7 @@ from mlime.train.samples import (
     Collator,
     CorpusStream,
     SampleBuilder,
+    TrainingExample,
 )
 from mlime.train.spans import SpanVocab
 
@@ -559,6 +560,9 @@ class UnevenTargets:
     @property
     def max_context_tokens(self) -> int:
         return self.inner.max_context_tokens
+
+    def rows(self, example: TrainingExample) -> int:
+        return self.inner.rows(example)
 
     def __call__(self, group: list) -> Batch:
         batch = self.inner(group)
