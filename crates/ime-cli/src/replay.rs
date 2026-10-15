@@ -25,6 +25,7 @@ use ime_session::{
     CacheReport, Cached, EngineStats, Fused, FusedConfig, Session, SessionOptions, Stages, Timed,
     TransitionStats,
 };
+use ort::environment::Environment;
 use serde::Serialize;
 use std::cell::RefCell;
 #[cfg(target_os = "macos")]
@@ -608,6 +609,7 @@ fn memory_breakdown(_: &str) {}
 
 /// One typing session's state shared by every transition kind.
 struct Harness<'a> {
+    environment: &'a Environment,
     towers: &'a RouteA,
     emittable: &'a ime_decode::Emittable,
     lexicon: &'a ime_pinyin::Lexicon,
@@ -1118,7 +1120,9 @@ pub fn run(args: &ReplayArgs) -> Result<()> {
     let (table, lexicon) = tables()?;
     memory_breakdown("tables");
     let backend = args.backend.unwrap_or_default();
+    let environment = ort::init().build()?;
     let towers = RouteA::open(
+        &environment,
         &args.route_a,
         ime_neural::SessionShape {
             backend: backend.neural_backend(),
@@ -1137,6 +1141,7 @@ pub fn run(args: &ReplayArgs) -> Result<()> {
         .as_deref()
         .map(|dir| {
             CharLm::open(
+                &environment,
                 dir,
                 &lexicon,
                 ime_lm::SessionShape {
@@ -1163,6 +1168,7 @@ pub fn run(args: &ReplayArgs) -> Result<()> {
             .context("--probe requires --lm: the calls it records are the model's")?;
         return probe(
             &Harness {
+                environment: &environment,
                 towers: &towers,
                 emittable: &emittable,
                 lexicon: &lexicon,
@@ -1191,6 +1197,7 @@ pub fn run(args: &ReplayArgs) -> Result<()> {
         "replaying"
     );
     let harness = Harness {
+        environment: &environment,
         towers: &towers,
         emittable: &emittable,
         lexicon: &lexicon,
@@ -1821,6 +1828,7 @@ fn probe(
     // the divergent keystroke's calls (the batches that matter) plus a
     // bounded prefix for an aggregate signal.
     let fresh = CharLm::open(
+        harness.environment,
         lm_dir,
         harness.lexicon,
         ime_lm::SessionShape {

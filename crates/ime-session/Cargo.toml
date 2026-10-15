@@ -16,5 +16,8 @@ ime-ngram.workspace = true
 ime-pinyin.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+ort.workspace = true
+
 [lints]
 workspace = true

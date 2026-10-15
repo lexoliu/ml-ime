@@ -152,7 +152,9 @@ fn sink(path: &PathBuf) -> Result<BufWriter<File>, EmitError> {
 }
 
 fn emit(args: &Args) -> Result<(), EmitError> {
+    let environment = ort::init().build().map_err(NeuralError::from)?;
     let towers = RouteA::open(
+        &environment,
         &args.export,
         SessionShape {
             backend: ime_neural::Backend::Cpu,
