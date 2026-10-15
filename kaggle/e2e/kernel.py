@@ -36,6 +36,7 @@ subprocess per configuration, and writes the rates, the peaks, the mean GPU
 utilisation and the per-phase timing table to `run-summary.json`.
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -57,6 +58,13 @@ MAX_DEPTH = 4
 
 #: Which segment of the chain this kernel is; stamped per copy at push time.
 SEGMENT = 0
+
+#: The `source_digest` of the `mlime` package this kernel was stamped against,
+#: or None to run whatever is mounted. `datasets status` reports a new
+#: `mlime-src` version ready before a kernel pushed right after it is sure
+#: to mount it, and a kernel on the previous version can run without a
+#: complaint; with the digest stamped it refuses instead.
+SOURCE_DIGEST = None
 
 #: Set nonzero for a smoke run: each configuration in `SMOKE_CONFIGS` gets
 #: this many timed steps after its warm-up, and the whole table lands in
@@ -302,22 +310,40 @@ def parquet_mounts(marker):
     return found["samples"], found["labels"]
 
 
+def source_digest(package):
+    """sha256 over a package's `.py` files: each relative path, then its bytes."""
+    digest = hashlib.sha256()
+    for path in sorted(package.rglob("*.py")):
+        digest.update(str(path.relative_to(package)).encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def importable_package():
     """A directory that can go on `PYTHONPATH` and make `mlime` importable.
 
     The marker is `train/e2e.py`, not just the package: a `mlime-src` dataset
     pushed before this branch exists still imports, and then the first `e2e`
-    command fails for the wrong reason.
+    command fails for the wrong reason. With `SOURCE_DIGEST` set, a mounted
+    package that is not the one stamped is refused.
     """
     try:
-        return locate("mlime/train/e2e.py")
+        root = locate("mlime/train/e2e.py")
     except FileNotFoundError:
         mount = locate("train/e2e.py", "__init__.py")
-    root = WORKING / "packages"
-    root.mkdir(parents=True, exist_ok=True)
-    link = root / "mlime"
-    if not link.exists():
-        link.symlink_to(mount, target_is_directory=True)
+        root = WORKING / "packages"
+        root.mkdir(parents=True, exist_ok=True)
+        link = root / "mlime"
+        if not link.exists():
+            link.symlink_to(mount, target_is_directory=True)
+    digest = source_digest(root / "mlime")
+    print(f"mlime source {digest}", flush=True)
+    if SOURCE_DIGEST is not None and digest != SOURCE_DIGEST:
+        raise RuntimeError(
+            f"the mounted mlime source is {digest}, not the stamped {SOURCE_DIGEST}: "
+            "the kernel was pushed before the new mlime-src version was attached"
+        )
     return root
 
 
