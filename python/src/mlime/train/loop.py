@@ -942,7 +942,7 @@ def train(
             # lexicon. Broadcasting them -- for running statistics this model
             # does not have -- copies megabytes from rank 0 at every forward
             # and makes each micro-batch wait for the slowest rank's last one.
-            broadcast_buffers=False,
+            forward_sync_buffers=False,
         )
     optimiser = torch.optim.AdamW(
         model.parameter_groups(config.base_lr, config.new_lr),
@@ -1238,6 +1238,10 @@ def train(
         sys.stdout.flush()
         metrics.write(event="dynamo", counters=dynamo)
     metrics.close()
+    # The wrapper's reducer holds the process group. Torn down after the group,
+    # on the frame's exit, it hung both ranks of a two-process gloo world in 5
+    # of 40 runs on a 4-core Linux box (none of 40 with this order); it goes first.
+    del trained
     world.stop()
     return Segment(metrics=metrics.path, step=step, finished=finished)
 
