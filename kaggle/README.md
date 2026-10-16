@@ -80,6 +80,9 @@ A segment that would reach `max_steps` but could not also fit the scoring pauses
 early (`SCORING_RESERVE_SECONDS`), so the run always finishes in a segment with
 room to score. To spend a partial quota week, stamp `SESSION_SECONDS` smaller at
 push time the way `SEGMENT` is stamped.
+The chain itself pushes a segment only with `MLIME_SESSION_HOURS` (default 12)
+of quota left; set it lower in the job's environment when the next segment
+needs less, as the last segment of a run that pauses with an hour to go does.
 
 ## The same kernel on Colab
 
