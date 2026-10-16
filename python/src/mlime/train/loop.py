@@ -942,7 +942,9 @@ def train(
             # lexicon. Broadcasting them -- for running statistics this model
             # does not have -- copies megabytes from rank 0 at every forward
             # and makes each micro-batch wait for the slowest rank's last one.
-            forward_sync_buffers=False,
+            # torch 2.13 deprecates the flag for `forward_sync_buffers`, which
+            # the torch in Kaggle's image does not take.
+            broadcast_buffers=False,
         )
     optimiser = torch.optim.AdamW(
         model.parameter_groups(config.base_lr, config.new_lr),
