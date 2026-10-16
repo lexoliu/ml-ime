@@ -133,7 +133,7 @@ With less than a whole session of quota left in the week, set `MLIME_SESSION_HOU
 
 ## Next
 
-The ranking term has to train the whole distribution the path score normalises over, not only the paths the beam found:
+The ranking term has to train the whole distribution the path score normalises over, not only the paths the beam found (#121):
 
 - Train the per-position term over the emittable set, the same normaliser the evaluation and the path score use, instead of over each span's homophone candidates. Its gradient then pushes down every character in proportion to its probability, rare ones included.
 - Run it on the same 42 shards, now read in full under the balanced dealing.
