@@ -335,13 +335,41 @@ def read_pair(sample_shard: Path, labels_dir: Path) -> Iterator[tuple[Sample, li
         yield sample, readings.get(sample.id)
 
 
+def text_characters(shard: Path) -> int:
+    """The characters of target text *shard* holds: what its examples cost to type."""
+    total = pl.scan_parquet(shard).select(pl.col("text").str.len_chars().sum()).collect().item()
+    return int(total)
+
+
+def deal_shards(sizes: Mapping[Path, int], readers: int) -> list[list[Path]]:
+    """Deal shards to *readers* so that each owns about the same amount of text.
+
+    Batches are token-budgeted, so a reader's share of an epoch is the text it
+    reads, and DDP ends every rank's epoch at the shortest rank's step count.
+    Dealt round-robin, the 42 shards of #116's ranking run left one rank 20%
+    more batches than the other, and the epoch ended before that rank read its
+    last sixth. Here each shard, largest first, goes to the reader holding the
+    least text so far, and a reader reads its own shards in the order *sizes*
+    lists them.
+    """
+    loads = [0] * readers
+    dealt: list[list[Path]] = [[] for _ in range(readers)]
+    for shard in sorted(sizes, key=lambda shard: (-sizes[shard], shard.name)):
+        reader = min(range(readers), key=lambda reader: (loads[reader], reader))
+        dealt[reader].append(shard)
+        loads[reader] += sizes[shard]
+    order = {shard: index for index, shard in enumerate(sizes)}
+    return [sorted(mine, key=order.__getitem__) for mine in dealt]
+
+
 class CorpusStream(IterableDataset[TrainingExample]):
     """The corpus as an epoch-reaugmented stream of examples.
 
-    Shards are dealt out across DDP ranks and dataloader workers, so a shard is
-    read by exactly one reader and nothing is trained on twice per epoch. Which
-    reader gets which shard does not change what an example looks like -- that
-    depends only on the seed, the epoch and the sample id.
+    Shards are dealt out across DDP ranks and dataloader workers by
+    :func:`deal_shards`, so a shard is read by exactly one reader, nothing is
+    trained on twice per epoch, and every reader reads about the same amount
+    of text. Which reader gets which shard does not change what an example
+    looks like -- that depends only on the seed, the epoch and the sample id.
     """
 
     def __init__(
@@ -372,6 +400,7 @@ class CorpusStream(IterableDataset[TrainingExample]):
             missing = wanted - {path.name for path in self.shards}
             if missing:
                 raise FileNotFoundError(f"no such shards under {samples_dir}: {sorted(missing)}")
+        self.sizes = {shard: text_characters(shard) for shard in self.shards}
 
     def set_epoch(self, epoch: int) -> None:
         """Re-augment from the next pass on."""
@@ -384,7 +413,7 @@ class CorpusStream(IterableDataset[TrainingExample]):
         worker = info.id if info is not None else 0
         readers = self.world_size * workers
         index = self.rank * workers + worker
-        return self.shards[index::readers]
+        return deal_shards(self.sizes, readers)[index]
 
     def __iter__(self) -> Iterator[TrainingExample]:
         for shard in self._mine():
