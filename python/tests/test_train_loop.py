@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import random
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -40,6 +41,7 @@ from mlime.train.samples import (
     Collator,
     CorpusStream,
     SampleBuilder,
+    TrainingExample,
 )
 from mlime.train.spans import SpanVocab
 
@@ -560,6 +562,9 @@ class UnevenTargets:
     def max_context_tokens(self) -> int:
         return self.inner.max_context_tokens
 
+    def rows(self, example: TrainingExample) -> int:
+        return self.inner.rows(example)
+
     def __call__(self, group: list) -> Batch:
         batch = self.inner(group)
         self._calls += 1
@@ -676,6 +681,38 @@ def test_a_profiled_run_writes_the_phase_table(
         assert phase["p95"] >= phase["mean"] >= 0.0
 
 
+def test_a_traced_run_writes_its_first_profiled_steps_as_a_trace(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """The trace holds every phase boundary of the traced steps and none after them."""
+    config = replace(RESUMABLE, max_steps=12, profile_steps=3, trace_steps=2, accumulate=2)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    train(tiny_model(lexicon), [(stream, collator)], config, tmp_path / "run")
+    events = json.loads((tmp_path / "run" / "trace-rank0.json").read_text())["traceEvents"]
+    marks = Counter(e["name"] for e in events if str(e.get("name", "")).startswith("phase."))
+    # Two steps of two micro-batches: each micro-batch marks h2d, forward and
+    # backward; each step marks the rest once.
+    assert marks == {
+        "phase.batch_wait": 2,
+        "phase.h2d": 4,
+        "phase.forward": 4,
+        "phase.backward": 4,
+        "phase.unscale_clip": 2,
+        "phase.optimizer": 2,
+        "phase.agree_log": 2,
+    }
+
+
+def test_a_trace_longer_than_the_profiled_window_is_refused() -> None:
+    with pytest.raises(ValueError, match="trace_steps"):
+        replace(RESUMABLE, profile_steps=1, trace_steps=2)
+
+
 # ---------------------------------------------------------------------------
 # One process running as a world: the virtual-rank path. A Kaggle segment is
 # two real ranks; a Colab segment is one process standing for both, and the
@@ -716,11 +753,15 @@ def _gloo_rank(
     out_dir: str,
     port: int,
     config: TrainingConfig,
+    early_window: bool = False,
 ) -> None:
     """One process of the two-rank gloo world the virtual-rank tests compare against.
 
     Runs under ``torch.multiprocessing``'s spawn, which starts a fresh
     interpreter: the fixtures are rebuilt inside it rather than pickled over.
+    *early_window* starts rank 1's measurement window after one warm-up
+    step instead of the usual ten, as a compiled rank that stopped
+    recompiling sooner than rank 0 does.
     """
     import os
     import sys
@@ -733,7 +774,11 @@ def _gloo_rank(
 
     from conftest import READINGS, StubTokenizer
 
+    from mlime.train import loop
     from mlime.train.lexicon import build_lexicon
+
+    if early_window and rank == 1:
+        loop.PROFILE_WARMUP_STEPS = 1
     from mlime.train.spans import SpanVocab
 
     spans = SpanVocab.load()
@@ -759,6 +804,7 @@ def _spawn_world(
     config: TrainingConfig,
     out_dir: str,
     resume: Path | None = None,
+    early_window: bool = False,
 ) -> Path:
     """Run *config*'s segment as a two-process gloo world under *out_dir*."""
     import socket
@@ -773,11 +819,34 @@ def _spawn_world(
     target = tmp_path / out_dir
     mp.spawn(
         _gloo_rank,
-        args=(paths, None if resume is None else str(resume), str(target), port, config),
+        args=(
+            paths,
+            None if resume is None else str(resume),
+            str(target),
+            port,
+            config,
+            early_window,
+        ),
         nprocs=2,
         join=True,
     )
     return target
+
+
+def test_a_measured_world_ends_on_rank_zeros_window(
+    corpus: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """Ranks whose windows fill on different steps still leave on the same one.
+
+    A compiled rank warms up on its own recompiles, so its window can fill
+    steps before rank 0's; leaving then would strand rank 0 in the next
+    gradient all-reduce. Rank 0's window decides, and both ranks stop after
+    its ten warm-up steps and two timed ones.
+    """
+    config = replace(RESUMABLE, max_steps=40, profile_steps=2, log_every=1)
+    measured = _spawn_world(corpus, tmp_path, config, "measured", early_window=True)
+    steps = [int(record["step"]) for record in records(measured / "metrics.jsonl", "step")]
+    assert max(steps) == 12
 
 
 def _positions(path: Path) -> list[dict[str, object]]:

@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import hashlib
 import random
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Protocol
@@ -335,13 +335,41 @@ def read_pair(sample_shard: Path, labels_dir: Path) -> Iterator[tuple[Sample, li
         yield sample, readings.get(sample.id)
 
 
+def text_characters(shard: Path) -> int:
+    """The characters of target text *shard* holds: what its examples cost to type."""
+    total = pl.scan_parquet(shard).select(pl.col("text").str.len_chars().sum()).collect().item()
+    return int(total)
+
+
+def deal_shards(sizes: Mapping[Path, int], readers: int) -> list[list[Path]]:
+    """Deal shards to *readers* so that each owns about the same amount of text.
+
+    Batches are token-budgeted, so a reader's share of an epoch is the text it
+    reads, and DDP ends every rank's epoch at the shortest rank's step count.
+    Dealt round-robin, the 42 shards of #116's ranking run left one rank 20%
+    more batches than the other, and the epoch ended before that rank read its
+    last sixth. Here each shard, largest first, goes to the reader holding the
+    least text so far, and a reader reads its own shards in the order *sizes*
+    lists them.
+    """
+    loads = [0] * readers
+    dealt: list[list[Path]] = [[] for _ in range(readers)]
+    for shard in sorted(sizes, key=lambda shard: (-sizes[shard], shard.name)):
+        reader = min(range(readers), key=lambda reader: (loads[reader], reader))
+        dealt[reader].append(shard)
+        loads[reader] += sizes[shard]
+    order = {shard: index for index, shard in enumerate(sizes)}
+    return [sorted(mine, key=order.__getitem__) for mine in dealt]
+
+
 class CorpusStream(IterableDataset[TrainingExample]):
     """The corpus as an epoch-reaugmented stream of examples.
 
-    Shards are dealt out across DDP ranks and dataloader workers, so a shard is
-    read by exactly one reader and nothing is trained on twice per epoch. Which
-    reader gets which shard does not change what an example looks like -- that
-    depends only on the seed, the epoch and the sample id.
+    Shards are dealt out across DDP ranks and dataloader workers by
+    :func:`deal_shards`, so a shard is read by exactly one reader, nothing is
+    trained on twice per epoch, and every reader reads about the same amount
+    of text. Which reader gets which shard does not change what an example
+    looks like -- that depends only on the seed, the epoch and the sample id.
     """
 
     def __init__(
@@ -372,6 +400,7 @@ class CorpusStream(IterableDataset[TrainingExample]):
             missing = wanted - {path.name for path in self.shards}
             if missing:
                 raise FileNotFoundError(f"no such shards under {samples_dir}: {sorted(missing)}")
+        self.sizes = {shard: text_characters(shard) for shard in self.shards}
 
     def set_epoch(self, epoch: int) -> None:
         """Re-augment from the next pass on."""
@@ -384,7 +413,7 @@ class CorpusStream(IterableDataset[TrainingExample]):
         worker = info.id if info is not None else 0
         readers = self.world_size * workers
         index = self.rank * workers + worker
-        return self.shards[index::readers]
+        return deal_shards(self.sizes, readers)[index]
 
     def __iter__(self) -> Iterator[TrainingExample]:
         for shard in self._mine():
@@ -433,6 +462,12 @@ class Batch:
     correction-widened set vary per position without a new mask row. ``span_letters
     [B, W, L]`` is the raw keys pressed, ``a``-``z`` as 0-25 and ``LETTER_PAD``
     past each span's length, which is all the letter encoder sees of a typo.
+
+    The context fields hold one row per *context*, not per fill row:
+    ``context_rows [B]`` names the context row each fill row reads. Every
+    example owns its own context in a plain batch, so there it is ``arange``;
+    a ranking batch types one example several ways and runs the context tower
+    once for all of them.
     """
 
     input_ids: torch.Tensor
@@ -444,6 +479,7 @@ class Batch:
     context_ids: torch.Tensor
     context_mask: torch.Tensor
     has_context: torch.Tensor
+    context_rows: torch.Tensor
     candidate_ids: torch.Tensor
     candidate_counts: torch.Tensor
     span_letters: torch.Tensor
@@ -451,7 +487,7 @@ class Batch:
 
     @property
     def size(self) -> int:
-        """Examples in the batch."""
+        """Fill rows in the batch: examples, unless a ranking batch types them several ways."""
         return int(self.input_ids.shape[0])
 
     @property
@@ -482,11 +518,62 @@ class Batch:
             context_ids=self.context_ids.to(device, non_blocking=True),
             context_mask=self.context_mask.to(device, non_blocking=True),
             has_context=self.has_context.to(device, non_blocking=True),
+            context_rows=self.context_rows.to(device, non_blocking=True),
             candidate_ids=self.candidate_ids.to(device, non_blocking=True),
             candidate_counts=self.candidate_counts.to(device, non_blocking=True),
             span_letters=self.span_letters.to(device, non_blocking=True),
             ids=self.ids,
         )
+
+
+class StepBatch(Protocol):
+    """What the training loop reads of a collated step, whatever the model consumes."""
+
+    @property
+    def scored(self) -> torch.Tensor:
+        """The flat indices of the positions the step's per-position loss scores."""
+        ...
+
+    @property
+    def size(self) -> int:
+        """Examples in the step."""
+        ...
+
+    @property
+    def tokens(self) -> int:
+        """Padded fill-tower positions."""
+        ...
+
+    @property
+    def context_tokens(self) -> int:
+        """Padded context-tower positions."""
+        ...
+
+    def to(self, device: torch.device) -> StepBatch:
+        """The same step on *device*."""
+        ...
+
+
+class BatchCollator(Protocol):
+    """What the training loop needs of a collator: a batch, its generator, its budget."""
+
+    @property
+    def rng(self) -> random.Random:
+        """The generator whose state a checkpoint carries."""
+        ...
+
+    @property
+    def max_context_tokens(self) -> int:
+        """The context budget batching is grouped under."""
+        ...
+
+    def rows(self, example: TrainingExample) -> int:
+        """Rows at the fill width *example* costs a step, which batching weighs it by."""
+        ...
+
+    def __call__(self, examples: Sequence[TrainingExample]) -> StepBatch:
+        """Collate one group of examples."""
+        ...
 
 
 class Collator:
@@ -518,10 +605,33 @@ class Collator:
         self.max_context_tokens = max_context_tokens
         self.rng = random.Random(seed)
 
+    def rows(self, example: TrainingExample) -> int:
+        """One: an example is one row of the fill tower."""
+        return 1
+
     def __call__(self, examples: Sequence[TrainingExample]) -> Batch:
         """Collate *examples*, keeping each one's context with probability 1-p."""
+        return self.collate(
+            examples, [example.context for example in examples], range(len(examples))
+        )
+
+    def collate(
+        self,
+        examples: Sequence[TrainingExample],
+        contexts: Sequence[str | None],
+        context_rows: Sequence[int],
+    ) -> Batch:
+        """Collate fill rows *examples* over *contexts*, row *i* reading ``context_rows[i]``.
+
+        The dropout coin is thrown once per context, so the rows that share one
+        are all typed with it or all without it.
+        """
         if not examples:
             raise ValueError("cannot collate an empty batch")
+        if len(context_rows) != len(examples):
+            raise ValueError(
+                f"{len(examples)} fill rows but {len(context_rows)} context assignments"
+            )
         width = max(len(example) for example in examples) + 2
         size = len(examples)
         input_ids = torch.full((size, width), self.tokenizer.pad_token_id, dtype=torch.long)
@@ -541,8 +651,6 @@ class Collator:
         candidate_counts = torch.zeros((size, width), dtype=torch.long)
         span_letters = torch.full((size, width, MAX_SPAN_LETTERS), LETTER_PAD, dtype=torch.long)
 
-        contexts: list[str] = []
-        has_context = torch.zeros(size, dtype=torch.float)
         for row, example in enumerate(examples):
             length = len(example)
             input_ids[row, 0] = self.tokenizer.cls_token_id
@@ -578,16 +686,15 @@ class Collator:
             span_ids[row, 1 : length + 1] = row_spans
             span_positions[row, 1 : length + 1] = True
             targets[row, 1 : length + 1] = row_targets
-            keep = example.context is not None and self.rng.random() >= self.context_dropout
-            contexts.append(
-                context_tail(example.context, self.max_context_tokens)
-                if keep and example.context
-                else ""
-            )
-            has_context[row] = 1.0 if keep else 0.0
 
+        kept: list[str] = []
+        has_context = torch.zeros(len(contexts), dtype=torch.float)
+        for index, context in enumerate(contexts):
+            keep = context is not None and self.rng.random() >= self.context_dropout
+            kept.append(context_tail(context, self.max_context_tokens) if keep and context else "")
+            has_context[index] = 1.0 if keep else 0.0
         encoded = self.tokenizer(
-            contexts,
+            kept,
             padding=True,
             truncation=True,
             max_length=self.max_context_tokens,
@@ -610,6 +717,7 @@ class Collator:
             context_ids=encoded["input_ids"],
             context_mask=encoded["attention_mask"],
             has_context=has_context,
+            context_rows=torch.tensor(context_rows, dtype=torch.long),
             candidate_ids=candidate_ids,
             candidate_counts=candidate_counts,
             span_letters=span_letters,
@@ -629,6 +737,7 @@ def token_budget_batches(
     examples: Iterator[TrainingExample],
     budget: int,
     max_context_tokens: int = 0,
+    rows: Callable[[TrainingExample], int] | None = None,
 ) -> Iterator[list[TrainingExample]]:
     """Group *examples* so one step's padded cost stays under *budget*.
 
@@ -646,21 +755,31 @@ def token_budget_batches(
 
     A *max_context_tokens* of zero means the contexts are not encoded at all,
     which is the case wherever only the fill tower is under test.
+
+    *rows* is how many rows at the fill width an example costs; one each when
+    it is not given. The ranking loss (#116) types an example every way its
+    keystrokes read and decodes several sentences on them, so one example
+    there is a dozen rows, and how many varies with the keystrokes: a budget
+    over its examples alone would let a batch of long full-pinyin sentences run
+    to twice the rows of the batch beside it.
     """
     if budget <= 0:
         raise ValueError(f"the token budget must be positive, got {budget}")
     batch: list[TrainingExample] = []
-    fill = context = 0
+    fill = context = filled = 0
     for example in examples:
+        cost = 1 if rows is None else rows(example)
         wide = max(fill, len(example) + 2)
         deep = max(context, _context_width(example, max_context_tokens))
-        if batch and (wide + deep) * (len(batch) + 1) > budget:
+        if batch and wide * (filled + cost) + deep * (len(batch) + 1) > budget:
             yield batch
             batch = []
+            filled = 0
             wide = len(example) + 2
             deep = _context_width(example, max_context_tokens)
         batch.append(example)
         fill, context = wide, deep
+        filled += cost
     if batch:
         yield batch
 

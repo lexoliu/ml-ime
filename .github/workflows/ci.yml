@@ -39,6 +39,8 @@ jobs:
   python:
     name: python
     runs-on: ubuntu-latest
+    # The suite takes about four minutes; a hung test once held this job for six hours.
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: python

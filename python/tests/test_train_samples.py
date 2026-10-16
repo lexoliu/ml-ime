@@ -32,7 +32,9 @@ from mlime.train.samples import (
     SampleBuilder,
     TrainingExample,
     context_tail,
+    deal_shards,
     example_rng,
+    text_characters,
     token_budget_batches,
     type_syllables,
 )
@@ -312,6 +314,28 @@ def test_a_batch_with_no_context_tower_pays_for_the_fill_alone(
     assert max(len(group) for group in groups) == 10
 
 
+def test_an_example_costs_every_row_it_is_collated_into(
+    lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
+) -> None:
+    """A collator that makes three fill rows of an example pays for all three."""
+    builder = SampleBuilder(lexicon, spans, arbitration, ALWAYS_FULL)
+    kept = [
+        example
+        for example in (
+            builder.build(_sample("我爱北京", context="北" * 40), ["wo", "ai", "bei", "jing"], 0)
+            for _ in range(20)
+        )
+        if example is not None
+    ]
+    groups = list(
+        token_budget_batches(iter(kept), budget=72, max_context_tokens=16, rows=lambda _: 3)
+    )
+    assert sum(len(group) for group in groups) == len(kept)
+    # Three rows of six fill positions and sixteen of context: two examples
+    # are 68 positions, three would be 102.
+    assert {len(group) for group in groups} == {2}
+
+
 def test_the_context_kept_is_the_end_of_it() -> None:
     """The cursor sits after the context, so its last characters are the useful ones."""
     assert context_tail("一二三四五六", 5) == "四五六"
@@ -347,6 +371,56 @@ def test_a_stream_reads_its_shards_and_reaugments(
     stream.set_epoch(1)
     assert len(list(stream)) == 2
     assert stream.builder.counts.kept == 4
+
+
+def test_shards_are_dealt_by_their_text_not_round_robin() -> None:
+    a, b, c, d = (Path(f"{name}.parquet") for name in "abcd")
+    # Round-robin would give the first reader 150 characters and the second 70.
+    dealt = deal_shards({a: 100, b: 60, c: 50, d: 10}, readers=2)
+    assert dealt == [[a, d], [b, c]]
+
+
+def test_two_ranks_read_every_shard_once_and_about_the_same_text(
+    tmp_path: Path, lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
+) -> None:
+    samples_dir, labels_dir = tmp_path / "samples", tmp_path / "labels"
+    samples_dir.mkdir()
+    labels_dir.mkdir()
+    texts = {
+        "我爱北京": ["wo3", "ai4", "bei3", "jing1"],
+        "中重我绿": ["zhong1", "chong2", "wo3", "lv4"],
+    }
+    # Shard sizes 4, 3, 2, 1 sentences in name order: round-robin deals 6 and 4.
+    for index, count in enumerate((4, 3, 2, 1)):
+        rows = [
+            Sample(id=f"{index}-{row}", source="test", text=text, context=None)
+            for row, text in zip(range(count), [*texts] * count, strict=False)
+        ]
+        name = f"test-{index:05d}.parquet"
+        pl.DataFrame([row.row() for row in rows], schema=SAMPLE_SCHEMA).write_parquet(
+            samples_dir / name
+        )
+        pl.DataFrame(
+            [{"id": row.id, "syllables": texts[row.text], "refusal": None} for row in rows],
+            schema=LABEL_SCHEMA,
+        ).write_parquet(labels_dir / name)
+
+    streams = [
+        CorpusStream(
+            samples_dir,
+            labels_dir,
+            SampleBuilder(lexicon, spans, arbitration),
+            rank=rank,
+            world_size=2,
+        )
+        for rank in range(2)
+    ]
+    assert text_characters(samples_dir / "test-00000.parquet") == 16
+    read = [[example.id for example in stream] for stream in streams]
+    assert [len(ids) for ids in read] == [5, 5]
+    assert sorted(read[0] + read[1]) == sorted(
+        f"{index}-{row}" for index, count in enumerate((4, 3, 2, 1)) for row in range(count)
+    )
 
 
 def test_a_missing_label_shard_is_an_error(

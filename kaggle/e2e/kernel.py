@@ -21,6 +21,14 @@ checkpoint. A segment that mounts a run whose training already finished --
 `run/checkpoint-final.pt` in its output, the evaluation having stopped before
 its report -- evaluates that checkpoint and trains nothing.
 
+A ranking stage (#116) is the same chain with `RANKING` stamped: the first
+segment starts from the finished v1 run mounted with `lexoliu/mlime-e2e-final`
+-- its weights, a fresh optimiser and schedule -- and every segment adds the
+sequence-level ranking loss, reading each example's other segmentations from
+the `ime-segment` binary the package dataset ships. Its one epoch runs over
+`TRAIN_SHARDS`. A finished run is told apart from the v1 run it started from
+by the `ranking` its run-config records.
+
 For a smoke run -- the few-minute rate check that the cost estimate is made
 from -- set `SMOKE_STEPS` nonzero: the kernel times each entry of
 `SMOKE_CONFIGS` for that many steps after a warm-up at `TOKEN_BUDGET`, one
@@ -28,11 +36,15 @@ subprocess per configuration, and writes the rates, the peaks, the mean GPU
 utilisation and the per-phase timing table to `run-summary.json`.
 """
 
+import ctypes
+import hashlib
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -49,6 +61,13 @@ MAX_DEPTH = 4
 #: Which segment of the chain this kernel is; stamped per copy at push time.
 SEGMENT = 0
 
+#: The `source_digest` of the `mlime` package this kernel was stamped against,
+#: or None to run whatever is mounted. `datasets status` reports a new
+#: `mlime-src` version ready before a kernel pushed right after it is sure
+#: to mount it, and a kernel on the previous version can run without a
+#: complaint; with the digest stamped it refuses instead.
+SOURCE_DIGEST = None
+
 #: Set nonzero for a smoke run: each configuration in `SMOKE_CONFIGS` gets
 #: this many timed steps after its warm-up, and the whole table lands in
 #: run-summary.json.
@@ -62,15 +81,23 @@ SMOKE_WARMUP_CAP = 30
 
 #: The configurations the smoke times against each other at `TOKEN_BUDGET`:
 #: prefetch and compile on throughout, accumulate 2 against accumulate 4.
-#: Accumulate 2 then also runs at `SMOKE_WIDE_BUDGET`.
+#: Accumulate 2 then also runs at `SMOKE_WIDE_BUDGET`. An entry may set
+#: `nproc` below `WORLD` to time the same step without its peers -- what the
+#: world costs each rank -- and is then shown but never recommended.
 SMOKE_CONFIGS = (
     ("compile-acc2", {"prefetch": True, "accumulate": 2, "compile": True}),
     ("compile-acc4", {"prefetch": True, "accumulate": 4, "compile": True}),
 )
 
+#: Timed steps per smoke configuration to also record as a Chrome trace,
+#: one per rank, copied out as `smoke-<name>-trace-rank<r>.json`. A trace
+#: shows where inside a phase a card idled; each is ~60 MB a step, so it is
+#: off unless a run is being diagnosed.
+SMOKE_TRACE_STEPS = 0
+
 #: The wider budget accumulate-2 gets a timed run at. The gate is that run's
 #: own timed peak: a 60-step probe was shown to under-report what a long
-#: segment sees, so it no longer stands in.
+#: segment sees, so it no longer stands in. None skips the wide run.
 SMOKE_WIDE_BUDGET = 12288
 
 #: A configuration is safe while its timed peak stays at or under this share of
@@ -125,7 +152,8 @@ INIT_DECODER = "charlm-transformer-s1.pt"
 AUX_WEIGHT = 0.3
 
 #: Padded positions per micro-batch per rank, both towers together -- the
-#: largest budget the smoke sweep measured with headroom.
+#: largest budget the smoke sweep measured with headroom. A ranking run counts
+#: every reading's fill row and every ranked path's decoder row in it.
 TOKEN_BUDGET = 8192
 
 #: Kaggle's session cap, and what is kept back from it. `SESSION_SECONDS` is
@@ -159,6 +187,23 @@ WORLD = 2
 #: because a Colab VM can die without warning and the interval trio is what
 #: its publisher ships.
 CHECKPOINT_MINUTES = 0
+
+#: The ranking stage of #116: None trains #88's objective from route A and the
+#: reader; a dict of `mlime train e2e --rank-*` settings (`segmentations`,
+#: `beam`, `negatives`, `weight`) starts from the finished v1 run instead and
+#: adds the sequence-level ranking loss. Stamped per push.
+RANKING = None
+
+#: The training shards a run makes its epoch over; None trains on every
+#: mounted shard but the held-out ones. Stamped per push.
+TRAIN_SHARDS = None
+
+#: The (pretrained, new) learning rates; None keeps `mlime train e2e`'s.
+LEARNING_RATES = None
+
+#: The segmenter binary the ranking loss pipes keystrokes through, shipped
+#: inside the package dataset.
+SEGMENTER = "ime-segment"
 
 #: Corrupt each example's typed keystrokes with the shared typo noise model.
 #: Off by default so the running chain stays on clean input until a pushed
@@ -267,23 +312,61 @@ def parquet_mounts(marker):
     return found["samples"], found["labels"]
 
 
+def source_digest(package):
+    """sha256 over a package's `.py` files: each relative path, then its bytes."""
+    digest = hashlib.sha256()
+    for path in sorted(package.rglob("*.py")):
+        digest.update(str(path.relative_to(package)).encode())
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
 def importable_package():
     """A directory that can go on `PYTHONPATH` and make `mlime` importable.
 
     The marker is `train/e2e.py`, not just the package: a `mlime-src` dataset
     pushed before this branch exists still imports, and then the first `e2e`
-    command fails for the wrong reason.
+    command fails for the wrong reason. With `SOURCE_DIGEST` set, a mounted
+    package that is not the one stamped is refused.
     """
     try:
-        return locate("mlime/train/e2e.py")
+        root = locate("mlime/train/e2e.py")
     except FileNotFoundError:
         mount = locate("train/e2e.py", "__init__.py")
-    root = WORKING / "packages"
-    root.mkdir(parents=True, exist_ok=True)
-    link = root / "mlime"
-    if not link.exists():
-        link.symlink_to(mount, target_is_directory=True)
+        root = WORKING / "packages"
+        root.mkdir(parents=True, exist_ok=True)
+        link = root / "mlime"
+        if not link.exists():
+            link.symlink_to(mount, target_is_directory=True)
+    digest = source_digest(root / "mlime")
+    print(f"mlime source {digest}", flush=True)
+    if SOURCE_DIGEST is not None and digest != SOURCE_DIGEST:
+        raise RuntimeError(
+            f"the mounted mlime source is {digest}, not the stamped {SOURCE_DIGEST}: "
+            "the kernel was pushed before the new mlime-src version was attached"
+        )
     return root
+
+
+def libcuda_link_dir():
+    """A directory holding `libcuda.so`, for the compiled wrappers' link step.
+
+    The training compiles its graphs' wrappers to C++, which links with
+    `-lcuda`. The image ships the driver only as `libcuda.so.<version>`,
+    found through the loader's path rather than ldconfig's cache, and no
+    unversioned name, so the link fails. The library the loader resolves is
+    linked here under the name the linker asks for.
+    """
+    ctypes.CDLL("libcuda.so.1")
+    with open("/proc/self/maps", encoding="utf-8") as maps:
+        real = next(line.split()[-1] for line in maps if "/libcuda.so." in line)
+    directory = Path(tempfile.gettempdir()) / "libcuda"
+    directory.mkdir(exist_ok=True)
+    link = directory / "libcuda.so"
+    if not link.exists():
+        link.symlink_to(real)
+    return directory
 
 
 def install():
@@ -335,15 +418,19 @@ def data_argv(char_table, token_budget=TOKEN_BUDGET):
     ]
     for shard in HELD_OUT:
         argv += ["--held-out-shard", shard]
+    for shard in TRAIN_SHARDS or ():
+        argv += ["--train-shard", shard]
     return argv
 
 
-def count_argv(char_table, out, census=None):
+def count_argv(char_table, out, segmenter, census=None):
     """Replay the batcher over the training shards and write the step budget.
 
     *census* is a mounted count from an earlier run; `count-batches` uses it
     only when every configuration field and the shard list equal this run's
-    and says which field differed otherwise.
+    and says which field differed otherwise. A ranking run's batches weigh
+    each example by every row the ranking step makes of it, so the count
+    reads the staged *segmenter* too.
     """
     argv = [
         sys.executable,
@@ -360,9 +447,27 @@ def count_argv(char_table, out, census=None):
         str(ACCUMULATE),
         "--out",
         str(out),
+        *ranking_argv(segmenter),
     ]
     if census is not None:
         argv += ["--reuse-census", str(census)]
+    return argv
+
+
+def start_argv(initials, init_e2e):
+    """Where a new run's weights come from: route A and the reader, or v1's run."""
+    if RANKING is None:
+        return ["--init-encoder", str(initials[0]), "--init-decoder", str(initials[1])]
+    return ["--init-e2e", str(init_e2e)]
+
+
+def ranking_argv(segmenter):
+    """The ranking loss's switches, the same on every segment of a ranking run."""
+    if RANKING is None:
+        return []
+    argv = ["--ranking", "--segmenter", str(segmenter)]
+    for name, value in RANKING.items():
+        argv += [f"--rank-{name}", str(value)]
     return argv
 
 
@@ -371,26 +476,30 @@ def train_argv(
     out,
     max_steps,
     wall_budget,
-    initials,
+    start,
     resume,
     token_budget,
     max_held_out=4096,
     prefetch=PREFETCH,
     accumulate=ACCUMULATE,
     profile_steps=0,
+    trace_steps=0,
     compile=COMPILE,
     compile_mode=COMPILE_MODE,
     nproc=WORLD,
     virtual_ranks=1,
     checkpoint_minutes=CHECKPOINT_MINUTES,
     log_every=10,
+    segmenter=None,
 ):
     """The training command the ranks of this segment run.
 
     *nproc* is how many processes the launcher's T4s host and
     *virtual_ranks* how many ranks each one stands for: on Kaggle two
     processes of one rank, on Colab one process of two, and the checkpoint
-    does not know the difference.
+    does not know the difference. *start* is `start_argv`'s for a new run and
+    None for a resumed one; *segmenter* is the staged binary a ranking run
+    reads.
     """
     argv = [
         sys.executable,
@@ -431,12 +540,17 @@ def train_argv(
         argv += ["--compile", "--compile-mode", str(compile_mode)]
     if profile_steps:
         argv += ["--profile-steps", str(profile_steps)]
+    if trace_steps:
+        argv += ["--trace-steps", str(trace_steps)]
     if wall_budget is not None:
         argv += ["--wall-budget-seconds", str(wall_budget)]
     if checkpoint_minutes:
         argv += ["--checkpoint-minutes", str(checkpoint_minutes)]
-    if initials is not None:
-        argv += ["--init-encoder", str(initials[0]), "--init-decoder", str(initials[1])]
+    if start is not None:
+        argv += start
+    if LEARNING_RATES is not None:
+        argv += ["--base-lr", str(LEARNING_RATES[0]), "--new-lr", str(LEARNING_RATES[1])]
+    argv += ranking_argv(segmenter)
     if resume is not None:
         argv += ["--resume", str(resume)]
     if ACTIVATION_CHECKPOINTING:
@@ -565,13 +679,31 @@ class GpuSampler:
     The check is the driver's, not torch's: a step that leaves the card idle
     while the host collates shows up here even though no device code knows
     about it. 500 ms is fine enough to catch a step boundary and coarse enough
-    to keep the log small.
+    to keep the log small. The samples go to a file: a pipe nobody drains
+    fills after a few minutes and stalls `nvidia-smi`, and every later
+    sample -- the timed window's, after a long compile -- never arrives.
+
+    Beside utilisation it reads what can slow a busy card down: the SM
+    clock, the temperature, the power draw and the driver's throttle-reason
+    bits, since two T4s working side by side share one chassis's cooling.
     """
 
-    def __init__(self, interval_ms=500):
+    FIELDS = (
+        "index",
+        "timestamp",
+        "utilization.gpu",
+        "memory.used",
+        "clocks.sm",
+        "temperature.gpu",
+        "power.draw",
+        "clocks_throttle_reasons.active",
+    )
+
+    def __init__(self, log, interval_ms=500):
+        self._log = log
         self._argv = [
             "nvidia-smi",
-            "--query-gpu=index,utilization.gpu,memory.used,timestamp",
+            f"--query-gpu={','.join(self.FIELDS)}",
             "--format=csv,noheader,nounits",
             "-lms",
             str(interval_ms),
@@ -580,60 +712,178 @@ class GpuSampler:
         self.samples = {}
 
     def __enter__(self):
-        self._process = subprocess.Popen(
-            self._argv,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
+        with self._log.open("w", encoding="utf-8") as sink:
+            self._process = subprocess.Popen(self._argv, stdout=sink, stderr=subprocess.DEVNULL)
         return self
 
     def __exit__(self, *_):
+        if self._process.poll() is not None:
+            raise RuntimeError(
+                f"nvidia-smi exited {self._process.returncode} before the run did: "
+                f"{' '.join(self._argv)}"
+            )
         self._process.terminate()
         try:
-            out, _ = self._process.communicate(timeout=15)
+            self._process.wait(timeout=15)
         except subprocess.TimeoutExpired:
             self._process.kill()
-            out, _ = self._process.communicate()
-        for line in out.splitlines():
-            fields = [field.strip() for field in line.split(",")]
-            if len(fields) != 4:
+            self._process.wait()
+        for line in self._log.read_text(encoding="utf-8").splitlines():
+            fields = dict(zip(self.FIELDS, (f.strip() for f in line.split(",")), strict=False))
+            if len(fields) != len(self.FIELDS):
                 continue
-            gpu, util, memory = int(fields[0]), int(fields[1]), int(fields[2])
-            epoch = datetime.strptime(fields[3], "%Y/%m/%d %H:%M:%S.%f").timestamp()
-            self.samples.setdefault(
-                gpu, {"utilization": [], "memory_mib": [], "times": []}
+            self.samples.setdefault(int(fields["index"]), []).append(
+                {
+                    "time": datetime.strptime(
+                        fields["timestamp"], "%Y/%m/%d %H:%M:%S.%f"
+                    ).timestamp(),
+                    "utilization": int(fields["utilization.gpu"]),
+                    "memory_mib": int(fields["memory.used"]),
+                    "sm_mhz": int(fields["clocks.sm"]),
+                    "celsius": int(fields["temperature.gpu"]),
+                    "watts": float(fields["power.draw"]),
+                    "throttle": fields["clocks_throttle_reasons.active"],
+                }
             )
-            self.samples[gpu]["utilization"].append(util)
-            self.samples[gpu]["memory_mib"].append(memory)
-            self.samples[gpu]["times"].append(epoch)
         return False
 
     def means(self, since=None, until=None):
-        """Mean utilisation and memory per GPU over the samples in the window.
+        """Per GPU over the samples in the window: means, the peak temperature,
+        and how often each throttle-reason mask was active.
 
         ``since``/``until`` are wall-clock epochs -- the profile record's
         ``window`` bounds -- so a run's mean covers its timed steps only, not
         the warm-up its compilation idles through.
         """
         out = {}
-        for gpu, v in sorted(self.samples.items()):
+        for gpu, samples in sorted(self.samples.items()):
             rows = [
-                (u, m)
-                for t, u, m in zip(
-                    v["times"], v["utilization"], v["memory_mib"], strict=True
-                )
-                if (since is None or t >= since) and (until is None or t <= until)
+                r
+                for r in samples
+                if (since is None or r["time"] >= since) and (until is None or r["time"] <= until)
             ]
+
+            def mean(key, digits, rows=rows):
+                return round(sum(r[key] for r in rows) / len(rows), digits) if rows else None
+
+            throttles = {}
+            for r in rows:
+                throttles[r["throttle"]] = throttles.get(r["throttle"], 0) + 1
             out[str(gpu)] = {
-                "utilization": round(sum(u for u, _ in rows) / len(rows), 1)
-                if rows
-                else None,
-                "memory_mib": round(sum(m for _, m in rows) / len(rows))
-                if rows
-                else None,
+                "utilization": mean("utilization", 1),
+                "memory_mib": mean("memory_mib", 0),
+                "sm_mhz": mean("sm_mhz", 0),
+                "watts": mean("watts", 1),
+                "max_celsius": max((r["celsius"] for r in rows), default=None),
+                "throttle_share": {k: round(n / len(rows), 3) for k, n in throttles.items()},
+                "samples": len(rows),
             }
         return out
+
+
+class CpuSampler:
+    """Every process's CPU time, per thread, sampled from `/proc` beside a run.
+
+    The T4 machines have four cores for two training processes, each with a
+    main thread that launches the device work and a producer thread that
+    collates, plus the segmenter they talk to. A card idling because its
+    launcher waits for a core shows up here and nowhere in the device's own
+    numbers. Each sample is the machine's busy and total jiffies and every
+    thread's cumulative user+system ticks; :meth:`usage` differences two of
+    them.
+    """
+
+    def __init__(self, interval=2.0):
+        self._interval = interval
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self.samples = []
+        # Read while the process lives: the report is written after it exits.
+        self._commands = {}
+
+    @staticmethod
+    def _machine():
+        fields = [int(v) for v in Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]]
+        idle = fields[3] + fields[4]
+        return sum(fields) - idle, sum(fields)
+
+    @staticmethod
+    def _threads():
+        ticks = {}
+        for task in Path("/proc").glob("[0-9]*/task/[0-9]*/stat"):
+            try:
+                text = task.read_text()
+            except OSError:  # the thread ended between the glob and the read
+                continue
+            rest = text[text.rindex(")") + 2 :].split()
+            pid, tid = int(task.parts[2]), int(task.parts[4])
+            ticks[(pid, tid)] = int(rest[11]) + int(rest[12])
+        return ticks
+
+    @staticmethod
+    def _command(pid):
+        try:
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return "?"
+        words = [w for w in raw.decode(errors="replace").split("\0") if w]
+        return " ".join(Path(w).name if i == 0 else w for i, w in enumerate(words[:4]))
+
+    def _run(self):
+        while not self._stopped.is_set():
+            busy, total = self._machine()
+            threads = self._threads()
+            for pid, _ in threads:
+                if pid not in self._commands:
+                    self._commands[pid] = self._command(pid)
+            self.samples.append((time.time(), busy, total, threads))
+            self._stopped.wait(self._interval)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_):
+        self._stopped.set()
+        self._thread.join()
+        return False
+
+    def usage(self, since=None, until=None, top=8):
+        """Machine busy percent and the busiest processes' cores over a window.
+
+        A process's cores split into its main thread's and the rest's: the
+        main thread is the one that launches device work.
+        """
+        inside = [
+            s
+            for s in self.samples
+            if (since is None or s[0] >= since) and (until is None or s[0] <= until)
+        ]
+        if len(inside) < 2:
+            return {"busy_percent": None, "samples": len(inside), "processes": []}
+        (t0, busy0, total0, threads0), (t1, busy1, total1, threads1) = inside[0], inside[-1]
+        hertz = os.sysconf("SC_CLK_TCK")
+        seconds = t1 - t0
+        processes = {}
+        for (pid, tid), ticks in threads1.items():
+            used = (ticks - threads0.get((pid, tid), ticks)) / hertz / seconds
+            entry = processes.setdefault(pid, {"main": 0.0, "other": 0.0})
+            entry["main" if tid == pid else "other"] += used
+        busiest = sorted(processes.items(), key=lambda kv: -(kv[1]["main"] + kv[1]["other"]))
+        return {
+            "busy_percent": round(100 * (busy1 - busy0) / (total1 - total0), 1),
+            "cores": os.cpu_count(),
+            "samples": len(inside),
+            "processes": [
+                {
+                    "pid": pid,
+                    "command": self._commands[pid],
+                    "main_cores": round(used["main"], 2),
+                    "other_cores": round(used["other"], 2),
+                }
+                for pid, used in busiest[:top]
+            ],
+        }
 
 
 def steps_per_second(steps):
@@ -656,7 +906,7 @@ def gpu_total_bytes():
     )
 
 
-def smoke_run(char_table, init_files, env, name, token_budget, options, steps, timed):
+def smoke_run(char_table, start, segmenter, env, name, token_budget, options, steps, timed):
     """One smoke subprocess: *steps* optimiser steps, the last *timed* measured.
 
     A configuration's run is a process of its own so an OOM neither corrupts
@@ -672,40 +922,48 @@ def smoke_run(char_table, init_files, env, name, token_budget, options, steps, t
         run_dir,
         steps,
         None,
-        init_files,
+        start,
         None,
         token_budget,
         max_held_out=256,
         prefetch=options.get("prefetch", False),
         accumulate=options.get("accumulate", 1),
+        nproc=options.get("nproc", WORLD),
         profile_steps=timed,
+        trace_steps=SMOKE_TRACE_STEPS,
         compile=options.get("compile", False),
         compile_mode=options.get("compile_mode", "default"),
         log_every=1,
+        segmenter=segmenter,
     )
-    with GpuSampler() as sampler:
-        code, seconds = run(argv, env, str(log_file))
+    # A recompile inside the window costs about a minute of an idle card;
+    # dynamo's reason for each lands in the log beside the step that paid it.
+    with (
+        GpuSampler(WORKING / f"smoke-{name}-gpu.csv") as sampler,
+        CpuSampler() as processor,
+    ):
+        code, seconds = run(argv, {**env, "TORCH_LOGS": "recompiles"}, str(log_file))
     text = log_file.read_text(encoding="utf-8")
     profiles = profile_phases(text)
     # GPU means cover the timed window only: the profile record's epoch bounds
     # cut the sampler's log, so warm-up -- and the compilation inside it --
     # does not dilute the number the utilisation floor reads.
     bounds = [p["window"] for p in profiles.values() if len(p.get("window") or []) == 2]
-    if bounds:
-        gpu_mean = sampler.means(
-            since=min(bound[0] for bound in bounds),
-            until=max(bound[1] for bound in bounds),
-        )
-    else:
-        gpu_mean = sampler.means()
+    window = (
+        {"since": min(b[0] for b in bounds), "until": max(b[1] for b in bounds)} if bounds else {}
+    )
+    gpu_mean = sampler.means(**window)
+    cpu_usage = processor.usage(**window)
     entry = {
         "name": name,
         "token_budget": token_budget,
         "prefetch": options.get("prefetch", False),
         "accumulate": options.get("accumulate", 1),
         "compile": options.get("compile", False),
+        "nproc": options.get("nproc", WORLD),
         "seconds": round(seconds, 1),
         "gpu_mean": gpu_mean,
+        "cpu": cpu_usage,
         "peak_bytes_per_rank": {
             str(rank): size for rank, size in sorted(peak_memory(text).items())
         },
@@ -753,6 +1011,8 @@ def smoke_run(char_table, init_files, env, name, token_budget, options, steps, t
             entry["first_loss"] = step_records[0]["loss"]
             entry["last_loss"] = step_records[-1]["loss"]
     print(json.dumps(entry), flush=True)
+    for trace in run_dir.glob("trace-rank*.json"):
+        shutil.move(trace, WORKING / f"smoke-{name}-{trace.name}")
     shutil.rmtree(run_dir, ignore_errors=True)
     return entry
 
@@ -786,7 +1046,7 @@ def settings_of(entry):
     }
 
 
-def smoke(char_table, out, init_files, env):
+def smoke(char_table, start, segmenter, env):
     """Time each `SMOKE_CONFIGS` entry at `TOKEN_BUDGET`, then acc2 wide.
 
     The wider run is always accumulate 2 -- the question it answers is memory,
@@ -797,7 +1057,8 @@ def smoke(char_table, out, init_files, env):
     entries = [
         smoke_run(
             char_table,
-            init_files,
+            start,
+            segmenter,
             env,
             name,
             TOKEN_BUDGET,
@@ -814,24 +1075,30 @@ def smoke(char_table, out, init_files, env):
         peak = peak_of(entry)
         return peak is not None and peak <= ceiling
 
-    wide = smoke_run(
-        char_table,
-        init_files,
-        env,
-        f"compile-acc2-{SMOKE_WIDE_BUDGET}",
-        SMOKE_WIDE_BUDGET,
-        {"prefetch": True, "accumulate": 2, "compile": True},
-        SMOKE_WARMUP_CAP + SMOKE_STEPS,
-        SMOKE_STEPS,
-    )
-    entries.append(wide)
+    if SMOKE_WIDE_BUDGET is not None:
+        entries.append(
+            smoke_run(
+                char_table,
+                start,
+                segmenter,
+                env,
+                f"compile-acc2-{SMOKE_WIDE_BUDGET}",
+                SMOKE_WIDE_BUDGET,
+                {"prefetch": True, "accumulate": 2, "compile": True},
+                SMOKE_WARMUP_CAP + SMOKE_STEPS,
+                SMOKE_STEPS,
+            )
+        )
     measured = [entry for entry in entries if entry["status"] == "ok"]
 
     # A run counts toward the recommendation only when it finished inside the
     # memory ceiling -- the wide run's timed peak is the gate, so a peak over
-    # the share still shows in the table but cannot be recommended.
+    # the share still shows in the table but cannot be recommended -- and ran
+    # in the world the segment trains in.
     for entry in entries:
-        entry["counted"] = entry["status"] == "ok" and peak_ok(entry)
+        entry["counted"] = (
+            entry["status"] == "ok" and peak_ok(entry) and entry["nproc"] == WORLD
+        )
 
     summary = {
         "segment": SEGMENT,
@@ -916,16 +1183,50 @@ def resume_candidates():
     return found
 
 
+def finished_runs(ranking):
+    """The final checkpoints of the mounted finished runs that trained *ranking*.
+
+    A run's run-config records its ranking settings, absent on v1's; that is
+    how a ranking stage tells its own finished run from the v1 run it starts
+    from, both mounted at once.
+    """
+    return [
+        mount / "run" / "checkpoint-final.pt"
+        for mount in locate_all("run/checkpoint-final.pt", "run-config.json")
+        if json.loads((mount / "run-config.json").read_text()).get("ranking") == ranking
+    ]
+
+
 def finished_checkpoint():
-    """The final checkpoint of a mounted run that finished training, or None.
+    """The final checkpoint of a mounted run of this kernel's kind, or None.
 
     Two such mounts would be two finished runs, and which one to evaluate is
     not this kernel's to guess.
     """
-    found = locate_all("run/checkpoint-final.pt", "run-config.json")
+    found = finished_runs(RANKING)
     if len(found) > 1:
         raise RuntimeError(f"{len(found)} finished runs are mounted: {found}")
-    return found[0] / "run" / "checkpoint-final.pt" if found else None
+    return found[0] if found else None
+
+
+def ranking_init():
+    """The finished v1 checkpoint a ranking stage starts from; exactly one is mounted."""
+    found = finished_runs(None)
+    if len(found) != 1:
+        raise FileNotFoundError(
+            f"a ranking stage starts from one finished v1 run, found {found}; "
+            f"mounts hold {describe()}"
+        )
+    return found[0]
+
+
+def stage_segmenter():
+    """The package dataset's `ime-segment`, copied out of the read-only mount, executable."""
+    target = WORKING / "bin" / SEGMENTER
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(locate(SEGMENTER) / SEGMENTER, target)
+    target.chmod(0o755)
+    return target
 
 
 def evaluate_lattices(checkpoint, assets, char_table, env):
@@ -1070,7 +1371,6 @@ def main():
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)
     rest_samples, rest_labels = parquet_mounts(REST_MARKER)
     assets = locate("char_pinyin.tsv", "lattice.jsonl")
-    initials = locate(INIT_ENCODER, INIT_DECODER)
     stage_data({"samples": (v1_samples, rest_samples), "labels": (v1_labels, rest_labels)})
     print(
         subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, check=True).stdout,
@@ -1079,6 +1379,9 @@ def main():
 
     env = dict(os.environ)
     env["PYTHONPATH"] = str(package_root)
+    env["LIBRARY_PATH"] = os.pathsep.join(
+        filter(None, (str(libcuda_link_dir()), env.get("LIBRARY_PATH")))
+    )
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     sys.path.insert(0, str(package_root))
@@ -1089,9 +1392,16 @@ def main():
     shutil.rmtree(out, ignore_errors=True)
     config_path = WORKING / "run-config.json"
 
+    segmenter = stage_segmenter() if RANKING is not None else None
+
+    def start():
+        if RANKING is not None:
+            return start_argv(None, ranking_init())
+        initials = locate(INIT_ENCODER, INIT_DECODER)
+        return start_argv((initials / INIT_ENCODER, initials / INIT_DECODER), None)
+
     if SMOKE_STEPS:
-        init_files = (initials / INIT_ENCODER, initials / INIT_DECODER)
-        smoke(char_table, WORKING / "run", init_files, env)
+        smoke(char_table, start(), segmenter, env)
         return
 
     final = finished_checkpoint()
@@ -1113,14 +1423,20 @@ def main():
     if previous is None:
         counts_path = WORKING / "batch-counts.json"
         code, _ = run(
-            count_argv(char_table, counts_path, find_census()),
+            count_argv(char_table, counts_path, segmenter, find_census()),
             env,
             str(WORKING / "count.log"),
         )
         if code != 0:
             raise RuntimeError("counting the batches failed; its log is in the kernel output")
         counts = json.loads(counts_path.read_text())
-        config = {"max_steps": int(counts["steps_for_epochs"]), "epochs": EPOCHS}
+        config = {
+            "max_steps": int(counts["steps_for_epochs"]),
+            "epochs": EPOCHS,
+            "ranking": RANKING,
+            "train_shards": TRAIN_SHARDS,
+            "learning_rates": LEARNING_RATES,
+        }
         resume = None
     else:
         resume, config = previous["checkpoint"], previous["config"]
@@ -1142,11 +1458,6 @@ def main():
     virtual = world // nproc
     print(f"world of {world}: {nproc} processes x {virtual} virtual ranks", flush=True)
 
-    init_files = (
-        (initials / INIT_ENCODER, initials / INIT_DECODER)
-        if resume is None
-        else None
-    )
     wall_budget = training_budget(
         time.monotonic() - started, config["max_steps"], previous, nproc
     )
@@ -1158,11 +1469,12 @@ def main():
             out,
             config["max_steps"],
             wall_budget,
-            init_files,
+            start() if resume is None else None,
             resume,
             TOKEN_BUDGET,
             nproc=nproc,
             virtual_ranks=virtual,
+            segmenter=segmenter,
         ),
         env,
         str(WORKING / "train.log"),

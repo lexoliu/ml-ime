@@ -98,3 +98,49 @@ def test_two_lineages_of_run_config_are_refused(
     trio(tmp_path / "b", step=20, max_steps=200)
     with pytest.raises(ValueError, match="max_steps"):
         kernel.previous_segment()
+
+
+def finished(directory: Path, ranking: dict[str, float] | None) -> Path:
+    """A mounted finished run whose run-config records *ranking* (v1's records none)."""
+    (directory / "run").mkdir(parents=True)
+    (directory / "run" / "checkpoint-final.pt").write_bytes(b"")
+    config: dict[str, object] = {"max_steps": 10, "epochs": 1, "segment": 3}
+    if ranking is not None:
+        config["ranking"] = ranking
+    (directory / "run-config.json").write_text(json.dumps(config))
+    return directory / "run" / "checkpoint-final.pt"
+
+
+def test_a_ranking_stage_starts_from_v1_and_evaluates_only_its_own_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """v1's finished run is the start of a ranking stage, never its result."""
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    ranking = {"segmentations": 8, "beam": 4, "negatives": 8, "weight": 1.0}
+    monkeypatch.setattr(kernel, "RANKING", ranking)
+    v1 = finished(tmp_path / "mlime-e2e-final", None)
+    assert kernel.ranking_init() == v1
+    assert kernel.finished_checkpoint() is None
+    assert kernel.start_argv(None, v1) == ["--init-e2e", str(v1)]
+    assert kernel.ranking_argv(Path("/bin/ime-segment")) == [
+        "--ranking",
+        "--segmenter",
+        "/bin/ime-segment",
+        "--rank-segmentations",
+        "8",
+        "--rank-beam",
+        "4",
+        "--rank-negatives",
+        "8",
+        "--rank-weight",
+        "1.0",
+    ]
+
+    ranked = finished(tmp_path / "mlime-e2e-rank-s2", ranking)
+    assert kernel.finished_checkpoint() == ranked
+    assert kernel.ranking_init() == v1
+
+    # The v1 kernel sees v1's run as its own finished one, and ranks nothing.
+    monkeypatch.setattr(kernel, "RANKING", None)
+    assert kernel.finished_checkpoint() == v1
+    assert kernel.ranking_argv(Path("/bin/ime-segment")) == []

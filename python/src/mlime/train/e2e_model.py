@@ -69,6 +69,31 @@ def _default_reader() -> CharLmConfig:
 
 
 @dataclass(frozen=True)
+class RankingConfig:
+    """The sequence-level ranking loss of #116, and the search that feeds it.
+
+    Each training example is typed every way the segmenter reads its
+    keystrokes -- up to ``segmentations`` readings, the evaluation lattice's
+    own count. A ``beam``-wide search over every reading finds the sentences
+    the model would offer; the ``negatives`` best that are not the gold one
+    are scored against it on the decode's own path score, and the softmax
+    over those scores, weighted by ``weight``, joins the per-position loss.
+    """
+
+    segmentations: int = 8
+    beam: int = 4
+    negatives: int = 8
+    weight: float = 1.0
+
+    def __post_init__(self) -> None:
+        for name in ("segmentations", "beam", "negatives"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"ranking {name} must be positive, got {getattr(self, name)}")
+        if self.weight <= 0.0:
+            raise ValueError(f"the ranking weight must be positive, got {self.weight}")
+
+
+@dataclass(frozen=True)
 class E2EConfig(RouteAConfig):
     """Route A's config, plus what the decoder adds.
 
@@ -83,6 +108,8 @@ class E2EConfig(RouteAConfig):
     decoder: CharLmConfig = field(default_factory=_default_reader)
     #: Weight of the encoder's own restricted loss inside the total.
     aux_weight: float = 0.3
+    #: The sequence-level ranking loss, when the run trains one (#116).
+    ranking: RankingConfig | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -98,6 +125,8 @@ class E2EConfig(RouteAConfig):
         """Rebuild a config from a checkpoint's ``e2e`` record."""
         fields = dict(record)
         fields["decoder"] = CharLmConfig(**fields["decoder"])
+        if fields.get("ranking") is not None:
+            fields["ranking"] = RankingConfig(**fields["ranking"])
         return cls(**fields)
 
 
@@ -179,6 +208,32 @@ class EncoderAttention(nn.Module):
         result: torch.Tensor = x + self.gate * self.out(merged)
         return result
 
+    def attend_beams(
+        self,
+        x: torch.Tensor,
+        keys: torch.Tensor,
+        values: torch.Tensor,
+        mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """One search step's ``x [L * W, 1, hidden]`` attends to its lanes' encoder.
+
+        The rows are ``L`` lanes of ``W`` beams each, lane-major, and *keys*,
+        *values* ``[L, heads, S, head_dim]`` and *mask* ``[L, S]`` are per lane:
+        a lane's beams fold into one block of queries against its own keys, so
+        no lane's encoder output is copied per beam. One query position
+        against a few dozen spans is a small matrix product; a fused
+        attention kernel tiles it as if it were a long sequence.
+        """
+        lanes, heads, _, head_dim = keys.shape
+        q = self.query(self.norm(x)).view(lanes, -1, heads, head_dim).transpose(1, 2)
+        scores = (q @ keys.transpose(-1, -2)) / math.sqrt(head_dim)
+        if mask is not None:
+            scores = scores.masked_fill(~mask[:, None, None, :], float("-inf"))
+        attended = torch.softmax(scores, dim=-1) @ values
+        merged = attended.transpose(1, 2).reshape(x.shape)
+        result: torch.Tensor = x + self.gate * self.out(merged)
+        return result
+
 
 class Decoder(nn.Module):
     """The reader's transformer plus the wiring that lets it see the encoder.
@@ -227,7 +282,9 @@ class Decoder(nn.Module):
             layers.append(layer)
         return layers
 
-    def embed(self, tokens: torch.Tensor, span_vectors: torch.Tensor, first: int) -> torch.Tensor:
+    def embed(
+        self, tokens: torch.Tensor, span_vectors: torch.Tensor, first: int | torch.Tensor
+    ) -> torch.Tensor:
         """``input(embed(token)) + span_input(span) + position``, ``[B, T] -> [B, T, H]``."""
         positions = torch.arange(tokens.shape[1], device=tokens.device) + first
         embedded = (
@@ -275,54 +332,82 @@ class Decoder(nn.Module):
         self,
         tokens: torch.Tensor,
         span_vector: torch.Tensor,
+        position: torch.Tensor,
         state: tuple[torch.Tensor, torch.Tensor],
         encoder_kv: Sequence[tuple[torch.Tensor, torch.Tensor]],
         encoder_mask: torch.Tensor | None = None,
         *,
         candidates: torch.Tensor,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Advance one position: logits over the position's candidates, and the cache.
+        """Advance one position: logits over the position's candidates, and its keys.
 
         ``tokens [B]`` are the reader ids of each row's previous character
         (``<bos>`` to open a path), ``span_vector [B, enc]`` the encoder vector
-        of the position being predicted, and ``candidates`` the emission
-        indices the position's span admits -- the only logits the search needs
-        and the only ones computed. ``state`` is the key/value cache,
-        ``[B, layers, heads, T, head_dim]`` each, and ``encoder_kv`` the
-        per-block encoder keys and values computed once for the path.
+        of the position being predicted, ``position`` that position as a
+        0-d long tensor, and ``candidates`` the emission indices the
+        position's span admits -- the only logits the search needs and the
+        only ones computed. ``state`` is the key/value cache, ``[layers, B,
+        heads, T, head_dim]`` each over the path's whole length ``T``, holding
+        the positions before this one; the step reads it and returns this
+        position's keys and values, ``[layers, B, heads, 1, head_dim]``, for
+        the caller to write in. Layers lead so a block's slice is contiguous
+        and its attention reads the cache in place, never through a copy. The
+        rows are lanes of beams, lane-major, and ``encoder_kv`` holds each
+        block's encoder keys and values per lane, ``[lanes, heads, S,
+        head_dim]``, with ``encoder_mask [lanes, S]``.
+
+        The cache's shape is the path's for every step, and the step writes
+        nothing it is given, so a compiled step is one graph for a whole
+        search and copies no cache back.
         """
         keys, values = state
-        x = self.embed(tokens.unsqueeze(1), span_vector.unsqueeze(1), keys.shape[3])
+        x = self.embed(tokens.unsqueeze(1), span_vector.unsqueeze(1), position)
+        before = torch.arange(keys.shape[3], device=keys.device) < position
         new_keys, new_values = [], []
         for layer, (block, cross) in enumerate(
             zip(self.reader.layers(), self.gated_layers(), strict=True)
         ):
-            x, k, v = _attend_step(block, x, keys[:, layer], values[:, layer])
+            x, k, v = _attend_step(block, x, keys[layer], values[layer], before)
             enc_keys, enc_values = encoder_kv[layer]
-            x = cross.attend(x, enc_keys, enc_values, encoder_mask)
+            x = cross.attend_beams(x, enc_keys, enc_values, encoder_mask)
             new_keys.append(k)
             new_values.append(v)
-        keys = torch.cat([keys, torch.stack(new_keys, dim=1)], dim=3)
-        values = torch.cat([values, torch.stack(new_values, dim=1)], dim=3)
         features: torch.Tensor = self.reader.norm(x).squeeze(1)
-        return self.logits_over(features, candidates), (keys, values)
+        return self.logits_over(features, candidates), (
+            torch.stack(new_keys),
+            torch.stack(new_values),
+        )
 
 
 def _attend_step(
-    block: Block, x: torch.Tensor, keys: torch.Tensor, values: torch.Tensor
+    block: Block,
+    x: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    before: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One position of *x* against the block's cache and itself.
 
     The reader's own :meth:`Block.attend` folds the prefix machinery in for the
     decoder's context prelude; this model has no prelude, so the step is the
     same split/merge arithmetic without it -- the block itself is reused, not
-    copied. Returns the merged output and the new key/value.
+    copied. *keys* and *values* are this block's slice of the cache,
+    ``[B, heads, T, head_dim]``, real where *before* is true; the position's
+    own key and value are scored beside them rather than written in. Returns
+    the merged output and the new key/value.
     """
     q, k, v = block.split(x)
-    keys = torch.cat([keys, k], dim=2)
-    values = torch.cat([values, v], dim=2)
-    scores = (q @ keys.transpose(-1, -2)) / math.sqrt(block.head_dim)
-    attended = torch.softmax(scores, dim=-1) @ values
+    scale = math.sqrt(block.head_dim)
+    past = ((q @ keys.transpose(-1, -2)) / scale).masked_fill(~before, float("-inf"))
+    own = (q * k).sum(dim=-1, keepdim=True) / scale
+    # The softmax over the cache and the position together, taken in two
+    # parts: the own score is always real, so it bounds the maximum even at
+    # the first position, where every cached score is minus infinity.
+    top = torch.maximum(past.amax(dim=-1, keepdim=True), own)
+    past_weights = (past - top).exp()
+    own_weight = (own - top).exp()
+    total = past_weights.sum(dim=-1, keepdim=True) + own_weight
+    attended = (past_weights @ values + own_weight * v) / total
     return block.merge(x, attended), k, v
 
 
