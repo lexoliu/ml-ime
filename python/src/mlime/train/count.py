@@ -34,16 +34,20 @@ from pathlib import Path
 from typing import Any
 
 from mlime.logging import log
+from mlime.train.e2e_model import RankingConfig
 from mlime.train.loop import epoch_groups
+from mlime.train.ranking import RankCollator
 from mlime.train.run import RunPaths, Slices, Vocabularies
-from mlime.train.samples import DEFAULT_CONTEXT_TOKENS, Augmentation
+from mlime.train.samples import DEFAULT_CONTEXT_TOKENS, Augmentation, BatchCollator
 
 #: The format of the census this module writes. The number moves when how the
 #: count is taken changes -- version 2 is the first in which each rank counts
 #: with its own builder, the draws the training loop's ranks actually make;
-#: version 1 walked the ranks off one shared builder. A stored census without
-#: the field is read as version 0, and only a census of this version is reused.
-CENSUS_VERSION = 2
+#: version 1 walked the ranks off one shared builder; version 3 deals the
+#: shards to ranks by their text (`deal_shards`) rather than round-robin. A
+#: stored census without the field is read as version 0, and only a census of
+#: this version is reused.
+CENSUS_VERSION = 3
 
 
 @dataclass(frozen=True)
@@ -83,6 +87,9 @@ class BatchCensus:
     #: The format this count was taken in; see :data:`CENSUS_VERSION`.
     census_version: int
     build_counts: dict[str, int]
+    #: The ranking loss's settings when the count weighed each example by
+    #: every row the ranking step makes of it; ``None`` for a plain run.
+    ranking: dict[str, Any] | None = None
 
     def write(self, path: Path) -> None:
         """Write the census as JSON, which is how the kernel reads it back."""
@@ -122,6 +129,7 @@ class CountSpec:
     shards: list[str]
     accumulate: int
     census_version: int
+    ranking: dict[str, Any] | None
 
 
 def census_mismatches(census: BatchCensus, spec: CountSpec) -> list[str]:
@@ -173,6 +181,8 @@ class _RankContext:
     augmentation: Augmentation
     max_context_tokens: int
     world_size: int
+    ranking: RankingConfig | None
+    segmenter: Path | None
 
 
 def _count_rank(context: _RankContext, rank: int) -> tuple[RankBatches, dict[str, int]]:
@@ -182,7 +192,14 @@ def _count_rank(context: _RankContext, rank: int) -> tuple[RankBatches, dict[str
     the training loop does it in its own rank's process, so the augmentation
     draws the count walks are the same draws the run will make.
     """
-    collator = context.vocabularies.collator(0.0, context.max_context_tokens, context.seed)
+    plain = context.vocabularies.collator(0.0, context.max_context_tokens, context.seed)
+    collator: BatchCollator = plain
+    if context.ranking is not None:
+        if context.segmenter is None:
+            raise ValueError("a ranking count reads the segmenter the run will read")
+        collator = RankCollator.launch(
+            plain, context.segmenter, context.vocabularies.spans, context.ranking
+        )
     builder = context.vocabularies.builder(context.augmentation, context.seed)
     stream = context.vocabularies.stream(
         context.paths, context.shards, builder, rank, context.world_size
@@ -228,6 +245,8 @@ def count_batches(
     epochs: int = 1,
     accumulate: int = 1,
     reuse_census: Path | None = None,
+    ranking: RankingConfig | None = None,
+    segmenter: Path | None = None,
 ) -> BatchCensus:
     """Count the batches every rank takes over *epochs*, the way the loop would.
 
@@ -239,6 +258,10 @@ def count_batches(
     *reuse_census* is a stored count from a previous run: it is used only when
     every configuration field and the shard list equal this call's, and the
     fields that differed are logged when it is refused.
+
+    *ranking* counts a ranking run, whose batches weigh each example by every
+    row the ranking step makes of it; *segmenter* is the binary those rows
+    come from.
     """
     if world_size < 1:
         raise ValueError(f"a world has at least one rank, got {world_size}")
@@ -257,6 +280,7 @@ def count_batches(
         shards=list(slices.train),
         accumulate=accumulate,
         census_version=CENSUS_VERSION,
+        ranking=None if ranking is None else asdict(ranking),
     )
     if reuse_census is not None:
         stored, differed = matching_census(reuse_census, spec)
@@ -274,6 +298,8 @@ def count_batches(
         augmentation=augmentation,
         max_context_tokens=max_context_tokens,
         world_size=world_size,
+        ranking=ranking,
+        segmenter=segmenter,
     )
     counted = _count_ranks(context)
     ranks = [rank for rank, _ in counted]
@@ -293,6 +319,7 @@ def count_batches(
         steps_for_epochs=-(-min(rank.total for rank in ranks) // accumulate),
         census_version=CENSUS_VERSION,
         build_counts=dict(tallies),
+        ranking=None if ranking is None else asdict(ranking),
     )
     log.info(
         "batches counted",

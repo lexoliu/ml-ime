@@ -45,9 +45,10 @@ from mlime.train.lexicon import CandidateSpace
 from mlime.train.model import RouteAConfig, RouteAModel, count_correct
 from mlime.train.samples import (
     BaseTokenizer,
-    Batch,
+    BatchCollator,
     Collator,
     CorpusStream,
+    StepBatch,
     TrainingExample,
     token_budget_batches,
 )
@@ -91,6 +92,11 @@ class TrainingConfig:
     #: Steps after warm-up to split into per-phase timings. Zero leaves the
     #: loop untouched by the profiler's synchronising marks.
     profile_steps: int = 0
+    #: The first of the profiled steps to also record as a torch.profiler
+    #: trace, one Chrome trace per rank in the run directory, with each
+    #: phase boundary a ``phase.<name>`` event. The trace shows what the
+    #: phase table cannot: where inside a phase the device sat idle.
+    trace_steps: int = 0
     #: Optimiser steps between the ranks agreeing whether the wall budget is
     #: spent. A world of one checks every step: it pays no collective either way.
     agree_every: int = 64
@@ -126,6 +132,11 @@ class TrainingConfig:
             raise ValueError(f"accumulate must be at least 1, got {self.accumulate}")
         if self.profile_steps < 0:
             raise ValueError(f"profile_steps must not be negative, got {self.profile_steps}")
+        if not 0 <= self.trace_steps <= self.profile_steps:
+            raise ValueError(
+                f"trace_steps must be within the {self.profile_steps} profiled steps, "
+                f"got {self.trace_steps}"
+            )
         if self.agree_every < 1:
             raise ValueError(f"agree_every must be at least 1, got {self.agree_every}")
         if self.compile_mode not in self.COMPILE_MODES:
@@ -269,7 +280,7 @@ class Accuracy:
 
 
 def epoch_groups(
-    stream: CorpusStream, collator: Collator, budget: int, epoch: int
+    stream: CorpusStream, collator: BatchCollator, budget: int, epoch: int
 ) -> Iterator[list[TrainingExample]]:
     """The examples of *epoch*, grouped exactly as the steps of that epoch will be.
 
@@ -285,7 +296,7 @@ def epoch_groups(
     of the lengths. Counting epoch 0 twice is not counting two epochs.
     """
     stream.set_epoch(epoch)
-    return token_budget_batches(iter(stream), budget, collator.max_context_tokens)
+    return token_budget_batches(iter(stream), budget, collator.max_context_tokens, collator.rows)
 
 
 @dataclass(frozen=True)
@@ -301,13 +312,13 @@ class Produced:
     writes is the last batch *consumed*, not the last one produced.
     """
 
-    batch: Batch
+    batch: StepBatch
     epoch: int
     index: int
     collator_rng: tuple[Any, ...]
 
 
-class EpochBatches(Iterator[Batch]):
+class EpochBatches(Iterator[StepBatch]):
     """The stream as collated batches, epoch after epoch, and where in it we are.
 
     The position is what makes a run resumable. A rank's batches are its own --
@@ -317,7 +328,7 @@ class EpochBatches(Iterator[Batch]):
     :meth:`skip` walks a fresh stream back to exactly there.
     """
 
-    def __init__(self, stream: CorpusStream, collator: Collator, budget: int):
+    def __init__(self, stream: CorpusStream, collator: BatchCollator, budget: int):
         self.stream = stream
         self.collator = collator
         self.budget = budget
@@ -327,7 +338,7 @@ class EpochBatches(Iterator[Batch]):
         self.index = 0
         self._groups = self._open_epoch()
 
-    def __next__(self) -> Batch:
+    def __next__(self) -> StepBatch:
         return self.produce().batch
 
     def produce(self) -> Produced:
@@ -541,15 +552,28 @@ class Profiler:
     window is full. ``sync_check`` arms the sync guard -- off for compiled
     runs, whose proof is zero breaks and recompiles, since a legitimate
     mid-window compile would trip a guard written for eager code.
+
+    ``trace`` is a number of steps and where to write them: the window's
+    first that many steps also run under torch.profiler, and the trace is
+    exported once they are done, every mark leaving a ``phase.<name>`` event
+    at the moment its phase ended.
     """
 
     def __init__(
-        self, device: torch.device, steps: int, *, dynamic: bool = False, sync_check: bool = True
+        self,
+        device: torch.device,
+        steps: int,
+        *,
+        dynamic: bool = False,
+        sync_check: bool = True,
+        trace: tuple[int, Path] | None = None,
     ):
         self.device = device
         self.steps = steps
         self.dynamic = dynamic
         self.sync_check = sync_check
+        self._trace = trace
+        self._tracer: torch.profiler.profile | None = None
         self.records: list[dict[str, float]] = []
         self._current: dict[str, float] | None = None
         self._t0 = 0.0
@@ -578,6 +602,12 @@ class Profiler:
         self._current = {} if collect else None
         if collect and not self._window:
             self._window.append(time.time())
+        if collect and not self.records and self._trace is not None:
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if self.device.type == "cuda":
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            self._tracer = torch.profiler.profile(activities=activities)
+            self._tracer.start()
         if self.dynamic:
             self._graphs_at_begin = _dynamo_graphs()
             self._breaks_at_begin = _dynamo_breaks()
@@ -594,6 +624,9 @@ class Profiler:
         now = time.perf_counter()
         self._current[phase] = self._current.get(phase, 0.0) + (now - self._t0)
         self._t0 = now
+        if self._tracer is not None:
+            with torch.profiler.record_function(f"phase.{phase}"):
+                pass
 
     @contextlib.contextmanager
     def guarded(self) -> Iterator[None]:
@@ -637,6 +670,12 @@ class Profiler:
             self._current = None
             if len(self.records) == self.steps:
                 self._window.append(time.time())
+            if self._tracer is not None and self._trace is not None:
+                steps, path = self._trace
+                if len(self.records) == steps:
+                    self._tracer.stop()
+                    self._tracer.export_chrome_trace(str(path))
+                    self._tracer = None
 
     def done(self) -> bool:
         """The window is full -- a measurement run has nothing left to measure."""
@@ -842,7 +881,7 @@ def evaluate(
 
 def train(
     model: RouteAModel,
-    lanes: Sequence[tuple[CorpusStream, Collator]],
+    lanes: Sequence[tuple[CorpusStream, BatchCollator]],
     config: TrainingConfig,
     out_dir: Path,
     distributed: Distributed | None = None,
@@ -899,6 +938,11 @@ def train(
             model,
             device_ids=[world.local_rank] if device.type == "cuda" else None,
             find_unused_parameters=False,
+            # Every buffer is a constant each rank builds identically from the
+            # lexicon. Broadcasting them -- for running statistics this model
+            # does not have -- copies megabytes from rank 0 at every forward
+            # and makes each micro-batch wait for the slowest rank's last one.
+            forward_sync_buffers=False,
         )
     optimiser = torch.optim.AdamW(
         model.parameter_groups(config.base_lr, config.new_lr),
@@ -980,6 +1024,9 @@ def train(
         config.profile_steps,
         dynamic=config.compile,
         sync_check=not config.compile,
+        trace=(config.trace_steps, out_dir / f"trace-rank{world.rank}.json")
+        if config.trace_steps
+        else None,
     )
 
     trained.train()
@@ -1158,7 +1205,10 @@ def train(
                     metrics.write(event="interval", step=step, seconds=round(elapsed, 1))
             # A measurement run ends when its window fills -- a compiled one
             # may warm up late, so its max_steps is a cap, not the target.
-            if profiler.done():
+            # Each rank warms up on its own recompiles, so rank 0's window
+            # decides for all: a rank leaving on its own window would leave
+            # the others in the next gradient all-reduce.
+            if profiler.steps > 0 and agreed(world, int(profiler.done()), device):
                 break
     finally:
         for lane in rank_lanes:
@@ -1188,6 +1238,10 @@ def train(
         sys.stdout.flush()
         metrics.write(event="dynamo", counters=dynamo)
     metrics.close()
+    # The wrapper's reducer holds the process group. Torn down after the group,
+    # on the frame's exit, it hung both ranks of a two-process gloo world in 5
+    # of 40 runs on a 4-core Linux box (none of 40 with this order); it goes first.
+    del trained
     world.stop()
     return Segment(metrics=metrics.path, step=step, finished=finished)
 
@@ -1256,7 +1310,8 @@ def agreed(world: Distributed, verdict: int, device: torch.device) -> int:
     and the rest are told.
 
     The verdicts: 0 carry on, 1 an interval checkpoint is due, 2 the wall
-    budget is spent.
+    budget is spent. A measurement run asks the same way, every step, whether
+    its timed window is full.
     """
     if world.world_size == 1:
         return verdict
@@ -1394,6 +1449,7 @@ SEGMENT_FIELDS = frozenset(
         "wall_budget_seconds",
         "prefetch",
         "profile_steps",
+        "trace_steps",
         "agree_every",
         "compile",
         "compile_mode",

@@ -62,6 +62,9 @@ ignore = ["RUF001", "RUF002", "RUF003"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# A test still running after five minutes dumps every thread's stack, so a
+# hang names itself in the log instead of holding a runner until it is cancelled.
+faulthandler_timeout = 300
 
 [tool.mypy]
 strict = true

@@ -1,0 +1,4 @@
+# `ime-segment` ships to the Kaggle kernels as a static Linux binary; rust-lld
+# links the musl target without a cross toolchain.
+[target.x86_64-unknown-linux-musl]
+linker = "rust-lld"

@@ -228,6 +228,7 @@ def mark_dynamic(batch: Batch) -> None:
     ):
         torch._dynamo.maybe_mark_dynamic(tensor, (0, 1))
     torch._dynamo.maybe_mark_dynamic(batch.has_context, 0)
+    torch._dynamo.maybe_mark_dynamic(batch.context_rows, 0)
     torch._dynamo.maybe_mark_dynamic(batch.candidate_ids, (0, 1, 2))
     torch._dynamo.maybe_mark_dynamic(batch.candidate_counts, (0, 1))
     torch._dynamo.maybe_mark_dynamic(batch.span_letters, (0, 1, 2))
@@ -455,7 +456,11 @@ class RouteAModel(nn.Module):
             past_key_values=None,
         )
         gated = self.gated_layers()
-        context = self._encode_context(batch) if gated else None
+        # The context tower runs once per context row; each fill row then
+        # reads the one ``context_rows`` names.
+        context = self._encode_context(batch)[batch.context_rows] if gated else None
+        context_mask = batch.context_mask[batch.context_rows]
+        has_context = batch.has_context[batch.context_rows]
         gated_from = len(self.fill.encoder.layer) - len(gated)
         hidden = embeddings
         for depth, layer in enumerate(self.fill.encoder.layer):
@@ -468,9 +473,7 @@ class RouteAModel(nn.Module):
             else:
                 hidden = torch.as_tensor(layer(hidden, attention_mask=attention_mask))
             if context is not None and depth >= gated_from:
-                hidden = gated[depth - gated_from](
-                    hidden, context, batch.context_mask, batch.has_context
-                )
+                hidden = gated[depth - gated_from](hidden, context, context_mask, has_context)
         return hidden
 
     def forward(self, batch: Batch) -> RouteAOutput:
