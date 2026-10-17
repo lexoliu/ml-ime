@@ -43,11 +43,12 @@ from mlime.train.samples import DEFAULT_CONTEXT_TOKENS, Augmentation, BatchColla
 #: The format of the census this module writes. The number moves when how the
 #: count is taken changes -- version 2 is the first in which each rank counts
 #: with its own builder, the draws the training loop's ranks actually make;
-#: version 1 walked the ranks off one shared builder; version 3 deals the
-#: shards to ranks by their text (`deal_shards`) rather than round-robin. A
-#: stored census without the field is read as version 0, and only a census of
-#: this version is reused.
-CENSUS_VERSION = 3
+#: version 1 walked the ranks off one shared builder; version 3 dealt whole
+#: shards to ranks by their text rather than round-robin; version 4 strides the
+#: rows of the interleaved shards across readers (`CorpusStream`). A stored
+#: census without the field is read as version 0, and only a census of this
+#: version is reused.
+CENSUS_VERSION = 4
 
 
 @dataclass(frozen=True)
