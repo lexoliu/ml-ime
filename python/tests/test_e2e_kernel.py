@@ -175,3 +175,46 @@ def test_a_control_stage_is_told_apart_from_the_ranking_stage(
 
     control = finished(tmp_path / "mlime-e2e-control-s0", kernel.stage())
     assert kernel.finished_checkpoint() == control
+
+
+def test_every_switch_the_kernel_passes_is_an_option_of_train_e2e(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The training command parses with every stamp switched on.
+
+    The kernel builds `mlime train e2e`'s argv by hand; an option it passes
+    that the command lacks otherwise surfaces only on Kaggle, after the
+    install, as a usage error from every rank.
+    """
+    import typer
+    from typer.core import TyperGroup
+
+    from mlime.__main__ import app
+
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    monkeypatch.setattr(
+        kernel, "RANKING", {"segmentations": 8, "beam": 4, "negatives": 8, "weight": 1.0}
+    )
+    monkeypatch.setattr(kernel, "FROM_V1", True)
+    monkeypatch.setattr(kernel, "WHOLE_ALPHABET", True)
+    monkeypatch.setattr(kernel, "LEARNING_RATES", (2e-5, 2e-5))
+    monkeypatch.setattr(kernel, "TYPOS", True)
+    monkeypatch.setattr(kernel, "ACTIVATION_CHECKPOINTING", True)
+    argv = kernel.train_argv(
+        tmp_path / "char_pinyin.tsv",
+        tmp_path / "run",
+        max_steps=100,
+        wall_budget=3600,
+        start=kernel.start_argv(None, tmp_path / "checkpoint-final.pt"),
+        resume=tmp_path / "checkpoint-paused.pt",
+        token_budget=12288,
+        trace_steps=5,
+        segmenter=tmp_path / "ime-segment",
+    )
+    command = argv.index("mlime")
+    assert argv[command + 1 : command + 3] == ["train", "e2e"]
+    group = typer.main.get_command(app)
+    assert isinstance(group, TyperGroup)
+    train = group.commands["train"]
+    assert isinstance(train, TyperGroup)
+    train.commands["e2e"].make_context("e2e", [str(arg) for arg in argv[command + 3 :]])
