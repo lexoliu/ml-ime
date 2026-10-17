@@ -26,6 +26,7 @@ from mlime.train.model import (
     count_correct,
     letter_token_ids,
     restricted_cross_entropy,
+    smoothed_cross_entropy,
 )
 from mlime.train.samples import IGNORE_INDEX, BaseTokenizer, Batch, Collator, SampleBuilder
 from mlime.train.spans import SpanVocab
@@ -154,6 +155,30 @@ def test_label_smoothing_spreads_over_candidates_only() -> None:
     expected = -(0.95 * log_probabilities[0] + 0.05 * log_probabilities.mean())
     assert smoothed == pytest.approx(float(expected), abs=1e-6)
     assert torch.isfinite(smoothed)
+
+
+def test_whole_alphabet_cross_entropy_normalises_over_every_column() -> None:
+    logits = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
+    candidates = torch.tensor([[True, True, False, False]])
+    targets = torch.tensor([0])
+    loss = smoothed_cross_entropy(logits, targets, candidates, label_smoothing=0.05)
+    log_probabilities = logits[0].log_softmax(dim=-1)
+    expected = -(0.95 * log_probabilities[0] + 0.05 * log_probabilities[:2].mean())
+    assert loss == pytest.approx(float(expected), abs=1e-6)
+
+
+def test_only_the_whole_alphabet_loss_pushes_ruled_out_characters_down() -> None:
+    candidates = torch.tensor([[True, True, False, False]])
+    targets = torch.tensor([0])
+    for loss_of, ruled_out_moves in (
+        (lambda x: restricted_cross_entropy(x, targets, candidates, 0.05), False),
+        (lambda x: smoothed_cross_entropy(x, targets, candidates, 0.05), True),
+    ):
+        logits = torch.tensor([[1.0, 2.0, 3.0, 4.0]], requires_grad=True)
+        loss_of(logits).backward()
+        assert logits.grad is not None
+        assert bool((logits.grad[0, 2:] > 0).all()) == ruled_out_moves
+        assert bool((logits.grad[0, 2:] == 0).all()) != ruled_out_moves
 
 
 def test_a_position_admitting_nothing_is_an_error() -> None:

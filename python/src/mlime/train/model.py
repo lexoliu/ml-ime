@@ -193,16 +193,32 @@ def restricted_cross_entropy(
     """
     if targets.numel() == 0:
         raise ValueError("no positions to take a loss at")
-    counts = candidates.sum(dim=-1)
-    if check and bool((counts == 0).any()):
+    if check and bool((candidates.sum(dim=-1) == 0).any()):
         raise ValueError("a position admits no character at all; the mask and the target disagree")
     floor = torch.finfo(logits.dtype).min
-    log_probabilities = logits.masked_fill(~candidates, floor).log_softmax(dim=-1)
+    return smoothed_cross_entropy(
+        logits.masked_fill(~candidates, floor), targets, candidates, label_smoothing
+    )
+
+
+def smoothed_cross_entropy(
+    logits: torch.Tensor, targets: torch.Tensor, candidates: torch.Tensor, label_smoothing: float
+) -> torch.Tensor:
+    """Cross-entropy normalised over every column of *logits*, smoothed over *candidates*.
+
+    :func:`restricted_cross_entropy` is this over logits whose non-candidates
+    were pushed to the floor. Called on whole-alphabet logits it is the loss
+    of a model whose scores are normalised over the whole alphabet -- the
+    ranking model's path score (#121) -- where every character the span rules
+    out still holds probability, and still gets the gradient that takes it
+    away. The smoothing mass stays on the candidates either way.
+    """
+    log_probabilities = logits.log_softmax(dim=-1)
     gold = log_probabilities.gather(1, targets[:, None]).squeeze(1)
     if label_smoothing == 0.0:
         return -gold.mean()
     zero = torch.zeros((), dtype=log_probabilities.dtype, device=log_probabilities.device)
-    spread = torch.where(candidates, log_probabilities, zero).sum(dim=-1) / counts
+    spread = torch.where(candidates, log_probabilities, zero).sum(dim=-1) / candidates.sum(dim=-1)
     return -((1.0 - label_smoothing) * gold + label_smoothing * spread).mean()
 
 
