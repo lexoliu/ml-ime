@@ -21,13 +21,15 @@ checkpoint. A segment that mounts a run whose training already finished --
 `run/checkpoint-final.pt` in its output, the evaluation having stopped before
 its report -- evaluates that checkpoint and trains nothing.
 
-A ranking stage (#116) is the same chain with `RANKING` stamped: the first
-segment starts from the finished v1 run mounted with `lexoliu/mlime-e2e-final`
--- its weights, a fresh optimiser and schedule -- and every segment adds the
-sequence-level ranking loss, reading each example's other segmentations from
-the `ime-segment` binary the package dataset ships. Its one epoch runs over
-`TRAIN_SHARDS`. A finished run is told apart from the v1 run it started from
-by the `ranking` its run-config records.
+A stage from v1 is the same chain with `FROM_V1` stamped: the first segment
+starts from the finished v1 run mounted with `lexoliu/mlime-e2e-final` -- its
+weights, a fresh optimiser and schedule -- and its one epoch runs over
+`TRAIN_SHARDS`. With `RANKING` stamped as well it is a ranking stage (#116):
+every segment adds the sequence-level ranking loss, reading each example's
+other segmentations from the `ime-segment` binary the package dataset ships.
+`WHOLE_ALPHABET` normalises the per-position loss over every emittable
+character (#121). A finished run is told apart from the v1 run it started
+from by the stage its run-config records.
 
 For a smoke run -- the few-minute rate check that the cost estimate is made
 from -- set `SMOKE_STEPS` nonzero: the kernel times each entry of
@@ -193,6 +195,15 @@ CHECKPOINT_MINUTES = 0
 #: `beam`, `negatives`, `weight`) starts from the finished v1 run instead and
 #: adds the sequence-level ranking loss. Stamped per push.
 RANKING = None
+
+#: Start from the finished v1 run mounted with `lexoliu/mlime-e2e-final` --
+#: its weights, a fresh optimiser and schedule -- instead of from route A and
+#: the reader. A ranking stage always does. Stamped per push.
+FROM_V1 = False
+
+#: Normalise the decoder's per-position loss over every emittable character
+#: rather than the span's candidates (#121). Stamped per push.
+WHOLE_ALPHABET = False
 
 #: The training shards a run makes its epoch over; None trains on every
 #: mounted shard but the held-out ones. Stamped per push.
@@ -456,9 +467,30 @@ def count_argv(char_table, out, segmenter, census=None):
 
 def start_argv(initials, init_e2e):
     """Where a new run's weights come from: route A and the reader, or v1's run."""
-    if RANKING is None:
+    if not FROM_V1:
         return ["--init-encoder", str(initials[0]), "--init-decoder", str(initials[1])]
     return ["--init-e2e", str(init_e2e)]
+
+
+def stage():
+    """What tells this kernel's runs apart, as its run-config records it."""
+    return {"ranking": RANKING, "whole_alphabet": WHOLE_ALPHABET, "from_v1": FROM_V1}
+
+
+def stage_of(config):
+    """The stage a mounted run-config records.
+
+    v1's run-config predates the stage fields and records none of them; it is
+    the plain run from route A and the reader.
+    """
+    return {
+        "ranking": config.get("ranking"),
+        "whole_alphabet": config.get("whole_alphabet", False),
+        "from_v1": config.get("from_v1", False),
+    }
+
+
+V1_STAGE = {"ranking": None, "whole_alphabet": False, "from_v1": False}
 
 
 def ranking_argv(segmenter):
@@ -551,6 +583,8 @@ def train_argv(
     if LEARNING_RATES is not None:
         argv += ["--base-lr", str(LEARNING_RATES[0]), "--new-lr", str(LEARNING_RATES[1])]
     argv += ranking_argv(segmenter)
+    if WHOLE_ALPHABET:
+        argv.append("--whole-alphabet")
     if resume is not None:
         argv += ["--resume", str(resume)]
     if ACTIVATION_CHECKPOINTING:
@@ -1183,17 +1217,17 @@ def resume_candidates():
     return found
 
 
-def finished_runs(ranking):
-    """The final checkpoints of the mounted finished runs that trained *ranking*.
+def finished_runs(wanted):
+    """The final checkpoints of the mounted finished runs of stage *wanted*.
 
-    A run's run-config records its ranking settings, absent on v1's; that is
-    how a ranking stage tells its own finished run from the v1 run it starts
-    from, both mounted at once.
+    A run's run-config records its stage; that is how a stage that starts
+    from v1 tells its own finished run from the v1 run it starts from, both
+    mounted at once.
     """
     return [
         mount / "run" / "checkpoint-final.pt"
         for mount in locate_all("run/checkpoint-final.pt", "run-config.json")
-        if json.loads((mount / "run-config.json").read_text()).get("ranking") == ranking
+        if stage_of(json.loads((mount / "run-config.json").read_text())) == wanted
     ]
 
 
@@ -1203,18 +1237,18 @@ def finished_checkpoint():
     Two such mounts would be two finished runs, and which one to evaluate is
     not this kernel's to guess.
     """
-    found = finished_runs(RANKING)
+    found = finished_runs(stage())
     if len(found) > 1:
         raise RuntimeError(f"{len(found)} finished runs are mounted: {found}")
     return found[0] if found else None
 
 
-def ranking_init():
-    """The finished v1 checkpoint a ranking stage starts from; exactly one is mounted."""
-    found = finished_runs(None)
+def v1_init():
+    """The finished v1 checkpoint a stage from v1 starts from; exactly one is mounted."""
+    found = finished_runs(V1_STAGE)
     if len(found) != 1:
         raise FileNotFoundError(
-            f"a ranking stage starts from one finished v1 run, found {found}; "
+            f"a stage from v1 starts from one finished v1 run, found {found}; "
             f"mounts hold {describe()}"
         )
     return found[0]
@@ -1366,6 +1400,8 @@ def training_budget(elapsed, max_steps, previous, processes):
 
 def main():
     started = time.monotonic()
+    if RANKING is not None and not FROM_V1:
+        raise RuntimeError("a ranking stage starts from v1's finished run; stamp FROM_V1")
     install()
     package_root = importable_package()
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)
@@ -1395,8 +1431,8 @@ def main():
     segmenter = stage_segmenter() if RANKING is not None else None
 
     def start():
-        if RANKING is not None:
-            return start_argv(None, ranking_init())
+        if FROM_V1:
+            return start_argv(None, v1_init())
         initials = locate(INIT_ENCODER, INIT_DECODER)
         return start_argv((initials / INIT_ENCODER, initials / INIT_DECODER), None)
 
@@ -1433,7 +1469,7 @@ def main():
         config = {
             "max_steps": int(counts["steps_for_epochs"]),
             "epochs": EPOCHS,
-            "ranking": RANKING,
+            **stage(),
             "train_shards": TRAIN_SHARDS,
             "learning_rates": LEARNING_RATES,
         }

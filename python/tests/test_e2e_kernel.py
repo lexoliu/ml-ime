@@ -100,13 +100,13 @@ def test_two_lineages_of_run_config_are_refused(
         kernel.previous_segment()
 
 
-def finished(directory: Path, ranking: dict[str, float] | None) -> Path:
-    """A mounted finished run whose run-config records *ranking* (v1's records none)."""
+def finished(directory: Path, stage: dict[str, object] | None) -> Path:
+    """A mounted finished run whose run-config records *stage* (v1's records none)."""
     (directory / "run").mkdir(parents=True)
     (directory / "run" / "checkpoint-final.pt").write_bytes(b"")
     config: dict[str, object] = {"max_steps": 10, "epochs": 1, "segment": 3}
-    if ranking is not None:
-        config["ranking"] = ranking
+    if stage is not None:
+        config.update(stage)
     (directory / "run-config.json").write_text(json.dumps(config))
     return directory / "run" / "checkpoint-final.pt"
 
@@ -118,8 +118,10 @@ def test_a_ranking_stage_starts_from_v1_and_evaluates_only_its_own_run(
     kernel = load_kernel(monkeypatch, tmp_path, segment=0)
     ranking = {"segmentations": 8, "beam": 4, "negatives": 8, "weight": 1.0}
     monkeypatch.setattr(kernel, "RANKING", ranking)
+    monkeypatch.setattr(kernel, "FROM_V1", True)
+    monkeypatch.setattr(kernel, "WHOLE_ALPHABET", True)
     v1 = finished(tmp_path / "mlime-e2e-final", None)
-    assert kernel.ranking_init() == v1
+    assert kernel.v1_init() == v1
     assert kernel.finished_checkpoint() is None
     assert kernel.start_argv(None, v1) == ["--init-e2e", str(v1)]
     assert kernel.ranking_argv(Path("/bin/ime-segment")) == [
@@ -136,11 +138,40 @@ def test_a_ranking_stage_starts_from_v1_and_evaluates_only_its_own_run(
         "1.0",
     ]
 
-    ranked = finished(tmp_path / "mlime-e2e-rank-s2", ranking)
+    ranked = finished(tmp_path / "mlime-e2e-rank-s2", kernel.stage())
     assert kernel.finished_checkpoint() == ranked
-    assert kernel.ranking_init() == v1
+    assert kernel.v1_init() == v1
 
     # The v1 kernel sees v1's run as its own finished one, and ranks nothing.
     monkeypatch.setattr(kernel, "RANKING", None)
+    monkeypatch.setattr(kernel, "FROM_V1", False)
+    monkeypatch.setattr(kernel, "WHOLE_ALPHABET", False)
     assert kernel.finished_checkpoint() == v1
     assert kernel.ranking_argv(Path("/bin/ime-segment")) == []
+    assert kernel.start_argv((Path("/enc"), Path("/dec")), None) == [
+        "--init-encoder",
+        "/enc",
+        "--init-decoder",
+        "/dec",
+    ]
+
+
+def test_a_control_stage_is_told_apart_from_the_ranking_stage(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A fine-tune from v1 without ranking evaluates its own run, not a ranking run's."""
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    monkeypatch.setattr(kernel, "FROM_V1", True)
+    monkeypatch.setattr(kernel, "WHOLE_ALPHABET", True)
+    v1 = finished(tmp_path / "mlime-e2e-final", None)
+    ranking = {"segmentations": 8, "beam": 4, "negatives": 8, "weight": 1.0}
+    finished(
+        tmp_path / "mlime-e2e-rank2-s1",
+        {"ranking": ranking, "whole_alphabet": True, "from_v1": True},
+    )
+    assert kernel.v1_init() == v1
+    assert kernel.finished_checkpoint() is None
+    assert kernel.ranking_argv(Path("/bin/ime-segment")) == []
+
+    control = finished(tmp_path / "mlime-e2e-control-s0", kernel.stage())
+    assert kernel.finished_checkpoint() == control

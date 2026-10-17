@@ -45,6 +45,7 @@ from mlime.train.model import (
     RouteAOutput,
     mark_dynamic,
     restricted_cross_entropy,
+    smoothed_cross_entropy,
 )
 from mlime.train.samples import IGNORE_INDEX, Batch
 
@@ -110,6 +111,9 @@ class E2EConfig(RouteAConfig):
     aux_weight: float = 0.3
     #: The sequence-level ranking loss, when the run trains one (#116).
     ranking: RankingConfig | None = None
+    #: Normalise the decoder's per-position term over the whole emittable set,
+    #: as its path score is, rather than over each span's candidates (#121).
+    whole_alphabet: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -580,6 +584,20 @@ class E2EModel(RouteAModel):
             region=region,
         )
 
+    def position_loss(
+        self, logits: torch.Tensor, targets: torch.Tensor, candidates: torch.Tensor
+    ) -> torch.Tensor:
+        """The decoder's per-position term over *logits* across the emittable set.
+
+        Over each span's candidates by default, v1's loss; with
+        ``whole_alphabet`` over every emittable character, the normaliser the
+        search's path score uses (#121). The smoothing stays on the candidates.
+        """
+        smoothing = self.config.label_smoothing
+        if self.e2e_config.whole_alphabet:
+            return smoothed_cross_entropy(logits, targets, candidates, smoothing)
+        return restricted_cross_entropy(logits, targets, candidates, smoothing, check=False)
+
     def forward(self, batch: Batch) -> RouteAOutput:
         """The training halves: the decoder's loss plus the encoder head's own.
 
@@ -594,12 +612,13 @@ class E2EModel(RouteAModel):
         scored = self._scored(batch)
         if scored is None:
             return RouteAOutput()
-        smoothing = self.config.label_smoothing
-        decoder_loss = restricted_cross_entropy(
-            scored.decoder, scored.targets, scored.candidates, smoothing, check=False
-        )
+        decoder_loss = self.position_loss(scored.decoder, scored.targets, scored.candidates)
         encoder_loss = restricted_cross_entropy(
-            scored.encoder, scored.targets, scored.candidates, smoothing, check=False
+            scored.encoder,
+            scored.targets,
+            scored.candidates,
+            self.config.label_smoothing,
+            check=False,
         )
         return RouteAOutput(
             loss=decoder_loss + self.e2e_config.aux_weight * encoder_loss,

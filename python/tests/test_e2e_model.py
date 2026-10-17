@@ -15,7 +15,7 @@ nine characters.
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 
 import pytest
@@ -40,7 +40,12 @@ from mlime.train.e2e_model import E2EConfig, E2EModel, emittable_ids
 from mlime.train.emit import CandidateIndex, LatticePath, LatticeRecord
 from mlime.train.lexicon import CandidateSpace, Lexicon, build_lexicon
 from mlime.train.loop import TrainingConfig, train
-from mlime.train.model import RouteAConfig, RouteAModel, restricted_cross_entropy
+from mlime.train.model import (
+    RouteAConfig,
+    RouteAModel,
+    restricted_cross_entropy,
+    smoothed_cross_entropy,
+)
 from mlime.train.samples import (
     IGNORE_INDEX,
     BaseTokenizer,
@@ -131,15 +136,23 @@ def test_the_emission_logits_have_the_frame_route_a_uses(
     assert not hasattr(output, "logits")
 
 
+@pytest.mark.parametrize("whole_alphabet", [False, True])
 def test_the_vectorised_loss_is_the_masked_full_vocabulary_loss(
     lexicon: Lexicon,
     spans: SpanVocab,
     tokenizer: StubTokenizer,
     reader_vocab: CharVocab,
     e2e_config: E2EConfig,
+    whole_alphabet: bool,
 ) -> None:
-    """forward()'s [P, E] losses equal restricted CE on wide logits."""
-    model = tiny_e2e(lexicon, reader_vocab, e2e_config).eval()
+    """forward()'s [P, E] losses equal the per-position CE on wide logits.
+
+    The decoder's term is normalised over the candidates, or over the whole
+    emittable alphabet when the run asks for it (#121); the encoder's
+    auxiliary term is route A's either way.
+    """
+    config = replace(e2e_config, whole_alphabet=whole_alphabet)
+    model = tiny_e2e(lexicon, reader_vocab, config).eval()
     batch = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
         [
             example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing")),
@@ -169,7 +182,8 @@ def test_the_vectorised_loss_is_the_masked_full_vocabulary_loss(
         wide_decoder = model.decoder.reader.project(features) @ emit_weight.T
         where = (batch.targets[:, 1 : width - 1] != IGNORE_INDEX).reshape(-1).nonzero()
         where = where.squeeze(1)
-        decoder_loss = restricted_cross_entropy(
+        position_loss = smoothed_cross_entropy if whole_alphabet else restricted_cross_entropy
+        decoder_loss = position_loss(
             wide_decoder.reshape(-1, lexicon.size).index_select(0, where),
             batch.targets[:, 1 : width - 1].reshape(-1).index_select(0, where),
             model.candidate_mask.index_select(
@@ -568,6 +582,13 @@ def test_a_checkpoint_round_trips_and_a_route_a_one_is_refused(
     loaded = torch.load(path, map_location="cpu", weights_only=False)
     rebuilt = from_checkpoint(loaded, lexicon, bert_config=TINY)
     rebuilt.load_state_dict(loaded["model"], strict=True)
+    assert rebuilt.e2e_config == model.e2e_config
+
+    # A run that switches to the whole-alphabet term records the switch.
+    switched = tiny_e2e(lexicon, reader_vocab, replace(e2e_config, whole_alphabet=True))
+    torch.save({"e2e": asdict(switched.config), "model": switched.state_dict(), "step": 7}, path)
+    loaded = torch.load(path, map_location="cpu", weights_only=False)
+    assert from_checkpoint(loaded, lexicon, bert_config=TINY).e2e_config.whole_alphabet
 
     wrong = tmp_path / "route-a.pt"
     torch.save({"route_a": {"base_model": "stub"}, "model": {}, "step": 1}, wrong)

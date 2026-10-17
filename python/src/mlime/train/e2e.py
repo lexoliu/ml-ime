@@ -72,6 +72,7 @@ def initialise(
     init_decoder: Path | str = "decoder checkpoint",
     bert_config: BertConfig | None = None,
     ranking: RankingConfig | None = None,
+    whole_alphabet: bool = False,
 ) -> E2EModel:
     """Build the model from a route A checkpoint and a transformer char-lm one.
 
@@ -94,6 +95,7 @@ def initialise(
         decoder=decoder,
         aux_weight=aux_weight,
         ranking=ranking,
+        whole_alphabet=whole_alphabet,
     )
     model = model_class(config).compose(
         bert_config or BertConfig.from_pretrained(route.base_model),
@@ -230,6 +232,7 @@ def e2e(
     init_e2e: Path | None = None,
     ranking: RankingConfig | None = None,
     segmenter: Path | None = None,
+    whole_alphabet: bool = False,
 ) -> RunResult:
     """Train the end-to-end model over *slices.train*; score held-out both ways.
 
@@ -242,7 +245,8 @@ def e2e(
     next segment of the run that wrote *resume*; anything else is an error.
     *ranking* adds the sequence-level loss of #116, which reads every
     example's other segmentations through the ``ime-segment`` binary at
-    *segmenter*. *run_config* is the kernel's own run-config file, copied
+    *segmenter*. *whole_alphabet* normalises the decoder's per-position term
+    over the whole emittable set (#121). *run_config* is the kernel's own run-config file, copied
     into each interval trio verbatim; the loop refuses ``checkpoint_minutes``
     without it.
     """
@@ -273,7 +277,9 @@ def e2e(
         model = from_checkpoint(
             state,
             vocabularies.lexicon,
-            replace(recorded, aux_weight=aux_weight, ranking=ranking),
+            replace(
+                recorded, aux_weight=aux_weight, ranking=ranking, whole_alphabet=whole_alphabet
+            ),
         )
         if init_e2e is not None:
             model.load_resumed(_weights(state, init_e2e), init_e2e)
@@ -293,6 +299,7 @@ def e2e(
             init_encoder,
             init_decoder,
             ranking=ranking,
+            whole_alphabet=whole_alphabet,
         )
     if activation_checkpointing:
         model.enable_encoder_checkpointing()
