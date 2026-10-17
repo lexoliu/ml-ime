@@ -200,6 +200,20 @@ def test_a_stage_starts_from_an_earlier_stage_mounted_as_kernel_output(
         kernel.init_checkpoint()
 
 
+def test_a_finished_run_keeps_only_its_final_checkpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The numbered checkpoints go; the final one and the metrics stay."""
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    out = tmp_path / "run"
+    out.mkdir()
+    for name in ("checkpoint-005000.pt", "checkpoint-010000.pt", "checkpoint-final.pt"):
+        (out / name).write_bytes(b"")
+    (out / "metrics.jsonl").write_text("")
+    kernel.drop_numbered_checkpoints(out)
+    assert sorted(path.name for path in out.iterdir()) == ["checkpoint-final.pt", "metrics.jsonl"]
+
+
 def test_every_switch_the_kernel_passes_is_an_option_of_train_e2e(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

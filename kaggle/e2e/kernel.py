@@ -1216,6 +1216,17 @@ def resume_candidates():
     return found
 
 
+def drop_numbered_checkpoints(out):
+    """Delete a finished run's numbered checkpoints, leaving `checkpoint-final.pt`.
+
+    They exist to recover a crash inside the session. Once the final one is
+    written they are 3.5 GB each of kernel output that every download of the
+    run pays for and nothing reads.
+    """
+    for numbered in out.glob("checkpoint-[0-9]*.pt"):
+        numbered.unlink()
+
+
 def finished_runs(wanted):
     """The final checkpoints of the mounted finished runs of stage *wanted*.
 
@@ -1559,6 +1570,7 @@ def main():
         checkpoint = out / "checkpoint-final.pt"
         if not checkpoint.is_file():
             raise RuntimeError("the run finished without writing a final checkpoint")
+        drop_numbered_checkpoints(out)
         evaluated = evaluate_lattices(checkpoint, assets, char_table, env)
         summary["evaluated"] = evaluated
         summary["held_out"] = records_of(out / "metrics.jsonl", "summary")[-1]
