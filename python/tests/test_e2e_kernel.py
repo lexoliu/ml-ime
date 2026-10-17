@@ -118,10 +118,10 @@ def test_a_ranking_stage_starts_from_v1_and_evaluates_only_its_own_run(
     kernel = load_kernel(monkeypatch, tmp_path, segment=0)
     ranking = {"segmentations": 8, "beam": 4, "negatives": 8, "weight": 1.0}
     monkeypatch.setattr(kernel, "RANKING", ranking)
-    monkeypatch.setattr(kernel, "FROM_V1", True)
+    monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-final")
     monkeypatch.setattr(kernel, "WHOLE_ALPHABET", True)
     v1 = finished(tmp_path / "mlime-e2e-final", None)
-    assert kernel.v1_init() == v1
+    assert kernel.init_checkpoint() == v1
     assert kernel.finished_checkpoint() is None
     assert kernel.start_argv(None, v1) == ["--init-e2e", str(v1)]
     assert kernel.ranking_argv(Path("/bin/ime-segment")) == [
@@ -140,11 +140,11 @@ def test_a_ranking_stage_starts_from_v1_and_evaluates_only_its_own_run(
 
     ranked = finished(tmp_path / "mlime-e2e-rank-s2", kernel.stage())
     assert kernel.finished_checkpoint() == ranked
-    assert kernel.v1_init() == v1
+    assert kernel.init_checkpoint() == v1
 
     # The v1 kernel sees v1's run as its own finished one, and ranks nothing.
     monkeypatch.setattr(kernel, "RANKING", None)
-    monkeypatch.setattr(kernel, "FROM_V1", False)
+    monkeypatch.setattr(kernel, "INIT_FROM", None)
     monkeypatch.setattr(kernel, "WHOLE_ALPHABET", False)
     assert kernel.finished_checkpoint() == v1
     assert kernel.ranking_argv(Path("/bin/ime-segment")) == []
@@ -161,20 +161,43 @@ def test_a_control_stage_is_told_apart_from_the_ranking_stage(
 ) -> None:
     """A fine-tune from v1 without ranking evaluates its own run, not a ranking run's."""
     kernel = load_kernel(monkeypatch, tmp_path, segment=0)
-    monkeypatch.setattr(kernel, "FROM_V1", True)
+    monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-final")
     monkeypatch.setattr(kernel, "WHOLE_ALPHABET", True)
     v1 = finished(tmp_path / "mlime-e2e-final", None)
     ranking = {"segmentations": 8, "beam": 4, "negatives": 8, "weight": 1.0}
     finished(
         tmp_path / "mlime-e2e-rank2-s1",
-        {"ranking": ranking, "whole_alphabet": True, "from_v1": True},
+        {"ranking": ranking, "whole_alphabet": True, "init_from": "mlime-e2e-final"},
     )
-    assert kernel.v1_init() == v1
+    assert kernel.init_checkpoint() == v1
     assert kernel.finished_checkpoint() is None
     assert kernel.ranking_argv(Path("/bin/ime-segment")) == []
 
     control = finished(tmp_path / "mlime-e2e-control-s0", kernel.stage())
     assert kernel.finished_checkpoint() == control
+
+
+def test_a_stage_starts_from_an_earlier_stage_mounted_as_kernel_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """INIT_FROM picks its parent by mount name, and the parent is never the result."""
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    finished(tmp_path / "datasets" / "lexoliu" / "mlime-e2e-final", None)
+    parent = finished(
+        tmp_path / "notebooks" / "lexoliu" / "mlime-e2e-control2-s0",
+        {"ranking": None, "whole_alphabet": False, "init_from": "mlime-e2e-final"},
+    )
+    monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-control2-s0")
+    assert kernel.init_checkpoint() == parent
+    assert kernel.finished_checkpoint() is None
+    assert kernel.start_argv(None, parent) == ["--init-e2e", str(parent)]
+
+    own = finished(tmp_path / "notebooks" / "lexoliu" / "mlime-e2e-stage2-s1", kernel.stage())
+    assert kernel.finished_checkpoint() == own
+
+    monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-missing")
+    with pytest.raises(FileNotFoundError, match="mlime-e2e-missing"):
+        kernel.init_checkpoint()
 
 
 def test_every_switch_the_kernel_passes_is_an_option_of_train_e2e(
@@ -195,7 +218,7 @@ def test_every_switch_the_kernel_passes_is_an_option_of_train_e2e(
     monkeypatch.setattr(
         kernel, "RANKING", {"segmentations": 8, "beam": 4, "negatives": 8, "weight": 1.0}
     )
-    monkeypatch.setattr(kernel, "FROM_V1", True)
+    monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-final")
     monkeypatch.setattr(kernel, "WHOLE_ALPHABET", True)
     monkeypatch.setattr(kernel, "LEARNING_RATES", (2e-5, 2e-5))
     monkeypatch.setattr(kernel, "TYPOS", True)
