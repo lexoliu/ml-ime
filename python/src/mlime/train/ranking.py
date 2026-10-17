@@ -13,6 +13,14 @@ segmenter reads its keystrokes; a beam over every reading finds the sentences
 the model would offer; the gold sentence and the best of the others are scored
 on the decode's own path score, teacher-forced with gradient; and the softmax
 over those scores is the loss, beside v1's per-position and auxiliary terms.
+
+That softmax moves only the differences between the paths the beam found.
+Trained beside v1's per-position term, which normalised over each span's
+homophones, it pushed down the common characters the beam offers and nothing
+held down the ones it never offers: #116's run ranked rarer characters first
+and lost three points of top-1 on abbreviated input, where a span admits
+hundreds. So the decoder's per-position term here is normalised like the path
+score, over the whole emittable set (#121).
 """
 
 from __future__ import annotations
@@ -28,7 +36,12 @@ import torch.utils.checkpoint
 from mlime.train.charlm_vocab import BOS
 from mlime.train.e2e_model import E2EModel, RankingConfig
 from mlime.train.e2e_search import Lane, decode_lanes
-from mlime.train.model import RouteAOutput, mark_dynamic, restricted_cross_entropy
+from mlime.train.model import (
+    RouteAOutput,
+    mark_dynamic,
+    restricted_cross_entropy,
+    smoothed_cross_entropy,
+)
 from mlime.train.samples import IGNORE_INDEX, Batch, Collator, TrainingExample
 from mlime.train.segmenter import Segmentations, Segmenter
 from mlime.train.spans import SpanVocab
@@ -320,9 +333,7 @@ class RankingE2EModel(E2EModel):
             self.head.transform(hidden.reshape(-1, hidden.shape[-1]).index_select(0, positions))
         )
         smoothing = self.config.label_smoothing
-        decoder_loss = restricted_cross_entropy(
-            decoder_logits, targets, candidates, smoothing, check=False
-        )
+        decoder_loss = smoothed_cross_entropy(decoder_logits, targets, candidates, smoothing)
         encoder_loss = restricted_cross_entropy(
             encoder_logits, targets, candidates, smoothing, check=False
         )
