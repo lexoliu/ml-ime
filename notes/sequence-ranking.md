@@ -2,15 +2,17 @@
 
 ## Verdict
 
-Against its proper control the ranking term costs accuracy, and the best end-to-end model so far is the control: v1 fine-tuned on 42 shards without the ranking term, with v1's own per-position loss (#126, below). A second such stage (#127) adds nothing measurable. Test slices, context on, top-1:
+The ranking term pays at a small weight. The best end-to-end model so far is #127's fine-tuned checkpoint with a ranking stage at weight 0.1, chosen on dev (#130, below). It beats the fused decoder on abbreviated input and trails it by about a point on the other two styles. Test slices, context on, top-1:
 
-| style | fine-tuned, no ranking (#126) | ranked (#116) | v1 | fused |
-|---|---|---|---|---|
-| full | **75.31%** | 74.40% | 73.52% | 78.16% |
-| abbreviated | **26.20%** | 22.14% | 25.05% | 28.26% |
-| mixed | **35.73%** | 32.04% | 34.70% | 38.54% |
+| style | ranked at 0.1 (#130) | fine-tuned (#127) | ranked at 1.0 (#116) | v1 | fused |
+|---|---|---|---|---|---|
+| full | **77.06%** | 75.37% | 74.40% | 73.52% | 78.16% |
+| abbreviated | **29.01%** | 26.63% | 22.14% | 25.05% | 28.26% |
+| mixed | **37.73%** | 35.69% | 32.04% | 34.70% | 38.54% |
 
 The sections below record each run in order. The first verdict, written after #116 alone, follows.
+
+### After #116
 
 The ranking stage improves full pinyin and makes abbreviated and mixed input worse. Test slices, context on, against e2e v1 (`notes/e2e-v1.md`) and the fused decoder (`notes/char-lm-v2.md`):
 
@@ -382,9 +384,84 @@ The answers keep v1's shape across both stages. Over every record, context on, t
 |---|---|---|
 | s0 | 2×T4 | 2.6 h session: 1.92 h of training at 368 examples/s for the world, then the six evaluations (8.0–10.3 min each, three per GPU) |
 
+## The ranking weight, chosen on dev (#130)
+
+Two ranking stages start from #127's final checkpoint, `INIT_FROM = "mlime-e2e-stage2-s0"`, and differ only in the ranking weight: 0.1 and 0.3. The rest is #116's ranking (8 segmentations, beam 4, 8 negatives) beside the candidates-only per-position term, with learning rates (2e-5, 2e-5), 12,288 tokens per rank × 2 ranks × accumulate 2. Both train one epoch over the 20-pick: 22 shards and 1,192,633 examples in 11,403 optimiser steps. They ran at once as `lexoliu/mlime-e2e-rankw01-s0` and `-rankw03-s0`.
+
+The ranks counted 22,805 and 23,884 micro-batches. Dealing whole shards cannot balance 22 of them, so 1,079 of rank 1's micro-batches (4.5%) were never trained on (#133).
+
+Held-out per-position accuracy is 91.83% / 89.36% (with / without context) at weight 0.1, and 91.49% / 88.99% at 0.3, against #127's 91.81% / 89.52%.
+
+### Choosing on dev
+
+Dev slice, context on, top-1. Weight 0 is #127 itself:
+
+| style | 0 | 0.1 | 0.3 |
+|---|---|---|---|
+| full | 77.71% | **78.71%** | 77.51% |
+| abbreviated | 26.53% | **26.95%** | 25.68% |
+| mixed | 36.98% | **38.64%** | 36.36% |
+
+Weight 0.1 is best on every style. With context off it is also best on full and mixed input, and 0.64 points below #127 on abbreviated input.
+
+### Results at weight 0.1
+
+Test slice, context on:
+
+| style | metric | weight 0.1 | #127 | fused |
+|---|---|---|---|---|
+| full | top-1 | 77.06% (+1.69) | 75.37% | **78.16%** |
+| full | top-8 | **91.63%** (+0.82) | 90.81% | 82.53% |
+| full | character | 95.44% (+1.34) | 94.10% | |
+| abbreviated | top-1 | **29.01%** (+2.38) | 26.63% | 28.26% |
+| abbreviated | top-8 | **43.29%** (+1.49) | 41.80% | 34.10% |
+| abbreviated | character | 67.63% (+2.36) | 65.27% | |
+| mixed | top-1 | 37.73% (+2.04) | 35.69% | **38.54%** |
+| mixed | top-8 | **53.20%** (+0.77) | 52.43% | 47.53% |
+| mixed | character | 75.19% (+1.51) | 73.68% | |
+
+Test slice, context off, top-1: 70.70% / 17.25% / 27.97% on full / abbreviated / mixed, against #127's 68.97% / 16.36% / 27.22%. Weight 0.3 on test, context on, top-1: 76.45% / 27.11% / 36.44%.
+
+The top-1 changes against #127 on the test slice with context on, record by record, and the shape of the answers over every record:
+
+| style | #127 → 0.1: gained / lost, z | #127 → 0.3: gained / lost, z |
+|---|---|---|
+| full | 171 / 86, 5.30 | 193 / 139, 2.96 |
+| abbreviated | 218 / 98, 6.75 | 224 / 200, 1.17 |
+| mixed | 211 / 108, 5.77 | 239 / 201, 1.81 |
+
+| style | run | right / same length / other length | unseen in the sample | median frequency rank |
+|---|---|---|---|---|
+| full | #127 | 4,176 / 1,216 / 133 | 3.1% | 404 |
+| full | 0.1 | 4,266 / 1,238 / 21 | 4.2% | 459 |
+| full | 0.3 | 4,229 / 1,279 / 17 | 7.2% | 525 |
+| abbreviated | #127 | 1,471 / 3,236 / 818 | 6.6% | 270 |
+| abbreviated | 0.1 | 1,593 / 3,468 / 464 | 7.3% | 316 |
+| abbreviated | 0.3 | 1,491 / 3,584 / 450 | 8.1% | 367 |
+| mixed | #127 | 1,978 / 2,931 / 616 | 7.2% | 279 |
+| mixed | 0.1 | 2,089 / 3,095 / 341 | 7.5% | 325 |
+| mixed | 0.3 | 2,013 / 3,187 / 325 | 8.9% | 378 |
+
+### What it says
+
+The weight trades the two effects #116 found. Both weights remove most wrong-length answers: on full pinyin from 133 to 21 and 17, on abbreviated input from 818 to 464 and 450. The drift toward rare characters grows with the weight: 4.2% of substituted characters unseen at 0.1 on full pinyin, 7.2% at 0.3. At 0.1 the segmentation gain is nearly all there and the drift is small, so most of the records that stop being wrong-length become right. At 0.3 more of them become right-length wrong answers instead.
+
+Weight 0.1 is the first end-to-end checkpoint to beat the fused decoder on any style: abbreviated input, by 0.75 points of top-1. Its top-8 is far above the fused decoder's on all three. The remaining top-1 gaps are 1.10 points on full pinyin and 0.81 on mixed input.
+
+The dev curve over 0, 0.1 and 0.3 peaks at 0.1, which does not rule out a lower optimum (#132).
+
+### Cost
+
+| job | where | time |
+|---|---|---|
+| weight 0.1, s0 | 2×T4 | 7.6 h session: 7.03 h of training at 47 examples/s for the world, then the six evaluations (8.3–11.0 min each, three per GPU) |
+| weight 0.3, s0 | 2×T4 | 7.7 h session: 7.09 h of training, then the six evaluations (8.4–11.5 min each) |
+
+The estimate was 6.2 h of training each: it assumed 1.1M examples at #116's 49 examples/s, against 1.19M at 47.
+
+The first harvest of weight 0.1 broke off with the Mac mini's disk at 15 GB free. The kernel output carried the run's numbered checkpoint beside the final one, 3.5 GB that nothing reads. A finished run now publishes only its final checkpoint (#131).
+
 ## Next
 
-The fine-tune is settled: one short pass across every source after the long epoch, and #127's checkpoint is the model to build on. Two things follow.
-
-- **Ranking within the beam.** The right answer is in the top-8 far more often than in the top-1. #116's ranking term found the right segmentations but pulled rare characters up, at weight 1.0 beside the candidates-only term. Its weight has not been chosen on dev yet, and the next ranking stage starts from #127's checkpoint with the weight selected there.
-- **The stream's order.** A future full epoch interleaves its sources rather than reading shards in order, so it does not end on one tail of the corpus.
+- **The weight below 0.1 (#132).** The same stage at weight 0.05 decides whether the optimum lies lower. It needs about 7.7 GPU-session hours, more than this week's remaining quota, so it is pushed after the 2026-10-23 reset.
+- **The stream's dealing and order (#133).** Deal below shard granularity so the ranks balance to within a micro-batch, and interleave the sources throughout the epoch, so a future full epoch neither drops examples nor ends on one tail of the corpus.
