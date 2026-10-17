@@ -131,9 +131,87 @@ The throughput was 24.5 examples/s per rank, 49.0 for the world, at 91.4% and 93
 
 With less than a whole session of quota left in the week, set `MLIME_SESSION_HOURS` in the chain's environment, as for the s1 push here. The final segment evaluates in-kernel. Its output, with `run/checkpoint-final.pt`, is the kernel output of `lexoliu/mlime-e2e-rank-s1`.
 
+## The per-position term over the emittable set (#121)
+
+The ranking term should train the whole distribution the path score normalises over, not only the paths the beam found. So the second run changes one thing: the decoder's per-position term is normalised over the 7,322 emittable characters (`smoothed_cross_entropy`) instead of over each span's homophones. Its gradient then pushes down every character in proportion to its probability, rare ones included. The smoothing mass stays on the candidates.
+
+Everything else is the first run's: v1's final checkpoint, the same 42 shards and settings. The shards are now dealt by their text, so both ranks counted 43,859 and 43,468 micro-batches and the epoch is 21,734 steps over all 2,190,297 examples. It ran as `lexoliu/mlime-e2e-rank2-s0` and `-s1`.
+
+Held-out per-position accuracy is 90.54% with context and 87.78% without. That is v1's 90.92% / 88.12%, less 0.4 points: candidates now compete with the whole alphabet for the mass.
+
+### Results
+
+Test slice, context on, top-1:
+
+| style | #121 | #116 | v1 | fused |
+|---|---|---|---|---|
+| full | **74.58%** | 74.40% | 73.52% | 78.16% |
+| abbreviated | 22.99% | 22.14% | **25.05%** | 28.26% |
+| mixed | 33.39% | 32.04% | **34.70%** | 38.54% |
+
+Test slice, context on, top-8 and character accuracy:
+
+| style | #121 top-8 | v1 top-8 | #121 character | v1 character |
+|---|---|---|---|---|
+| full | 90.21% | 89.72% | 94.72% | 93.69% |
+| abbreviated | 35.90% | 39.33% | 61.46% | 63.25% |
+| mixed | 48.30% | 50.47% | 71.82% | 72.39% |
+
+Test slice, context off, top-1:
+
+| style | #121 | #116 | v1 |
+|---|---|---|---|
+| full | 66.24% | 66.28% | 65.86% |
+| abbreviated | 11.80% | 9.76% | 14.18% |
+| mixed | 22.95% | 20.43% | 24.82% |
+
+Dev slice, context on, top-1:
+
+| style | #121 | #116 | v1 |
+|---|---|---|---|
+| full | 73.29% | 74.50% | 73.90% |
+| abbreviated | 23.58% | 21.89% | 26.32% |
+| mixed | 33.88% | 31.61% | 34.50% |
+
+The top-1 answers over every record, context on, sorted by right / wrong at the gold length / wrong at another length. Rarity is measured on the same-length wrong answers, over the characters that differ from the truth, with the same local frequency sample as above:
+
+| style | run | right / same length / other length | unseen in the sample | median frequency rank |
+|---|---|---|---|---|
+| full | v1 | 4,064 / 1,330 / 131 | 2.7% | 433 |
+| full | #116 | 4,111 / 1,385 / 29 | 11.4% | 690 |
+| full | #121 | 4,114 / 1,396 / 15 | 5.9% | 482 |
+| abbreviated | v1 | 1,390 / 3,308 / 827 | 6.4% | 267 |
+| abbreviated | #116 | 1,222 / 3,778 / 525 | 9.1% | 403 |
+| abbreviated | #121 | 1,273 / 3,736 / 516 | 7.9% | 369 |
+| mixed | v1 | 1,916 / 2,992 / 617 | 6.8% | 281 |
+| mixed | #116 | 1,768 / 3,383 / 374 | 10.6% | 419 |
+| mixed | #121 | 1,847 / 3,323 / 355 | 9.0% | 384 |
+
+### What it says
+
+The whole-alphabet term did what it was built for:
+
+- On full pinyin it halved the rare-character drift (11.4% → 5.9% unseen).
+- It kept the ranking stage's segmentation gain: wrong-length answers fell from 131 to 15.
+- Full-pinyin top-1 is the end-to-end model's best so far, 74.58% on test. The fused decoder is still 3.58 points ahead.
+
+On abbreviated and mixed input it recovers 0.85 and 1.35 points of #116's loss, but both stay below v1: −2.06 and −1.31 on test, and further below with context off. The drift toward rarer characters is smaller there but not gone (7.9% and 9.0% unseen, against v1's 6.4% and 6.8%). Abbreviated input still has 428 more right-length wrong answers than v1.
+
+So the anchoring explains part of #116's regression, not all of it. Both stages fine-tune v1 on 2.2M examples (5% of v1's epoch) with a fresh optimiser and schedule, beside the ranking term. These runs cannot separate what the ranking term costs from what that fine-tuning costs.
+
+### Cost
+
+| job | where | time |
+|---|---|---|
+| s0 | 2×T4 | 12.0 h session: 11.31 h of training, 19,450 steps at 0.478 steps/s |
+| s1 | 2×T4 | 2.27 h session: a 7 min resume skip, 92 min of training, 34 min for the six evaluations |
+| the first s0 attempt | 2×T4 | ~10 min: DDP rejected `forward_sync_buffers`, which Kaggle's torch does not take (#123) |
+
+The s1 push at 20:40 EDT, right after the weekly quota reset, waited 83 minutes in Kaggle's queue before its container started, with `kernels status` already reporting RUNNING.
+
 ## Next
 
-The ranking term has to train the whole distribution the path score normalises over, not only the paths the beam found (#121):
+Separate the two causes with a control. Run the same fine-tuning from v1's final checkpoint on the same 42 shards, with the same optimiser, schedule and whole-alphabet per-position term, but without the ranking term.
 
-- Train the per-position term over the emittable set, the same normaliser the evaluation and the path score use, instead of over each span's homophone candidates. Its gradient then pushes down every character in proportion to its probability, rare ones included.
-- Run it on the same 42 shards, now read in full under the balanced dealing.
+- If the control also loses abbreviated and mixed top-1, the fine-tuning is the cost. The ranking term then belongs in v1's full epoch rather than in a short stage after it.
+- If the control holds v1's numbers, the ranking term is the cost, and its weight is chosen on the dev slice.
