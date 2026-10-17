@@ -2,6 +2,16 @@
 
 ## Verdict
 
+Against its proper control the ranking term costs accuracy, and the best end-to-end model so far is the control: v1 fine-tuned on 42 shards without the ranking term, with v1's own per-position loss (#126, below). Test slices, context on, top-1:
+
+| style | fine-tuned, no ranking (#126) | ranked (#116) | v1 | fused |
+|---|---|---|---|---|
+| full | **75.31%** | 74.40% | 73.52% | 78.16% |
+| abbreviated | **26.20%** | 22.14% | 25.05% | 28.26% |
+| mixed | **35.73%** | 32.04% | 34.70% | 38.54% |
+
+The sections below record each run in order. The first verdict, written after #116 alone, follows.
+
 The ranking stage improves full pinyin and makes abbreviated and mixed input worse. Test slices, context on, against e2e v1 (`notes/e2e-v1.md`) and the fused decoder (`notes/char-lm-v2.md`):
 
 | style | ranked top-1 | v1 top-1 | fused top-1 | ranked top-8 | v1 top-8 | fused top-8 |
@@ -197,7 +207,7 @@ The whole-alphabet term did what it was built for:
 
 On abbreviated and mixed input it recovers 0.85 and 1.35 points of #116's loss, but both stay below v1: −2.06 and −1.31 on test, and further below with context off. The drift toward rarer characters is smaller there but not gone (7.9% and 9.0% unseen, against v1's 6.4% and 6.8%). Abbreviated input still has 428 more right-length wrong answers than v1.
 
-So the anchoring explains part of #116's regression, not all of it. Both stages fine-tune v1 on 2.2M examples (5% of v1's epoch) with a fresh optimiser and schedule, beside the ranking term. These runs cannot separate what the ranking term costs from what that fine-tuning costs.
+So the anchoring explains part of #116's regression, not all of it. Both stages fine-tune v1 on 2.2M examples (11% of v1's 20.3M-example epoch) with a fresh optimiser and schedule, beside the ranking term. These runs cannot separate what the ranking term costs from what that fine-tuning costs.
 
 ### Cost
 
@@ -264,7 +274,7 @@ The control's loss has a different shape from the ranking stages'. Its per-posit
 Two changes from v1 are folded together in the control, and the run cannot separate them:
 
 - **The whole-alphabet term.** v1 trained the decoder over each span's homophones only, so the logits outside them were never trained. Normalised over the emittable set, the control's decoder loss starts at 3.48 nats (#121's at 3.39) and ends at 1.18, while #121's, trained beside the ranking term, ends at 2.22. The control spends its updates pulling the untrained mass back onto the candidates, which is a direct change to the per-step scale.
-- **The short fine-tune itself.** A fresh optimiser and schedule over 5% of v1's epoch, drawn from 42 of its 813 shards.
+- **The short fine-tune itself.** A fresh optimiser and schedule over 11% of v1's epoch, drawn from 42 of its 813 shards.
 
 ### Cost
 
@@ -273,9 +283,70 @@ Two changes from v1 are folded together in the control, and the run cannot separ
 | s0 | 2×T4 | ~2.5 h session: 1.81 h of training at 336 examples/s for the world, then the six evaluations (8.5–11.4 min each, three per GPU) |
 | the first s0 attempt | 2×T4 | ~3 min: `train e2e` lacked the `--whole-alphabet` option the kernel passed; every rank exited on the usage error |
 
+## The candidates-only control (#126)
+
+The same control once more, with the per-position term over each span's homophone candidates (`--candidates-only`), which is v1's own loss. Everything else is #124's: the same source, shards, examples, learning rates, token budget and 4,277 optimiser steps. It ran as `lexoliu/mlime-e2e-control2-s0`.
+
+Held-out per-position accuracy is 91.62% with context and 89.19% without, against v1's 90.92% / 88.12%. The decoder loss over the candidates starts at 0.94 and ends at 0.83.
+
+### Results
+
+Test slice, context on:
+
+| style | metric | #126 | #124 | #121 | v1 | fused |
+|---|---|---|---|---|---|---|
+| full | top-1 | **75.31%** | 69.15% | 74.58% | 73.52% | 78.16% |
+| full | top-8 | **90.85%** | 84.01% | 90.21% | 89.72% | 82.53% |
+| full | character | 94.19% | 90.37% | **94.72%** | 93.69% | |
+| abbreviated | top-1 | **26.20%** | 21.41% | 22.99% | 25.05% | 28.26% |
+| abbreviated | top-8 | **41.13%** | 35.25% | 35.90% | 39.33% | 34.10% |
+| abbreviated | character | **64.61%** | 60.42% | 61.46% | 63.25% | |
+| mixed | top-1 | **35.73%** | 31.50% | 33.39% | 34.70% | 38.54% |
+| mixed | top-8 | **51.93%** | 45.73% | 48.30% | 50.47% | 47.53% |
+| mixed | character | **73.51%** | 68.72% | 71.82% | 72.39% | |
+
+Top-1 on the other slices, #126 against v1:
+
+| style | test, context off | dev, context on | dev, context off |
+|---|---|---|---|
+| full | 68.43% / 65.86% | 75.70% / 73.90% | 70.68% / 66.67% |
+| abbreviated | 15.58% / 14.18% | 26.95% / 26.32% | 18.32% / 16.42% |
+| mixed | 26.48% / 24.82% | 36.57% / 34.50% | 26.45% / 25.83% |
+
+The top-1 answers over every record, context on:
+
+| style | run | right / same length / other length | unseen in the sample | median frequency rank |
+|---|---|---|---|---|
+| full | v1 | 4,064 / 1,330 / 131 | 2.7% | 433 |
+| full | #126 | 4,163 / 1,229 / 133 | 3.2% | 410 |
+| abbreviated | v1 | 1,390 / 3,308 / 827 | 6.4% | 267 |
+| abbreviated | #126 | 1,451 / 3,263 / 811 | 6.5% | 276 |
+| mixed | v1 | 1,916 / 2,992 / 617 | 6.8% | 281 |
+| mixed | #126 | 1,978 / 2,929 / 618 | 7.1% | 284 |
+
+### What it says
+
+The whole-alphabet term was the whole of #124's loss. Without it, the same short fine-tune improves v1 on every style and slice: +1.79, +1.15 and +1.03 points of test top-1 with context on, and more with context off. The answers keep v1's shape. The wrong-length count is unchanged and so is the rarity of the wrong characters, so the gain is in choosing characters, not in segmenting.
+
+With the four runs, each term's cost can be read against the right baseline:
+
+- **The ranking term**, with the per-position term over the candidates, costs 0.91, 4.06 and 3.69 points of test top-1 (#116 against #126). It fixes segmentation, but not by enough to pay for the rare-character drift.
+- **The whole-alphabet term** costs 6.16, 4.79 and 4.23 points without the ranking term (#124 against #126). With the ranking term beside it, it costs much less, because the ranking term trains the comparison between readings that the whole-alphabet term disturbs.
+- **The short fine-tune** gains 1.03–1.79 points by itself.
+
+So the ranking loss, in the form #116 built, does not belong in the product model, and the fine-tune does.
+
+### Cost
+
+| job | where | time |
+|---|---|---|
+| s0 | 2×T4 | 2.5 h session: 1.81 h of training at 337 examples/s for the world, then the six evaluations (8.6–11.6 min each, three per GPU) |
+
 ## Next
 
-Run the control once more with the per-position term over the homophone candidates (`--candidates-only`), everything else unchanged. It isolates the whole-alphabet term from the fine-tune:
+Find out why the short fine-tune helps (#127). v1 read its train shards in order, and its last, near-zero-rate steps saw only the hardest tail of the corpus (`notes/e2e-v1.md`). A fine-tune spread across every source may simply rebalance that. Or v1 is under-trained, and any further training on fresh data helps.
 
-- If it holds v1's numbers, the whole-alphabet term is what moves the per-step scale. Only a stage that also trains whole paths can carry it, which #121 already does.
-- If it loses as the control did, the short fine-tune is the cost. The next stage then keeps v1's optimiser state and data mix rather than restarting both on 42 shards.
+A second stage from #126's checkpoint, on the 51 shards of the 80-pick that the first stage never saw, tells the two apart:
+
+- If it gains about as much again, more training is the lever. The next run is a long, resumable continuation over the whole corpus with its sources interleaved.
+- If it is flat, the gain was the rebalancing. The fix then belongs in how the stream orders shards, for every future run.
