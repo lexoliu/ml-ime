@@ -2,7 +2,7 @@
 
 ## Verdict
 
-Against its proper control the ranking term costs accuracy, and the best end-to-end model so far is the control: v1 fine-tuned on 42 shards without the ranking term, with v1's own per-position loss (#126, below). Test slices, context on, top-1:
+Against its proper control the ranking term costs accuracy, and the best end-to-end model so far is the control: v1 fine-tuned on 42 shards without the ranking term, with v1's own per-position loss (#126, below). A second such stage (#127) adds nothing measurable. Test slices, context on, top-1:
 
 | style | fine-tuned, no ranking (#126) | ranked (#116) | v1 | fused |
 |---|---|---|---|---|
@@ -342,11 +342,49 @@ So the ranking loss, in the form #116 built, does not belong in the product mode
 |---|---|---|
 | s0 | 2×T4 | 2.5 h session: 1.81 h of training at 337 examples/s for the world, then the six evaluations (8.6–11.6 min each, three per GPU) |
 
+## A second fine-tune stage (#127)
+
+The second stage starts from #126's final checkpoint and repeats its fine-tune, with v1's own loss, fresh optimiser and schedule and the same settings, on shards #126 never saw: the 80-pick minus the 40-pick, 51 shards and 2,544,331 examples in 5,025 optimiser steps. The kernel now names the finished run a stage starts from (`INIT_FROM`), so the parent mounts as the kernel output `lexoliu/mlime-e2e-control2-s0`. It ran as `lexoliu/mlime-e2e-stage2-s0`.
+
+Held-out per-position accuracy is 91.81% with context and 89.52% without, against #126's 91.62% / 89.19%.
+
+### Results
+
+Test slice, top-1:
+
+| style | context on: stage 2 / #126 / v1 | context off: stage 2 / #126 / v1 |
+|---|---|---|
+| full | 75.37% / 75.31% / 73.52% | 68.97% / 68.43% / 65.86% |
+| abbreviated | 26.63% / 26.20% / 25.05% | 16.36% / 15.58% / 14.18% |
+| mixed | 35.69% / 35.73% / 34.70% | 27.22% / 26.48% / 24.82% |
+
+Top-8 with context on is 90.81% / 41.80% / 52.43%, against #126's 90.85% / 41.13% / 51.93%. On dev with context on, top-1 is 77.71% / 26.53% / 36.98%, against #126's 75.70% / 26.95% / 36.57%.
+
+The top-1 changes on the test slice with context on, record by record. "Gained" counts records the later run answers right and the earlier one wrong; z is McNemar's statistic over those two counts:
+
+| style | v1 → #126: gained / lost, z | #126 → stage 2: gained / lost, z |
+|---|---|---|
+| full | 176 / 86, 5.56 | 79 / 76, 0.24 |
+| abbreviated | 141 / 83, 3.88 | 94 / 72, 1.71 |
+| mixed | 149 / 97, 3.32 | 82 / 84, −0.16 |
+
+### What it says
+
+The second stage is flat. It reshuffles about 160 answers per style both ways and nets nothing measurable with context on. With context off it gains 0.5–0.8 points, which is consistent, but small beside the first stage's gain. The first stage's gain over v1 is well outside noise on all three styles.
+
+So the gain was not "more training". Some 2.5M more examples of fresh data at the same settings add nothing. What the first stage changed is what v1's end left behind: v1 read its shards in order, and its last, near-zero-rate steps saw only the corpus's hardest tail (`notes/e2e-v1.md`). A short pass spread across every source, at a small rate, rebalances that once, and doing it again does not pay.
+
+The answers keep v1's shape across both stages. Over every record, context on, the wrong-length counts are 133 / 818 / 616 (v1: 131 / 827 / 617), and the rarity of the wrong characters is unchanged. The fine-tunes choose characters better. They do nothing for the gap between the beam's top-8 and its top-1: 90.81% against 75.37% on full pinyin, 15.4 points, where the fused decoder's top-1 is 78.16%.
+
+### Cost
+
+| job | where | time |
+|---|---|---|
+| s0 | 2×T4 | 2.6 h session: 1.92 h of training at 368 examples/s for the world, then the six evaluations (8.0–10.3 min each, three per GPU) |
+
 ## Next
 
-Find out why the short fine-tune helps (#127). v1 read its train shards in order, and its last, near-zero-rate steps saw only the hardest tail of the corpus (`notes/e2e-v1.md`). A fine-tune spread across every source may simply rebalance that. Or v1 is under-trained, and any further training on fresh data helps.
+The fine-tune is settled: one short pass across every source after the long epoch, and #127's checkpoint is the model to build on. Two things follow.
 
-A second stage from #126's checkpoint, on the 51 shards of the 80-pick that the first stage never saw, tells the two apart:
-
-- If it gains about as much again, more training is the lever. The next run is a long, resumable continuation over the whole corpus with its sources interleaved.
-- If it is flat, the gain was the rebalancing. The fix then belongs in how the stream orders shards, for every future run.
+- **Ranking within the beam.** The right answer is in the top-8 far more often than in the top-1. #116's ranking term found the right segmentations but pulled rare characters up, at weight 1.0 beside the candidates-only term. Its weight has not been chosen on dev yet, and the next ranking stage starts from #127's checkpoint with the weight selected there.
+- **The stream's order.** A future full epoch interleaves its sources rather than reading shards in order, so it does not end on one tail of the corpus.

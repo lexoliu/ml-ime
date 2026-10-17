@@ -21,15 +21,16 @@ checkpoint. A segment that mounts a run whose training already finished --
 `run/checkpoint-final.pt` in its output, the evaluation having stopped before
 its report -- evaluates that checkpoint and trains nothing.
 
-A stage from v1 is the same chain with `FROM_V1` stamped: the first segment
-starts from the finished v1 run mounted with `lexoliu/mlime-e2e-final` -- its
-weights, a fresh optimiser and schedule -- and its one epoch runs over
+A stage is the same chain with `INIT_FROM` stamped: the first segment starts
+from the finished run mounted under that name -- v1's dataset
+`lexoliu/mlime-e2e-final`, or the kernel output of an earlier stage -- with its
+weights, a fresh optimiser and schedule, and its one epoch runs over
 `TRAIN_SHARDS`. With `RANKING` stamped as well it is a ranking stage (#116):
 every segment adds the sequence-level ranking loss, reading each example's
 other segmentations from the `ime-segment` binary the package dataset ships.
 `WHOLE_ALPHABET` normalises the per-position loss over every emittable
-character (#121). A finished run is told apart from the v1 run it started
-from by the stage its run-config records.
+character (#121). A finished run is told apart from the run it started from
+by the stage its run-config records.
 
 For a smoke run -- the few-minute rate check that the cost estimate is made
 from -- set `SMOKE_STEPS` nonzero: the kernel times each entry of
@@ -196,10 +197,11 @@ CHECKPOINT_MINUTES = 0
 #: adds the sequence-level ranking loss. Stamped per push.
 RANKING = None
 
-#: Start from the finished v1 run mounted with `lexoliu/mlime-e2e-final` --
-#: its weights, a fresh optimiser and schedule -- instead of from route A and
-#: the reader. A ranking stage always does. Stamped per push.
-FROM_V1 = False
+#: The mount a stage starts from: a finished run's dataset or kernel-output
+#: slug, such as "mlime-e2e-final" for v1. Its weights start the run with a
+#: fresh optimiser and schedule; None starts from route A and the reader. A
+#: ranking stage always names one. Stamped per push.
+INIT_FROM = None
 
 #: Normalise the decoder's per-position loss over every emittable character
 #: rather than the span's candidates (#121). Stamped per push.
@@ -466,15 +468,15 @@ def count_argv(char_table, out, segmenter, census=None):
 
 
 def start_argv(initials, init_e2e):
-    """Where a new run's weights come from: route A and the reader, or v1's run."""
-    if not FROM_V1:
+    """Where a new run's weights come from: route A and the reader, or a finished run."""
+    if INIT_FROM is None:
         return ["--init-encoder", str(initials[0]), "--init-decoder", str(initials[1])]
     return ["--init-e2e", str(init_e2e)]
 
 
 def stage():
     """What tells this kernel's runs apart, as its run-config records it."""
-    return {"ranking": RANKING, "whole_alphabet": WHOLE_ALPHABET, "from_v1": FROM_V1}
+    return {"ranking": RANKING, "whole_alphabet": WHOLE_ALPHABET, "init_from": INIT_FROM}
 
 
 def stage_of(config):
@@ -486,11 +488,8 @@ def stage_of(config):
     return {
         "ranking": config.get("ranking"),
         "whole_alphabet": config.get("whole_alphabet", False),
-        "from_v1": config.get("from_v1", False),
+        "init_from": config.get("init_from"),
     }
-
-
-V1_STAGE = {"ranking": None, "whole_alphabet": False, "from_v1": False}
 
 
 def ranking_argv(segmenter):
@@ -1243,12 +1242,20 @@ def finished_checkpoint():
     return found[0] if found else None
 
 
-def v1_init():
-    """The finished v1 checkpoint a stage from v1 starts from; exactly one is mounted."""
-    found = finished_runs(V1_STAGE)
+def init_checkpoint():
+    """The final checkpoint of the finished run mounted as `INIT_FROM`; exactly one.
+
+    A dataset mounts under its slug and a kernel output under its kernel's, so
+    the name is one component of the mount's path.
+    """
+    found = [
+        mount / "run" / "checkpoint-final.pt"
+        for mount in locate_all("run/checkpoint-final.pt", "run-config.json")
+        if INIT_FROM in mount.relative_to(INPUTS).parts
+    ]
     if len(found) != 1:
         raise FileNotFoundError(
-            f"a stage from v1 starts from one finished v1 run, found {found}; "
+            f"a stage starts from one finished run mounted as {INIT_FROM}, found {found}; "
             f"mounts hold {describe()}"
         )
     return found[0]
@@ -1400,8 +1407,8 @@ def training_budget(elapsed, max_steps, previous, processes):
 
 def main():
     started = time.monotonic()
-    if RANKING is not None and not FROM_V1:
-        raise RuntimeError("a ranking stage starts from v1's finished run; stamp FROM_V1")
+    if RANKING is not None and INIT_FROM is None:
+        raise RuntimeError("a ranking stage starts from a finished run; stamp INIT_FROM")
     install()
     package_root = importable_package()
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)
@@ -1431,8 +1438,8 @@ def main():
     segmenter = stage_segmenter() if RANKING is not None else None
 
     def start():
-        if FROM_V1:
-            return start_argv(None, v1_init())
+        if INIT_FROM is not None:
+            return start_argv(None, init_checkpoint())
         initials = locate(INIT_ENCODER, INIT_DECODER)
         return start_argv((initials / INIT_ENCODER, initials / INIT_DECODER), None)
 
