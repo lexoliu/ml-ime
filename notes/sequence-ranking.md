@@ -209,9 +209,73 @@ So the anchoring explains part of #116's regression, not all of it. Both stages 
 
 The s1 push at 20:40 EDT, right after the weekly quota reset, waited 83 minutes in Kaggle's queue before its container started, with `kernels status` already reporting RUNNING.
 
+## The control without the ranking term (#124)
+
+The control fine-tunes v1's final checkpoint exactly as #121 did, minus the ranking term. It uses the same 42 shards, dealt by text, the same 2,190,297 examples, the same learning rates (2e-5 for both groups, cosine), and the same 12,288 tokens per rank × 2 ranks × accumulate 2. The decoder's per-position term is normalised over the emittable set (`train e2e --whole-alphabet`), and route A's auxiliary term is unchanged. It ran as `lexoliu/mlime-e2e-control-s0`.
+
+One setting does not carry over. The token budget counts the tokens a step trains on, and a ranking step types each example up to 8 ways, so #121 fit about 100 examples into a step and the control about 512. Over the same epoch the control took 4,277 optimiser steps against #121's 21,734, at the same peak rate. It moved v1's weights through 5× fewer updates.
+
+Held-out per-position accuracy is 90.80% with context and 88.39% without, against v1's 90.92% / 88.12% and #121's 90.54% / 87.78%.
+
+### Results
+
+Test slice, context on:
+
+| style | metric | control | #121 | v1 |
+|---|---|---|---|---|
+| full | top-1 | 69.15% | **74.58%** | 73.52% |
+| full | top-8 | 84.01% | **90.21%** | 89.72% |
+| full | character | 90.37% | **94.72%** | 93.69% |
+| abbreviated | top-1 | 21.41% | 22.99% | **25.05%** |
+| abbreviated | top-8 | 35.25% | 35.90% | **39.33%** |
+| abbreviated | character | 60.42% | 61.46% | **63.25%** |
+| mixed | top-1 | 31.50% | 33.39% | **34.70%** |
+| mixed | top-8 | 45.73% | 48.30% | **50.47%** |
+| mixed | character | 68.72% | 71.82% | **72.39%** |
+
+Top-1 on the other slices:
+
+| style | test, context off: control / #121 / v1 | dev, context on: control / #121 / v1 |
+|---|---|---|
+| full | 60.87% / 66.24% / 65.86% | 69.28% / 73.29% / 73.90% |
+| abbreviated | 12.79% / 11.80% / 14.18% | 21.47% / 23.58% / 26.32% |
+| mixed | 22.95% / 22.95% / 24.82% | 34.09% / 33.88% / 34.50% |
+
+The top-1 answers over every record, context on, measured as in the tables above:
+
+| style | run | right / same length / other length | unseen in the sample | median frequency rank |
+|---|---|---|---|---|
+| full | v1 | 4,064 / 1,330 / 131 | 2.7% | 433 |
+| full | #121 | 4,114 / 1,396 / 15 | 5.9% | 482 |
+| full | control | 3,821 / 1,251 / 453 | 1.5% | 356 |
+| abbreviated | v1 | 1,390 / 3,308 / 827 | 6.4% | 267 |
+| abbreviated | #121 | 1,273 / 3,736 / 516 | 7.9% | 369 |
+| abbreviated | control | 1,183 / 3,191 / 1,151 | 4.1% | 201 |
+| mixed | v1 | 1,916 / 2,992 / 617 | 6.8% | 281 |
+| mixed | #121 | 1,847 / 3,323 / 355 | 9.0% | 384 |
+| mixed | control | 1,753 / 2,797 / 975 | 4.8% | 209 |
+
+### What it says
+
+The fine-tuning is the cost, and the ranking term is a gain on top of it. Against the control, the ranking term adds 5.43, 1.58 and 1.89 points of test top-1 on full, abbreviated and mixed input. The control itself loses 4.37, 3.64 and 3.20 points against v1.
+
+The control's loss has a different shape from the ranking stages'. Its per-position accuracy is v1's, and its wrong characters are more common than v1's (1.5–4.8% unseen). What breaks is segmentation: answers of the wrong length rise from 131 to 453 on full pinyin, from 827 to 1,151 on abbreviated input and from 617 to 975 on mixed. The path score sums one log-probability per character, so readings of different lengths compete through the scale of those log-probabilities. The control changes that scale and nothing retrains the comparison. The ranking term trains exactly that comparison, which is why #121 has the fewest wrong-length answers of all four runs.
+
+Two changes from v1 are folded together in the control, and the run cannot separate them:
+
+- **The whole-alphabet term.** v1 trained the decoder over each span's homophones only, so the logits outside them were never trained. Normalised over the emittable set, the control's decoder loss starts at 3.48 nats (#121's at 3.39) and ends at 1.18, while #121's, trained beside the ranking term, ends at 2.22. The control spends its updates pulling the untrained mass back onto the candidates, which is a direct change to the per-step scale.
+- **The short fine-tune itself.** A fresh optimiser and schedule over 5% of v1's epoch, drawn from 42 of its 813 shards.
+
+### Cost
+
+| job | where | time |
+|---|---|---|
+| s0 | 2×T4 | ~2.5 h session: 1.81 h of training at 336 examples/s for the world, then the six evaluations (8.5–11.4 min each, three per GPU) |
+| the first s0 attempt | 2×T4 | ~3 min: `train e2e` lacked the `--whole-alphabet` option the kernel passed; every rank exited on the usage error |
+
 ## Next
 
-Separate the two causes with a control. Run the same fine-tuning from v1's final checkpoint on the same 42 shards, with the same optimiser, schedule and whole-alphabet per-position term, but without the ranking term.
+Run the control once more with the per-position term over the homophone candidates (`--candidates-only`), everything else unchanged. It isolates the whole-alphabet term from the fine-tune:
 
-- If the control also loses abbreviated and mixed top-1, the fine-tuning is the cost. The ranking term then belongs in v1's full epoch rather than in a short stage after it.
-- If the control holds v1's numbers, the ranking term is the cost, and its weight is chosen on the dev slice.
+- If it holds v1's numbers, the whole-alphabet term is what moves the per-step scale. Only a stage that also trains whole paths can carry it, which #121 already does.
+- If it loses as the control did, the short fine-tune is the cost. The next stage then keeps v1's optimiser state and data mix rather than restarting both on 42 shards.

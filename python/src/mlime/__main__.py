@@ -514,6 +514,12 @@ def train_e2e(
     rank_beam: int = RANK_BEAM,
     rank_negatives: int = RANK_NEGATIVES,
     rank_weight: float = RANK_WEIGHT,
+    whole_alphabet: bool = typer.Option(
+        False,
+        "--whole-alphabet/--candidates-only",
+        help="Normalise the decoder's per-position loss over every emittable character "
+        "rather than the position's candidates",
+    ),
     typos: bool = typer.Option(
         False,
         "--typos/--no-typos",
@@ -638,6 +644,7 @@ def train_e2e(
             init_e2e=init_e2e,
             ranking=ranking_config,
             segmenter=segmenter,
+            whole_alphabet=whole_alphabet,
         )
     except torch.cuda.OutOfMemoryError as error:
         # The sweep that drives this wants the peak recorded even at the crash,

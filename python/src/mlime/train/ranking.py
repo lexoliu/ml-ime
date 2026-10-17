@@ -19,8 +19,8 @@ Trained beside v1's per-position term, which normalised over each span's
 homophones, it pushed down the common characters the beam offers and nothing
 held down the ones it never offers: #116's run ranked rarer characters first
 and lost three points of top-1 on abbreviated input, where a span admits
-hundreds. So the decoder's per-position term here is normalised like the path
-score, over the whole emittable set (#121).
+hundreds. ``E2EConfig.whole_alphabet`` normalises the per-position term like
+the path score, over the whole emittable set (#121).
 """
 
 from __future__ import annotations
@@ -40,7 +40,6 @@ from mlime.train.model import (
     RouteAOutput,
     mark_dynamic,
     restricted_cross_entropy,
-    smoothed_cross_entropy,
 )
 from mlime.train.samples import IGNORE_INDEX, Batch, Collator, TrainingExample
 from mlime.train.segmenter import Segmentations, Segmenter
@@ -333,7 +332,7 @@ class RankingE2EModel(E2EModel):
             self.head.transform(hidden.reshape(-1, hidden.shape[-1]).index_select(0, positions))
         )
         smoothing = self.config.label_smoothing
-        decoder_loss = smoothed_cross_entropy(decoder_logits, targets, candidates, smoothing)
+        decoder_loss = self.position_loss(decoder_logits, targets, candidates)
         encoder_loss = restricted_cross_entropy(
             encoder_logits, targets, candidates, smoothing, check=False
         )
