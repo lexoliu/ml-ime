@@ -137,7 +137,7 @@ The ranking term should train the whole distribution the path score normalises o
 
 Everything else is the first run's: v1's final checkpoint, the same 42 shards and settings. The shards are now dealt by their text, so both ranks counted 43,859 and 43,468 micro-batches and the epoch is 21,734 steps over all 2,190,297 examples. It ran as `lexoliu/mlime-e2e-rank2-s0` and `-s1`.
 
-Held-out per-position accuracy is 90.54% with context and 87.78% without. That is v1's 90.92% / 88.12%, less 0.4 points: candidates now compete with the whole alphabet for the mass.
+Held-out per-position accuracy is 90.54% with context and 87.78% without. That is about 0.35 points below both v1 (90.92% / 88.12%) and #116 (91.00% / 88.26%).
 
 ### Results
 
