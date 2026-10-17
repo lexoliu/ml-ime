@@ -39,6 +39,7 @@ import hashlib
 import random
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
+from fractions import Fraction
 from pathlib import Path
 from typing import Protocol
 
@@ -314,8 +315,10 @@ class SampleBuilder:
         )
 
 
-def read_pair(sample_shard: Path, labels_dir: Path) -> Iterator[tuple[Sample, list[str] | None]]:
-    """Stream one sample shard beside the label shard of the same name.
+def read_pair(
+    sample_shard: Path, labels_dir: Path, first: int = 0, step: int = 1
+) -> Iterator[tuple[Sample, list[str] | None]]:
+    """Stream rows ``first, first + step, ...`` of one sample shard beside its labels.
 
     The two are joined on id rather than on row order, because a label shard is
     written from its sample shard but nothing in the format promises the order
@@ -330,46 +333,48 @@ def read_pair(sample_shard: Path, labels_dir: Path) -> Iterator[tuple[Sample, li
     readings: dict[str, list[str] | None] = dict(
         zip(labels["id"].to_list(), labels["syllables"].to_list(), strict=True)
     )
-    for row in pl.read_parquet(sample_shard).iter_rows(named=True):
+    for row in pl.read_parquet(sample_shard).gather_every(step, offset=first).iter_rows(named=True):
         sample = Sample.from_row(row)
         yield sample, readings.get(sample.id)
 
 
-def text_characters(shard: Path) -> int:
-    """The characters of target text *shard* holds: what its examples cost to type."""
-    total = pl.scan_parquet(shard).select(pl.col("text").str.len_chars().sum()).collect().item()
-    return int(total)
+def shard_rows(shard: Path) -> int:
+    """The rows *shard* holds, from its metadata."""
+    return int(pl.scan_parquet(shard).select(pl.len()).collect().item())
 
 
-def deal_shards(sizes: Mapping[Path, int], readers: int) -> list[list[Path]]:
-    """Deal shards to *readers* so that each owns about the same amount of text.
+def interleave(shards: Sequence[Path]) -> list[Path]:
+    """*shards* in an order that spreads every source evenly over the whole list.
 
-    Batches are token-budgeted, so a reader's share of an epoch is the text it
-    reads, and DDP ends every rank's epoch at the shortest rank's step count.
-    Dealt round-robin, the 42 shards of #116's ranking run left one rank 20%
-    more batches than the other, and the epoch ended before that rank read its
-    last sixth. Here each shard, largest first, goes to the reader holding the
-    least text so far, and a reader reads its own shards in the order *sizes*
-    lists them.
+    A source is a shard's name without its trailing number (``news-rest-00042``
+    belongs to ``news-rest``). The *i*-th of a source's *n* shards, in name
+    order, sits at ``(2i + 1) / 2n`` of the way through, so no stretch of an
+    epoch reads one source alone. v1 read its shards in name order, and its last
+    near-zero-rate steps saw only the corpus's hardest tail (#133).
     """
-    loads = [0] * readers
-    dealt: list[list[Path]] = [[] for _ in range(readers)]
-    for shard in sorted(sizes, key=lambda shard: (-sizes[shard], shard.name)):
-        reader = min(range(readers), key=lambda reader: (loads[reader], reader))
-        dealt[reader].append(shard)
-        loads[reader] += sizes[shard]
-    order = {shard: index for index, shard in enumerate(sizes)}
-    return [sorted(mine, key=order.__getitem__) for mine in dealt]
+    sources: dict[str, list[Path]] = {}
+    for shard in sorted(shards, key=lambda shard: shard.name):
+        sources.setdefault(shard.stem.rsplit("-", 1)[0], []).append(shard)
+    keyed = [
+        (Fraction(2 * index + 1, 2 * len(members)), source, shard.name, shard)
+        for source, members in sources.items()
+        for index, shard in enumerate(members)
+    ]
+    return [shard for *_, shard in sorted(keyed)]
 
 
 class CorpusStream(IterableDataset[TrainingExample]):
     """The corpus as an epoch-reaugmented stream of examples.
 
-    Shards are dealt out across DDP ranks and dataloader workers by
-    :func:`deal_shards`, so a shard is read by exactly one reader, nothing is
-    trained on twice per epoch, and every reader reads about the same amount
-    of text. Which reader gets which shard does not change what an example
-    looks like -- that depends only on the seed, the epoch and the sample id.
+    Every reader -- a DDP rank's dataloader worker -- walks the shards in
+    :func:`interleave` order and takes every *readers*-th row of their
+    concatenation, starting at its own index. So each row is read by exactly
+    one reader, the readers' example counts differ by at most one, and each
+    reader's stream mixes every source throughout the epoch. Dealing whole
+    shards left #130's two ranks 4.5% apart over 22 shards, and DDP ends the
+    epoch at the shorter rank. Which reader gets which row does not change what
+    an example looks like -- that depends only on the seed, the epoch and the
+    sample id.
     """
 
     def __init__(
@@ -400,24 +405,29 @@ class CorpusStream(IterableDataset[TrainingExample]):
             missing = wanted - {path.name for path in self.shards}
             if missing:
                 raise FileNotFoundError(f"no such shards under {samples_dir}: {sorted(missing)}")
-        self.sizes = {shard: text_characters(shard) for shard in self.shards}
+        self.shards = interleave(self.shards)
+        self.rows = [shard_rows(shard) for shard in self.shards]
 
     def set_epoch(self, epoch: int) -> None:
         """Re-augment from the next pass on."""
         self.epoch = epoch
 
-    def _mine(self) -> list[Path]:
-        """The shards this reader owns, given its rank and dataloader worker."""
+    def _reader(self) -> tuple[int, int]:
+        """This reader's index and the number of readers, from rank and dataloader worker."""
         info = get_worker_info()
         workers = info.num_workers if info is not None else 1
         worker = info.id if info is not None else 0
-        readers = self.world_size * workers
-        index = self.rank * workers + worker
-        return deal_shards(self.sizes, readers)[index]
+        return self.rank * workers + worker, self.world_size * workers
 
     def __iter__(self) -> Iterator[TrainingExample]:
-        for shard in self._mine():
-            for sample, syllables in read_pair(shard, self.labels_dir):
+        index, readers = self._reader()
+        offset = 0
+        for shard, rows in zip(self.shards, self.rows, strict=True):
+            first = (index - offset) % readers
+            offset += rows
+            if first >= rows:
+                continue
+            for sample, syllables in read_pair(shard, self.labels_dir, first, readers):
                 example = self.builder.build(sample, syllables, self.epoch)
                 if example is not None:
                     yield example
