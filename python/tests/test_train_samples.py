@@ -32,9 +32,8 @@ from mlime.train.samples import (
     SampleBuilder,
     TrainingExample,
     context_tail,
-    deal_shards,
     example_rng,
-    text_characters,
+    interleave,
     token_budget_batches,
     type_syllables,
 )
@@ -373,25 +372,39 @@ def test_a_stream_reads_its_shards_and_reaugments(
     assert stream.builder.counts.kept == 4
 
 
-def test_shards_are_dealt_by_their_text_not_round_robin() -> None:
-    a, b, c, d = (Path(f"{name}.parquet") for name in "abcd")
-    # Round-robin would give the first reader 150 characters and the second 70.
-    dealt = deal_shards({a: 100, b: 60, c: 50, d: 10}, readers=2)
-    assert dealt == [[a, d], [b, c]]
+def test_every_source_is_spread_over_the_epoch() -> None:
+    shards = [
+        Path(f"{name}.parquet")
+        for name in (
+            "a-00000",
+            "a-00001",
+            "a-00002",
+            "a-00003",
+            "b-rest-00000",
+            "b-rest-00001",
+            "c-00000",
+        )
+    ]
+    order = [shard.stem for shard in interleave(list(reversed(shards)))]
+    assert order == [
+        "a-00000",
+        "b-rest-00000",
+        "a-00001",
+        "c-00000",
+        "a-00002",
+        "b-rest-00001",
+        "a-00003",
+    ]
 
 
-def test_two_ranks_read_every_shard_once_and_about_the_same_text(
-    tmp_path: Path, lexicon: Lexicon, spans: SpanVocab, arbitration: ReadingArbitration
-) -> None:
-    samples_dir, labels_dir = tmp_path / "samples", tmp_path / "labels"
-    samples_dir.mkdir()
-    labels_dir.mkdir()
+def write_shards(samples_dir: Path, labels_dir: Path, counts: tuple[int, ...]) -> list[str]:
+    """Shards of *counts* sentences each, in name order, and every id they hold."""
     texts = {
         "我爱北京": ["wo3", "ai4", "bei3", "jing1"],
         "中重我绿": ["zhong1", "chong2", "wo3", "lv4"],
     }
-    # Shard sizes 4, 3, 2, 1 sentences in name order: round-robin deals 6 and 4.
-    for index, count in enumerate((4, 3, 2, 1)):
+    ids = []
+    for index, count in enumerate(counts):
         rows = [
             Sample(id=f"{index}-{row}", source="test", text=text, context=None)
             for row, text in zip(range(count), [*texts] * count, strict=False)
@@ -404,23 +417,39 @@ def test_two_ranks_read_every_shard_once_and_about_the_same_text(
             [{"id": row.id, "syllables": texts[row.text], "refusal": None} for row in rows],
             schema=LABEL_SCHEMA,
         ).write_parquet(labels_dir / name)
+        ids += [row.id for row in rows]
+    return ids
 
+
+@pytest.mark.parametrize("world_size", [2, 3])
+def test_ranks_read_every_row_once_and_balance_to_one_example(
+    tmp_path: Path,
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    world_size: int,
+) -> None:
+    samples_dir, labels_dir = tmp_path / "samples", tmp_path / "labels"
+    samples_dir.mkdir()
+    labels_dir.mkdir()
+    # Dealt whole, shards of 6, 2 and 1 sentences leave one rank 6 and the others 3 or less.
+    ids = write_shards(samples_dir, labels_dir, (6, 2, 1))
     streams = [
         CorpusStream(
             samples_dir,
             labels_dir,
             SampleBuilder(lexicon, spans, arbitration),
             rank=rank,
-            world_size=2,
+            world_size=world_size,
         )
-        for rank in range(2)
+        for rank in range(world_size)
     ]
-    assert text_characters(samples_dir / "test-00000.parquet") == 16
     read = [[example.id for example in stream] for stream in streams]
-    assert [len(ids) for ids in read] == [5, 5]
-    assert sorted(read[0] + read[1]) == sorted(
-        f"{index}-{row}" for index, count in enumerate((4, 3, 2, 1)) for row in range(count)
-    )
+    counts = [len(mine) for mine in read]
+    assert max(counts) - min(counts) <= 1
+    assert sorted(row for mine in read for row in mine) == sorted(ids)
+    # Each rank's first shard contributes rows to it, not a whole shard to one rank.
+    assert {mine[0].split("-")[0] for mine in read} == {"0"}
 
 
 def test_a_missing_label_shard_is_an_error(
