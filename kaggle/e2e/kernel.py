@@ -222,16 +222,53 @@ RESUME_MARKERS = ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
 #: the next leg's staging restores them here, so it skips compiling (#140).
 INDUCTOR_CACHE = Path("/tmp/inductor-cache")
 
+#: What the kernel installs beside the image's torch: every package that
+#: `polars`, `pydantic-settings`, `pypinyin`, `structlog`, `opencc`,
+#: `rapidfuzz`, `regex`, `typer` and `transformers` need on Linux, each at the
+#: version `python/uv.lock` resolves, installed without dependency resolution
+#: so nothing else moves. A tokenizer that splits a context differently
+#: changes the batches, the census and `max_steps`; the pins keep every leg
+#: on the lock's. `test_kernel_requirements.py` fails when they drift.
 REQUIREMENTS = (
-    "polars",
-    "pydantic-settings",
-    "pypinyin",
-    "structlog",
-    "opencc",
-    "rapidfuzz",
-    "regex",
-    "typer",
-    "transformers>=5.16",
+    "annotated-doc==0.0.5",
+    "annotated-types==0.8.0",
+    "anyio==4.14.2",
+    "certifi==2026.7.22",
+    "click==8.5.0",
+    "filelock==3.32.4",
+    "fsspec==2026.6.0",
+    "h11==0.16.0",
+    "hf-xet==1.6.0",
+    "httpcore==1.0.9",
+    "httpx==0.28.1",
+    "huggingface-hub==1.28.0",
+    "idna==3.19",
+    "markdown-it-py==4.2.0",
+    "mdurl==0.1.2",
+    "numpy==2.5.2",
+    "opencc==1.4.2",
+    "packaging==26.3",
+    "polars==1.44.1",
+    "polars-runtime-32==1.44.1",
+    "pydantic==2.13.4",
+    "pydantic-core==2.46.4",
+    "pydantic-settings==2.15.0",
+    "pygments==2.21.0",
+    "pypinyin==0.55.0",
+    "python-dotenv==1.2.3",
+    "pyyaml==6.0.3",
+    "rapidfuzz==3.14.6",
+    "regex==2026.7.19",
+    "rich==15.0.0",
+    "safetensors==0.8.0",
+    "shellingham==1.5.4",
+    "structlog==26.1.0",
+    "tokenizers==0.23.1",
+    "tqdm==4.70.0",
+    "transformers==5.16.1",
+    "typer==0.27.1",
+    "typing-extensions==4.16.0",
+    "typing-inspection==0.4.4",
 )
 
 
@@ -395,8 +432,10 @@ def libcuda_link_dir():
 
 
 def install():
-    """Install what the image does not ship."""
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", *REQUIREMENTS], check=True)
+    """Install the pinned requirements, exactly them and nothing they would pull in."""
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", "--no-deps", *REQUIREMENTS], check=True
+    )
 
 
 def stage_data(mounts):

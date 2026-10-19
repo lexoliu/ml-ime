@@ -35,7 +35,7 @@ import tempfile
 import time
 from pathlib import Path
 
-import httpx2
+import httpx
 from huggingface_hub import HfApi
 
 WORKING = Path("/kaggle/working")
@@ -249,7 +249,7 @@ def main():
             if not caches_published and compiled():
                 publish_compile_cache(api)
                 caches_published = True
-        except (httpx2.HTTPError, OSError) as error:
+        except (httpx.HTTPError, OSError) as error:
             # A publish failure is transient until it is not: say so, keep
             # polling, and leave the error where status can read it. What the
             # bucket holds is read again, since a failure can stop mid-publish.
