@@ -91,9 +91,8 @@ needs less, as the last segment of a run that pauses with an hour to go does.
 google-colab-cli`, then `colab usage` once to log in). `start` provisions the
 runtime (an A100 by default), uploads the Hugging Face token and the kernel,
 and runs `colab/stage.py` on the VM, which downloads the four datasets from
-their private Hugging Face repos into `/kaggle/input/<slug>` at once and
-launches the kernel as a detached
-process; `status`, `fetch <dir>` and `stop` follow. The kernel sizes itself to
+their private Hugging Face repos into `/kaggle/input/<slug>` and launches the
+kernel as a detached process; `status`, `fetch <dir>` and `stop` follow. The kernel sizes itself to
 the GPUs it finds (one rank per GPU, `TOKENS_PER_STEP` split across them), so
 one A100 trains the same batches as Kaggle's two T4s in roughly a third of the
 time, for about 35 compute units.
@@ -112,11 +111,18 @@ CPU runtime before a GPU is billed for it. The session is named after the run;
 the Hugging Face access token, never the OAuth refresh token, so no VM can
 refresh it out from under the Mac's login.
 
+Both stagers fetch the Hub repos with `colab/hub.py`: every file of every repo
+over its `resolve` URL in one `aria2c` run, 32 files at once. The Hub client's
+`snapshot_download` spends about two seconds on each file before its first
+byte, and the e2e inputs are some 1,700 shards: staged that way a leg waited
+twelve minutes with its GPU billed. Through `aria2c` the same 8.3 GB took 96
+seconds on a CPU runtime, and a second run over files already whole 11.
+
 Kernel outputs are fetched with `kaggle/output.py <owner>/<kernel> <dir>
 [--pattern REGEX]`, never `kaggle kernels output`: the CLI reads each file
 whole into memory, so a multi-gigabyte checkpoint whose connection drops fails
 with `IncompleteRead` and can leave an empty file behind, and the output host
 cuts each connection after about thirty seconds. `output.py` hands the files
-to `aria2c` (Homebrew or apt `aria2`): sixteen ranged connections per file,
+to `aria2c` through `kaggle/aria2.py` (Homebrew or apt `aria2`): sixteen ranged connections per file,
 each segment retried where it broke, a partial file continued on the next run.
 The chain's harvest uses it too.

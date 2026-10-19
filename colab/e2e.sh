@@ -46,7 +46,9 @@ case $command in
     colab upload -s $session "$kernel_dir/kernel.py" /kaggle/kernel.py
     colab upload -s $session "$kernel_dir/kernel-metadata.json" /kaggle/kernel-metadata.json
     colab upload -s $session "$here/colab/e2e-publish.py" /kaggle/e2e-publish.py
-    colab upload -s $session "$here/kaggle/output.py" /kaggle/output.py
+    for f in kaggle/output.py kaggle/aria2.py colab/hub.py; do
+      colab upload -s $session "$here/$f" "/kaggle/$(basename $f)"
+    done
     # A census counted for the same corpus and batch shape -- by a sibling
     # run, or by a CPU rehearsal -- spares the GPU the count; the kernel
     # recounts when even one field differs.
