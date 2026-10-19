@@ -176,6 +176,9 @@ WHOLE_ALPHABET = False
 
 #: The training shards a run makes its epoch over; None trains on every
 #: mounted shard but the held-out ones. Stamped per push.
+#: Replay the ranking search from captured CUDA graphs (#137): on a card whose
+#: host cannot issue the search's kernels as fast as it runs them.
+SEARCH_GRAPHS = False
 TRAIN_SHARDS = None
 
 #: The (pretrained, new) learning rates; None keeps `mlime train e2e`'s.
@@ -551,6 +554,8 @@ def train_argv(
     argv += ranking_argv(segmenter)
     if WHOLE_ALPHABET:
         argv.append("--whole-alphabet")
+    if SEARCH_GRAPHS:
+        argv.append("--search-graphs")
     if resume is not None:
         argv += ["--resume", str(resume)]
     if ACTIVATION_CHECKPOINTING:

@@ -25,6 +25,7 @@ from mlime.logging import log
 from mlime.train.charlm_model import CharLmConfig
 from mlime.train.charlm_vocab import CharVocab
 from mlime.train.e2e_model import E2EConfig, E2EModel, RankingConfig, emittable_ids
+from mlime.train.e2e_search import SearchGraphs
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import Distributed, MetricLog, TrainingConfig, evaluate, train
 from mlime.train.model import RouteAConfig
@@ -185,7 +186,8 @@ def compile_modules(model: E2EModel, mode: str) -> None:
     graph at DDP's gradient buckets: each bucket's allreduce then starts while
     the rest of backward still runs.
 
-    The decoder's ``step`` is the third: the ranking loss's search runs it
+    The decoder's ``advance`` -- one search position: the step and the beam's
+    bookkeeping after it -- is the third: the ranking loss's search runs it
     once per position over every reading's beam, about a thousand small ops
     a position, and eager dispatch of those took longer than the card took
     to run them. It has no backward, so the bucket cut buys nothing and costs
@@ -204,15 +206,15 @@ def compile_modules(model: E2EModel, mode: str) -> None:
     model.decoder.forward = torch.compile(  # type: ignore[method-assign]
         model.decoder.forward, dynamic=True, options=options
     )
-    step = torch.compile(model.decoder.step, dynamic=True, options=options)
+    advance = torch.compile(model.decoder.advance, dynamic=True, options=options)
 
-    @functools.wraps(model.decoder.step)
-    def whole_step(*args: Any, **kwargs: Any) -> Any:
+    @functools.wraps(model.decoder.advance)
+    def whole_advance(*args: Any, **kwargs: Any) -> Any:
         # Read when dynamo compiles a frame, which is inside this call.
         with torch._dynamo.config.patch(optimize_ddp=False):
-            return step(*args, **kwargs)
+            return advance(*args, **kwargs)
 
-    model.decoder.step = whole_step  # type: ignore[method-assign]
+    model.decoder.advance = whole_advance  # type: ignore[method-assign]
     log.info("towers and decoder compiled", mode=mode)
 
 
@@ -233,6 +235,7 @@ def e2e(
     ranking: RankingConfig | None = None,
     segmenter: Path | None = None,
     whole_alphabet: bool = False,
+    search_graphs: bool = False,
 ) -> RunResult:
     """Train the end-to-end model over *slices.train*; score held-out both ways.
 
@@ -246,9 +249,10 @@ def e2e(
     *ranking* adds the sequence-level loss of #116, which reads every
     example's other segmentations through the ``ime-segment`` binary at
     *segmenter*. *whole_alphabet* normalises the decoder's per-position term
-    over the whole emittable set (#121). *run_config* is the kernel's own run-config file, copied
-    into each interval trio verbatim; the loop refuses ``checkpoint_minutes``
-    without it.
+    over the whole emittable set (#121). *search_graphs* replays the
+    ranking loss's search from captured CUDA graphs (#137). *run_config* is
+    the kernel's own run-config file, copied into each interval trio
+    verbatim; the loop refuses ``checkpoint_minutes`` without it.
     """
     world = Distributed.from_environment()
     starts = (
@@ -306,6 +310,12 @@ def e2e(
         log.info("encoder activation checkpointing on", trade="memory for one extra forward")
     if training.compile:
         compile_modules(model, training.compile_mode)
+    if search_graphs:
+        if not isinstance(model, RankingE2EModel):
+            raise ValueError("--search-graphs captures the ranking loss's search; add --ranking")
+        if not torch.cuda.is_available():
+            raise ValueError("--search-graphs replays CUDA graphs and this run has no CUDA device")
+        model.search_graphs = SearchGraphs()
     lexicon, tokenizer = vocabularies.lexicon, vocabularies.tokenizer
 
     # One (stream, collator) lane per rank this process stands for: lane j of

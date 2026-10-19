@@ -520,6 +520,11 @@ def train_e2e(
         help="Normalise the decoder's per-position loss over every emittable character "
         "rather than the position's candidates",
     ),
+    search_graphs: bool = typer.Option(
+        False,
+        "--search-graphs/--no-search-graphs",
+        help="Replay the ranking loss's beam search from captured CUDA graphs",
+    ),
     typos: bool = typer.Option(
         False,
         "--typos/--no-typos",
@@ -645,6 +650,7 @@ def train_e2e(
             ranking=ranking_config,
             segmenter=segmenter,
             whole_alphabet=whole_alphabet,
+            search_graphs=search_graphs,
         )
     except torch.cuda.OutOfMemoryError as error:
         # The peak is recorded even at the crash, and the cache freed before

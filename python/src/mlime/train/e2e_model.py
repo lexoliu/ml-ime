@@ -382,6 +382,73 @@ class Decoder(nn.Module):
             torch.stack(new_values),
         )
 
+    def advance(
+        self,
+        at: torch.Tensor,
+        tokens: torch.Tensor,
+        scores: torch.Tensor,
+        cache: tuple[torch.Tensor, torch.Tensor],
+        vectors: torch.Tensor,
+        masks: torch.Tensor,
+        lane_of_row: torch.Tensor,
+        encoder_kv: Sequence[tuple[torch.Tensor, torch.Tensor]],
+        encoder_mask: torch.Tensor | None,
+        lane_lengths: torch.Tensor,
+        carried: torch.Tensor,
+        everything: torch.Tensor,
+        block: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor
+    ]:
+        """One position of the beam search, start to finish on the device.
+
+        ``at`` is the position as a 0-d long tensor, ``tokens [R]`` each row's
+        previous reader id, ``scores [L, W]`` each lane's beam scores, and
+        ``cache`` the key/value cache over the whole path. ``vectors [L, T,
+        enc]`` and ``masks [L, T, E]`` are every lane's span vectors and
+        admitted characters, read here at ``at``. With ``encoder_mask`` the
+        lanes are ragged, and a row whose lane has ended takes ``carried``, the
+        free step. Returns the next tokens, the scores, the cache with this
+        position's keys written in and reordered to the surviving beams, and
+        each new beam's parent and choice.
+
+        Nothing here depends on the position except through ``at``, and
+        nothing reads back to the host, so a compiled advance is one graph a
+        search shape -- captured once and replayed at every position.
+        """
+        count, width = scores.shape
+        rows = count * width
+        emittable = masks.shape[-1]
+        logits, (new_keys, new_values) = self.step(
+            tokens,
+            vectors[lane_of_row, at],
+            at,
+            cache,
+            encoder_kv,
+            encoder_mask,
+            candidates=everything,
+        )
+        log_probs = (
+            logits.float().log_softmax(dim=-1).masked_fill(~masks[lane_of_row, at], float("-inf"))
+        )
+        if encoder_mask is not None:
+            ended = (lane_lengths <= at)[lane_of_row]
+            log_probs = torch.where(ended.unsqueeze(1), carried, log_probs)
+        total = (scores.reshape(rows, 1) + log_probs).reshape(count, width * emittable)
+        top = total.topk(width, dim=1)
+        parent = top.indices // emittable
+        choice = top.indices % emittable
+        source = (block + parent).reshape(rows)
+        # Reordered first and written after: the new keys follow their rows
+        # to the surviving beams, and the cache the call was given is never
+        # written, which a captured graph must not do to its inputs.
+        keys, values = cache
+        keys = keys.index_select(1, source)
+        values = values.index_select(1, source)
+        keys.index_copy_(3, at.view(1), new_keys.index_select(1, source))
+        values.index_copy_(3, at.view(1), new_values.index_select(1, source))
+        return self.emit_ids[choice.reshape(rows)], top.values, (keys, values), parent, choice
+
 
 def _attend_step(
     block: Block,
