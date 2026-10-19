@@ -5,13 +5,14 @@ Runs on the VM as its own process, which `colab/e2e.sh start` launches
 Face token, the Kaggle credentials, the kernel script, its metadata and the
 checkpoint publisher. It recreates the mount layout the Kaggle kernel expects
 under `/kaggle/input/<name>`: every dataset and every finished run the kernel
-starts from comes from the private Hub dataset repo of the same name, all at
-once. The resume point is the newest `checkpoint-paused` trio by step among
-the run's trio in the `lexoliu/mlime-resume` bucket and the latest COMPLETE
-Kaggle segment's output. It stamps the segment number and the interval
-checkpoint cadence into the kernel, launches it detached, and launches the
-publisher beside it: every interval trio lands in the bucket, so a VM that
-dies without warning loses minutes of training, not the leg.
+starts from comes from the private Hub dataset repo of the same name, all of
+them in one `aria2c` run (`hub.py`). The resume point is the newest
+`checkpoint-paused` trio by step among the run's trio in the
+`lexoliu/mlime-resume` bucket and the latest COMPLETE Kaggle segment's output.
+It stamps the segment number and the interval checkpoint cadence into the
+kernel, launches it detached, and launches the publisher beside it: every
+interval trio lands in the bucket, so a VM that dies without warning loses
+minutes of training, not the leg.
 """
 
 import importlib.util
@@ -23,14 +24,14 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from huggingface_hub import HfApi, snapshot_download
-
 INPUTS = Path("/kaggle/input")
 WORKING = Path("/kaggle/working")
 KERNEL = Path("/kaggle/kernel.py")
 METADATA = Path("/kaggle/kernel-metadata.json")
 PUBLISHER = Path("/kaggle/e2e-publish.py")
 OUTPUT = Path("/kaggle/output.py")
+HUB = Path("/kaggle/hub.py")
+ARIA2 = Path("/kaggle/aria2.py")
 HF_TOKEN = Path("/root/.cache/huggingface/token")
 #: The files of a kernel output the kernel reads: a finished run's final
 #: checkpoint and config, and a paused segment's trio.
@@ -38,31 +39,12 @@ KERNEL_READS = (
     r"^(run-config\.json|run-summary\.json|checkpoint-paused\.pt|run/checkpoint-final\.pt)$"
 )
 RESUME_MARKERS = ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
-#: Inputs in flight while staging: every Hub repo, the resume trio and the
-#: latest Kaggle segment's probe at once.
-STAGING_TRANSFERS = 16
-#: Parallel file downloads inside one Hub repo.
-HUB_WORKERS_PER_REPO = 8
+#: Transfers in flight while staging: the Hub repos, the resume trio and the
+#: latest Kaggle segment's probe.
+STAGING_TRANSFERS = 3
 #: The cadence a Colab leg checkpoints at: the VM can die without warning, so
 #: the trio it would hand the next leg is re-written every twenty minutes.
 CHECKPOINT_MINUTES = 20
-
-
-def hub_dataset(source):
-    """Download the Hub dataset repo named like Kaggle *source* into its mount.
-
-    The repo keeps the Kaggle slug's owner and name, so a kernel's metadata
-    names its inputs once for both. A download into an existing mount
-    fetches only what is missing or changed.
-    """
-    mount = INPUTS / source.split("/")[1]
-    snapshot_download(
-        source, repo_type="dataset", local_dir=mount, max_workers=HUB_WORKERS_PER_REPO
-    )
-    # The Hub keeps its download metadata under the mount's `.cache`.
-    files = sum(1 for f in mount.rglob("*") if f.is_file() and ".cache" not in f.parts)
-    print(f"{source}: {files} files", flush=True)
-    return mount
 
 
 def bucket_trio(publisher, api, run):
@@ -195,8 +177,8 @@ def launch(argv, log_name, pid_name):
 
 
 def main():
-    # The Hub client with bucket support, and aria2c, which `output.py`
-    # downloads Kaggle segment outputs with.
+    # The Hub client with bucket support, and aria2c, which `hub.py` and
+    # `output.py` download with.
     installs = [
         subprocess.Popen(
             [sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle", "huggingface_hub"]
@@ -209,9 +191,14 @@ def main():
     for credential in (HF_TOKEN, Path("/root/.kaggle/credentials.json")):
         if not credential.is_file():
             raise FileNotFoundError(f"upload {credential.name} to {credential} first")
-    for uploaded in (KERNEL, METADATA, PUBLISHER, OUTPUT):
+    for uploaded in (KERNEL, METADATA, PUBLISHER, OUTPUT, HUB, ARIA2):
         if not uploaded.is_file():
             raise FileNotFoundError(f"upload {uploaded.name} to {uploaded} first")
+    # Imported only now: the Hub client is the one just installed, and
+    # `hub.py` finds `aria2.py` beside it.
+    sys.path.insert(0, str(HUB.parent))
+    import hub
+    from huggingface_hub import HfApi
     WORKING.mkdir(parents=True, exist_ok=True)
 
     # The run's names -- its Kaggle segments and its place in the resume
@@ -226,12 +213,10 @@ def main():
     # Every input downloads at once: the GPU is billed while it waits, and one
     # transfer at a time leaves most of the VM's bandwidth unused. The
     # finished runs a stage starts from (`INIT_FROM`) are Hub repos too.
+    repos = [*metadata["dataset_sources"], *metadata["kernel_sources"]]
     with ThreadPoolExecutor(max_workers=STAGING_TRANSFERS) as pool:
         transfers = [
-            *(
-                pool.submit(hub_dataset, source)
-                for source in [*metadata["dataset_sources"], *metadata["kernel_sources"]]
-            ),
+            pool.submit(hub.download, repos, INPUTS),
             pool.submit(bucket_trio, publisher, api, publisher.run_name(METADATA)),
             pool.submit(stage_latest_segment, base),
         ]
