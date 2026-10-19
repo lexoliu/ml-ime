@@ -36,6 +36,7 @@ case $command in
     provisioned
     ;;
   status)
+    heartbeat $session
     printf 'from pathlib import Path\np = Path("/kaggle/working")\nfor name in ("stage.out", "kernel.out", "train.log"):\n    f = p / name\n    if f.is_file():\n        print(f"--- {name} ---")\n        print(f.read_text()[-3000:])\nprint("summary:", (p / "run-summary.json").is_file())\n' | colab exec -s $session
     ;;
   fetch)
