@@ -16,6 +16,7 @@ from dataclasses import dataclass
 import torch
 from torch import nn
 
+from mlime.logging import log
 from mlime.train.charlm_vocab import BOS
 from mlime.train.e2e_model import Decoder, E2EModel
 
@@ -218,6 +219,10 @@ class SearchGraphs:
                 dtype=like.dtype,
                 device=like.device,
             )
+            if self.captured:
+                log.info(
+                    "search buffers grown, graphs dropped", buffer=name, graphs=len(self.captured)
+                )
             self.captured.clear()
             flat = self.flat[name]
         return flat[: like.numel()].view(like.shape)
@@ -246,6 +251,15 @@ class SearchGraphs:
             view.copy_(tensor)
         if captured is None:
             captured = self.captured[key] = self._capture(decoder, static, autocast)
+            # Each capture costs a search run eagerly and once more under
+            # capture; a measured span starts after the last of them.
+            log.info(
+                "search graph captured",
+                lanes=static.masks.shape[0],
+                length=static.masks.shape[1],
+                ragged=static.ragged,
+                graphs=len(self.captured),
+            )
         graph, _, outputs = captured
         graph.replay()
         parents, choices, scores = outputs
