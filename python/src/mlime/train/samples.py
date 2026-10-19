@@ -40,6 +40,7 @@ import random
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from fractions import Fraction
+from itertools import accumulate
 from pathlib import Path
 from typing import Protocol
 
@@ -49,7 +50,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 from mlime.data.corpus import Sample
 from mlime.data.shards import shard_paths
-from mlime.data.text import HAN
+from mlime.data.text import all_han
 from mlime.logging import log
 from mlime.train.arbitration import ReadingArbitration
 from mlime.train.labels import keyboard_form
@@ -260,6 +261,11 @@ class SampleBuilder:
         self.candidates = candidates or CandidateSpace(spans, lexicon.candidate_mask)
         self.seed = seed
         self.counts = BuildCounts()
+        #: The reading each (character, annotator syllable) pair settles to,
+        #: and whether the arbitration rewrote it. The pairs number in the tens
+        #: of thousands; folding one afresh -- a regex, three string copies and
+        #: the arbitration lookup -- was the largest part of a sentence's cost.
+        self._settled: dict[tuple[str, str], tuple[str, bool]] = {}
 
     def build(
         self, sample: Sample, syllables: Sequence[str] | None, epoch: int
@@ -268,48 +274,48 @@ class SampleBuilder:
         if syllables is None:
             self.counts.unlabelled += 1
             return None
-        characters = tuple(sample.text)
-        if not all(HAN.match(character) for character in characters):
+        text = sample.text
+        if not all_han(text):
             self.counts.not_all_han += 1
             return None
-        if len(characters) != len(syllables):
+        if len(text) != len(syllables):
             self.counts.length_mismatch += 1
             return None
-        labelled = tuple(keyboard_form(syllable) for syllable in syllables)
-        readings = tuple(
-            self.arbitration.reading(character, label)
-            for character, label in zip(characters, labelled, strict=True)
-        )
-        self.counts.reading_arbitrated += sum(
-            arbitrated != label for arbitrated, label in zip(readings, labelled, strict=True)
-        )
-        if any(reading not in self.spans for reading in readings):
+        known = self._settled
+        readings = []
+        arbitrated = 0
+        for pair in zip(text, syllables, strict=True):
+            settled = known.get(pair)
+            if settled is None:
+                label = keyboard_form(pair[1])
+                reading = self.arbitration.reading(pair[0], label)
+                settled = known[pair] = (reading, reading != label)
+            readings.append(settled[0])
+            arbitrated += settled[1]
+        self.counts.reading_arbitrated += arbitrated
+        if not self.spans.covers(readings):
             self.counts.unknown_span += 1
             return None
-        if not all(self.lexicon.contains(character) for character in characters):
+        targets = self.lexicon.indices(text)
+        if targets is None:
             self.counts.unemittable_character += 1
             return None
 
         rng = example_rng(self.seed, epoch, sample.id)
-        spans = type_syllables(readings, rng, self.augmentation)
+        spans = type_syllables(tuple(readings), rng, self.augmentation)
         if self.noise is not None:
             # The styles choose *which* keys the typist meant to press and the
             # noise model then slips them -- corrupting before the abbreviation
             # would let the initial of a typoed syllable erase the slip.
             spans = self.noise.maybe_corrupt(spans, rng).spans
-        span_ids = tuple(self.spans.id_or_unknown(span) for span in spans)
-        targets = tuple(self.lexicon.index(character) for character in characters)
-        if not all(
-            self.candidates.admits(span, target)
-            for span, target in zip(spans, targets, strict=True)
-        ):
+        if not self.candidates.admits_all(spans, targets):
             self.counts.target_not_admitted += 1
             return None
         self.counts.kept += 1
         return TrainingExample(
             id=sample.id,
             spans=spans,
-            span_ids=span_ids,
+            span_ids=tuple(self.spans.id_or_unknown(span) for span in spans),
             targets=targets,
             context=sample.context,
         )
@@ -363,6 +369,17 @@ def interleave(shards: Sequence[Path]) -> list[Path]:
     return [shard for *_, shard in sorted(keyed)]
 
 
+def first_row(offset: int, reader: int, readers: int) -> int:
+    """The first row of a shard starting at global row *offset* that *reader* takes.
+
+    The readers stride the shards' concatenation: reader *i* takes the global
+    rows ``i, i + readers, ...``, so within a shard it takes every
+    *readers*-th row from this one on. A result past the shard's end means the
+    reader takes nothing there.
+    """
+    return (reader - offset) % readers
+
+
 class CorpusStream(IterableDataset[TrainingExample]):
     """The corpus as an epoch-reaugmented stream of examples.
 
@@ -408,6 +425,11 @@ class CorpusStream(IterableDataset[TrainingExample]):
         self.shards = interleave(self.shards)
         self.rows = [shard_rows(shard) for shard in self.shards]
 
+    @property
+    def offsets(self) -> list[int]:
+        """The global row each shard starts at, in reading order."""
+        return list(accumulate(self.rows[:-1], initial=0))
+
     def set_epoch(self, epoch: int) -> None:
         """Re-augment from the next pass on."""
         self.epoch = epoch
@@ -421,10 +443,8 @@ class CorpusStream(IterableDataset[TrainingExample]):
 
     def __iter__(self) -> Iterator[TrainingExample]:
         index, readers = self._reader()
-        offset = 0
-        for shard, rows in zip(self.shards, self.rows, strict=True):
-            first = (index - offset) % readers
-            offset += rows
+        for shard, rows, offset in zip(self.shards, self.rows, self.offsets, strict=True):
+            first = first_row(offset, index, readers)
             if first >= rows:
                 continue
             for sample, syllables in read_pair(shard, self.labels_dir, first, readers):
@@ -773,25 +793,66 @@ def token_budget_batches(
     over its examples alone would let a batch of long full-pinyin sentences run
     to twice the rows of the batch beside it.
     """
-    if budget <= 0:
-        raise ValueError(f"the token budget must be positive, got {budget}")
+    packer = BudgetPacker(budget)
     batch: list[TrainingExample] = []
-    fill = context = filled = 0
     for example in examples:
-        cost = 1 if rows is None else rows(example)
-        wide = max(fill, len(example) + 2)
-        deep = max(context, _context_width(example, max_context_tokens))
-        if batch and wide * (filled + cost) + deep * (len(batch) + 1) > budget:
+        fill, context = example_shape(example, max_context_tokens)
+        if packer.add(fill, context, 1 if rows is None else rows(example)):
             yield batch
             batch = []
-            filled = 0
-            wide = len(example) + 2
-            deep = _context_width(example, max_context_tokens)
         batch.append(example)
-        fill, context = wide, deep
-        filled += cost
     if batch:
         yield batch
+
+
+class BudgetPacker:
+    """:func:`token_budget_batches`' grouping, one example's shape at a time.
+
+    The grouping is greedy and sequential -- whether an example opens a new
+    batch depends on every example before it in the batch -- but it reads
+    nothing of an example except its two widths and its rows. Kept apart from
+    the examples, it is what the batch census replays over shapes measured in
+    other processes, so the census and the loop group with one implementation.
+    """
+
+    def __init__(self, budget: int) -> None:
+        if budget <= 0:
+            raise ValueError(f"the token budget must be positive, got {budget}")
+        self.budget = budget
+        #: Batches closed so far; :attr:`batches` adds the open one.
+        self.closed = 0
+        self._fill = self._context = self._rows = self._examples = 0
+
+    def add(self, fill: int, context: int, rows: int) -> bool:
+        """Place one example; true when it opens a new batch, closing the one before.
+
+        *fill* and *context* are its padded widths (:func:`example_shape`),
+        *rows* how many rows at the fill width it costs.
+        """
+        wide = max(self._fill, fill)
+        deep = max(self._context, context)
+        opens = (
+            self._examples > 0
+            and wide * (self._rows + rows) + deep * (self._examples + 1) > self.budget
+        )
+        if opens:
+            self.closed += 1
+            self._rows = self._examples = 0
+            wide, deep = fill, context
+        self._examples += 1
+        self._fill, self._context = wide, deep
+        self._rows += rows
+        return opens
+
+    @property
+    def batches(self) -> int:
+        """Every batch so far, the open one included."""
+        return self.closed + (self._examples > 0)
+
+
+def example_shape(example: TrainingExample, max_context_tokens: int) -> tuple[int, int]:
+    """The fill and context widths *example* pads a batch to, sentinels included."""
+    return len(example) + 2, _context_width(example, max_context_tokens)
 
 
 def _context_width(example: TrainingExample, max_context_tokens: int) -> int:

@@ -20,6 +20,7 @@ import regex
 
 #: Any Han character, in the Unicode-property sense rather than a hand-drawn range.
 HAN = regex.compile(r"\p{Han}")
+_HAN_ONLY = regex.compile(r"\p{Han}*")
 
 #: Characters that terminate a sentence, full-width and ASCII alike.
 SENTENCE_DELIMITERS = "。！？；!?;"
@@ -109,6 +110,11 @@ def han_ratio(text: str) -> float:
     if not visible:
         return 0.0
     return sum(1 for character in visible if HAN.match(character)) / len(visible)
+
+
+def all_han(text: str) -> bool:
+    """Whether every character of *text* is Han; the empty string is."""
+    return _HAN_ONLY.fullmatch(text) is not None
 
 
 def han_characters(text: str) -> list[str]:

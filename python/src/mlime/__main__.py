@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -729,6 +730,12 @@ def train_count_batches(
     rank_beam: int = RANK_BEAM,
     rank_negatives: int = RANK_NEGATIVES,
     rank_weight: float = RANK_WEIGHT,
+    workers: int | None = typer.Option(
+        None,
+        "--workers",
+        help="Processes that build the examples; every core this process may use "
+        "when omitted. The census does not depend on it",
+    ),
     verbose: bool = VERBOSE,
 ) -> None:
     """Count the steps *epochs* of the training shards come to, for --max-steps.
@@ -743,6 +750,10 @@ def train_count_batches(
     from mlime.train.count import count_batches
     from mlime.train.run import Vocabularies
 
+    if workers is None:
+        workers = os.process_cpu_count()
+        if workers is None:
+            raise typer.BadParameter("the cores are not countable here; pass --workers")
     paths = route_a_paths(data_dir, labels, char_table, out.parent)
     census = count_batches(
         Vocabularies.load(paths.char_table, base_model),
@@ -758,6 +769,7 @@ def train_count_batches(
             ranking, rank_segmentations, rank_beam, rank_negatives, rank_weight
         ),
         segmenter=segmenter,
+        workers=workers,
     )
     census.write(out)
     typer.echo(
