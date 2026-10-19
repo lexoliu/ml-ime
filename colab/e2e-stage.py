@@ -39,6 +39,7 @@ HUB = Path("/kaggle/hub.py")
 #: leg resumes instead of its own, so two cards can race the same leg from
 #: one checkpoint while each publishes under its own run name.
 RESUME_FROM = Path("/kaggle/resume-from")
+NO_PUBLISH = Path("/kaggle/no-publish")
 ARIA2 = Path("/kaggle/aria2.py")
 HF_TOKEN = Path("/root/.cache/huggingface/token")
 #: The files of a kernel output the kernel reads: a finished run's final
@@ -272,7 +273,9 @@ def main():
     )
 
     launch([sys.executable, str(KERNEL)], "kernel.out", "kernel.pid")
-    launch([sys.executable, str(PUBLISHER)], "publish.out", "publish.pid")
+    # A check publishes nothing: its trios would enter the run's lineage.
+    if not NO_PUBLISH.is_file():
+        launch([sys.executable, str(PUBLISHER)], "publish.out", "publish.pid")
 
 
 main()

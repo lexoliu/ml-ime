@@ -75,6 +75,10 @@ SOURCE_DIGEST = None
 #: (`run/trace-rank<r>.json`, ~60 MB a step). The run trains on past the
 #: window; `mlime train measure` reads it back with the samplers' logs.
 PROFILE_STEPS = 0
+#: Steps this segment trains before it pauses, or None for the wall budget
+#: alone: a check of the code on the run's own checkpoint and data, which
+#: leaves the run's schedule and lineage where they were.
+SEGMENT_STEPS = None
 TRACE_STEPS = 0
 
 #: Recompute the encoder towers' layers in backward when even the smallest
@@ -551,6 +555,8 @@ def train_argv(
         argv += ["--trace-steps", str(trace_steps)]
     if wall_budget is not None:
         argv += ["--wall-budget-seconds", str(wall_budget)]
+    if SEGMENT_STEPS is not None:
+        argv += ["--segment-steps", str(SEGMENT_STEPS)]
     if checkpoint_minutes:
         argv += ["--checkpoint-minutes", str(checkpoint_minutes)]
     if start is not None:
