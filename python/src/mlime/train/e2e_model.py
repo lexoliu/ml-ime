@@ -406,7 +406,9 @@ class Decoder(nn.Module):
         previous reader id, ``scores [L, W]`` each lane's beam scores, and
         ``cache`` the key/value cache over the whole path. ``vectors [L, T,
         enc]`` and ``masks [L, T, E]`` are every lane's span vectors and
-        admitted characters, read here at ``at``. With ``encoder_mask`` the
+        admitted characters, read here at ``at`` through a one-element view:
+        a CUDA graph capture refuses the host read-back that indexing by a 0-d
+        CUDA tensor costs. With ``encoder_mask`` the
         lanes are ragged, and a row whose lane has ended takes ``carried``, the
         free step. Returns the next tokens, the scores, the cache with this
         position's keys written in and reordered to the surviving beams, and
@@ -421,7 +423,7 @@ class Decoder(nn.Module):
         emittable = masks.shape[-1]
         logits, (new_keys, new_values) = self.step(
             tokens,
-            vectors[lane_of_row, at],
+            vectors[lane_of_row, at.view(1)],
             at,
             cache,
             encoder_kv,
@@ -429,7 +431,9 @@ class Decoder(nn.Module):
             candidates=everything,
         )
         log_probs = (
-            logits.float().log_softmax(dim=-1).masked_fill(~masks[lane_of_row, at], float("-inf"))
+            logits.float()
+            .log_softmax(dim=-1)
+            .masked_fill(~masks[lane_of_row, at.view(1)], float("-inf"))
         )
         if encoder_mask is not None:
             ended = (lane_lengths <= at)[lane_of_row]
