@@ -64,6 +64,7 @@ case $command in
     provisioned
     ;;
   status)
+    heartbeat $session
     printf 'import json, time\nfrom pathlib import Path\np = Path("/kaggle/working")\nfor name in ("stage.out", "kernel.out", "train.log", "publish.out"):\n    f = p / name\n    if f.is_file():\n        print(f"--- {name} ---")\n        print(f.read_text()[-3000:])\nstate = p / "publish-state.json"\nif state.is_file():\n    s = json.loads(state.read_text())\n    if "last_published_at" in s:\n        print(f"last publish: step {s[\"last_published_step\"]}, {round(time.time() - s[\"last_published_at\"])}s ago")\n    if s.get("last_error"):\n        print(f"last publish error: {s[\"last_error\"]}")\nrun = p / "run"\nif run.is_dir():\n    print("intervals:", sorted(d.name for d in run.glob("interval-*")))\n' | colab exec -s $session
     ;;
   fetch)
