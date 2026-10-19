@@ -8,6 +8,13 @@
 # exits with the failing command named, and creates the runtime.
 # `provisioned` disarms the trap once the start has handed the runtime its
 # work: what runs after that on the VM is the waiter's to watch.
+#
+# The waiter can end before the runtime does, and then nothing would stop it.
+# So the first thing a new runtime runs is `watchdog.py`, which releases the
+# runtime from inside once its heartbeat goes stale; whatever controls the
+# runtime touches the heartbeat each time it looks at it (`heartbeat`).
+
+watchdog=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/watchdog.py
 
 provision() {
   local session=$1
@@ -18,6 +25,13 @@ provision() {
   fi
   trap "release_on_failure $session" ERR
   colab new -s "$session" "$@"
+  colab upload -s "$session" "$watchdog" /root/watchdog.py
+  printf 'import subprocess, sys\nlog = open("/root/watchdog.out", "ab")\nchild = subprocess.Popen([sys.executable, "/root/watchdog.py"], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)\nprint(f"watchdog started, pid {child.pid}")\n' | colab exec -s "$session"
+}
+
+# The controller's beat: run on every look at the runtime.
+heartbeat() {
+  printf 'from pathlib import Path\nPath("/root/heartbeat").touch()\n' | colab exec -s "$1" > /dev/null
 }
 
 release_on_failure() {
