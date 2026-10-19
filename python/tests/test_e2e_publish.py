@@ -1,15 +1,15 @@
-"""The Colab publisher's alternation between two resume slots, against a fake kaggle.
+"""The Colab publisher's resume trios in the Hub bucket, against a fake bucket.
 
 colab/e2e-publish.py is a script rather than a package module, so it is
-imported by path with its filesystem constants redirected; the `kaggle` it
-drives is a stub on PATH that keeps each "dataset" as a directory, so create,
-delete, list and a single-file download behave the way the real service does
-for the calls the publisher makes, and every argv is recorded.
+imported by path with its filesystem constants redirected; the `HfApi` it
+drives is a fake that keeps the bucket as a dict of path to bytes and records
+every batch, so listing, adding and deleting behave the way the real bucket
+does for the calls the publisher makes.
 """
 
 import importlib.util
 import json
-import os
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
@@ -17,10 +17,41 @@ import pytest
 import torch
 
 PUBLISHER_PATH = Path(__file__).resolve().parents[2] / "colab" / "e2e-publish.py"
+RUN = "mlime-e2e-rankw01b"
 
 
-def load_publisher(monkeypatch: pytest.MonkeyPatch, working: Path) -> ModuleType:
-    """e2e-publish.py as a module, with its working dir redirected."""
+@dataclass
+class Entry:
+    type: str
+    path: str
+
+
+class FakeBucket:
+    """The bucket calls the publisher makes, over a dict of path to bytes."""
+
+    def __init__(self) -> None:
+        self.files: dict[str, bytes] = {}
+        self.batches: list[tuple[list[str], list[str]]] = []
+
+    def list_bucket_tree(self, bucket_id: str, prefix: str = "", *, recursive: bool = False):
+        return [Entry("file", path) for path in sorted(self.files) if path.startswith(prefix)]
+
+    def batch_bucket_files(self, bucket_id: str, *, add=(), delete=()) -> None:
+        for source, destination in add:
+            self.files[destination] = source if isinstance(source, bytes) else source.read_bytes()
+        for path in delete:
+            del self.files[path]
+        self.batches.append(([destination for _, destination in add], list(delete)))
+
+    def steps(self) -> list[str]:
+        """The trio directories the bucket holds."""
+        return sorted({path.rsplit("/", 1)[0] for path in self.files})
+
+
+def load_publisher(
+    monkeypatch: pytest.MonkeyPatch, working: Path, bucket: FakeBucket | None = None
+) -> ModuleType:
+    """e2e-publish.py as a module, with its working dir and Hub client redirected."""
     spec = importlib.util.spec_from_file_location("e2e_publish", PUBLISHER_PATH)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
@@ -28,40 +59,13 @@ def load_publisher(monkeypatch: pytest.MonkeyPatch, working: Path) -> ModuleType
     monkeypatch.setattr(module, "WORKING", working)
     monkeypatch.setattr(module, "RUN", working / "run")
     monkeypatch.setattr(module, "STATE", working / "publish-state.json")
+    metadata = working / "kernel-metadata.json"
+    metadata.parent.mkdir(parents=True, exist_ok=True)
+    metadata.write_text(json.dumps({"id": f"lexoliu/{RUN}-s0"}))
+    monkeypatch.setattr(module, "METADATA", metadata)
+    if bucket is not None:
+        monkeypatch.setattr(module, "HfApi", lambda: bucket)
     return module
-
-
-@pytest.fixture
-def kaggle_stub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A fake `kaggle` on PATH whose datasets are directories under ``store``."""
-    log = tmp_path / "kaggle-calls.log"
-    store = tmp_path / "store"
-    store.mkdir()
-    binary = tmp_path / "bin" / "kaggle"
-    binary.parent.mkdir()
-    binary.write_text(
-        "#!/bin/bash\n"
-        f'echo "$@" >> "{log}"\n'
-        f'store="{store}"\n'
-        'case "$1 $2" in\n'
-        '  "datasets list")\n'
-        '    echo "ref,title,size,lastUpdated,downloadCount,voteCount,usabilityRating"\n'
-        '    for d in "$store"/*; do [ -d "$d" ] && '
-        'echo "lexoliu/$(basename "$d"),x,1,2026-09-28,0,0,0"; done; true ;;\n'
-        '  "datasets download")\n'
-        '    cp "$store/${3#lexoliu/}/$5" "$7/$5" ;;\n'
-        '  "datasets delete")\n'
-        '    rm -rf "$store/${4#lexoliu/}" ;;\n'
-        '  "datasets create")\n'
-        "    id=$(python3 -c \"import json,sys; print(json.load(open(sys.argv[1]))['id'])\" "
-        '"$4/dataset-metadata.json")\n'
-        '    mkdir -p "$store/${id#lexoliu/}" && cp "$4"/* "$store/${id#lexoliu/}/" ;;\n'
-        '  *) echo "unexpected kaggle call: $*" >&2; exit 1 ;;\n'
-        "esac\n"
-    )
-    binary.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{binary.parent}:{os.environ['PATH']}")
-    return store
 
 
 def write_trio(directory: Path, step: int) -> Path:
@@ -75,53 +79,61 @@ def write_trio(directory: Path, step: int) -> Path:
     return directory
 
 
-def held(store: Path) -> dict[str, int]:
-    """The step each existing fake slot holds."""
-    return {
-        slot.name: json.loads((slot / "run-summary.json").read_text())["checkpoint_step"]
-        for slot in sorted(store.iterdir())
-    }
-
-
-def publish_once(monkeypatch: pytest.MonkeyPatch, working: Path, step: int) -> None:
+def publish_once(
+    monkeypatch: pytest.MonkeyPatch, working: Path, bucket: FakeBucket, step: int
+) -> None:
     """Put a trio at *step* in the working root and run one publisher pass."""
     write_trio(working, step=step)
-    publisher = load_publisher(monkeypatch, working)
+    publisher = load_publisher(monkeypatch, working, bucket)
     monkeypatch.setenv("ONCE", "1")
     publisher.main()
 
 
-def test_slots_fill_then_the_older_one_is_replaced(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kaggle_stub: Path
+def test_each_publish_leaves_exactly_the_newest_whole_trio(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Two creates fill both slots; the third publish deletes and recreates the older."""
+    """The new trio lands, then its marker, and only then the older trio goes."""
     working = tmp_path / "working"
-    publish_once(monkeypatch, working, 30)
-    assert held(kaggle_stub) == {"mlime-e2e-resume-a": 30}
-    publish_once(monkeypatch, working, 40)
-    assert held(kaggle_stub) == {"mlime-e2e-resume-a": 30, "mlime-e2e-resume-b": 40}
-    publish_once(monkeypatch, working, 50)
-    assert held(kaggle_stub) == {"mlime-e2e-resume-a": 50, "mlime-e2e-resume-b": 40}
-    publish_once(monkeypatch, working, 60)
-    assert held(kaggle_stub) == {"mlime-e2e-resume-a": 50, "mlime-e2e-resume-b": 60}
-    calls = (tmp_path / "kaggle-calls.log").read_text()
-    assert "datasets version" not in calls
-    assert calls.count("datasets delete") == 2
+    bucket = FakeBucket()
+    publish_once(monkeypatch, working, bucket, 30)
+    assert bucket.steps() == [f"{RUN}/step-0000030"]
+    publish_once(monkeypatch, working, bucket, 40)
+    assert bucket.steps() == [f"{RUN}/step-0000040"]
+    assert set(bucket.files) == {
+        f"{RUN}/step-0000040/{name}"
+        for name in ("checkpoint-paused.pt", "run-config.json", "run-summary.json", "complete")
+    }
+    trio, marker, deletion = bucket.batches[-3:]
+    assert sorted(trio[0]) == sorted(
+        f"{RUN}/step-0000040/{name}"
+        for name in ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
+    )
+    assert marker[0] == [f"{RUN}/step-0000040/complete"]
+    assert all(path.startswith(f"{RUN}/step-0000030/") for path in deletion[1])
     state = json.loads((working / "publish-state.json").read_text())
-    assert state["last_published_step"] == 60
+    assert state["last_published_step"] == 40
 
 
-def test_nothing_newer_publishes_nothing(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kaggle_stub: Path
+def test_a_trio_without_its_marker_is_not_a_published_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A trio no newer than what a slot already holds is not published again."""
+    """A VM that died mid-publish leaves files without a marker; staging skips them."""
+    bucket = FakeBucket()
+    bucket.files[f"{RUN}/step-0000030/complete"] = b"30\n"
+    bucket.files[f"{RUN}/step-0000040/checkpoint-paused.pt"] = b"partial"
+    publisher = load_publisher(monkeypatch, tmp_path / "working")
+    assert publisher.published_steps(bucket, RUN) == [30]
+
+
+def test_nothing_newer_publishes_nothing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A trio no newer than the bucket's is not published again."""
     working = tmp_path / "working"
-    publish_once(monkeypatch, working, 30)
-    before = (tmp_path / "kaggle-calls.log").read_text()
-    publish_once(monkeypatch, working, 30)
-    after = (tmp_path / "kaggle-calls.log").read_text()
-    assert "datasets create" not in after[len(before) :]
-    assert held(kaggle_stub) == {"mlime-e2e-resume-a": 30}
+    bucket = FakeBucket()
+    publish_once(monkeypatch, working, bucket, 30)
+    batches = len(bucket.batches)
+    publish_once(monkeypatch, working, bucket, 30)
+    assert len(bucket.batches) == batches
+    assert bucket.steps() == [f"{RUN}/step-0000030"]
 
 
 def test_a_second_poll_reads_no_checkpoint_again(

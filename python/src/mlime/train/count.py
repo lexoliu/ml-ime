@@ -88,8 +88,9 @@ class BatchCensus:
     #: The format this count was taken in; see :data:`CENSUS_VERSION`.
     census_version: int
     build_counts: dict[str, int]
-    #: The ranking loss's settings when the count weighed each example by
-    #: every row the ranking step makes of it; ``None`` for a plain run.
+    #: The ranking search's shape when the count weighed each example by
+    #: every row the ranking step makes of it (see :func:`ranking_shape`);
+    #: ``None`` for a plain run.
     ranking: dict[str, Any] | None = None
 
     def write(self, path: Path) -> None:
@@ -131,6 +132,19 @@ class CountSpec:
     accumulate: int
     census_version: int
     ranking: dict[str, Any] | None
+
+
+def ranking_shape(ranking: RankingConfig | None) -> dict[str, Any] | None:
+    """The ranking settings a count depends on: the search's shape, not its weight.
+
+    The weight only scales the loss, so runs that differ in nothing else --
+    a weight sweep -- share one census.
+    """
+    if ranking is None:
+        return None
+    shape = asdict(ranking)
+    del shape["weight"]
+    return shape
 
 
 def census_mismatches(census: BatchCensus, spec: CountSpec) -> list[str]:
@@ -281,7 +295,7 @@ def count_batches(
         shards=list(slices.train),
         accumulate=accumulate,
         census_version=CENSUS_VERSION,
-        ranking=None if ranking is None else asdict(ranking),
+        ranking=ranking_shape(ranking),
     )
     if reuse_census is not None:
         stored, differed = matching_census(reuse_census, spec)
@@ -320,7 +334,7 @@ def count_batches(
         steps_for_epochs=-(-min(rank.total for rank in ranks) // accumulate),
         census_version=CENSUS_VERSION,
         build_counts=dict(tallies),
-        ranking=None if ranking is None else asdict(ranking),
+        ranking=ranking_shape(ranking),
     )
     log.info(
         "batches counted",

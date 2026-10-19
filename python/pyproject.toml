@@ -28,7 +28,7 @@ dependencies = [
 ]
 
 [project.scripts]
-mlime = "mlime.__main__:app"
+mlime = "mlime.__main__:run"
 
 [project.optional-dependencies]
 train = ["safetensors>=0.4"]

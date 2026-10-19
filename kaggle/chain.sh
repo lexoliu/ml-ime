@@ -111,10 +111,9 @@ harvest() {
   if [ -e "$dir/harvested" ]; then return 0; fi
   say "downloading segment $n output"
   mkdir -p "$dir"
-  # The CLI keeps going after one file breaks off, so a small file such as
-  # run-summary.json can land while a checkpoint did not: the stamp, not any
-  # downloaded file, is what says the segment is here in full.
-  if ! kaggle kernels output "$SLUG$n" -p "$dir" >> "$dir/download.log" 2>&1 || [ ! -e "$dir/run-summary.json" ]; then
+  # output.py streams each file and resumes one whose connection breaks; the
+  # stamp, written only once it has everything, says the segment is here in full.
+  if ! uv run --quiet --with kaggle python "$REPO/kaggle/output.py" "$SLUG$n" "$dir" >> "$dir/download.log" 2>&1; then
     say "download of segment $n failed; retry next hour"; return 1
   fi
   touch "$dir/harvested"

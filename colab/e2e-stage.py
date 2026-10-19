@@ -1,66 +1,84 @@
 """Stage the e2e kernel's inputs on a Colab VM and start it detached.
 
 Runs on the VM as its own process, which `colab/e2e.sh start` launches
-(logging to `/kaggle/working/stage.out`) after it has uploaded the Kaggle
-credentials, the kernel script, its metadata and the checkpoint publisher. It recreates the mount layout the
-Kaggle kernel expects by downloading the same datasets, stages the resume
-point -- the newest `checkpoint-paused` trio by step among the latest
-COMPLETE Kaggle segment's output and the two `mlime-e2e-resume-{a,b}` slots -- stamps
-the segment number and the interval checkpoint cadence into the kernel,
-launches it detached, and launches the publisher beside it: every interval
-trio lands in one of the `mlime-e2e-resume-{a,b}` slots, so a VM that dies without warning loses
-minutes of training, not the leg.
+(logging to `/kaggle/working/stage.out`) after it has uploaded the Hugging
+Face token, the Kaggle credentials, the kernel script, its metadata and the
+checkpoint publisher. It recreates the mount layout the Kaggle kernel expects
+under `/kaggle/input/<name>`: every dataset and every finished run the kernel
+starts from comes from the private Hub dataset repo of the same name, all at
+once. The resume point is the newest `checkpoint-paused` trio by step among
+the run's trio in the `lexoliu/mlime-resume` bucket and the latest COMPLETE
+Kaggle segment's output. It stamps the segment number and the interval
+checkpoint cadence into the kernel, launches it detached, and launches the
+publisher beside it: every interval trio lands in the bucket, so a VM that
+dies without warning loses minutes of training, not the leg.
 """
 
+import importlib.util
 import json
 import os
 import re
 import subprocess
 import sys
-import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+from huggingface_hub import HfApi, snapshot_download
 
 INPUTS = Path("/kaggle/input")
 WORKING = Path("/kaggle/working")
 KERNEL = Path("/kaggle/kernel.py")
 METADATA = Path("/kaggle/kernel-metadata.json")
 PUBLISHER = Path("/kaggle/e2e-publish.py")
-#: The two slots the publisher alternates between (see e2e-publish.py).
-RESUME_DATASETS = ("lexoliu/mlime-e2e-resume-a", "lexoliu/mlime-e2e-resume-b")
-SEGMENT_SLUG = "lexoliu/mlime-e2e-s"
+OUTPUT = Path("/kaggle/output.py")
+HF_TOKEN = Path("/root/.cache/huggingface/token")
+#: The files of a kernel output the kernel reads: a finished run's final
+#: checkpoint and config, and a paused segment's trio.
+KERNEL_READS = (
+    r"^(run-config\.json|run-summary\.json|checkpoint-paused\.pt|run/checkpoint-final\.pt)$"
+)
 RESUME_MARKERS = ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
+#: Inputs in flight while staging: every Hub repo, the resume trio and the
+#: latest Kaggle segment's probe at once.
+STAGING_TRANSFERS = 16
+#: Parallel file downloads inside one Hub repo.
+HUB_WORKERS_PER_REPO = 8
 #: The cadence a Colab leg checkpoints at: the VM can die without warning, so
 #: the trio it would hand the next leg is re-written every twenty minutes.
 CHECKPOINT_MINUTES = 20
 
 
-def download(dataset, tolerate=False):
-    """Fetch *dataset* into its mount directory unless it is already there."""
-    mount = INPUTS / dataset.split("/")[1]
-    if mount.is_dir() and any(mount.iterdir()):
-        print(f"{dataset}: already staged", flush=True)
-        return mount
-    mount.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
-        ["kaggle", "datasets", "download", "-d", dataset, "-p", str(mount)],
-        check=False,
-        capture_output=True,
-        text=True,
+def hub_dataset(source):
+    """Download the Hub dataset repo named like Kaggle *source* into its mount.
+
+    The repo keeps the Kaggle slug's owner and name, so a kernel's metadata
+    names its inputs once for both. A download into an existing mount
+    fetches only what is missing or changed.
+    """
+    mount = INPUTS / source.split("/")[1]
+    snapshot_download(
+        source, repo_type="dataset", local_dir=mount, max_workers=HUB_WORKERS_PER_REPO
     )
-    if result.returncode != 0:
-        if tolerate:
-            print(
-                f"{dataset}: not mounted this leg ({result.stderr.strip() or 'not found'})",
-                flush=True,
-            )
-            return None
-        print(result.stderr, flush=True)
-        result.check_returncode()
-    for archive in mount.glob("*.zip"):
-        with zipfile.ZipFile(archive) as zipped:
-            zipped.extractall(mount)
-        archive.unlink()
-    print(f"{dataset}: {sum(1 for _ in mount.rglob('*') if _.is_file())} files", flush=True)
+    # The Hub keeps its download metadata under the mount's `.cache`.
+    files = sum(1 for f in mount.rglob("*") if f.is_file() and ".cache" not in f.parts)
+    print(f"{source}: {files} files", flush=True)
+    return mount
+
+
+def bucket_trio(publisher, api, run):
+    """Download the run's whole trio from the resume bucket, or None before its first."""
+    steps = publisher.published_steps(api, run)
+    if not steps:
+        print(f"{publisher.BUCKET}/{run}: no trio published yet", flush=True)
+        return None
+    prefix = publisher.trio_prefix(run, steps[-1])
+    mount = INPUTS / f"{run}-resume"
+    api.download_bucket_files(
+        publisher.BUCKET,
+        [(f"{prefix}/{marker}", mount / marker) for marker in RESUME_MARKERS],
+        raise_on_missing_files=True,
+    )
+    print(f"{publisher.BUCKET}/{prefix}: staged under {mount}", flush=True)
     return mount
 
 
@@ -85,7 +103,7 @@ def kernel_status(slug):
     return output
 
 
-def latest_segment():
+def latest_segment(base):
     """The newest COMPLETE Kaggle segment's slug, or None when none has one.
 
     A segment still RUNNING or QUEUED means the chain owns the run right now;
@@ -95,7 +113,7 @@ def latest_segment():
     n = 0
     latest = None
     while True:
-        slug = f"{SEGMENT_SLUG}{n}"
+        slug = f"{base}-s{n}"
         status = kernel_status(slug)
         if status is None:
             break
@@ -111,15 +129,25 @@ def latest_segment():
 
 
 def kernel_output(slug):
-    """Download *slug*'s output under the input layout and return its mount."""
+    """Download what the kernel reads of *slug*'s output; return its mount.
+
+    `output.py` continues a partial file where it stopped, so a restaged leg
+    fetches only what an earlier attempt did not finish.
+    """
     mount = INPUTS / slug.split("/")[1]
-    if (mount / "run-config.json").is_file():
-        print(f"{slug}: output already staged", flush=True)
-        return mount
     mount.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["kaggle", "kernels", "output", slug, "-p", str(mount)], check=True)
+    subprocess.run(
+        [sys.executable, str(OUTPUT), slug, str(mount), "--pattern", KERNEL_READS], check=True
+    )
     print(f"{slug}: output staged under {mount}", flush=True)
     return mount
+
+
+def stage_latest_segment(base):
+    """Stage the newest complete Kaggle segment's output, when the run has one."""
+    latest = latest_segment(base)
+    if latest is not None:
+        kernel_output(latest)
 
 
 def step_of(trio):
@@ -167,22 +195,48 @@ def launch(argv, log_name, pid_name):
 
 
 def main():
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle"], check=True)
-    if not Path("/root/.kaggle/credentials.json").is_file():
-        raise FileNotFoundError("upload ~/.kaggle/credentials.json to /root/.kaggle first")
-    for uploaded in (KERNEL, METADATA, PUBLISHER):
+    # The Hub client with bucket support, and aria2c, which `output.py`
+    # downloads Kaggle segment outputs with.
+    installs = [
+        subprocess.Popen(
+            [sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle", "huggingface_hub"]
+        ),
+        subprocess.Popen(["apt-get", "install", "-y", "-q", "aria2"]),
+    ]
+    for install in installs:
+        if install.wait() != 0:
+            raise subprocess.CalledProcessError(install.returncode, install.args)
+    for credential in (HF_TOKEN, Path("/root/.kaggle/credentials.json")):
+        if not credential.is_file():
+            raise FileNotFoundError(f"upload {credential.name} to {credential} first")
+    for uploaded in (KERNEL, METADATA, PUBLISHER, OUTPUT):
         if not uploaded.is_file():
             raise FileNotFoundError(f"upload {uploaded.name} to {uploaded} first")
     WORKING.mkdir(parents=True, exist_ok=True)
 
-    for dataset in json.loads(METADATA.read_text())["dataset_sources"]:
-        # The resume dataset holds the Colab leg's checkpoints; before the
-        # first Colab segment it does not exist, and the kernel tolerates its
-        # absence the way it would on Kaggle.
-        download(dataset, tolerate=(dataset in RESUME_DATASETS))
-    latest = latest_segment()
-    if latest is not None:
-        kernel_output(latest)
+    # The run's names -- its Kaggle segments and its place in the resume
+    # bucket -- come from the stamped kernel's slug, the way the publisher
+    # reads them.
+    spec = importlib.util.spec_from_file_location("publisher", PUBLISHER)
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    base = publisher.run_base(METADATA)
+    api = HfApi()
+    metadata = json.loads(METADATA.read_text())
+    # Every input downloads at once: the GPU is billed while it waits, and one
+    # transfer at a time leaves most of the VM's bandwidth unused. The
+    # finished runs a stage starts from (`INIT_FROM`) are Hub repos too.
+    with ThreadPoolExecutor(max_workers=STAGING_TRANSFERS) as pool:
+        transfers = [
+            *(
+                pool.submit(hub_dataset, source)
+                for source in [*metadata["dataset_sources"], *metadata["kernel_sources"]]
+            ),
+            pool.submit(bucket_trio, publisher, api, publisher.run_name(METADATA)),
+            pool.submit(stage_latest_segment, base),
+        ]
+        for transfer in as_completed(transfers):
+            transfer.result()
 
     # Every mounted trio is a resume candidate; the kernel picks the newest by
     # the step the checkpoint itself holds. The leg's number continues the
@@ -192,9 +246,7 @@ def main():
     picked = max(candidates, key=lambda candidate: candidate[2], default=None)
     segment = 0 if picked is None else picked[1] + 1
     KERNEL.write_text(
-        stamp(
-            KERNEL.read_text(), SEGMENT=segment, CHECKPOINT_MINUTES=CHECKPOINT_MINUTES
-        ),
+        stamp(KERNEL.read_text(), SEGMENT=segment, CHECKPOINT_MINUTES=CHECKPOINT_MINUTES),
         encoding="utf-8",
     )
     print(

@@ -56,11 +56,23 @@ Read this file, then `notes/route-a-v1.md`, `notes/v2-data-prep.md` and
   v1 kernel output and score files), `route-a-v2/s<n>/` (every harvested
   segment). Nothing under `data/` is on GitHub.
 
-## 2. Kaggle datasets and kernels
+## 2. Datasets and kernels
+
+Datasets live only on Hugging Face, as private dataset repos under `lexoliu`
+named like the Kaggle slugs below (#136): the Colab staging downloads them at
+about 150 MB/s, where Kaggle served its datasets at about 17 MB/s and kernel
+outputs at about 12 MiB/s. Push a new version with
+`hf upload lexoliu/<name> <dir> --repo-type dataset`; log in once with
+`hf auth login` (a browser device flow, no personal access token). The
+finished runs a stage starts from are repos too (`lexoliu/mlime-e2e-stage2-s0`:
+`run-config.json`, `run-summary.json`, `run/checkpoint-final.pt`), and a Colab
+leg's resume trio lives in the private bucket `lexoliu/mlime-resume` under
+`<run>/step-<step>/`. The Kaggle copies below are what the Kaggle chain still
+mounts.
 
 | dataset | holds |
 |---|---|
-| `lexoliu/mlime-src` | the `mlime` Python package from `dev` (must be versioned with `--dir-mode tar`, see §5) |
+| `lexoliu/mlime-src` | the `mlime` Python package from `dev` (on Kaggle, versioned with `--dir-mode tar`, see §5) |
 | `lexoliu/mlime-route-a-assets` | `char_pinyin.tsv`, `emittable.txt`, `syllables.txt`, `typed_spans.txt`, `eval3*.jsonl`, `lattice*.jsonl` |
 | `lexoliu/mlime-run3-v1-samples`, `-labels` | the 10.03M v1 subset and its g2pW labels |
 | `lexoliu/mlime-run3-rest-samples`, `-labels` | the 31.25M rest of run3 and its labels (404 shards each) |
