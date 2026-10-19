@@ -522,6 +522,58 @@ def test_a_budget_may_change_between_segments_but_nothing_else_may(
     assert "wall_budget_seconds" not in str(refusal.value)
 
 
+def test_a_counted_segment_pauses_on_its_step_and_resumes_into_the_same_run(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    uninterrupted = tiny_model(lexicon)
+    whole = train(uninterrupted, [(stream, collator)], RESUMABLE, tmp_path / "whole")
+
+    counted = tmp_path / "counted"
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    paused = train(
+        tiny_model(lexicon), [(stream, collator)], replace(RESUMABLE, segment_steps=2), counted
+    )
+    assert (paused.step, paused.finished) == (2, False)
+    assert [record["step"] for record in records(paused.metrics, "paused")] == [2]
+
+    # The count is the segment's, so the next segment may count differently.
+    resumed_model = tiny_model(lexicon)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    resumed = train(
+        resumed_model,
+        [(stream, collator)],
+        replace(RESUMABLE, segment_steps=2),
+        tmp_path / "resumed",
+        resume=counted / "checkpoint-paused.pt",
+    )
+    assert (resumed.step, resumed.finished) == (4, False)
+    assert step_losses(resumed.metrics) == step_losses(whole.metrics)[2:4]
+
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    finished = train(
+        resumed_model,
+        [(stream, collator)],
+        RESUMABLE,
+        tmp_path / "finished",
+        resume=tmp_path / "resumed" / "checkpoint-paused.pt",
+    )
+    assert finished.finished and finished.step == RESUMABLE.max_steps
+    weights = uninterrupted.state_dict()
+    for name, tensor in resumed_model.state_dict().items():
+        assert torch.equal(tensor, weights[name]), name
+
+
+def test_a_segment_of_no_steps_is_refused() -> None:
+    with pytest.raises(ValueError, match="segment_steps must be at least 1"):
+        TrainingConfig(max_steps=1, segment_steps=0)
+
+
 def test_a_wall_budget_that_is_not_time_is_refused() -> None:
     with pytest.raises(ValueError, match="wall_budget_seconds must be positive"):
         TrainingConfig(max_steps=1, wall_budget_seconds=0.0)
