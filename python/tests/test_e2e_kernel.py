@@ -7,6 +7,7 @@ the stamp a push applies.
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 from types import ModuleType
 
@@ -331,3 +332,42 @@ def test_trios_of_one_run_on_two_allowed_commits_still_resume(
         (mount / "run-config.json").write_text(json.dumps({**config, "commit": commit}))
     picked = kernel.previous_segment()
     assert picked is not None and picked["mount"] == newer
+
+
+def test_the_kernels_count_builds_on_every_core(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`count-batches` as the kernel runs it counts with one worker per usable core.
+
+    The kernel passes no `--workers`, so the command's default is what sizes
+    the census to the card's VM: twelve processes on an A100's, two on a T4's.
+    """
+    from typer.testing import CliRunner
+
+    import mlime.__main__ as cli
+    import mlime.train.count as count
+    from mlime.train.run import Slices, Vocabularies
+
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    argv = kernel.count_argv(tmp_path / "char_pinyin.tsv", tmp_path / "batch-counts.json", None)
+    command = argv.index("mlime")
+    assert argv[command + 1 : command + 3] == ["train", "count-batches"]
+    assert "--workers" not in argv
+
+    asked: dict[str, object] = {}
+
+    class CountedError(Exception):
+        pass
+
+    def counting(*args: object, **kwargs: object) -> None:
+        asked.update(kwargs)
+        raise CountedError
+
+    monkeypatch.setattr(count, "count_batches", counting)
+    monkeypatch.setattr(Vocabularies, "load", classmethod(lambda cls, *_: None))
+    monkeypatch.setattr(cli, "route_a_slices", lambda *_: Slices(train=("a",), held_out=()))
+    (tmp_path / "char_pinyin.tsv").touch()
+    result = CliRunner().invoke(cli.app, [str(arg) for arg in argv[command + 1 :]])
+    assert isinstance(result.exception, CountedError), result.output
+    assert asked["workers"] == os.process_cpu_count()
+    assert asked["world_size"] == 2
