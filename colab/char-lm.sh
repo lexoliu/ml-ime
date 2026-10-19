@@ -28,6 +28,9 @@ case $command in
     # Staging downloads gigabytes, far past what one `colab exec` waits for,
     # so it runs as its own process and `status` reads its log.
     colab upload -s $session "$here/colab/stage.py" /kaggle/stage.py
+    for f in kaggle/aria2.py colab/hub.py; do
+      colab upload -s $session "$here/$f" "/kaggle/$(basename $f)"
+    done
     printf 'import subprocess, sys\nlog = open("/kaggle/working/stage.out", "ab")\nchild = subprocess.Popen([sys.executable, "/kaggle/stage.py"], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)\nprint(f"staging started, pid {child.pid}; log /kaggle/working/stage.out")\n' | colab exec -s $session
     ;;
   status)

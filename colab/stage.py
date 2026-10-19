@@ -5,19 +5,19 @@ Runs on the VM as its own process, which `colab/char-lm.sh start` launches
 Face token and the kernel script. It recreates the mount layout the Kaggle
 kernel expects (`/kaggle/input/<slug>` holding each dataset's files,
 `/kaggle/working` for outputs) by downloading the same datasets from their
-private Hugging Face repos, all at once, then launches the unchanged kernel as
-a process that outlives this one.
+private Hugging Face repos, all of them in one `aria2c` run (`hub.py`), then
+launches the unchanged kernel as a process that outlives this one.
 """
 
 import os
 import subprocess
 import sys
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 INPUTS = Path("/kaggle/input")
 WORKING = Path("/kaggle/working")
 KERNEL = Path("/kaggle/kernel.py")
+HUB = Path("/kaggle/hub.py")
 HF_TOKEN = Path("/root/.cache/huggingface/token")
 #: Private Hub dataset repos, named like the Kaggle slugs the kernel mounts.
 DATASETS = (
@@ -28,28 +28,26 @@ DATASETS = (
 )
 
 
-def download(dataset):
-    """Download the Hub dataset repo *dataset* into its mount directory."""
-    from huggingface_hub import snapshot_download
-
-    mount = INPUTS / dataset.split("/")[1]
-    snapshot_download(dataset, repo_type="dataset", local_dir=mount, max_workers=8)
-    # The Hub keeps its download metadata under the mount's `.cache`.
-    files = sum(1 for f in mount.rglob("*") if f.is_file() and ".cache" not in f.parts)
-    print(f"{dataset}: {files} files", flush=True)
-
-
 def main():
-    subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub"], check=True
-    )
+    installs = [
+        subprocess.Popen([sys.executable, "-m", "pip", "install", "-q", "-U", "huggingface_hub"]),
+        subprocess.Popen(["apt-get", "install", "-y", "-q", "aria2"]),
+    ]
+    for install in installs:
+        if install.wait() != 0:
+            raise subprocess.CalledProcessError(install.returncode, install.args)
     if not HF_TOKEN.is_file():
         raise FileNotFoundError(f"upload ~/.cache/huggingface/token to {HF_TOKEN} first")
-    if not KERNEL.is_file():
-        raise FileNotFoundError(f"upload kaggle/char-lm/kernel.py to {KERNEL} first")
+    for uploaded in (KERNEL, HUB, HUB.parent / "aria2.py"):
+        if not uploaded.is_file():
+            raise FileNotFoundError(f"upload {uploaded.name} to {uploaded} first")
     WORKING.mkdir(parents=True, exist_ok=True)
-    with ThreadPoolExecutor(max_workers=len(DATASETS)) as pool:
-        list(pool.map(download, DATASETS))
+    # Imported only now: the Hub client is the one just installed, and
+    # `hub.py` finds `aria2.py` beside it.
+    sys.path.insert(0, str(HUB.parent))
+    import hub
+
+    hub.download(DATASETS, INPUTS)
     log = open(WORKING / "kernel.out", "ab")  # noqa: SIM115 -- handed to the child
     child = subprocess.Popen(
         [sys.executable, str(KERNEL)],
