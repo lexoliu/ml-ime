@@ -11,13 +11,14 @@
 # GPUs it finds, so one A100 trains the same batches as two T4s.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
+source "$here/colab/provision.sh"
 session=char-lm
 command=${1:?start|status|fetch|stop}; shift
 case $command in
   start)
     gpu=A100
     while [ $# -gt 0 ]; do case $1 in --gpu) gpu=$2; shift 2;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
-    colab new -s $session --gpu "$gpu"
+    provision $session --gpu "$gpu"
     # Colab mounts an empty, read-only /kaggle/input for its own Kaggle
     # integration; the kernel reads the datasets staged there, so it goes first.
     printf 'import os, subprocess\nif os.path.ismount("/kaggle/input"):\n    subprocess.run(["umount", "/kaggle/input"], check=True)\nfor d in ("/root/.cache/huggingface", "/kaggle/input", "/kaggle/working"): os.makedirs(d, exist_ok=True)\n' | colab exec -s $session
@@ -32,6 +33,7 @@ case $command in
       colab upload -s $session "$here/$f" "/kaggle/$(basename $f)"
     done
     printf 'import subprocess, sys\nlog = open("/kaggle/working/stage.out", "ab")\nchild = subprocess.Popen([sys.executable, "/kaggle/stage.py"], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)\nprint(f"staging started, pid {child.pid}; log /kaggle/working/stage.out")\n' | colab exec -s $session
+    provisioned
     ;;
   status)
     printf 'from pathlib import Path\np = Path("/kaggle/working")\nfor name in ("stage.out", "kernel.out", "train.log"):\n    f = p / name\n    if f.is_file():\n        print(f"--- {name} ---")\n        print(f.read_text()[-3000:])\nprint("summary:", (p / "run-summary.json").is_file())\n' | colab exec -s $session
