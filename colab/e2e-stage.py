@@ -59,7 +59,9 @@ def hub_dataset(source):
     snapshot_download(
         source, repo_type="dataset", local_dir=mount, max_workers=HUB_WORKERS_PER_REPO
     )
-    print(f"{source}: {sum(1 for _ in mount.rglob('*') if _.is_file())} files", flush=True)
+    # The Hub keeps its download metadata under the mount's `.cache`.
+    files = sum(1 for f in mount.rglob("*") if f.is_file() and ".cache" not in f.parts)
+    print(f"{source}: {files} files", flush=True)
     return mount
 
 

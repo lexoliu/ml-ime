@@ -34,7 +34,9 @@ def download(dataset):
 
     mount = INPUTS / dataset.split("/")[1]
     snapshot_download(dataset, repo_type="dataset", local_dir=mount, max_workers=8)
-    print(f"{dataset}: {sum(1 for _ in mount.rglob('*') if _.is_file())} files", flush=True)
+    # The Hub keeps its download metadata under the mount's `.cache`.
+    files = sum(1 for f in mount.rglob("*") if f.is_file() and ".cache" not in f.parts)
+    print(f"{dataset}: {files} files", flush=True)
 
 
 def main():
