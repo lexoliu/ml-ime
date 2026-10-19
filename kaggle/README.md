@@ -102,7 +102,12 @@ time, for about 35 compute units.
 
 `colab/e2e.sh <kernel dir> start --session-hours H [--commit REV] [--gpu G|--cpu]
 [--census FILE] [--resume-from RUN] [--no-publish]` does the same for a stamped
-e2e kernel (`kaggle/e2e`, or a run stamped from it with `mlime e2e stamp`). The
+e2e kernel (`kaggle/e2e`, or a run stamped from it with `mlime e2e stamp`).
+`mlime e2e stamp mlime-e2e-v2-<card> --out DIR [--train-shard S ...]
+[--profile-steps N] [--trace-steps N]` writes a v2 run's directory: v1's recipe
+(refused when `kaggle/e2e` no longer holds it), the run's own slug, so its
+trios and segments are its own, and the v2 sources alone (the assets, the four
+shard repos and `mlime-e2e-init`). The
 code is one commit of this public repository: the VM fetches `--commit`
 (default HEAD, refused when this checkout has uncommitted changes or no branch
 of origin holds it) from GitHub, the kernel imports `mlime` from that checkout

@@ -25,11 +25,9 @@ dies without warning loses minutes of training, not the leg.
 """
 
 import argparse
-import ast
 import importlib.util
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -49,12 +47,15 @@ PUBLISHER = HERE / "e2e-publish.py"
 HUB = HERE / "hub.py"
 OUTPUT = HERE.parent / "kaggle" / "output.py"
 ARIA2 = HERE.parent / "kaggle" / "aria2.py"
+# The checkout's `mlime.stamp`, the one kernel rewrite the repository has; it
+# is standard library only, so it imports before anything is installed.
+sys.path.insert(0, str(HERE.parent / "python" / "src"))
+from mlime.stamp import literal, stamp  # noqa: E402
+
 HF_TOKEN = Path("/root/.cache/huggingface/token")
 #: The files of a kernel output the kernel reads: a finished run's final
 #: checkpoint and config, and a paused segment's trio.
-KERNEL_READS = (
-    r"^(run-config\.json|run-summary\.json|checkpoint-paused\.pt|run/checkpoint-final\.pt)$"
-)
+KERNEL_READS = r"^(run-config\.json|run-summary\.json|checkpoint-paused\.pt|run/checkpoint-final\.pt)$"
 RESUME_MARKERS = ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
 #: Transfers in flight while staging: the Hub repos, the resume trio, the
 #: compile caches and the latest Kaggle segment's probe.
@@ -96,16 +97,26 @@ def compile_caches(publisher, api):
         print("no GPU: nothing compiles, so no compile caches", flush=True)
         return
     path = publisher.compile_cache_path()
-    entries = api.list_bucket_tree(publisher.BUCKET, prefix=f"{publisher.CACHE_PREFIX}/")
+    entries = api.list_bucket_tree(
+        publisher.BUCKET, prefix=f"{publisher.CACHE_PREFIX}/"
+    )
     if not any(entry.type == "file" and entry.path == path for entry in entries):
-        print(f"{publisher.BUCKET}/{path}: not packed yet; the kernel compiles", flush=True)
+        print(
+            f"{publisher.BUCKET}/{path}: not packed yet; the kernel compiles",
+            flush=True,
+        )
         return
     archive = publisher.INDUCTOR_CACHE.with_suffix(".tar")
-    api.download_bucket_files(publisher.BUCKET, [(path, archive)], raise_on_missing_files=True)
+    api.download_bucket_files(
+        publisher.BUCKET, [(path, archive)], raise_on_missing_files=True
+    )
     with tarfile.open(archive) as tar:
         tar.extractall(publisher.INDUCTOR_CACHE, filter="data")
     archive.unlink()
-    print(f"{publisher.BUCKET}/{path}: restored under {publisher.INDUCTOR_CACHE}", flush=True)
+    print(
+        f"{publisher.BUCKET}/{path}: restored under {publisher.INDUCTOR_CACHE}",
+        flush=True,
+    )
 
 
 def kernel_status(slug):
@@ -145,7 +156,9 @@ def latest_segment(base):
             break
         lowered = status.lower()
         if "running" in lowered or "queued" in lowered:
-            raise RuntimeError(f"{slug} is {status}; refusing to start a second lineage")
+            raise RuntimeError(
+                f"{slug} is {status}; refusing to start a second lineage"
+            )
         if "complete" in lowered:
             latest = slug
         n += 1
@@ -163,7 +176,8 @@ def kernel_output(slug):
     mount = INPUTS / slug.split("/")[1]
     mount.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        [sys.executable, str(OUTPUT), slug, str(mount), "--pattern", KERNEL_READS], check=True
+        [sys.executable, str(OUTPUT), slug, str(mount), "--pattern", KERNEL_READS],
+        check=True,
     )
     print(f"{slug}: output staged under {mount}", flush=True)
     return mount
@@ -180,7 +194,9 @@ def step_of(trio):
     """The step the checkpoint itself records; a summary's field can lag it."""
     import torch
 
-    state = torch.load(trio / "checkpoint-paused.pt", map_location="cpu", weights_only=False)
+    state = torch.load(
+        trio / "checkpoint-paused.pt", map_location="cpu", weights_only=False
+    )
     return int(state["step"])
 
 
@@ -190,27 +206,10 @@ def trios():
     for directory in [INPUTS, *[d for d in INPUTS.rglob("*") if d.is_dir()]]:
         if all((directory / marker).is_file() for marker in RESUME_MARKERS):
             config = json.loads((directory / "run-config.json").read_text())
-            found.append((directory, int(config.get("segment", -1)), step_of(directory)))
+            found.append(
+                (directory, int(config.get("segment", -1)), step_of(directory))
+            )
     return found
-
-
-def stamp(source, **fields):
-    """Rewrite a ``NAME = value`` kernel line per field as the value's literal.
-
-    A field the kernel has no line for is refused: a stamp that lands nowhere
-    would leave the kernel's default in force without a word.
-    """
-    for key, value in fields.items():
-        source, count = re.subn(
-            rf"^{key} = .*$",
-            lambda _, key=key, value=value: f"{key} = {value!r}",
-            source,
-            count=1,
-            flags=re.MULTILINE,
-        )
-        if count != 1:
-            raise RuntimeError(f"{KERNEL} holds no `{key} =` line to stamp")
-    return source
 
 
 def launch(argv, log_name, pid_name):
@@ -225,17 +224,15 @@ def launch(argv, log_name, pid_name):
         start_new_session=True,
     )
     (WORKING / pid_name).write_text(f"{child.pid}\n")
-    print(f"{' '.join(argv)} started, pid {child.pid}; log {WORKING / log_name}", flush=True)
+    print(
+        f"{' '.join(argv)} started, pid {child.pid}; log {WORKING / log_name}",
+        flush=True,
+    )
 
 
 def requirements(kernel):
     """The kernel's pinned `REQUIREMENTS`, read from its source without running it."""
-    for node in ast.parse(kernel.read_text()).body:
-        if isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == [
-            "REQUIREMENTS"
-        ]:
-            return list(ast.literal_eval(node.value))
-    raise RuntimeError(f"{kernel} holds no REQUIREMENTS")
+    return list(literal(kernel.read_text(), "REQUIREMENTS"))
 
 
 def options(argv=None):
@@ -248,7 +245,9 @@ def options(argv=None):
         type=int,
         help="How long this runtime is held; the kernel pauses inside it",
     )
-    parser.add_argument("--resume-from", help="Resume this run's newest trio, not the leg's own")
+    parser.add_argument(
+        "--resume-from", help="Resume this run's newest trio, not the leg's own"
+    )
     parser.add_argument("--no-publish", action="store_true", help="Run no publisher")
     parser.add_argument(
         "--allow-commit-change",
@@ -257,7 +256,9 @@ def options(argv=None):
     )
     parsed = parser.parse_args(argv)
     if parsed.session_seconds <= 0:
-        parser.error(f"--session-seconds must be positive, got {parsed.session_seconds}")
+        parser.error(
+            f"--session-seconds must be positive, got {parsed.session_seconds}"
+        )
     return parsed
 
 
@@ -332,7 +333,9 @@ def main(argv=None):
     candidates = trios()
     picked = max(candidates, key=lambda candidate: candidate[2], default=None)
     segment = 0 if picked is None else picked[1] + 1
-    KERNEL.write_text(stamp(KERNEL.read_text(), **stamps(leg, segment)), encoding="utf-8")
+    KERNEL.write_text(
+        stamp(KERNEL.read_text(), **stamps(leg, segment)), encoding="utf-8"
+    )
     print(
         f"segment {segment}; resume candidates: "
         + ", ".join(f"{directory} at step {step}" for directory, _, step in candidates),
