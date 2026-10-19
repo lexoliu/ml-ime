@@ -17,7 +17,7 @@ import torch
 from torch import nn
 
 from mlime.train.charlm_vocab import BOS
-from mlime.train.e2e_model import E2EModel
+from mlime.train.e2e_model import Decoder, E2EModel
 
 
 @dataclass(frozen=True)
@@ -39,42 +39,89 @@ class Lane:
         return int(self.vectors.shape[0])
 
 
-def decode_lanes(
-    model: E2EModel, lanes: Sequence[Lane], beam_width: int
-) -> list[list[tuple[list[int], float]]]:
-    """Beam-search lanes together; each lane's hypotheses and scores.
+def bucket(size: int) -> int:
+    """*size* rounded up to the next of four steps an octave: 8, 10, 12, 14, 16, 20, ...
+
+    A captured search graph serves one shape; padding every search to these
+    sizes bounds the graphs a run records by a few an octave, at a quarter
+    of padding at most.
+    """
+    if size <= 8:
+        return 8
+    quantum = 1 << (size.bit_length() - 3)
+    return -(-size // quantum) * quantum
+
+
+@dataclass(frozen=True)
+class SearchInputs:
+    """What a search reads on the device, lanes padded to one length.
+
+    ``vectors [L, T, enc]`` and ``masks [L, T, E]`` are every lane's span
+    vectors and admitted characters, ``lane_lengths [L]`` each lane's own
+    length. ``ragged`` is whether the lanes differ in length, decided on the
+    host: an equal-length search takes no mask, so its arithmetic is the
+    unpadded search's exactly.
+    """
+
+    vectors: torch.Tensor
+    masks: torch.Tensor
+    lane_lengths: torch.Tensor
+    ragged: bool
+    width: int
+
+
+def search_inputs(
+    lanes: Sequence[Lane], beam_width: int, device: torch.device, *, bucketed: bool
+) -> SearchInputs:
+    """Pad *lanes* into the tensors a search reads; with *bucketed*, to :func:`bucket` sizes.
+
+    The extra lanes a bucket adds admit nothing, so every row of theirs stays
+    at minus infinity, and the extra positions are the ragged search's ended
+    steps.
+    """
+    lengths = [lane.length for lane in lanes]
+    length = max(lengths)
+    if bucketed:
+        length = bucket(length)
+        filler = lanes[0]
+        padding = bucket(len(lanes)) - len(lanes)
+        lanes = [
+            *lanes,
+            *[
+                Lane(-1, filler.vectors[:1], torch.zeros_like(filler.candidates[:1]))
+                for _ in range(padding)
+            ],
+        ]
+        lengths += [1] * padding
+    vectors = nn.utils.rnn.pad_sequence([lane.vectors for lane in lanes], batch_first=True)
+    masks = nn.utils.rnn.pad_sequence([lane.candidates for lane in lanes], batch_first=True)
+    vectors = nn.functional.pad(vectors, (0, 0, 0, length - vectors.shape[1]))
+    masks = nn.functional.pad(masks, (0, 0, 0, length - masks.shape[1]))
+    return SearchInputs(
+        vectors=vectors.to(device),
+        masks=masks.to(device),
+        lane_lengths=torch.tensor(lengths).to(device),
+        ragged=min(lengths) != length,
+        width=beam_width,
+    )
+
+
+def run_search(
+    decoder: Decoder, inputs: SearchInputs
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The whole search on the device: ``parents``, ``choices [T, L, W]`` and the final scores.
 
     Every lane owns a block of ``beam_width`` rows from the first step, the
     unused ones at a score of minus infinity, so the row layout never changes
     and a lane's beams read its encoder keys and values as one block, computed
-    once per lane. Each step's scores are
-    log-probabilities over the full emittable row, and the candidate
-    restriction masks the characters the position does not admit afterwards,
-    so a path's score is comparable with another segmentation's. Rows still at minus
-    infinity when the path ends are slots the lattice never filled and are
-    dropped, so a lane admitting fewer than ``beam_width`` sentences returns
-    fewer.
-
-    Lanes may differ in length. A shorter lane's span vectors are padded and
-    masked out of the cross-attention, and once it has ended each of its rows
-    continues with a single free step, so its beam is carried unchanged to the
-    last position and cut back to its own length on the way out. Lanes of one
-    length -- what the evaluation's buckets hold -- take no mask and no
-    padding, so their arithmetic is the equal-length search's exactly.
+    once per lane. Nothing here reads back to the host, so the whole search
+    can be captured as one CUDA graph (:class:`SearchGraphs`).
     """
-    decoder = model.decoder
-    device = decoder.emit_ids.device
-    count, width = len(lanes), beam_width
+    vectors, masks = inputs.vectors, inputs.masks
+    device = vectors.device
+    count, length, emittable = masks.shape
+    width = inputs.width
     rows = count * width
-    lengths = [lane.length for lane in lanes]
-    length = max(lengths)
-    vectors = nn.utils.rnn.pad_sequence([lane.vectors for lane in lanes], batch_first=True).to(
-        device
-    )
-    masks = nn.utils.rnn.pad_sequence([lane.candidates for lane in lanes], batch_first=True).to(
-        device
-    )
-    emittable = masks.shape[-1]
     everything = torch.arange(emittable, device=device)
     lane_of_row = torch.arange(count, device=device).repeat_interleave(width)
     # Contiguous once here, or every step's attention copies them into shape.
@@ -82,10 +129,9 @@ def decode_lanes(
         (keys.contiguous(), values.contiguous())
         for keys, values in (cross.kv(vectors) for cross in decoder.gated_layers())
     ]
-    ragged = min(lengths) != length
-    lane_lengths = torch.tensor(lengths, device=device)
+    lane_lengths = inputs.lane_lengths
     encoder_mask = (
-        torch.arange(length, device=device) < lane_lengths.unsqueeze(1) if ragged else None
+        torch.arange(length, device=device) < lane_lengths.unsqueeze(1) if inputs.ragged else None
     )
     # The step an ended row takes: emission 0 for free, everything else barred.
     carried = torch.full((emittable,), float("-inf"), device=device)
@@ -110,53 +156,181 @@ def decode_lanes(
     parents: list[torch.Tensor] = []
     choices: list[torch.Tensor] = []
     # Rows, length and span count change with every search; marked here, a
-    # compiled step's first graph is the dynamic one.
-    for tensor in (lane_of_row, *(part for pair in encoder_kv for part in pair)):
+    # compiled advance's first graph is the dynamic one.
+    for tensor in (lane_of_row, tokens, scores, block, lane_lengths, vectors, masks):
         torch._dynamo.maybe_mark_dynamic(tensor, 0)
+    for tensor in (vectors, masks):
+        torch._dynamo.maybe_mark_dynamic(tensor, 1)
+    for tensor in (keys, values):
+        torch._dynamo.maybe_mark_dynamic(tensor, (1, 3))
     for pair in encoder_kv:
         for part in pair:
-            torch._dynamo.maybe_mark_dynamic(part, 2)
+            torch._dynamo.maybe_mark_dynamic(part, (0, 2))
     for position in range(length):
-        span_vector = vectors[lane_of_row, position]
-        for tensor in (tokens, span_vector):
-            torch._dynamo.maybe_mark_dynamic(tensor, 0)
-        for tensor in (keys, values):
-            torch._dynamo.maybe_mark_dynamic(tensor, (1, 3))
-        at = positions[position]
-        logits, (new_keys, new_values) = decoder.step(
+        tokens, scores, (keys, values), parent, choice = decoder.advance(
+            positions[position],
             tokens,
-            span_vector,
-            at,
+            scores,
             (keys, values),
+            vectors,
+            masks,
+            lane_of_row,
             encoder_kv,
             encoder_mask,
-            candidates=everything,
+            lane_lengths,
+            carried,
+            everything,
+            block,
         )
-        keys.index_copy_(3, at.view(1), new_keys)
-        values.index_copy_(3, at.view(1), new_values)
-        admitted = masks[lane_of_row, position]
-        log_probs = logits.float().log_softmax(dim=-1).masked_fill(~admitted, float("-inf"))
-        if ragged:
-            ended = (lane_lengths <= position)[lane_of_row]
-            log_probs = torch.where(ended.unsqueeze(1), carried, log_probs)
-        total = (scores.reshape(rows, 1) + log_probs).reshape(count, width * emittable)
-        top = total.topk(width, dim=1)
-        parent = top.indices // emittable
-        choice = top.indices % emittable
-        source = (block + parent).reshape(rows)
-        keys, values = keys.index_select(1, source), values.index_select(1, source)
-        tokens = decoder.emit_ids[choice.reshape(rows)]
-        scores = top.values
         parents.append(parent)
         choices.append(choice)
+    return torch.stack(parents), torch.stack(choices), scores
 
+
+class SearchGraphs:
+    """Beam searches captured as CUDA graphs, one a bucketed shape, replayed.
+
+    A search position is some four hundred kernels, and issuing them one by
+    one from the host is what bounds the ranking step on a fast card (#137):
+    replayed from a graph, a whole search is one launch. Searches are padded
+    to :func:`bucket` shapes, so a run captures a few graphs an octave of lane
+    count and length. Every graph's inputs are views of one set of flat
+    buffers, grown when a larger shape arrives (which drops the graphs that
+    baked the old addresses), and every graph's working memory comes from one
+    shared pool: searches never overlap, so neither costs more than the
+    largest search alone.
+    """
+
+    def __init__(self) -> None:
+        self.pool = torch.cuda.graph_pool_handle()
+        self.flat: dict[str, torch.Tensor] = {}
+        self.captured: dict[
+            tuple[object, ...],
+            tuple[torch.cuda.CUDAGraph, SearchInputs, tuple[torch.Tensor, ...]],
+        ] = {}
+
+    def _view(self, name: str, like: torch.Tensor) -> torch.Tensor:
+        """A view shaped like *like* into the flat buffer *name*, grown when too small."""
+        flat = self.flat.get(name)
+        if flat is None or flat.numel() < like.numel() or flat.dtype != like.dtype:
+            self.flat[name] = torch.empty(
+                max(like.numel(), 0 if flat is None else flat.numel()),
+                dtype=like.dtype,
+                device=like.device,
+            )
+            self.captured.clear()
+            flat = self.flat[name]
+        return flat[: like.numel()].view(like.shape)
+
+    def run(
+        self, decoder: Decoder, inputs: SearchInputs
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """:func:`run_search` over *inputs*, from this shape's captured graph."""
+        autocast = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None
+        key = (inputs.masks.shape, inputs.vectors.dtype, inputs.ragged, inputs.width, autocast)
+        given = (inputs.vectors, inputs.masks, inputs.lane_lengths)
+        captured = self.captured.get(key)
+        if captured is None:
+            vectors, masks, lane_lengths = (
+                self._view(name, tensor)
+                for name, tensor in zip(("vectors", "masks", "lane_lengths"), given, strict=True)
+            )
+            static = SearchInputs(
+                vectors, masks, lane_lengths, ragged=inputs.ragged, width=inputs.width
+            )
+        else:
+            static = captured[1]
+        for view, tensor in zip(
+            (static.vectors, static.masks, static.lane_lengths), given, strict=True
+        ):
+            view.copy_(tensor)
+        if captured is None:
+            captured = self.captured[key] = self._capture(decoder, static, autocast)
+        graph, _, outputs = captured
+        graph.replay()
+        parents, choices, scores = outputs
+        return parents, choices, scores
+
+    def _capture(
+        self, decoder: Decoder, static: SearchInputs, autocast: torch.dtype | None
+    ) -> tuple[torch.cuda.CUDAGraph, SearchInputs, tuple[torch.Tensor, ...]]:
+        """Warm the search up on a side stream, then capture it over *static*.
+
+        Autocast's weight-cast cache would hand the graph casts made outside
+        it, so the casts are taken inside, uncached, like every other kernel.
+        """
+
+        def search() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+            if autocast is None:
+                return run_search(decoder, static)
+            with torch.autocast("cuda", dtype=autocast, cache_enabled=False):
+                return run_search(decoder, static)
+
+        side = torch.cuda.Stream()  # type: ignore[no-untyped-call]  # torch ships it untyped
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            search()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, pool=self.pool):
+            outputs = search()
+        return graph, static, outputs
+
+
+def decode_lanes(
+    model: E2EModel,
+    lanes: Sequence[Lane],
+    beam_width: int,
+    *,
+    graphs: SearchGraphs | None = None,
+) -> list[list[tuple[list[int], float]]]:
+    """Beam-search lanes together; each lane's hypotheses and scores.
+
+    Each step's scores are log-probabilities over the full emittable row, and
+    the candidate restriction masks the characters the position does not
+    admit afterwards, so a path's score is comparable with another
+    segmentation's. Rows still at minus infinity when the path ends are slots
+    the lattice never filled and are dropped, so a lane admitting fewer than
+    ``beam_width`` sentences returns fewer.
+
+    Lanes may differ in length. A shorter lane's span vectors are padded and
+    masked out of the cross-attention, and once it has ended each of its rows
+    continues with a single free step, so its beam is carried unchanged to the
+    last position and cut back to its own length on the way out. Lanes of one
+    length -- what the evaluation's buckets hold -- take no mask and no
+    padding, so their arithmetic is the equal-length search's exactly.
+
+    With *graphs* the search is padded to bucketed shapes and replayed from
+    the graph captured for its shape.
+    """
+    decoder = model.decoder
+    inputs = search_inputs(lanes, beam_width, decoder.emit_ids.device, bucketed=graphs is not None)
+    if graphs is None:
+        parents, choices, scores = run_search(decoder, inputs)
+    else:
+        parents, choices, scores = graphs.run(decoder, inputs)
+    return walk_back(parents, choices, scores, lanes)
+
+
+def walk_back(
+    parents: torch.Tensor,
+    choices: torch.Tensor,
+    scores: torch.Tensor,
+    lanes: Sequence[Lane],
+) -> list[list[tuple[list[int], float]]]:
+    """Each lane's hypotheses, read back from a search's parents and choices.
+
+    Lanes past ``lanes`` -- a bucket's padding -- are not read; each
+    sequence is cut back to its own lane's length.
+    """
     # Plain lists: the walk back reads one element at a time, which a tensor
     # charges a dispatch for.
-    parent_steps: list[list[list[int]]] = torch.stack(parents).tolist()
-    choice_steps: list[list[list[int]]] = torch.stack(choices).tolist()
+    parent_steps: list[list[list[int]]] = parents.tolist()
+    choice_steps: list[list[list[int]]] = choices.tolist()
     final: list[list[float]] = scores.tolist()
+    length = len(parent_steps)
     decoded: list[list[tuple[list[int], float]]] = []
-    for lane in range(count):
+    for lane, own in enumerate(lane.length for lane in lanes):
         hypotheses = []
         for beam, score in enumerate(final[lane]):
             if score == float("-inf"):
@@ -167,6 +341,6 @@ def decode_lanes(
                 sequence.append(choice_steps[position][lane][row])
                 row = parent_steps[position][lane][row]
             sequence.reverse()
-            hypotheses.append((sequence[: lengths[lane]], score))
+            hypotheses.append((sequence[:own], score))
         decoded.append(hypotheses)
     return decoded
