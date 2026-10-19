@@ -21,6 +21,7 @@
 # the leg.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
+source "$here/colab/provision.sh"
 kernel_dir=$(cd "${1:?kernel dir}" && pwd); shift
 slug=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["id"])' "$kernel_dir/kernel-metadata.json")
 session=$(basename "${slug%-s[0-9]*}")
@@ -35,7 +36,7 @@ case $command in
       --census) census=$(cd "$(dirname "$2")" && pwd)/$(basename "$2"); shift 2;;
       *) echo "unknown argument $1" >&2; exit 2;;
     esac; done
-    colab new -s $session ${gpu:+--gpu "$gpu"}
+    provision $session ${gpu:+--gpu "$gpu"}
     # Colab mounts an empty, read-only /kaggle/input for its own Kaggle
     # integration; the kernel reads the datasets staged there, so it goes first.
     printf 'import os, subprocess\nif os.path.ismount("/kaggle/input"):\n    subprocess.run(["umount", "/kaggle/input"], check=True)\nfor d in ("/root/.kaggle", "/root/.cache/huggingface", "/kaggle/input", "/kaggle/working"): os.makedirs(d, exist_ok=True)\n' | colab exec -s $session
@@ -60,6 +61,7 @@ case $command in
     # so it runs as its own process and `status` reads its log.
     colab upload -s $session "$here/colab/e2e-stage.py" /kaggle/stage.py
     printf 'import subprocess, sys\nlog = open("/kaggle/working/stage.out", "ab")\nchild = subprocess.Popen([sys.executable, "/kaggle/stage.py"], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)\nprint(f"staging started, pid {child.pid}; log /kaggle/working/stage.out")\n' | colab exec -s $session
+    provisioned
     ;;
   status)
     printf 'import json, time\nfrom pathlib import Path\np = Path("/kaggle/working")\nfor name in ("stage.out", "kernel.out", "train.log", "publish.out"):\n    f = p / name\n    if f.is_file():\n        print(f"--- {name} ---")\n        print(f.read_text()[-3000:])\nstate = p / "publish-state.json"\nif state.is_file():\n    s = json.loads(state.read_text())\n    if "last_published_at" in s:\n        print(f"last publish: step {s[\"last_published_step\"]}, {round(time.time() - s[\"last_published_at\"])}s ago")\n    if s.get("last_error"):\n        print(f"last publish error: {s[\"last_error\"]}")\nrun = p / "run"\nif run.is_dir():\n    print("intervals:", sorted(d.name for d in run.glob("interval-*")))\n' | colab exec -s $session

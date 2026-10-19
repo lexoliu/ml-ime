@@ -92,7 +92,10 @@ google-colab-cli`, then `colab usage` once to log in). `start` provisions the
 runtime (an A100 by default), uploads the Hugging Face token and the kernel,
 and runs `colab/stage.py` on the VM, which downloads the four datasets from
 their private Hugging Face repos into `/kaggle/input/<slug>` and launches the
-kernel as a detached process; `status`, `fetch <dir>` and `stop` follow. The kernel sizes itself to
+kernel as a detached process; `status`, `fetch <dir>` and `stop` follow. Both launchers
+provision through `colab/provision.sh`: `start` refuses a session name that is already running,
+and a step that fails after the runtime exists stops that runtime and names the step, so a
+failed start leaves nothing billing and can simply be run again. The kernel sizes itself to
 the GPUs it finds (one rank per GPU, `TOKENS_PER_STEP` split across them), so
 one A100 trains the same batches as Kaggle's two T4s in roughly a third of the
 time, for about 35 compute units.
