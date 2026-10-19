@@ -35,6 +35,10 @@ METADATA = Path("/kaggle/kernel-metadata.json")
 PUBLISHER = Path("/kaggle/e2e-publish.py")
 OUTPUT = Path("/kaggle/output.py")
 HUB = Path("/kaggle/hub.py")
+#: Written by `e2e.sh start --resume-from RUN`: the run whose newest trio this
+#: leg resumes instead of its own, so two cards can race the same leg from
+#: one checkpoint while each publishes under its own run name.
+RESUME_FROM = Path("/kaggle/resume-from")
 ARIA2 = Path("/kaggle/aria2.py")
 HF_TOKEN = Path("/root/.cache/huggingface/token")
 #: The files of a kernel output the kernel reads: a finished run's final
@@ -221,6 +225,7 @@ def main():
     sys.path.insert(0, str(HUB.parent))
     import hub
     from huggingface_hub import HfApi
+
     WORKING.mkdir(parents=True, exist_ok=True)
 
     # The run's names -- its Kaggle segments and its place in the resume
@@ -236,10 +241,13 @@ def main():
     # transfer at a time leaves most of the VM's bandwidth unused. The
     # finished runs a stage starts from (`INIT_FROM`) are Hub repos too.
     repos = [*metadata["dataset_sources"], *metadata["kernel_sources"]]
+    resumed_run = (
+        RESUME_FROM.read_text().strip() if RESUME_FROM.is_file() else publisher.run_name(METADATA)
+    )
     with ThreadPoolExecutor(max_workers=STAGING_TRANSFERS) as pool:
         transfers = [
             pool.submit(hub.download, repos, INPUTS),
-            pool.submit(bucket_trio, publisher, api, publisher.run_name(METADATA)),
+            pool.submit(bucket_trio, publisher, api, resumed_run),
             pool.submit(compile_caches, publisher, api),
             pool.submit(stage_latest_segment, base),
         ]
