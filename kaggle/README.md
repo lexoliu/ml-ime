@@ -107,7 +107,10 @@ repos named like its `dataset_sources` and `kernel_sources` (a stage's
 `INIT_FROM`), the run's newest trio in the `lexoliu/mlime-resume` bucket, and
 the newest complete Kaggle segment's output, then launches the kernel and
 `colab/e2e-publish.py`, which puts each interval checkpoint in the bucket so a
-lost VM costs minutes. `--census` hands it a count of the same corpus and batch
+lost VM costs minutes. Once a leg has logged fifty steps the publisher also packs
+inductor's caches (`TORCHINDUCTOR_CACHE_DIR=/tmp/inductor-cache`) into the
+bucket as `compile-cache/<gpu>-torch<version>.tar`, and the next leg's staging
+on the same card restores them, so it trains without compiling again. `--census` hands it a count of the same corpus and batch
 shape so the GPU does not count again, and `--cpu` rehearses the staging on a
 CPU runtime before a GPU is billed for it. The session is named after the run;
 `status`, `fetch <dir>`, `publish` and `stop` follow. Both drivers upload only

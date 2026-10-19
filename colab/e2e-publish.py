@@ -14,13 +14,23 @@ then writes its `complete` marker, and only then deletes every other trio of
 the run. A VM that dies between those calls leaves the previous trio whole
 and the new one without its marker, which staging passes over.
 
+Once this leg has trained a few logged steps it has compiled everything the
+training runs, so the publisher packs inductor's caches once and puts them in
+the bucket under `compile-cache/<gpu>-torch<version>.tar`; the next leg on the
+same card and torch restores them and starts training without compiling again
+(#140).
+
 What it last did -- step and time of the last publish, or the last error -- is
 written to `publish-state.json`, which `e2e.sh status` reads.
 """
 
+import importlib.metadata
 import json
 import os
+import re
 import shutil
+import subprocess
+import tarfile
 import tempfile
 import time
 from pathlib import Path
@@ -39,6 +49,14 @@ BUCKET = "lexoliu/mlime-resume"
 COMPLETE = "complete"
 #: How often the publisher looks for a newer trio than the one it last sent.
 POLL_SECONDS = 60
+#: Where the kernel points inductor's caches (`TORCHINDUCTOR_CACHE_DIR`):
+#: outside the working directory, which a Kaggle segment publishes as output.
+INDUCTOR_CACHE = Path("/tmp/inductor-cache")
+#: The bucket directory the packed caches live in, one archive per card and torch.
+CACHE_PREFIX = "compile-cache"
+#: Step records this leg logs before its caches are packed: by then every graph
+#: the training runs has compiled, the recompile a second shape brings included.
+CACHE_AFTER_RECORDS = 5
 
 #: Steps already read off checkpoints, keyed by the file's identity: path,
 #: modified time, size. A trio lands whole via rename, so a rewrite makes a
@@ -77,6 +95,50 @@ def published_steps(api, run):
         if entry.type == "file" and name == COMPLETE:
             steps.append(int(directory.rpartition("/step-")[2]))
     return sorted(steps)
+
+
+def compile_cache_path():
+    """The bucket path of the compile caches for this VM's GPU and installed torch.
+
+    Inductor keys every entry by its own inputs, so an archive from a different
+    source tree only misses where the source changed; the card and the torch
+    build decide whether any entry can hit at all.
+    """
+    gpu = subprocess.run(
+        ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()[0]
+    torch = importlib.metadata.version("torch")
+    return f"{CACHE_PREFIX}/{re.sub(r'[^A-Za-z0-9.+-]+', '-', gpu)}-torch{torch}.tar"
+
+
+def compiled():
+    """Whether this leg has logged enough steps for its caches to be whole.
+
+    The kernel starts every leg on an empty run directory, so the step records
+    in its metrics are this leg's own. Only finished lines are read; the
+    trainer may be writing the last one.
+    """
+    metrics = RUN / "metrics.jsonl"
+    if not metrics.is_file():
+        return False
+    lines = metrics.read_text().split("\n")[:-1]
+    steps = sum(1 for line in lines if json.loads(line)["event"] == "step")
+    return steps >= CACHE_AFTER_RECORDS
+
+
+def publish_compile_cache(api):
+    """Pack the inductor caches and replace this card's archive in the bucket."""
+    path = compile_cache_path()
+    with tempfile.TemporaryDirectory() as scratch:
+        archive = Path(scratch) / "inductor-cache.tar"
+        with tarfile.open(archive, "w") as tar:
+            tar.add(INDUCTOR_CACHE, arcname=".")
+        api.batch_bucket_files(BUCKET, add=[(archive, path)])
+        size = archive.stat().st_size
+    print(f"published the compile caches ({size} bytes) to {BUCKET}/{path}", flush=True)
 
 
 def record_state(**fields):
@@ -172,6 +234,7 @@ def main():
     api = HfApi()
     run = run_name(METADATA)
     published = None
+    caches_published = False
     while True:
         try:
             if published is None:
@@ -183,6 +246,9 @@ def main():
                 if step is not None:
                     published = step
                     record_state(last_published_step=step, last_published_at=time.time())
+            if not caches_published and compiled():
+                publish_compile_cache(api)
+                caches_published = True
         except (httpx2.HTTPError, OSError) as error:
             # A publish failure is transient until it is not: say so, keep
             # polling, and leave the error where status can read it. What the
