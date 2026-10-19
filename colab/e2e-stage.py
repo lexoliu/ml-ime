@@ -25,6 +25,7 @@ dies without warning loses minutes of training, not the leg.
 """
 
 import argparse
+import ast
 import importlib.util
 import json
 import os
@@ -227,6 +228,16 @@ def launch(argv, log_name, pid_name):
     print(f"{' '.join(argv)} started, pid {child.pid}; log {WORKING / log_name}", flush=True)
 
 
+def requirements(kernel):
+    """The kernel's pinned `REQUIREMENTS`, read from its source without running it."""
+    for node in ast.parse(kernel.read_text()).body:
+        if isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == [
+            "REQUIREMENTS"
+        ]:
+            return list(ast.literal_eval(node.value))
+    raise RuntimeError(f"{kernel} holds no REQUIREMENTS")
+
+
 def options(argv=None):
     """The leg's options; the commit and the session's length have no default."""
     parser = argparse.ArgumentParser(description="Stage and start one e2e leg.")
@@ -265,23 +276,20 @@ def main(argv=None):
     leg = options(argv)
     WORKING.mkdir(parents=True, exist_ok=True)
     LEG.write_text(json.dumps(vars(leg), indent=2) + "\n", encoding="utf-8")
-    # The Hub client with bucket support, and aria2c, which `hub.py` and
-    # `output.py` download with.
-    installs = [
-        subprocess.Popen(
-            [sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle", "huggingface_hub"]
-        ),
-        subprocess.Popen(["apt-get", "install", "-y", "-q", "aria2"]),
-    ]
-    for install in installs:
-        if install.wait() != 0:
-            raise subprocess.CalledProcessError(install.returncode, install.args)
-    for credential in (HF_TOKEN, Path("/root/.kaggle/credentials.json")):
-        if not credential.is_file():
-            raise FileNotFoundError(f"upload {credential.name} to {credential} first")
-    for uploaded in (KERNEL, METADATA):
-        if not uploaded.is_file():
-            raise FileNotFoundError(f"upload {uploaded.name} to {uploaded} first")
+    for needed in (HF_TOKEN, Path("/root/.kaggle/credentials.json"), KERNEL, METADATA):
+        if not needed.is_file():
+            raise FileNotFoundError(f"upload {needed.name} to {needed} first")
+    # aria2c, which `hub.py` and `output.py` download with, beside the Python
+    # packages: the Kaggle client, then the kernel's pins over whatever it
+    # pulled in. The Hub client this stager and the publisher import is the
+    # kernel's pinned one, so the kernel's own install moves nothing under a
+    # publisher that is already running.
+    apt = subprocess.Popen(["apt-get", "install", "-y", "-q", "aria2"])
+    pip = [sys.executable, "-m", "pip", "install", "-q"]
+    subprocess.run([*pip, "-U", "kaggle"], check=True)
+    subprocess.run([*pip, "--no-deps", *requirements(KERNEL)], check=True)
+    if apt.wait() != 0:
+        raise subprocess.CalledProcessError(apt.returncode, apt.args)
     # Imported only now: the Hub client is the one just installed, and
     # `hub.py` imports `aria2.py` from the checkout's kaggle/.
     sys.path[:0] = [str(HUB.parent), str(ARIA2.parent)]
