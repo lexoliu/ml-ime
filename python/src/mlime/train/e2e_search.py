@@ -135,7 +135,7 @@ def run_search(
     )
     # The step an ended row takes: emission 0 for free, everything else barred.
     carried = torch.full((emittable,), float("-inf"), device=device)
-    carried[0] = 0.0
+    carried[:1].fill_(0.0)
     layers, heads = decoder.reader.config.layers, decoder.reader.config.heads
     head_dim = decoder.reader.config.hidden // heads
     # The cache holds the whole path from the start, in the dtype the steps
@@ -149,7 +149,7 @@ def run_search(
     keys = torch.zeros(layers, rows, heads, length, head_dim, dtype=cached, device=device)
     values = torch.zeros_like(keys)
     scores = torch.full((count, width), float("-inf"), device=device)
-    scores[:, 0] = 0.0
+    scores[:, :1].fill_(0.0)
     tokens = torch.full((rows,), BOS, dtype=torch.long, device=device)
     block = torch.arange(count, device=device).unsqueeze(1) * width
     positions = torch.arange(length, device=device)

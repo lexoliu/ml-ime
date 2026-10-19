@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run a Colab leg of an e2e kernel through the Colab CLI.
 #
-#   colab/e2e.sh <kernel dir> start [--gpu T4|--cpu] [--census FILE]
+#   colab/e2e.sh <kernel dir> start [--gpu T4|--cpu] [--census FILE] [--source DIR]
 #                                                provision, stage, resume the newest trio, launch
 #   colab/e2e.sh <kernel dir> status             tail of the kernel's and publisher's logs
 #   colab/e2e.sh <kernel dir> fetch <out dir>    download the metrics, the summary, the logs
@@ -30,12 +30,22 @@ case $command in
   start)
     gpu=T4
     census=
+    source=
     while [ $# -gt 0 ]; do case $1 in
       --gpu) gpu=$2; shift 2;;
       --cpu) gpu=; shift;;
       --census) census=$(cd "$(dirname "$2")" && pwd)/$(basename "$2"); shift 2;;
+      --source) source=$(cd "$2" && pwd); shift 2;;
       *) echo "unknown argument $1" >&2; exit 2;;
     esac; done
+    # --source mounts DIR, laid out like mlime-src (mlime/ and bin/ime-segment),
+    # in place of the published package, to measure a branch before it merges.
+    # Both at once would mount two packages, so the kernel's inputs must not
+    # name mlime-src.
+    if [ -n "$source" ] && grep -q '"lexoliu/mlime-src"' "$kernel_dir/kernel-metadata.json"; then
+      echo "--source replaces lexoliu/mlime-src; drop it from $kernel_dir/kernel-metadata.json" >&2
+      exit 2
+    fi
     provision $session ${gpu:+--gpu "$gpu"}
     # Colab mounts an empty, read-only /kaggle/input for its own Kaggle
     # integration; the kernel reads the datasets staged there, so it goes first.
@@ -56,6 +66,12 @@ case $command in
     if [ -n "$census" ]; then
       printf 'import os\nos.makedirs("/kaggle/input/census", exist_ok=True)\n' | colab exec -s $session
       colab upload -s $session "$census" /kaggle/input/census/batch-counts.json
+    fi
+    if [ -n "$source" ]; then
+      package=$(mktemp -d)/mlime.tar
+      tar -C "$source" --exclude __pycache__ -cf "$package" .
+      colab upload -s $session "$package" /kaggle/mlime.tar
+      printf 'import os, tarfile\nos.makedirs("/kaggle/input/mlime-src", exist_ok=True)\ntarfile.open("/kaggle/mlime.tar").extractall("/kaggle/input/mlime-src", filter="data")\n' | colab exec -s $session
     fi
     # Staging downloads gigabytes, far past what one `colab exec` waits for,
     # so it runs as its own process and `status` reads its log.
