@@ -20,8 +20,10 @@ case $command in
     colab new -s $session --gpu "$gpu"
     # Colab mounts an empty, read-only /kaggle/input for its own Kaggle
     # integration; the kernel reads the datasets staged there, so it goes first.
-    printf 'import os, subprocess\nif os.path.ismount("/kaggle/input"):\n    subprocess.run(["umount", "/kaggle/input"], check=True)\nfor d in ("/root/.kaggle", "/kaggle/input", "/kaggle/working"): os.makedirs(d, exist_ok=True)\n' | colab exec -s $session
-    colab upload -s $session "$HOME/.kaggle/credentials.json" /root/.kaggle/credentials.json
+    printf 'import os, subprocess\nif os.path.ismount("/kaggle/input"):\n    subprocess.run(["umount", "/kaggle/input"], check=True)\nfor d in ("/root/.cache/huggingface", "/kaggle/input", "/kaggle/working"): os.makedirs(d, exist_ok=True)\n' | colab exec -s $session
+    # Only the access token: the OAuth refresh token stays on the Mac, so no
+    # VM ever refreshes it and invalidates the Mac's login.
+    colab upload -s $session "$HOME/.cache/huggingface/token" /root/.cache/huggingface/token
     colab upload -s $session "$here/kaggle/char-lm/kernel.py" /kaggle/kernel.py
     # Staging downloads gigabytes, far past what one `colab exec` waits for,
     # so it runs as its own process and `status` reads its log.
