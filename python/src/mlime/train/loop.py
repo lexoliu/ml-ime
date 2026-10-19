@@ -42,7 +42,7 @@ from torch.nn.parallel import DistributedDataParallel
 
 from mlime.logging import log
 from mlime.train.lexicon import CandidateSpace
-from mlime.train.model import RouteAConfig, RouteAModel, count_correct
+from mlime.train.model import RouteAModel, count_correct
 from mlime.train.samples import (
     BaseTokenizer,
     BatchCollator,
@@ -930,13 +930,33 @@ def train(
     total_world = world.world_size * virtual
     device = world.device
     model.to(device)
+    optimiser = torch.optim.AdamW(
+        model.parameter_groups(config.base_lr, config.new_lr),
+        weight_decay=config.weight_decay,
+        # The fused CUDA kernels run the whole step without leaving the device;
+        # the flag does not exist on CPU, where the plain implementation stands.
+        fused=device.type == "cuda",
+    )
+    scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimiser,
+        lambda step: cosine_with_warmup(step, config.warmup_steps, config.max_steps),
+    )
+    amp = config.fp16 and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=amp)
     resumed = (
-        Resumption.read(resume, config, model.config, world, record=model.config_key)
+        Resumption.restore(
+            resume,
+            config,
+            model,
+            optimiser,
+            scheduler,
+            scaler,
+            world,
+            record=model.config_key,
+        )
         if resume is not None
         else None
     )
-    if resumed is not None:
-        model.load_resumed(resumed.model, resumed.path)
     trained: nn.Module = model
     if world.world_size > 1:
         trained = DistributedDataParallel(
@@ -951,19 +971,6 @@ def train(
             # the torch in Kaggle's image does not take.
             broadcast_buffers=False,
         )
-    optimiser = torch.optim.AdamW(
-        model.parameter_groups(config.base_lr, config.new_lr),
-        weight_decay=config.weight_decay,
-        # The fused CUDA kernels run the whole step without leaving the device;
-        # the flag does not exist on CPU, where the plain implementation stands.
-        fused=device.type == "cuda",
-    )
-    scheduler = torch.optim.lr_scheduler.LambdaLR(
-        optimiser,
-        lambda step: cosine_with_warmup(step, config.warmup_steps, config.max_steps),
-    )
-    amp = config.fp16 and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=amp)
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics = MetricLog(out_dir / "metrics.jsonl")
     if world.is_main:
@@ -1003,9 +1010,6 @@ def train(
 
     step = 0
     if resumed is not None:
-        _load_resumed_optimiser(optimiser, resumed.optimiser, resumed.path)
-        scheduler.load_state_dict(resumed.scheduler)
-        scaler.load_state_dict(resumed.scaler)
         step = resumed.step
         if world.is_main:
             metrics.write(
@@ -1492,29 +1496,34 @@ def refuse_mismatch(
 
 @dataclass(frozen=True)
 class Resumption:
-    """A checkpoint read back and checked, ready to be poured into a fresh run."""
+    """Where a resumed run picks up, once its checkpoint has been poured into it.
+
+    The checkpoint's weights and optimiser state go straight into the run's
+    model, optimiser, scheduler and scaler, and nothing here keeps them: a
+    checkpoint held for the whole run is gigabytes of host memory that a small
+    VM does not have.
+    """
 
     path: Path
     step: int
-    model: dict[str, Any]
-    optimiser: dict[str, Any]
-    scheduler: dict[str, Any]
-    scaler: dict[str, Any]
     #: This process's lanes' positions, in lane order: the checkpoint's full
     #: list is indexed by rank of the whole world, and a process that stands
     #: for several virtual ranks takes the contiguous block that is its own.
     positions: list[RankState]
 
     @classmethod
-    def read(
+    def restore(
         cls,
         path: Path,
         config: TrainingConfig,
-        model_config: RouteAConfig,
+        model: RouteAModel,
+        optimiser: torch.optim.AdamW,
+        scheduler: torch.optim.lr_scheduler.LambdaLR,
+        scaler: torch.amp.GradScaler,
         world: Distributed,
         record: str = "route_a",
     ) -> Resumption:
-        """Load *path* and refuse it unless it is this run, one segment earlier."""
+        """Pour *path* into the run, refusing it unless it is this run, one segment earlier."""
         state = torch.load(path, map_location="cpu", weights_only=False)
         absent = sorted({"optimiser", "scheduler", "scaler", "positions"} - set(state))
         if absent:
@@ -1527,7 +1536,7 @@ class Resumption:
                 f"{path} holds no {record} config; it is a checkpoint of a different model"
             )
         refuse_mismatch(path, "training", state["training"], asdict(config), SEGMENT_FIELDS)
-        refuse_mismatch(path, record, state[record], asdict(model_config))
+        refuse_mismatch(path, record, state[record], asdict(model.config))
         positions = state["positions"]
         expected = world.world_size * config.virtual_ranks
         if len(positions) != expected:
@@ -1541,14 +1550,14 @@ class Resumption:
                 f"{path} is already at step {step} of {config.max_steps}; "
                 "raise max_steps to run further, or this resume would do nothing"
             )
+        model.load_resumed(state["model"], path)
+        _load_resumed_optimiser(optimiser, state["optimiser"], path)
+        scheduler.load_state_dict(state["scheduler"])
+        scaler.load_state_dict(state["scaler"])
         first = world.rank * config.virtual_ranks
         return cls(
             path=path,
             step=step,
-            model=state["model"],
-            optimiser=state["optimiser"],
-            scheduler=state["scheduler"],
-            scaler=state["scaler"],
             positions=[
                 RankState.from_record(record)
                 for record in positions[first : first + config.virtual_ranks]
