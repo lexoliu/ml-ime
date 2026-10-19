@@ -542,6 +542,11 @@ def train_e2e(
         None,
         help="Pause and checkpoint after this many seconds, for a session that gets killed",
     ),
+    segment_steps: int = typer.Option(
+        None,
+        "--segment-steps",
+        help="Pause and checkpoint after this many steps of the segment; --max-steps is unchanged",
+    ),
     resume: Path = typer.Option(
         None,
         help="Continue the run that wrote this checkpoint; every other option must match it",
@@ -628,6 +633,7 @@ def train_e2e(
                 checkpoint_every=checkpoint_every,
                 keep_checkpoints=keep_checkpoints,
                 wall_budget_seconds=wall_budget_seconds,
+                segment_steps=segment_steps,
                 accumulate=accumulate,
                 prefetch=prefetch,
                 profile_steps=profile_steps,

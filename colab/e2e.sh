@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run a Colab leg of an e2e kernel through the Colab CLI.
 #
-#   colab/e2e.sh <kernel dir> start [--gpu T4|--cpu] [--census FILE] [--source DIR] [--resume-from RUN]
+#   colab/e2e.sh <kernel dir> start [--gpu T4|--cpu] [--census FILE] [--source DIR] [--resume-from RUN] [--no-publish]
 #                                                provision, stage, resume the newest trio, launch
 #   colab/e2e.sh <kernel dir> status             tail of the kernel's and publisher's logs
 #   colab/e2e.sh <kernel dir> fetch <out dir>    download the metrics, the summary, the logs
@@ -32,12 +32,14 @@ case $command in
     census=
     source=
     resume_from=
+    publish=1
     while [ $# -gt 0 ]; do case $1 in
       --gpu) gpu=$2; shift 2;;
       --cpu) gpu=; shift;;
       --census) census=$(cd "$(dirname "$2")" && pwd)/$(basename "$2"); shift 2;;
       --source) source=$(cd "$2" && pwd); shift 2;;
       --resume-from) resume_from=$2; shift 2;;
+      --no-publish) publish=; shift;;
       *) echo "unknown argument $1" >&2; exit 2;;
     esac; done
     # --source mounts DIR, laid out like mlime-src (mlime/ and bin/ime-segment),
@@ -82,6 +84,11 @@ case $command in
     # bucket -- two cards racing one leg each publish under their own run.
     if [ -n "$resume_from" ]; then
       printf 'from pathlib import Path\nPath("/kaggle/resume-from").write_text("%s\\n")\n' "$resume_from" | colab exec -s $session
+    fi
+    # --no-publish runs no publisher: a check of the code on the run's
+    # checkpoint leaves the run's lineage in the bucket untouched.
+    if [ -z "$publish" ]; then
+      printf 'from pathlib import Path\nPath("/kaggle/no-publish").touch()\n' | colab exec -s $session
     fi
     # Staging downloads gigabytes, far past what one `colab exec` waits for,
     # so it runs as its own process and `status` reads its log.

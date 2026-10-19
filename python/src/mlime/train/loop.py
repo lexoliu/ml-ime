@@ -81,6 +81,11 @@ class TrainingConfig:
     #: output goes with it, so a segment that means to survive stops itself with
     #: time to spare and writes a checkpoint the next kernel resumes from.
     wall_budget_seconds: float | None = None
+    #: Optimiser steps this *segment* trains before it pauses itself, or
+    #: ``None`` for no count of its own. A check runs the real run's code on a
+    #: few of its steps this way and stops, while ``max_steps`` -- where the
+    #: cosine schedule ends -- stays the run's.
+    segment_steps: int | None = None
     fp16: bool = True
     #: Micro-batches whose gradients one optimiser step accumulates. The step's
     #: loss is the mean over every scored position across them -- not the mean
@@ -147,6 +152,8 @@ class TrainingConfig:
             raise ValueError(
                 f"wall_budget_seconds must be positive, got {self.wall_budget_seconds}"
             )
+        if self.segment_steps is not None and self.segment_steps < 1:
+            raise ValueError(f"segment_steps must be at least 1, got {self.segment_steps}")
         if self.virtual_ranks < 1:
             raise ValueError(f"virtual_ranks must be at least 1, got {self.virtual_ranks}")
         if self.checkpoint_minutes is not None and self.checkpoint_minutes <= 0:
@@ -1191,6 +1198,9 @@ def train(
                 verdict = 1
             if world.world_size > 1:
                 verdict = agreed(world, verdict, device) if step % config.agree_every == 0 else 0
+            # Every rank counts the same steps, so this verdict needs no agreement.
+            if config.segment_steps is not None and step - first_step + 1 >= config.segment_steps:
+                verdict = 2
             profiler.mark("agree_log")
             if profiler.end():
                 write_profile(profiler, world, metrics)
@@ -1201,11 +1211,7 @@ def train(
                 checkpoints.paused(step, states())
                 if world.is_main:
                     metrics.write(event="paused", step=step, seconds=round(elapsed, 1))
-                log.info(
-                    "wall budget spent, segment paused",
-                    step=step,
-                    seconds=round(elapsed, 1),
-                )
+                log.info("segment paused", step=step, seconds=round(elapsed, 1))
                 break
             if verdict == 1:
                 checkpoints.interval(step, states(), interval_summary(step, elapsed))
@@ -1455,6 +1461,7 @@ class Checkpointer:
 SEGMENT_FIELDS = frozenset(
     {
         "wall_budget_seconds",
+        "segment_steps",
         "prefetch",
         "profile_steps",
         "trace_steps",
