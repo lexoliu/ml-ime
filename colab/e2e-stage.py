@@ -9,6 +9,8 @@ starts from comes from the private Hub dataset repo of the same name, all of
 them in one `aria2c` run (`hub.py`). The resume point is the newest
 `checkpoint-paused` trio by step among the run's trio in the
 `lexoliu/mlime-resume` bucket and the latest COMPLETE Kaggle segment's output.
+On a GPU it also restores the inductor caches an earlier leg on the same card
+and torch packed into the bucket (#140), so the kernel does not compile again.
 It stamps the segment number and the interval checkpoint cadence into the
 kernel, launches it detached, and launches the publisher beside it: every
 interval trio lands in the bucket, so a VM that dies without warning loses
@@ -19,8 +21,10 @@ import importlib.util
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tarfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -39,9 +43,9 @@ KERNEL_READS = (
     r"^(run-config\.json|run-summary\.json|checkpoint-paused\.pt|run/checkpoint-final\.pt)$"
 )
 RESUME_MARKERS = ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
-#: Transfers in flight while staging: the Hub repos, the resume trio and the
-#: latest Kaggle segment's probe.
-STAGING_TRANSFERS = 3
+#: Transfers in flight while staging: the Hub repos, the resume trio, the
+#: compile caches and the latest Kaggle segment's probe.
+STAGING_TRANSFERS = 4
 #: The cadence a Colab leg checkpoints at: the VM can die without warning, so
 #: the trio it would hand the next leg is re-written every twenty minutes.
 CHECKPOINT_MINUTES = 20
@@ -62,6 +66,24 @@ def bucket_trio(publisher, api, run):
     )
     print(f"{publisher.BUCKET}/{prefix}: staged under {mount}", flush=True)
     return mount
+
+
+def compile_caches(publisher, api):
+    """Restore the inductor caches packed for this GPU and torch, when a leg packed them."""
+    if shutil.which("nvidia-smi") is None:
+        print("no GPU: nothing compiles, so no compile caches", flush=True)
+        return
+    path = publisher.compile_cache_path()
+    entries = api.list_bucket_tree(publisher.BUCKET, prefix=f"{publisher.CACHE_PREFIX}/")
+    if not any(entry.type == "file" and entry.path == path for entry in entries):
+        print(f"{publisher.BUCKET}/{path}: not packed yet; the kernel compiles", flush=True)
+        return
+    archive = publisher.INDUCTOR_CACHE.with_suffix(".tar")
+    api.download_bucket_files(publisher.BUCKET, [(path, archive)], raise_on_missing_files=True)
+    with tarfile.open(archive) as tar:
+        tar.extractall(publisher.INDUCTOR_CACHE, filter="data")
+    archive.unlink()
+    print(f"{publisher.BUCKET}/{path}: restored under {publisher.INDUCTOR_CACHE}", flush=True)
 
 
 def kernel_status(slug):
@@ -218,6 +240,7 @@ def main():
         transfers = [
             pool.submit(hub.download, repos, INPUTS),
             pool.submit(bucket_trio, publisher, api, publisher.run_name(METADATA)),
+            pool.submit(compile_caches, publisher, api),
             pool.submit(stage_latest_segment, base),
         ]
         for transfer in as_completed(transfers):

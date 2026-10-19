@@ -193,6 +193,11 @@ TYPOS = False
 #: The three files a leg hands the next one.
 RESUME_MARKERS = ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
 
+#: Inductor's caches, outside the working directory a Kaggle segment publishes
+#: as output. A Colab leg's publisher packs them into the resume bucket and
+#: the next leg's staging restores them here, so it skips compiling (#140).
+INDUCTOR_CACHE = Path("/tmp/inductor-cache")
+
 REQUIREMENTS = (
     "polars",
     "pydantic-settings",
@@ -870,6 +875,7 @@ def main():
     )
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+    env["TORCHINDUCTOR_CACHE_DIR"] = str(INDUCTOR_CACHE)
     sys.path.insert(0, str(package_root))
     warm_cache()
 
