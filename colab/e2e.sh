@@ -1,7 +1,7 @@
 #!/bin/bash
 # Run a Colab leg of an e2e kernel through the Colab CLI.
 #
-#   colab/e2e.sh <kernel dir> start [--gpu T4|--cpu] [--census FILE] [--source DIR]
+#   colab/e2e.sh <kernel dir> start [--gpu T4|--cpu] [--census FILE] [--source DIR] [--resume-from RUN]
 #                                                provision, stage, resume the newest trio, launch
 #   colab/e2e.sh <kernel dir> status             tail of the kernel's and publisher's logs
 #   colab/e2e.sh <kernel dir> fetch <out dir>    download the metrics, the summary, the logs
@@ -31,11 +31,13 @@ case $command in
     gpu=T4
     census=
     source=
+    resume_from=
     while [ $# -gt 0 ]; do case $1 in
       --gpu) gpu=$2; shift 2;;
       --cpu) gpu=; shift;;
       --census) census=$(cd "$(dirname "$2")" && pwd)/$(basename "$2"); shift 2;;
       --source) source=$(cd "$2" && pwd); shift 2;;
+      --resume-from) resume_from=$2; shift 2;;
       *) echo "unknown argument $1" >&2; exit 2;;
     esac; done
     # --source mounts DIR, laid out like mlime-src (mlime/ and bin/ime-segment),
@@ -72,6 +74,11 @@ case $command in
       tar -C "$source" --exclude __pycache__ -cf "$package" .
       colab upload -s $session "$package" /kaggle/mlime.tar
       printf 'import os, tarfile\nos.makedirs("/kaggle/input/mlime-src", exist_ok=True)\ntarfile.open("/kaggle/mlime.tar").extractall("/kaggle/input/mlime-src", filter="data")\n' | colab exec -s $session
+    fi
+    # --resume-from starts this leg from another run's newest trio in the
+    # bucket -- two cards racing one leg each publish under their own run.
+    if [ -n "$resume_from" ]; then
+      printf 'from pathlib import Path\nPath("/kaggle/resume-from").write_text("%s\\n")\n' "$resume_from" | colab exec -s $session
     fi
     # Staging downloads gigabytes, far past what one `colab exec` waits for,
     # so it runs as its own process and `status` reads its log.
