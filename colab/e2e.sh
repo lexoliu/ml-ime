@@ -71,7 +71,10 @@ case $command in
     fi
     if [ -n "$source" ]; then
       package=$(mktemp -d)/mlime.tar
-      tar -C "$source" --exclude __pycache__ -cf "$package" .
+      # macOS tar stores extended attributes as `._*` AppleDouble members; on
+      # Linux they extract as stray `._*.py` files that change the package's
+      # digest, so the archive carries the files and nothing else.
+      COPYFILE_DISABLE=1 tar -C "$source" --exclude __pycache__ --no-xattrs --no-mac-metadata -cf "$package" .
       colab upload -s $session "$package" /kaggle/mlime.tar
       printf 'import os, tarfile\nos.makedirs("/kaggle/input/mlime-src", exist_ok=True)\ntarfile.open("/kaggle/mlime.tar").extractall("/kaggle/input/mlime-src", filter="data")\n' | colab exec -s $session
     fi
