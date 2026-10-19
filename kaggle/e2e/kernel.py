@@ -1195,8 +1195,9 @@ def resume_candidates():
     world read off the checkpoint itself, not off its summary.
 
     A leg's checkpoint reaches the next segment two ways: inside the previous
-    kernel's own output (which the chain mounts) and inside the
-    `mlime-e2e-resume-{a,b}` slots a Colab leg publishes to. A segment's own
+    kernel's own output (which the chain mounts) and as the trio a Colab leg
+    publishes to the `lexoliu/mlime-resume` bucket, which the Colab staging
+    downloads under `<run>-resume`. A segment's own
     interval checkpoints are found here too, inside the output's `run/`
     directory -- same run, older steps, so the pick by step passes over them.
     """

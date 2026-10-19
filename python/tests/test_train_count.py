@@ -21,6 +21,7 @@ from mlime.train.count import (
     census_mismatches,
     count_batches,
     matching_census,
+    ranking_shape,
 )
 from mlime.train.e2e_model import RankingConfig
 from mlime.train.lexicon import CandidateSpace, Lexicon
@@ -186,9 +187,12 @@ def test_a_ranking_count_weighs_each_example_by_every_row_it_costs(
     )
     assert ranked.ranks[0].epochs == [taken]
     assert ranked.steps_for_epochs > plain.steps_for_epochs
-    assert ranked.ranking == asdict(RANKING)
+    assert ranked.ranking == ranking_shape(RANKING)
     assert plain.ranking is None
     assert census_mismatches(ranked, spec_for(ranking=None)) == ["ranking"]
+    # The weight only scales the loss: a weight sweep shares one census.
+    reweighted = ranking_shape(replace(RANKING, weight=0.1))
+    assert census_mismatches(ranked, spec_for(ranking=reweighted)) == []
 
 
 def test_every_rank_is_counted_over_the_shards_it_owns(

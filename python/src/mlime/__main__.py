@@ -1171,5 +1171,21 @@ def eval_gui(
         write_report(report, out)
 
 
+def run() -> None:
+    """The `mlime` entry point.
+
+    Typer answers an `EOFError` raised anywhere inside a command -- `torch.load`
+    on a truncated checkpoint, for one -- with a bare "Aborted." and exit 1, so
+    the failure's cause never reaches the log; raise that cause instead.
+    """
+    try:
+        app()
+    except SystemExit as exit_:
+        abort = exit_.__context__
+        if isinstance(abort, typer.Abort) and isinstance(abort.__cause__, EOFError):
+            raise abort.__cause__ from None
+        raise
+
+
 if __name__ == "__main__":
-    app()
+    run()

@@ -1,35 +1,59 @@
 #!/bin/bash
-# Run the e2e chain's Colab leg on a T4 through the Colab CLI.
+# Run a Colab leg of an e2e kernel through the Colab CLI.
 #
-#   colab/e2e.sh start [--gpu T4]   provision, stage, resume the newest trio, launch
-#   colab/e2e.sh status             tail of the kernel's and publisher's logs
-#   colab/e2e.sh fetch <out dir>    download the metrics, the summary, the logs
-#   colab/e2e.sh publish            publish the newest trio to a resume slot once, in the VM
-#   colab/e2e.sh stop               release the VM
+#   colab/e2e.sh <kernel dir> start [--gpu T4|--cpu] [--census FILE]
+#                                                provision, stage, resume the newest trio, launch
+#   colab/e2e.sh <kernel dir> status             tail of the kernel's and publisher's logs
+#   colab/e2e.sh <kernel dir> fetch <out dir>    download the metrics, the summary, the logs
+#   colab/e2e.sh <kernel dir> publish            publish the newest trio to a resume slot once
+#   colab/e2e.sh <kernel dir> stop               release the VM
 #
-# The session is named e2e; `colab sessions` lists it. The kernel is the same
-# script Kaggle runs (kaggle/e2e/kernel.py): on one T4 it trains the run's
-# world of two as one process of two virtual ranks, and it resumes the newest
-# checkpoint-paused trio mounted -- the latest COMPLETE Kaggle segment's
-# output or the lexoliu/mlime-e2e-resume-{a,b} slots, whichever reached the higher
-# step. A publisher loop beside the kernel pushes each interval checkpoint to
-# that dataset, so a VM that dies without warning loses minutes, not the leg.
+# <kernel dir> holds a stamped kernel.py and its kernel-metadata.json --
+# kaggle/e2e for v1's chain, or a stage stamped from it. Its slug,
+# <run>-s<n>, names the run: the session is the run's name (`colab sessions`
+# lists it), the Kaggle segments are <run>-s<n>, and the publisher's resume
+# slots are <run>-resume-{a,b}. The kernel is the same script Kaggle runs: on
+# one GPU it trains the run's world of two as one process of two virtual
+# ranks, and it resumes the newest checkpoint-paused trio mounted -- the
+# latest COMPLETE Kaggle segment's output or a resume slot, whichever reached
+# the higher step. A publisher loop beside the kernel pushes each interval
+# checkpoint to a slot, so a VM that dies without warning loses minutes, not
+# the leg.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)
-session=e2e
+kernel_dir=$(cd "${1:?kernel dir}" && pwd); shift
+slug=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["id"])' "$kernel_dir/kernel-metadata.json")
+session=$(basename "${slug%-s[0-9]*}")
 command=${1:?start|status|fetch|publish|stop}; shift
 case $command in
   start)
     gpu=T4
-    while [ $# -gt 0 ]; do case $1 in --gpu) gpu=$2; shift 2;; *) echo "unknown argument $1" >&2; exit 2;; esac; done
-    colab new -s $session --gpu "$gpu"
+    census=
+    while [ $# -gt 0 ]; do case $1 in
+      --gpu) gpu=$2; shift 2;;
+      --cpu) gpu=; shift;;
+      --census) census=$(cd "$(dirname "$2")" && pwd)/$(basename "$2"); shift 2;;
+      *) echo "unknown argument $1" >&2; exit 2;;
+    esac; done
+    colab new -s $session ${gpu:+--gpu "$gpu"}
     # Colab mounts an empty, read-only /kaggle/input for its own Kaggle
     # integration; the kernel reads the datasets staged there, so it goes first.
-    printf 'import os, subprocess\nif os.path.ismount("/kaggle/input"):\n    subprocess.run(["umount", "/kaggle/input"], check=True)\nfor d in ("/root/.kaggle", "/kaggle/input", "/kaggle/working"): os.makedirs(d, exist_ok=True)\n' | colab exec -s $session
+    printf 'import os, subprocess\nif os.path.ismount("/kaggle/input"):\n    subprocess.run(["umount", "/kaggle/input"], check=True)\nfor d in ("/root/.kaggle", "/root/.cache/huggingface", "/kaggle/input", "/kaggle/working"): os.makedirs(d, exist_ok=True)\n' | colab exec -s $session
     colab upload -s $session "$HOME/.kaggle/credentials.json" /root/.kaggle/credentials.json
-    colab upload -s $session "$here/kaggle/e2e/kernel.py" /kaggle/kernel.py
-    colab upload -s $session "$here/kaggle/e2e/kernel-metadata.json" /kaggle/kernel-metadata.json
+    # Only the access token: the OAuth refresh token stays on the Mac, so no
+    # VM ever refreshes it and invalidates the Mac's login.
+    colab upload -s $session "$HOME/.cache/huggingface/token" /root/.cache/huggingface/token
+    colab upload -s $session "$kernel_dir/kernel.py" /kaggle/kernel.py
+    colab upload -s $session "$kernel_dir/kernel-metadata.json" /kaggle/kernel-metadata.json
     colab upload -s $session "$here/colab/e2e-publish.py" /kaggle/e2e-publish.py
+    colab upload -s $session "$here/kaggle/output.py" /kaggle/output.py
+    # A census counted for the same corpus and batch shape -- by a sibling
+    # run, or by a CPU rehearsal -- spares the GPU the count; the kernel
+    # recounts when even one field differs.
+    if [ -n "$census" ]; then
+      printf 'import os\nos.makedirs("/kaggle/input/census", exist_ok=True)\n' | colab exec -s $session
+      colab upload -s $session "$census" /kaggle/input/census/batch-counts.json
+    fi
     # Staging downloads gigabytes, far past what one `colab exec` waits for,
     # so it runs as its own process and `status` reads its log.
     colab upload -s $session "$here/colab/e2e-stage.py" /kaggle/stage.py

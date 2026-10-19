@@ -89,10 +89,34 @@ needs less, as the last segment of a run that pauses with an hour to go does.
 `colab/char-lm.sh` runs `char-lm/kernel.py` unchanged on a Colab GPU through the
 [Colab CLI](https://github.com/googlecolab/google-colab-cli) (`uv tool install
 google-colab-cli`, then `colab usage` once to log in). `start` provisions the
-runtime (an A100 by default), uploads the Kaggle credentials and the kernel,
-and runs `colab/stage.py` on the VM, which downloads the four datasets with the
-Kaggle API into `/kaggle/input/<slug>` and launches the kernel as a detached
+runtime (an A100 by default), uploads the Hugging Face token and the kernel,
+and runs `colab/stage.py` on the VM, which downloads the four datasets from
+their private Hugging Face repos into `/kaggle/input/<slug>` at once and
+launches the kernel as a detached
 process; `status`, `fetch <dir>` and `stop` follow. The kernel sizes itself to
 the GPUs it finds (one rank per GPU, `TOKENS_PER_STEP` split across them), so
 one A100 trains the same batches as Kaggle's two T4s in roughly a third of the
 time, for about 35 compute units.
+
+`colab/e2e.sh <kernel dir> start [--gpu G|--cpu] [--census FILE]` does the
+same for a stamped e2e kernel (`kaggle/e2e` or a stage stamped from it):
+`colab/e2e-stage.py` downloads, all at once, the private Hugging Face dataset
+repos named like its `dataset_sources` and `kernel_sources` (a stage's
+`INIT_FROM`), the run's newest trio in the `lexoliu/mlime-resume` bucket, and
+the newest complete Kaggle segment's output, then launches the kernel and
+`colab/e2e-publish.py`, which puts each interval checkpoint in the bucket so a
+lost VM costs minutes. `--census` hands it a count of the same corpus and batch
+shape so the GPU does not count again, and `--cpu` rehearses the staging on a
+CPU runtime before a GPU is billed for it. The session is named after the run;
+`status`, `fetch <dir>`, `publish` and `stop` follow. Both drivers upload only
+the Hugging Face access token, never the OAuth refresh token, so no VM can
+refresh it out from under the Mac's login.
+
+Kernel outputs are fetched with `kaggle/output.py <owner>/<kernel> <dir>
+[--pattern REGEX]`, never `kaggle kernels output`: the CLI reads each file
+whole into memory, so a multi-gigabyte checkpoint whose connection drops fails
+with `IncompleteRead` and can leave an empty file behind, and the output host
+cuts each connection after about thirty seconds. `output.py` hands the files
+to `aria2c` (Homebrew or apt `aria2`): sixteen ranged connections per file,
+each segment retried where it broke, a partial file continued on the next run.
+The chain's harvest uses it too.
