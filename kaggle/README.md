@@ -29,7 +29,7 @@ Kaggle runs two kernels at once per account and allows 30 GPU-hours a week, so
 push two, and the next two when those finish.
 | `route-a-v2` | two epochs over all of run3 as a chain of segments; segment 0 counts the steps, every segment trains on a wall budget and pauses resumably |
 | `char-lm` | a character language model over the same 41M lines (`mlime train char-lm`, 2×T4 DDP, wall budget; the kernel's `MODEL` picks the architecture, a 12-layer transformer since `notes/generate-ceiling.md`, the LSTM of `notes/char-lm-v1.md` before it), exported to ONNX (`charlm.onnx`, `prefill.onnx`, the `charlm.weights` shared weights file, `charlm.json`) for `ime-cli fused-eval --lm`. A run longer than one session resumes: push the next session with the previous output added as a kernel source and it continues from that output's `run/charlm.pt` |
-| `e2e` | the end-to-end model of issue #88 (`mlime train e2e`, 2×T4 DDP, wall budget, same segment chain as `route-a-v2`): route A's towers and the transformer reader initialised from `lexoliu/mlime-e2e-init`, decoded by its own beam search with `mlime eval e2e` on the finishing segment. Every segment logs its cards to `gpu.csv` and its trainers' threads and the host's memory to `host.jsonl`; a nonzero `PROFILE_STEPS` (the first `TRACE_STEPS` of them traced) times that many steps after the warm-up and trains on, and `mlime train measure` reads the leg's steady-state rate, utilisation and phase table back from those files; `ACTIVATION_CHECKPOINTING` recomputes the encoder towers when nothing fits. With `INIT_FROM` stamped, the same chain starts from the finished run mounted under that name (`mlime-e2e-final` for v1, or an earlier stage's kernel output) and trains one epoch over `TRAIN_SHARDS`; `WHOLE_ALPHABET` normalises the per-position loss over every emittable character (#121). With `RANKING` stamped as well, it is the ranking stage of #116: it adds the sequence-level ranking loss, and reads segmentations from the `ime-segment` binary the package dataset ships at `bin/ime-segment` (`cargo build --release -p ime-pinyin --bin ime-segment --target x86_64-unknown-linux-musl`; `.cargo/config.toml` links it with rust-lld) |
+| `e2e` | the end-to-end model of issue #88 (`mlime train e2e`, 2×T4 DDP, wall budget, same segment chain as `route-a-v2`): route A's towers and the transformer reader initialised from `lexoliu/mlime-e2e-init`, decoded by its own beam search with `mlime eval e2e` on the finishing segment. Every segment logs its cards to `gpu.csv` and its trainers' threads and the host's memory to `host.jsonl`; a nonzero `PROFILE_STEPS` (the first `TRACE_STEPS` of them traced) times that many steps after the warm-up and trains on, and `mlime train measure` reads the leg's steady-state rate, utilisation and phase table back from those files; `ACTIVATION_CHECKPOINTING` recomputes the encoder towers when nothing fits. With `INIT_FROM` stamped, the same chain starts from the finished run mounted under that name (`mlime-e2e-final` for v1, or an earlier stage's kernel output) and trains one epoch over `TRAIN_SHARDS`; `WHOLE_ALPHABET` normalises the per-position loss over every emittable character (#121). With `RANKING` stamped as well, it is the ranking stage of #116: it adds the sequence-level ranking loss, and reads segmentations from `ime-segment`, which `colab/e2e.sh start` builds from the leg's commit (`cargo build --release -p ime-pinyin --bin ime-segment --target x86_64-unknown-linux-musl`; `.cargo/config.toml` links it with rust-lld) and uploads beside the inputs |
 
 ## Chaining a training run
 
@@ -100,9 +100,17 @@ the GPUs it finds (one rank per GPU, `TOKENS_PER_STEP` split across them), so
 one A100 trains the same batches as Kaggle's two T4s in roughly a third of the
 time, for about 35 compute units.
 
-`colab/e2e.sh <kernel dir> start [--gpu G|--cpu] [--census FILE]` does the
-same for a stamped e2e kernel (`kaggle/e2e` or a stage stamped from it):
-`colab/e2e-stage.py` downloads, all at once, the private Hugging Face dataset
+`colab/e2e.sh <kernel dir> start --session-hours H [--commit REV] [--gpu G|--cpu]
+[--census FILE] [--resume-from RUN] [--no-publish]` does the same for a stamped
+e2e kernel (`kaggle/e2e`, or a run stamped from it with `mlime e2e stamp`). The
+code is one commit of this public repository: the VM fetches `--commit`
+(default HEAD, refused when this checkout has uncommitted changes or no branch
+of origin holds it) from GitHub, the kernel imports `mlime` from that checkout
+and records the commit in `run-config.json` and the provenance, and a resume
+on a different commit than the run's is refused unless the leg is started
+`--allow-commit-change`. `--session-hours` is required: the stager stamps it
+as `SESSION_SECONDS`, so the leg pauses inside the session it was given.
+`colab/e2e-stage.py`, run from the checkout, downloads, all at once, the private Hugging Face dataset
 repos named like its `dataset_sources` and `kernel_sources` (a stage's
 `INIT_FROM`), the run's newest trio in the `lexoliu/mlime-resume` bucket, and
 the newest complete Kaggle segment's output, then launches the kernel and
@@ -112,8 +120,17 @@ inductor's caches (`TORCHINDUCTOR_CACHE_DIR=/tmp/inductor-cache`) into the
 bucket as `compile-cache/<gpu>-torch<version>.tar`, and the next leg's staging
 on the same card restores them, so it trains without compiling again. `--census` hands it a count of the same corpus and batch
 shape so the GPU does not count again, and `--cpu` rehearses the staging on a
-CPU runtime before a GPU is billed for it. The session is named after the run;
-`status`, `fetch <dir>`, `publish` and `stop` follow. Both drivers upload only
+CPU runtime before a GPU is billed for it. `--resume-from RUN` starts the leg
+from another run's newest trio (two cards racing one leg), and `--no-publish`
+runs no publisher, for a check that must not enter the run's lineage. The
+session is named after the run. `wait --deadline SECONDS` probes the VM every
+minute through `colab/leg.py` -- each probe is the watchdog's heartbeat -- and
+exits with the leg's end, read from the processes, `run-summary.json` and
+`publish-state.json`: 10 paused with its trio published, 11 finished, 12
+failed, 13 past the deadline, 14 runtime lost. `stop` refuses while the newest
+trio is unpublished or a finished run lives only on the VM (`--force` releases
+it anyway); `status`, `fetch <dir>` (the census `batch-counts.json`, the
+metrics and both samplers' logs among them) and `publish` follow. Both drivers upload only
 the Hugging Face access token, never the OAuth refresh token, so no VM can
 refresh it out from under the Mac's login.
 

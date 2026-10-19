@@ -167,21 +167,19 @@ def corpus_digest(paths: list[Path]) -> str:
 
 
 def git_commit() -> str:
-    """The checkout's commit, or a marker when there is no checkout to ask.
+    """The commit of the checkout this package runs from.
 
-    A Kaggle kernel has the package but not the repository, so this is allowed to
-    come back unknown -- what must never happen is a *wrong* commit being
-    recorded, which is why nothing is guessed.
+    Asked of the package's own directory, not the working directory: a kernel
+    runs from `/kaggle/working`, while its package is the leg's commit checked
+    out from GitHub. A package outside a checkout has no commit to record, and
+    that is an error rather than an unknown in the provenance.
     """
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except (OSError, subprocess.CalledProcessError):
-        return "unknown"
+    result = subprocess.run(
+        ["git", "-C", str(Path(__file__).resolve().parent), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
     return result.stdout.strip()
 
 

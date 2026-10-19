@@ -94,3 +94,32 @@ def test_resuming_another_run_stages_its_newest_whole_trio(
     mount = stager.bucket_trio(publisher, FakeBucket(files), "mlime-e2e-v2-a100", True)
     assert mount == tmp_path / "input" / "mlime-e2e-v2-a100-resume"
     assert sorted(p.name for p in mount.iterdir()) == sorted(stager.RESUME_MARKERS)
+
+
+def test_a_leg_without_its_commit_or_session_length_is_refused(stager: ModuleType) -> None:
+    with pytest.raises(SystemExit):
+        stager.options(["--commit", "a" * 40])
+    with pytest.raises(SystemExit):
+        stager.options(["--session-seconds", "3600"])
+    with pytest.raises(SystemExit):
+        stager.options(["--commit", "a" * 40, "--session-seconds", "0"])
+
+
+def test_the_leg_stamps_its_commit_and_session_into_the_kernel(
+    stager: ModuleType, tmp_path: Path
+) -> None:
+    """Each stamp lands on its own line as a literal the kernel reads back."""
+    leg = stager.options(
+        ["--commit", "c" * 40, "--session-seconds", "5400", "--allow-commit-change"]
+    )
+    kernel = Path(__file__).resolve().parents[2] / "kaggle" / "e2e" / "kernel.py"
+    stamped = tmp_path / "kernel.py"
+    stamped.write_text(stager.stamp(kernel.read_text(), **stager.stamps(leg, 3)))
+    module = load("stamped_kernel", stamped)
+    assert module.COMMIT == "c" * 40
+    assert module.SESSION_SECONDS == 5400
+    assert module.ALLOW_COMMIT_CHANGE is True
+    assert module.SEGMENT == 3
+    assert module.CHECKPOINT_MINUTES == stager.CHECKPOINT_MINUTES
+    with pytest.raises(RuntimeError, match="no `MISSING =` line"):
+        stager.stamp(kernel.read_text(), MISSING=1)

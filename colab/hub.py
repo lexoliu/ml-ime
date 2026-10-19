@@ -5,8 +5,8 @@ would mount at. `snapshot_download` fetches every file through the Xet
 client, which spends about two seconds on a file before its first byte: on a
 Colab VM a 415-file sample repo (925 MB) took twelve minutes beside the other
 repos, with the GPU billed and idle. The same files over the repo's plain
-`resolve` URLs, all repos in one `aria2c` run (`aria2.py`, uploaded beside
-this file), took 22 seconds.
+`resolve` URLs, all repos in one `aria2c` run (`kaggle/aria2.py`, on the
+import path the stager sets), took 22 seconds.
 
 Needs `aria2c`, `huggingface_hub` and the Hub token at its default path.
 """
