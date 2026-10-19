@@ -14,6 +14,7 @@ import random
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -24,6 +25,7 @@ from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.loop import (
     PHASES,
     Accuracy,
+    Checkpointer,
     Distributed,
     EpochBatches,
     MetricLog,
@@ -33,6 +35,7 @@ from mlime.train.loop import (
     evaluate,
     train,
 )
+from mlime.train.measure import measure
 from mlime.train.model import RouteAConfig, RouteAModel
 from mlime.train.samples import (
     IGNORE_INDEX,
@@ -669,13 +672,25 @@ def test_a_profiled_run_writes_the_phase_table(
     tokenizer: BaseTokenizer,
     tmp_path: Path,
 ) -> None:
-    """A run asked to profile writes its timed steps' phases to the metrics."""
-    config = replace(RESUMABLE, max_steps=12, profile_steps=2)
+    """A run asked to profile writes its timed steps' phases, then trains on.
+
+    The window is ten warm-up steps and two timed ones; the record is written
+    when it fills, and the run carries on to its last step.
+    """
+    config = replace(RESUMABLE, max_steps=16, profile_steps=2)
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     segment = train(tiny_model(lexicon), [(stream, collator)], config, tmp_path / "run")
+    assert segment.finished and segment.step == 16
     profiled = records(segment.metrics, "profile")
     assert len(profiled) == 1
     assert profiled[0]["steps"] == 2
+    window_closed = profiled[0]["window"][1]
+    after = [r for r in records(segment.metrics, "step") if r["time"] > window_closed]
+    assert [r["step"] for r in after] == [13, 14, 15, 16]
+    # The steady state is what the run trained after its window.
+    steady = measure(tmp_path / "run")
+    assert (steady["rate"]["first_step"], steady["rate"]["last_step"]) == (13, 16)
+    assert steady["profile"]["steps"] == 2
     assert set(profiled[0]["phases"]) == set(PHASES)
     for phase in profiled[0]["phases"].values():
         assert phase["p95"] >= phase["mean"] >= 0.0
@@ -833,20 +848,21 @@ def _spawn_world(
     return target
 
 
-def test_a_measured_world_ends_on_rank_zeros_window(
+def test_a_measured_world_trains_past_windows_that_fill_on_different_steps(
     corpus: tuple[Path, Path], tmp_path: Path
 ) -> None:
-    """Ranks whose windows fill on different steps still leave on the same one.
+    """Ranks whose windows fill on different steps train on together.
 
     A compiled rank warms up on its own recompiles, so its window can fill
-    steps before rank 0's; leaving then would strand rank 0 in the next
-    gradient all-reduce. Rank 0's window decides, and both ranks stop after
-    its ten warm-up steps and two timed ones.
+    steps before rank 0's. A window is a stretch of the run, not its end, so
+    neither rank leaves on its own and both reach the last step; rank 0's
+    phase table is the one in the metrics.
     """
-    config = replace(RESUMABLE, max_steps=40, profile_steps=2, log_every=1)
+    config = replace(RESUMABLE, max_steps=16, profile_steps=2, log_every=1)
     measured = _spawn_world(corpus, tmp_path, config, "measured", early_window=True)
-    steps = [int(record["step"]) for record in records(measured / "metrics.jsonl", "step")]
-    assert max(steps) == 12
+    metrics = measured / "metrics.jsonl"
+    assert max(int(record["step"]) for record in records(metrics, "step")) == 16
+    assert len(records(metrics, "profile")) == 1
 
 
 def _positions(path: Path) -> list[dict[str, object]]:
@@ -956,6 +972,7 @@ def test_an_interval_checkpoint_resumes_like_a_pause(
     arbitration: ReadingArbitration,
     tokenizer: BaseTokenizer,
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The trio an interval checkpoint writes continues the run at its step.
 
@@ -968,22 +985,35 @@ def test_an_interval_checkpoint_resumes_like_a_pause(
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
     whole = train(tiny_model(lexicon), [(stream, collator)], longer, whole_dir)
 
-    # A leg that dies mid-run: the measurement window fills at step 12 and
-    # the loop stops there, leaving the interval trios it wrote along the way
-    # -- the cadence here is fast enough to fire every step, and only the
-    # newest is kept. The trio's run-config is the kernel's own file, verbatim.
+    # A leg that dies mid-run: the VM goes away right after the interval trio
+    # of step 12, leaving the trios it wrote along the way -- the cadence here
+    # is fast enough to fire every step, and only the newest is kept. The
+    # trio's run-config is the kernel's own file, verbatim.
+    class VmGoneError(Exception):
+        pass
+
+    written = Checkpointer.interval
+
+    def interval_then_die(self: Checkpointer, step: int, *rest: Any) -> Path | None:
+        trio = written(self, step, *rest)
+        if step == 12:
+            raise VmGoneError
+        return trio
+
+    monkeypatch.setattr(Checkpointer, "interval", interval_then_die)
     died_dir = tmp_path / "died"
     run_config = tmp_path / "kernel-run-config.json"
     run_config.write_text(json.dumps({"max_steps": 20, "epochs": 1, "segment": 3}) + "\n")
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
-    died = train(
-        tiny_model(lexicon),
-        [(stream, collator)],
-        replace(longer, checkpoint_minutes=1e-9, profile_steps=2),
-        died_dir,
-        run_config=run_config,
-    )
-    assert not died.finished and died.step == 12
+    with pytest.raises(VmGoneError):
+        train(
+            tiny_model(lexicon),
+            [(stream, collator)],
+            replace(longer, checkpoint_minutes=1e-9),
+            died_dir,
+            run_config=run_config,
+        )
+    monkeypatch.undo()
     intervals = sorted(died_dir.glob("interval-*"))
     assert [directory.name for directory in intervals] == ["interval-000012"]
     trio = intervals[0]

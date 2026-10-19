@@ -647,8 +647,8 @@ def train_e2e(
             whole_alphabet=whole_alphabet,
         )
     except torch.cuda.OutOfMemoryError as error:
-        # The sweep that drives this wants the peak recorded even at the crash,
-        # and a freed cache before the process exits so a shared card is clean.
+        # The peak is recorded even at the crash, and the cache freed before
+        # the process exits so a shared card is clean.
         torch.cuda.empty_cache()
         typer.echo(f"out of memory: {error}")
         raise typer.Exit(3) from error
@@ -676,6 +676,22 @@ def train_e2e(
         f"off {without_context.rate:.4f} "
         f"({with_context.scored} characters)"
     )
+
+
+@train_app.command("measure")
+def train_measure(
+    run_dir: Path = typer.Argument(..., help="A run directory: its metrics.jsonl"),
+    gpu: Path | None = typer.Option(None, "--gpu", help="The kernel's gpu.csv"),
+    cpu: Path | None = typer.Option(None, "--cpu", help="The kernel's cpu.jsonl"),
+    trace: Path | None = typer.Option(None, "--trace", help="A trace-rank<r>.json of the run"),
+    from_step: int = typer.Option(
+        0, "--from-step", help="Start the span here at the earliest, past costs the records miss"
+    ),
+) -> None:
+    """The run's steady state: its rate, its GPUs and its host over the same steps."""
+    from mlime.train.measure import measure
+
+    typer.echo(json.dumps(measure(run_dir, gpu, cpu, trace, from_step), indent=2))
 
 
 @train_app.command("count-batches")

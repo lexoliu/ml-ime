@@ -547,9 +547,9 @@ class Profiler:
 
     ``dynamic`` is for a compiled run: its warm-up ends once dynamo has added
     no graph for ``COMPILE_STABLE_STEPS`` steps running (capped at
-    ``COMPILE_WARMUP_CAP``), each collected step carries how many graphs and
-    breaks happened inside it, and ``done`` lets the loop leave as soon as the
-    window is full. ``sync_check`` arms the sync guard -- off for compiled
+    ``COMPILE_WARMUP_CAP``), and each collected step carries how many graphs
+    and breaks happened inside it. The window is a stretch of the run, not
+    its end: the run trains on past it. ``sync_check`` arms the sync guard -- off for compiled
     runs, whose proof is zero breaks and recompiles, since a legitimate
     mid-window compile would trip a guard written for eager code.
 
@@ -646,13 +646,14 @@ class Profiler:
             if checking:
                 torch.cuda.set_sync_debug_mode("default")
 
-    def end(self) -> None:
+    def end(self) -> bool:
         """Close the step; keep it if it was being collected.
 
         In a compiled run the step's compile cost is settled here too: new
         graphs feed the stability counter that ends the warm-up, and both
         deltas are stamped onto a collected record so the report can total
-        what happened inside the window.
+        what happened inside the window. True when this step filled the
+        window, the moment its report is ready.
         """
         recompiles = 0
         graph_breaks = 0
@@ -662,24 +663,23 @@ class Profiler:
                 self._stable = self._stable + 1 if recompiles == 0 else 0
                 if self._stable >= COMPILE_STABLE_STEPS or self.warmup_steps >= COMPILE_WARMUP_CAP:
                     self._warmed = True
-        if self._current is not None:
-            if self.dynamic:
-                self._current["recompiles"] = float(recompiles)
-                self._current["graph_breaks"] = float(graph_breaks)
-            self.records.append(self._current)
-            self._current = None
-            if len(self.records) == self.steps:
-                self._window.append(time.time())
-            if self._tracer is not None and self._trace is not None:
-                steps, path = self._trace
-                if len(self.records) == steps:
-                    self._tracer.stop()
-                    self._tracer.export_chrome_trace(str(path))
-                    self._tracer = None
-
-    def done(self) -> bool:
-        """The window is full -- a measurement run has nothing left to measure."""
-        return self.steps > 0 and len(self.records) >= self.steps
+        if self._current is None:
+            return False
+        if self.dynamic:
+            self._current["recompiles"] = float(recompiles)
+            self._current["graph_breaks"] = float(graph_breaks)
+        self.records.append(self._current)
+        self._current = None
+        if self._tracer is not None and self._trace is not None:
+            steps, path = self._trace
+            if len(self.records) == steps:
+                self._tracer.stop()
+                self._tracer.export_chrome_trace(str(path))
+                self._tracer = None
+        if len(self.records) < self.steps:
+            return False
+        self._window.append(time.time())
+        return True
 
     def report(self) -> dict[str, Any]:
         """Mean and p95 of each phase over the collected steps, as a record.
@@ -699,6 +699,11 @@ class Profiler:
             "steps": len(self.records),
             "warmup_steps": self.warmup_steps,
             "window": self._window,
+            # The allocator's high-water mark so far: the window comes after
+            # the warm-up, so the shapes the run trains on have all been seen.
+            "peak_bytes": torch.cuda.max_memory_allocated(self.device)
+            if self.device.type == "cuda"
+            else None,
             "recompiles": int(sum(record.get("recompiles", 0.0) for record in self.records)),
             "graph_breaks": int(sum(record.get("graph_breaks", 0.0) for record in self.records)),
             "phases": {
@@ -1156,6 +1161,9 @@ def train(
                     "tokens": sum(item.batch.tokens for item in windows[0]),
                     "context_tokens": sum(item.batch.context_tokens for item in windows[0]),
                     "seconds": round(time.monotonic() - started, 1),
+                    # Wall clock, to match a span of steps against samples
+                    # taken outside the process (nvidia-smi, /proc).
+                    "time": round(time.time(), 3),
                     "gates": model.gates(),
                 }
                 first_logged_loss = loss_now if first_logged_loss is None else first_logged_loss
@@ -1184,7 +1192,8 @@ def train(
             if world.world_size > 1:
                 verdict = agreed(world, verdict, device) if step % config.agree_every == 0 else 0
             profiler.mark("agree_log")
-            profiler.end()
+            if profiler.end():
+                write_profile(profiler, world, metrics)
             if step >= config.max_steps:
                 finished = True
                 break
@@ -1205,13 +1214,6 @@ def train(
                 next_interval += interval_seconds
                 if world.is_main:
                     metrics.write(event="interval", step=step, seconds=round(elapsed, 1))
-            # A measurement run ends when its window fills -- a compiled one
-            # may warm up late, so its max_steps is a cap, not the target.
-            # Each rank warms up on its own recompiles, so rank 0's window
-            # decides for all: a rank leaving on its own window would leave
-            # the others in the next gradient all-reduce.
-            if profiler.steps > 0 and agreed(world, int(profiler.done()), device):
-                break
     finally:
         for lane in rank_lanes:
             lane.close()
@@ -1219,14 +1221,9 @@ def train(
         raise RuntimeError("the loop ran no step; nothing was consumed")
     if finished:
         checkpoints.final(step, states())
-    if profiler.records:
-        profile = profiler.report()
-        # The kernel reads the phase table out of the log stream, like
-        # `peak-memory`; rank 0 also writes it to the metrics file.
-        sys.stdout.write(json.dumps({"event": "profile", "rank": world.rank, **profile}) + "\n")
-        sys.stdout.flush()
-        if world.is_main:
-            metrics.write(event="profile", **profile)
+    if profiler.records and len(profiler.records) < profiler.steps:
+        # The segment ended inside its window: what was collected still counts.
+        write_profile(profiler, world, metrics)
     if config.compile and world.is_main:
         # How dynamo did: graphs compiled, breaks taken, and each recompile --
         # the record a compiled run owes the reader of its numbers. The import
@@ -1246,6 +1243,15 @@ def train(
     del trained
     world.stop()
     return Segment(metrics=metrics.path, step=step, finished=finished)
+
+
+def write_profile(profiler: Profiler, world: Distributed, metrics: MetricLog) -> None:
+    """The window's phase table, to the log stream and to rank 0's metrics."""
+    profile = profiler.report()
+    sys.stdout.write(json.dumps({"event": "profile", "rank": world.rank, **profile}) + "\n")
+    sys.stdout.flush()
+    if world.is_main:
+        metrics.write(event="profile", **profile)
 
 
 def save_checkpoint(

@@ -32,11 +32,11 @@ other segmentations from the `ime-segment` binary the package dataset ships.
 character (#121). A finished run is told apart from the run it started from
 by the stage its run-config records.
 
-For a smoke run -- the few-minute rate check that the cost estimate is made
-from -- set `SMOKE_STEPS` nonzero: the kernel times each entry of
-`SMOKE_CONFIGS` for that many steps after a warm-up at `TOKEN_BUDGET`, one
-subprocess per configuration, and writes the rates, the peaks, the mean GPU
-utilisation and the per-phase timing table to `run-summary.json`.
+A leg measures itself while it trains: `GpuSampler` and `CpuSampler` log the
+cards and the trainers' threads to `gpu.csv` and `cpu.jsonl` beside the run,
+and with `PROFILE_STEPS` stamped the loop times that many steps after its
+warm-up and trains on. `mlime train measure` turns the files into the leg's
+steady-state rate, utilisation and phase table.
 """
 
 import ctypes
@@ -47,10 +47,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
 from pathlib import Path
 from queue import Empty, SimpleQueue
 
@@ -71,43 +69,12 @@ SEGMENT = 0
 #: complaint; with the digest stamped it refuses instead.
 SOURCE_DIGEST = None
 
-#: Set nonzero for a smoke run: each configuration in `SMOKE_CONFIGS` gets
-#: this many timed steps after its warm-up, and the whole table lands in
-#: run-summary.json.
-SMOKE_STEPS = 0
-
-#: A compiled run warms up until dynamo has added no graph for five
-#: consecutive steps; this is the cap on that, since a dimension that still
-#: specialises at that point keeps doing so. `max_steps` gets the cap plus
-#: the timed steps -- the loop leaves on its own once the window is full.
-SMOKE_WARMUP_CAP = 30
-
-#: The configurations the smoke times against each other at `TOKEN_BUDGET`:
-#: prefetch and compile on throughout, accumulate 2 against accumulate 4.
-#: Accumulate 2 then also runs at `SMOKE_WIDE_BUDGET`. An entry may set
-#: `nproc` below `WORLD` to time the same step without its peers -- what the
-#: world costs each rank -- and is then shown but never recommended.
-SMOKE_CONFIGS = (
-    ("compile-acc2", {"prefetch": True, "accumulate": 2, "compile": True}),
-    ("compile-acc4", {"prefetch": True, "accumulate": 4, "compile": True}),
-)
-
-#: Timed steps per smoke configuration to also record as a Chrome trace,
-#: one per rank, copied out as `smoke-<name>-trace-rank<r>.json`. A trace
-#: shows where inside a phase a card idled; each is ~60 MB a step, so it is
-#: off unless a run is being diagnosed.
-SMOKE_TRACE_STEPS = 0
-
-#: The wider budget accumulate-2 gets a timed run at. The gate is that run's
-#: own timed peak: a 60-step probe was shown to under-report what a long
-#: segment sees, so it no longer stands in. None skips the wide run.
-SMOKE_WIDE_BUDGET = 12288
-
-#: A configuration is safe while its timed peak stays at or under this share of
-#: the smallest card, and competitive while its mean GPU utilisation reaches
-#: `SMOKE_UTILISATION_FLOOR`; `recommended` says which it found.
-SMOKE_PEAK_CEILING = 0.88
-SMOKE_UTILISATION_FLOOR = 80.0
+#: Steps after the compile warm-up whose phases the loop times, and how many
+#: of the first of them it also records as a torch.profiler trace
+#: (`run/trace-rank<r>.json`, ~60 MB a step). The run trains on past the
+#: window; `mlime train measure` reads it back with the samplers' logs.
+PROFILE_STEPS = 0
+TRACE_STEPS = 0
 
 #: Recompute the encoder towers' layers in backward when even the smallest
 #: budget cannot fit -- the kernel flag for it, off until the sweep says so.
@@ -642,542 +609,6 @@ def records_of(metrics, event):
     ]
 
 
-def peak_memory(log_text):
-    """Per-rank peak CUDA bytes, from the peak-memory lines the ranks print."""
-    peaks = {}
-    for line in log_text.splitlines():
-        if '"peak-memory"' not in line:
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if record.get("event") == "peak-memory":
-            peaks[int(record["rank"])] = int(record["bytes"])
-    return peaks
-
-
-def profile_phases(log_text):
-    """Each rank's per-phase timing table, from the profile lines it prints.
-
-    Beyond the phase stats the record carries ``warmup_steps`` (how long the
-    adaptive warm-up took), ``window`` (the wall-clock bounds of the timed
-    steps, for slicing the GPU samples) and ``recompiles``/``graph_breaks``
-    (what dynamo did inside the window -- the compiled run's assertion of
-    steadiness).
-    """
-    tables = {}
-    for line in log_text.splitlines():
-        if '"profile"' not in line:
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if record.get("event") == "profile":
-            tables[int(record["rank"])] = {
-                "steps": record["steps"],
-                "warmup_steps": record["warmup_steps"],
-                "window": record["window"],
-                "recompiles": record["recompiles"],
-                "graph_breaks": record["graph_breaks"],
-                "phases": record["phases"],
-            }
-    return tables
-
-
-def dynamo_counters(log_text):
-    """Each rank's `torch._dynamo` counters, from the lines a compile run prints.
-
-    `graph_breaks` is the Counter of reasons dynamo fell back to eager; the
-    rest count cache hits, recompilations and frames. A run without --compile
-    emits no such line and reads as absent.
-    """
-    counters = {}
-    for line in log_text.splitlines():
-        if '"dynamo"' not in line:
-            continue
-        try:
-            record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if record.get("event") == "dynamo":
-            counters[int(record["rank"])] = record["counters"]
-    return counters
-
-
-class GpuSampler:
-    """`nvidia-smi -lms` running beside a subprocess: per-GPU utilisation.
-
-    The check is the driver's, not torch's: a step that leaves the card idle
-    while the host collates shows up here even though no device code knows
-    about it. 500 ms is fine enough to catch a step boundary and coarse enough
-    to keep the log small. The samples go to a file: a pipe nobody drains
-    fills after a few minutes and stalls `nvidia-smi`, and every later
-    sample -- the timed window's, after a long compile -- never arrives.
-
-    Beside utilisation it reads what can slow a busy card down: the SM
-    clock, the temperature, the power draw and the driver's throttle-reason
-    bits, since two T4s working side by side share one chassis's cooling.
-    """
-
-    FIELDS = (
-        "index",
-        "timestamp",
-        "utilization.gpu",
-        "memory.used",
-        "clocks.sm",
-        "temperature.gpu",
-        "power.draw",
-        "clocks_throttle_reasons.active",
-    )
-
-    def __init__(self, log, interval_ms=500):
-        self._log = log
-        self._argv = [
-            "nvidia-smi",
-            f"--query-gpu={','.join(self.FIELDS)}",
-            "--format=csv,noheader,nounits",
-            "-lms",
-            str(interval_ms),
-        ]
-        self._process = None
-        self.samples = {}
-
-    def __enter__(self):
-        with self._log.open("w", encoding="utf-8") as sink:
-            self._process = subprocess.Popen(self._argv, stdout=sink, stderr=subprocess.DEVNULL)
-        return self
-
-    def __exit__(self, *_):
-        if self._process.poll() is not None:
-            raise RuntimeError(
-                f"nvidia-smi exited {self._process.returncode} before the run did: "
-                f"{' '.join(self._argv)}"
-            )
-        self._process.terminate()
-        try:
-            self._process.wait(timeout=15)
-        except subprocess.TimeoutExpired:
-            self._process.kill()
-            self._process.wait()
-        for line in self._log.read_text(encoding="utf-8").splitlines():
-            fields = dict(zip(self.FIELDS, (f.strip() for f in line.split(",")), strict=False))
-            if len(fields) != len(self.FIELDS):
-                continue
-            self.samples.setdefault(int(fields["index"]), []).append(
-                {
-                    "time": datetime.strptime(
-                        fields["timestamp"], "%Y/%m/%d %H:%M:%S.%f"
-                    ).timestamp(),
-                    "utilization": int(fields["utilization.gpu"]),
-                    "memory_mib": int(fields["memory.used"]),
-                    "sm_mhz": int(fields["clocks.sm"]),
-                    "celsius": int(fields["temperature.gpu"]),
-                    "watts": float(fields["power.draw"]),
-                    "throttle": fields["clocks_throttle_reasons.active"],
-                }
-            )
-        return False
-
-    def means(self, since=None, until=None):
-        """Per GPU over the samples in the window: means, the peak temperature,
-        and how often each throttle-reason mask was active.
-
-        ``since``/``until`` are wall-clock epochs -- the profile record's
-        ``window`` bounds -- so a run's mean covers its timed steps only, not
-        the warm-up its compilation idles through.
-        """
-        out = {}
-        for gpu, samples in sorted(self.samples.items()):
-            rows = [
-                r
-                for r in samples
-                if (since is None or r["time"] >= since) and (until is None or r["time"] <= until)
-            ]
-
-            def mean(key, digits, rows=rows):
-                return round(sum(r[key] for r in rows) / len(rows), digits) if rows else None
-
-            throttles = {}
-            for r in rows:
-                throttles[r["throttle"]] = throttles.get(r["throttle"], 0) + 1
-            out[str(gpu)] = {
-                "utilization": mean("utilization", 1),
-                "memory_mib": mean("memory_mib", 0),
-                "sm_mhz": mean("sm_mhz", 0),
-                "watts": mean("watts", 1),
-                "max_celsius": max((r["celsius"] for r in rows), default=None),
-                "throttle_share": {k: round(n / len(rows), 3) for k, n in throttles.items()},
-                "samples": len(rows),
-            }
-        return out
-
-
-class CpuSampler:
-    """Every process's CPU time, per thread, sampled from `/proc` beside a run.
-
-    The T4 machines have four cores for two training processes, each with a
-    main thread that launches the device work and a producer thread that
-    collates, plus the segmenter they talk to. A card idling because its
-    launcher waits for a core shows up here and nowhere in the device's own
-    numbers. Each sample is the machine's busy and total jiffies and every
-    thread's cumulative user+system ticks; :meth:`usage` differences two of
-    them.
-    """
-
-    def __init__(self, interval=2.0):
-        self._interval = interval
-        self._stopped = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self.samples = []
-        # Read while the process lives: the report is written after it exits.
-        self._commands = {}
-
-    @staticmethod
-    def _machine():
-        fields = [int(v) for v in Path("/proc/stat").read_text().split("\n", 1)[0].split()[1:]]
-        idle = fields[3] + fields[4]
-        return sum(fields) - idle, sum(fields)
-
-    @staticmethod
-    def _threads():
-        ticks = {}
-        for task in Path("/proc").glob("[0-9]*/task/[0-9]*/stat"):
-            try:
-                text = task.read_text()
-            except OSError:  # the thread ended between the glob and the read
-                continue
-            rest = text[text.rindex(")") + 2 :].split()
-            pid, tid = int(task.parts[2]), int(task.parts[4])
-            ticks[(pid, tid)] = int(rest[11]) + int(rest[12])
-        return ticks
-
-    @staticmethod
-    def _command(pid):
-        try:
-            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-        except OSError:
-            return "?"
-        words = [w for w in raw.decode(errors="replace").split("\0") if w]
-        return " ".join(Path(w).name if i == 0 else w for i, w in enumerate(words[:4]))
-
-    def _run(self):
-        while not self._stopped.is_set():
-            busy, total = self._machine()
-            threads = self._threads()
-            for pid, _ in threads:
-                if pid not in self._commands:
-                    self._commands[pid] = self._command(pid)
-            self.samples.append((time.time(), busy, total, threads))
-            self._stopped.wait(self._interval)
-
-    def __enter__(self):
-        self._thread.start()
-        return self
-
-    def __exit__(self, *_):
-        self._stopped.set()
-        self._thread.join()
-        return False
-
-    def usage(self, since=None, until=None, top=8):
-        """Machine busy percent and the busiest processes' cores over a window.
-
-        A process's cores split into its main thread's and the rest's: the
-        main thread is the one that launches device work.
-        """
-        inside = [
-            s
-            for s in self.samples
-            if (since is None or s[0] >= since) and (until is None or s[0] <= until)
-        ]
-        if len(inside) < 2:
-            return {"busy_percent": None, "samples": len(inside), "processes": []}
-        (t0, busy0, total0, threads0), (t1, busy1, total1, threads1) = inside[0], inside[-1]
-        hertz = os.sysconf("SC_CLK_TCK")
-        seconds = t1 - t0
-        processes = {}
-        for (pid, tid), ticks in threads1.items():
-            used = (ticks - threads0.get((pid, tid), ticks)) / hertz / seconds
-            entry = processes.setdefault(pid, {"main": 0.0, "other": 0.0})
-            entry["main" if tid == pid else "other"] += used
-        busiest = sorted(processes.items(), key=lambda kv: -(kv[1]["main"] + kv[1]["other"]))
-        return {
-            "busy_percent": round(100 * (busy1 - busy0) / (total1 - total0), 1),
-            "cores": os.cpu_count(),
-            "samples": len(inside),
-            "processes": [
-                {
-                    "pid": pid,
-                    "command": self._commands[pid],
-                    "main_cores": round(used["main"], 2),
-                    "other_cores": round(used["other"], 2),
-                }
-                for pid, used in busiest[:top]
-            ],
-        }
-
-
-def steps_per_second(steps):
-    """Steps/s from the step records' own clock: last minus first over the span."""
-    if len(steps) < 2:
-        return None
-    span = steps[-1]["seconds"] - steps[0]["seconds"]
-    if span <= 0:
-        return None
-    return round((steps[-1]["step"] - steps[0]["step"]) / span, 3)
-
-
-def gpu_total_bytes():
-    """The smallest card's memory: the per-rank ceiling the headroom rule reads."""
-    import torch
-
-    return min(
-        torch.cuda.get_device_properties(index).total_memory
-        for index in range(torch.cuda.device_count())
-    )
-
-
-def smoke_run(char_table, start, segmenter, env, name, token_budget, options, steps, timed):
-    """One smoke subprocess: *steps* optimiser steps, the last *timed* measured.
-
-    A configuration's run is a process of its own so an OOM neither corrupts
-    nor misattributes the next configuration's measurement. Rates come off the
-    timed window's own step records; `GpuSampler` brackets the run so a step
-    that idles the card shows in the utilisation mean, and the loop's
-    profiler -- on for the timed steps only -- splits them into phases.
-    """
-    run_dir = WORKING / f"smoke-{name}"
-    log_file = WORKING / f"smoke-{name}.log"
-    argv = train_argv(
-        char_table,
-        run_dir,
-        steps,
-        None,
-        start,
-        None,
-        token_budget,
-        max_held_out=256,
-        prefetch=options.get("prefetch", False),
-        accumulate=options.get("accumulate", 1),
-        nproc=options.get("nproc", WORLD),
-        profile_steps=timed,
-        trace_steps=SMOKE_TRACE_STEPS,
-        compile=options.get("compile", False),
-        compile_mode=options.get("compile_mode", "default"),
-        log_every=1,
-        segmenter=segmenter,
-    )
-    # A recompile inside the window costs about a minute of an idle card;
-    # dynamo's reason for each lands in the log beside the step that paid it.
-    with (
-        GpuSampler(WORKING / f"smoke-{name}-gpu.csv") as sampler,
-        CpuSampler() as processor,
-    ):
-        code, seconds = run(argv, {**env, "TORCH_LOGS": "recompiles"}, str(log_file))
-    text = log_file.read_text(encoding="utf-8")
-    profiles = profile_phases(text)
-    # GPU means cover the timed window only: the profile record's epoch bounds
-    # cut the sampler's log, so warm-up -- and the compilation inside it --
-    # does not dilute the number the utilisation floor reads.
-    bounds = [p["window"] for p in profiles.values() if len(p.get("window") or []) == 2]
-    window = (
-        {"since": min(b[0] for b in bounds), "until": max(b[1] for b in bounds)} if bounds else {}
-    )
-    gpu_mean = sampler.means(**window)
-    cpu_usage = processor.usage(**window)
-    entry = {
-        "name": name,
-        "token_budget": token_budget,
-        "prefetch": options.get("prefetch", False),
-        "accumulate": options.get("accumulate", 1),
-        "compile": options.get("compile", False),
-        "nproc": options.get("nproc", WORLD),
-        "seconds": round(seconds, 1),
-        "gpu_mean": gpu_mean,
-        "cpu": cpu_usage,
-        "peak_bytes_per_rank": {
-            str(rank): size for rank, size in sorted(peak_memory(text).items())
-        },
-        "phases": {str(rank): t for rank, t in sorted(profiles.items())},
-        "recompiles": {
-            str(rank): table.get("recompiles")
-            for rank, table in sorted(profiles.items())
-        },
-        "graph_breaks": {
-            str(rank): table.get("graph_breaks")
-            for rank, table in sorted(profiles.items())
-        },
-        "dynamo": {str(rank): c for rank, c in sorted(dynamo_counters(text).items())},
-    }
-    if code != 0:
-        entry["status"] = (
-            "oom" if code == 3 or "out of memory" in text.lower() else "failed"
-        )
-    else:
-        step_records = records_of(run_dir / "metrics.jsonl", "step")
-        timed_records = step_records[-timed:] if timed else []
-        entry["status"] = "ok"
-        entry["timed_steps"] = len(timed_records)
-        if len(timed_records) > 1:
-            span = timed_records[-1]["seconds"] - timed_records[0]["seconds"]
-            entry["steps_per_second"] = steps_per_second(timed_records)
-            if span > 0:
-                entry["examples_per_second_per_rank"] = round(
-                    sum(step["examples"] for step in timed_records[1:]) / span, 1
-                )
-                entry["padded_tokens_per_second_per_rank"] = round(
-                    sum(
-                        step["tokens"] + step["context_tokens"]
-                        for step in timed_records[1:]
-                    )
-                    / span,
-                    1,
-                )
-        if step_records:
-            # The first step carries the compile latency when one runs; as a
-            # warm step its rate is excluded from every timing either way.
-            entry["first_step_seconds"] = step_records[0]["seconds"]
-            if options.get("compile", False):
-                entry["compile_seconds"] = step_records[0]["seconds"]
-            entry["first_loss"] = step_records[0]["loss"]
-            entry["last_loss"] = step_records[-1]["loss"]
-    print(json.dumps(entry), flush=True)
-    for trace in run_dir.glob("trace-rank*.json"):
-        shutil.move(trace, WORKING / f"smoke-{name}-{trace.name}")
-    shutil.rmtree(run_dir, ignore_errors=True)
-    return entry
-
-
-def rate_of(entry):
-    """What "fastest" reads: padded tokens/s per rank over the timed window."""
-    return entry.get("padded_tokens_per_second_per_rank") or 0.0
-
-
-def peak_of(entry):
-    """An entry's worst per-rank peak in bytes; None when it never ran far."""
-    peaks = entry.get("peak_bytes_per_rank") or {}
-    return max(peaks.values()) if peaks else None
-
-
-def utilisation_of(entry):
-    """An entry's worst-GPU mean utilisation; None when it was never sampled."""
-    means = entry.get("gpu_mean") or {}
-    values = [m["utilization"] for m in means.values() if m["utilization"] is not None]
-    return min(values) if values else None
-
-
-def settings_of(entry):
-    """The switches a recommended entry would carry into the real segments."""
-    return {
-        "token_budget": entry["token_budget"],
-        "prefetch": entry["prefetch"],
-        "accumulate": entry["accumulate"],
-        "compile": entry["compile"],
-        "after": entry["name"],
-    }
-
-
-def smoke(char_table, start, segmenter, env):
-    """Time each `SMOKE_CONFIGS` entry at `TOKEN_BUDGET`, then acc2 wide.
-
-    The wider run is always accumulate 2 -- the question it answers is memory,
-    not rate -- and it is counted only if its own timed peak fits the ceiling.
-    `recommended` is the fastest counted entry whose utilisation reaches the
-    floor; without one it is the fastest memory-safe entry, marked so.
-    """
-    entries = [
-        smoke_run(
-            char_table,
-            start,
-            segmenter,
-            env,
-            name,
-            TOKEN_BUDGET,
-            options,
-            SMOKE_WARMUP_CAP + SMOKE_STEPS,
-            SMOKE_STEPS,
-        )
-        for name, options in SMOKE_CONFIGS
-    ]
-
-    ceiling = gpu_total_bytes() * SMOKE_PEAK_CEILING
-
-    def peak_ok(entry):
-        peak = peak_of(entry)
-        return peak is not None and peak <= ceiling
-
-    if SMOKE_WIDE_BUDGET is not None:
-        entries.append(
-            smoke_run(
-                char_table,
-                start,
-                segmenter,
-                env,
-                f"compile-acc2-{SMOKE_WIDE_BUDGET}",
-                SMOKE_WIDE_BUDGET,
-                {"prefetch": True, "accumulate": 2, "compile": True},
-                SMOKE_WARMUP_CAP + SMOKE_STEPS,
-                SMOKE_STEPS,
-            )
-        )
-    measured = [entry for entry in entries if entry["status"] == "ok"]
-
-    # A run counts toward the recommendation only when it finished inside the
-    # memory ceiling -- the wide run's timed peak is the gate, so a peak over
-    # the share still shows in the table but cannot be recommended -- and ran
-    # in the world the segment trains in.
-    for entry in entries:
-        entry["counted"] = (
-            entry["status"] == "ok" and peak_ok(entry) and entry["nproc"] == WORLD
-        )
-
-    summary = {
-        "segment": SEGMENT,
-        "smoke": True,
-        "token_budget": TOKEN_BUDGET,
-        "warmup_cap": SMOKE_WARMUP_CAP,
-        "timed_steps": SMOKE_STEPS,
-        "configurations": entries,
-    }
-    if not measured:
-        (WORKING / "run-summary.json").write_text(
-            json.dumps(summary, indent=2) + "\n", encoding="utf-8"
-        )
-        raise RuntimeError(
-            "every smoke configuration failed; the table is in run-summary.json"
-        )
-
-    counted = [entry for entry in measured if entry["counted"]]
-    fed = [
-        entry
-        for entry in counted
-        if (utilisation_of(entry) or 0.0) >= SMOKE_UTILISATION_FLOOR
-    ]
-    if fed:
-        recommended = max(fed, key=rate_of)
-        summary["recommended"] = settings_of(recommended)
-    elif counted:
-        recommended = max(counted, key=rate_of)
-        summary["recommended"] = {
-            **settings_of(recommended),
-            "note": (
-                f"no configuration reached {SMOKE_UTILISATION_FLOOR}% GPU "
-                "utilisation; this is the fastest that fits the card"
-            ),
-        }
-    else:
-        recommended = max(measured, key=rate_of)
-        summary["recommended"] = {
-            **settings_of(recommended),
-            "note": "every measured configuration peaked over the memory ceiling",
-        }
-    (WORKING / "run-summary.json").write_text(
-        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
-    )
-
-
 def torch_load(path):
     """torch.load with memory-mapping when this torch has it, for header reads."""
     import inspect
@@ -1294,7 +725,7 @@ def evaluate_lattices(checkpoint, assets, char_table, env):
         raise FileNotFoundError(f"no lattice*.jsonl under {assets}")
     sections = SimpleQueue()
     for lattice in lattices:
-        suffix = lattice.stem[len("lattice"):]
+        suffix = lattice.stem[len("lattice") :]
         eval_set = assets / f"eval3{suffix}.jsonl"
         if not eval_set.is_file():
             raise FileNotFoundError(
@@ -1455,10 +886,6 @@ def main():
         initials = locate(INIT_ENCODER, INIT_DECODER)
         return start_argv((initials / INIT_ENCODER, initials / INIT_DECODER), None)
 
-    if SMOKE_STEPS:
-        smoke(char_table, start(), segmenter, env)
-        return
-
     final = finished_checkpoint()
     if final is not None:
         print(f"evaluating the finished run at {final}; nothing to train", flush=True)
@@ -1507,33 +934,40 @@ def main():
     world = WORLD if previous is None else previous["world"]
     nproc = min(gpu_count(), world)
     if world % nproc:
-        raise RuntimeError(
-            f"a world of {world} ranks does not split evenly over {nproc} processes"
-        )
+        raise RuntimeError(f"a world of {world} ranks does not split evenly over {nproc} processes")
     virtual = world // nproc
     print(f"world of {world}: {nproc} processes x {virtual} virtual ranks", flush=True)
 
-    wall_budget = training_budget(
-        time.monotonic() - started, config["max_steps"], previous, nproc
-    )
+    wall_budget = training_budget(time.monotonic() - started, config["max_steps"], previous, nproc)
     if wall_budget <= 0:
         raise RuntimeError("the session was spent before training could start")
-    code, seconds = run(
-        train_argv(
-            char_table,
-            out,
-            config["max_steps"],
-            wall_budget,
-            start() if resume is None else None,
-            resume,
-            TOKEN_BUDGET,
-            nproc=nproc,
-            virtual_ranks=virtual,
-            segmenter=segmenter,
-        ),
-        env,
-        str(WORKING / "train.log"),
-    )
+    # The package is importable from here on (`sys.path` above); its samplers
+    # watch the whole segment, so any span of it can be measured afterwards.
+    from mlime.train.measure import CpuSampler, GpuSampler
+
+    if PROFILE_STEPS:
+        # A recompile inside the window costs an idle card; dynamo's reason
+        # for each lands in the log beside the step that paid it.
+        env["TORCH_LOGS"] = "recompiles"
+    with GpuSampler(WORKING / "gpu.csv"), CpuSampler(WORKING / "cpu.jsonl"):
+        code, seconds = run(
+            train_argv(
+                char_table,
+                out,
+                config["max_steps"],
+                wall_budget,
+                start() if resume is None else None,
+                resume,
+                TOKEN_BUDGET,
+                profile_steps=PROFILE_STEPS,
+                trace_steps=TRACE_STEPS,
+                nproc=nproc,
+                virtual_ranks=virtual,
+                segmenter=segmenter,
+            ),
+            env,
+            str(WORKING / "train.log"),
+        )
     if code != 0:
         raise RuntimeError("the training segment failed; its log is in the kernel output")
 
@@ -1576,7 +1010,9 @@ def main():
         summary["evaluated"] = evaluated
         summary["held_out"] = records_of(out / "metrics.jsonl", "summary")[-1]
 
-    (WORKING / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    (WORKING / "run-summary.json").write_text(
+        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+    )
     print(json.dumps(summary, indent=2), flush=True)
 
 
