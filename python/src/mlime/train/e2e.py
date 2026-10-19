@@ -170,6 +170,36 @@ def load_model(
     return model, int(state["step"])
 
 
+def build_from(
+    source: Path,
+    char_table: Path,
+    *,
+    with_weights: bool,
+    aux_weight: float,
+    ranking: RankingConfig | None,
+    whole_alphabet: bool,
+) -> tuple[E2EModel, Vocabularies]:
+    """The model the e2e checkpoint at *source* describes, under this stage's losses.
+
+    *with_weights* -- a stage starting from a finished run -- carries the
+    checkpoint's weights over; a resume takes them from the loop instead. The
+    checkpoint is gigabytes, and it lives only in this frame: nothing holds it
+    once the model is built.
+    """
+    state = torch.load(source, map_location="cpu", weights_only=False)
+    recorded = E2EConfig.from_record(_record(state, "e2e", source))
+    vocabularies = Vocabularies.load(char_table, recorded.base_model)
+    model = from_checkpoint(
+        state,
+        vocabularies.lexicon,
+        replace(recorded, aux_weight=aux_weight, ranking=ranking, whole_alphabet=whole_alphabet),
+    )
+    if with_weights:
+        model.load_resumed(_weights(state, source), source)
+        log.info("e2e model initialised from a finished run", step=state.get("step"))
+    return model, vocabularies
+
+
 def compile_modules(model: E2EModel, mode: str) -> None:
     """torch.compile the encoder pass and the decoder stack, in place.
 
@@ -271,19 +301,14 @@ def e2e(
         )
     source = init_e2e if init_e2e is not None else resume
     if source is not None:
-        state = torch.load(source, map_location="cpu", weights_only=False)
-        recorded = E2EConfig.from_record(_record(state, "e2e", source))
-        vocabularies = Vocabularies.load(paths.char_table, recorded.base_model)
-        model = from_checkpoint(
-            state,
-            vocabularies.lexicon,
-            replace(
-                recorded, aux_weight=aux_weight, ranking=ranking, whole_alphabet=whole_alphabet
-            ),
+        model, vocabularies = build_from(
+            source,
+            paths.char_table,
+            with_weights=init_e2e is not None,
+            aux_weight=aux_weight,
+            ranking=ranking,
+            whole_alphabet=whole_alphabet,
         )
-        if init_e2e is not None:
-            model.load_resumed(_weights(state, init_e2e), init_e2e)
-            log.info("e2e model initialised from a finished run", step=state.get("step"))
     else:
         if init_encoder is None or init_decoder is None:
             raise ValueError("a new run needs both --init-encoder and --init-decoder")
