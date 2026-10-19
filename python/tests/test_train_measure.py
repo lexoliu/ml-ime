@@ -37,6 +37,7 @@ def test_the_steady_span_starts_after_the_window_and_the_last_recompile() -> Non
     ]
     assert [r["step"] for r in steady_steps(steps, {"window": [1005.0, 1025.0]})] == [30, 40, 50]
     assert [r["step"] for r in steady_steps(steps, {"window": [1005.0, 1035.0]})] == [40, 50]
+    assert [r["step"] for r in steady_steps(steps, {"window": [1005.0, 1025.0]}, 40)] == [40, 50]
     steps[3]["recompiles"] = 2
     with pytest.raises(ValueError, match="a span needs two"):
         steady_steps(steps, {"window": [1005.0, 1025.0]})

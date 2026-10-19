@@ -174,14 +174,16 @@ def records(metrics: Path, event: str) -> list[dict[str, Any]]:
 
 
 def steady_steps(
-    steps: list[dict[str, Any]], profile: dict[str, Any] | None
+    steps: list[dict[str, Any]], profile: dict[str, Any] | None, from_step: int = 0
 ) -> list[dict[str, Any]]:
     """The step records of the run's steady state.
 
     That is every record logged after the profiled window closed -- its
     steps are serialised by the profiler's marks -- and after the last
-    record that paid for a recompile. The first record kept is the span's
-    starting point, so the steps it covers are only the ones after it.
+    record that paid for a recompile, from step *from_step* on: a cost the
+    records do not carry (a graph capture, say) is the caller's to step
+    past. The first record kept is the span's starting point, so the steps
+    it covers are only the ones after it.
     """
     start = 0.0
     if profile is not None:
@@ -192,7 +194,7 @@ def steady_steps(
     compiled = [r["time"] for r in steps if r.get("recompiles", 0) > 0]
     if compiled:
         start = max(start, max(compiled))
-    steady = [r for r in steps if r["time"] > start]
+    steady = [r for r in steps if r["time"] > start and r["step"] >= from_step]
     if len(steady) < 2:
         raise ValueError(
             f"{len(steady)} step records after the window and the last recompile; a span needs two"
@@ -416,18 +418,20 @@ def measure(
     gpu_log: Path | None = None,
     cpu_log: Path | None = None,
     trace: Path | None = None,
+    from_step: int = 0,
 ) -> dict[str, Any]:
     """The steady state of the run in *run_dir*, from the files the run left.
 
-    Rates come from the step records; the GPU and CPU logs, when given, are
-    cut to the same wall-clock span; the profile record's phase table and
-    *trace*, when given, say where the profiled steps spent their time.
+    Rates come from the step records, from *from_step* on at the earliest;
+    the GPU and CPU logs, when given, are cut to the same wall-clock span;
+    the profile record's phase table and *trace*, when given, say where the
+    profiled steps spent their time.
     """
     metrics = run_dir / "metrics.jsonl"
     steps = records(metrics, "step")
     profiles = records(metrics, "profile")
     profile = profiles[0] if profiles else None
-    steady = steady_steps(steps, profile)
+    steady = steady_steps(steps, profile, from_step)
     since, until = steady[0]["time"], steady[-1]["time"]
     report: dict[str, Any] = {
         # The first step's clock includes the compile, when the run compiles.

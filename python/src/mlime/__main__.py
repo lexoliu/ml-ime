@@ -684,11 +684,14 @@ def train_measure(
     gpu: Path | None = typer.Option(None, "--gpu", help="The kernel's gpu.csv"),
     cpu: Path | None = typer.Option(None, "--cpu", help="The kernel's cpu.jsonl"),
     trace: Path | None = typer.Option(None, "--trace", help="A trace-rank<r>.json of the run"),
+    from_step: int = typer.Option(
+        0, "--from-step", help="Start the span here at the earliest, past costs the records miss"
+    ),
 ) -> None:
     """The run's steady state: its rate, its GPUs and its host over the same steps."""
     from mlime.train.measure import measure
 
-    typer.echo(json.dumps(measure(run_dir, gpu, cpu, trace), indent=2))
+    typer.echo(json.dumps(measure(run_dir, gpu, cpu, trace, from_step), indent=2))
 
 
 @train_app.command("count-batches")
