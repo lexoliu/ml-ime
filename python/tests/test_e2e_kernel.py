@@ -237,6 +237,7 @@ def test_every_switch_the_kernel_passes_is_an_option_of_train_e2e(
     monkeypatch.setattr(kernel, "LEARNING_RATES", (2e-5, 2e-5))
     monkeypatch.setattr(kernel, "TYPOS", True)
     monkeypatch.setattr(kernel, "ACTIVATION_CHECKPOINTING", True)
+    monkeypatch.setattr(kernel, "SEGMENT_STEPS", 70)
     argv = kernel.train_argv(
         tmp_path / "char_pinyin.tsv",
         tmp_path / "run",

@@ -35,6 +35,12 @@ METADATA = Path("/kaggle/kernel-metadata.json")
 PUBLISHER = Path("/kaggle/e2e-publish.py")
 OUTPUT = Path("/kaggle/output.py")
 HUB = Path("/kaggle/hub.py")
+#: Written by `e2e.sh start --resume-from RUN`: the run whose newest trio this
+#: leg resumes instead of its own, so two cards can race the same leg from
+#: one checkpoint while each publishes under its own run name.
+RESUME_FROM = Path("/kaggle/resume-from")
+#: Written by `e2e.sh start --no-publish`: a check leg runs no publisher.
+NO_PUBLISH = Path("/kaggle/no-publish")
 ARIA2 = Path("/kaggle/aria2.py")
 HF_TOKEN = Path("/root/.cache/huggingface/token")
 #: The files of a kernel output the kernel reads: a finished run's final
@@ -51,10 +57,19 @@ STAGING_TRANSFERS = 4
 CHECKPOINT_MINUTES = 20
 
 
-def bucket_trio(publisher, api, run):
-    """Download the run's whole trio from the resume bucket, or None before its first."""
+def bucket_trio(publisher, api, run, required):
+    """Download *run*'s whole trio from the resume bucket, or None before its first.
+
+    A leg started `--resume-from` another run *requires* that run's trio: one
+    missing would start the leg fresh instead, on a schedule nobody asked for.
+    """
     steps = publisher.published_steps(api, run)
     if not steps:
+        if required:
+            raise FileNotFoundError(
+                f"{publisher.BUCKET}/{run}: no whole trio to resume from; "
+                "--resume-from names a run that has published one"
+            )
         print(f"{publisher.BUCKET}/{run}: no trio published yet", flush=True)
         return None
     prefix = publisher.trio_prefix(run, steps[-1])
@@ -221,6 +236,7 @@ def main():
     sys.path.insert(0, str(HUB.parent))
     import hub
     from huggingface_hub import HfApi
+
     WORKING.mkdir(parents=True, exist_ok=True)
 
     # The run's names -- its Kaggle segments and its place in the resume
@@ -236,10 +252,14 @@ def main():
     # transfer at a time leaves most of the VM's bandwidth unused. The
     # finished runs a stage starts from (`INIT_FROM`) are Hub repos too.
     repos = [*metadata["dataset_sources"], *metadata["kernel_sources"]]
+    if RESUME_FROM.is_file():
+        resumed_run, required = RESUME_FROM.read_text().strip(), True
+    else:
+        resumed_run, required = publisher.run_name(METADATA), False
     with ThreadPoolExecutor(max_workers=STAGING_TRANSFERS) as pool:
         transfers = [
             pool.submit(hub.download, repos, INPUTS),
-            pool.submit(bucket_trio, publisher, api, publisher.run_name(METADATA)),
+            pool.submit(bucket_trio, publisher, api, resumed_run, required),
             pool.submit(compile_caches, publisher, api),
             pool.submit(stage_latest_segment, base),
         ]
@@ -264,7 +284,10 @@ def main():
     )
 
     launch([sys.executable, str(KERNEL)], "kernel.out", "kernel.pid")
-    launch([sys.executable, str(PUBLISHER)], "publish.out", "publish.pid")
+    # A check publishes nothing: its trios would enter the run's lineage.
+    if not NO_PUBLISH.is_file():
+        launch([sys.executable, str(PUBLISHER)], "publish.out", "publish.pid")
 
 
-main()
+if __name__ == "__main__":
+    main()
