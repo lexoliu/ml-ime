@@ -32,8 +32,9 @@ other segmentations from the `ime-segment` binary the package dataset ships.
 character (#121). A finished run is told apart from the run it started from
 by the stage its run-config records.
 
-A leg measures itself while it trains: `GpuSampler` and `CpuSampler` log the
-cards and the trainers' threads to `gpu.csv` and `cpu.jsonl` beside the run,
+A leg measures itself while it trains: `GpuSampler` and `HostSampler` log the
+cards, and the trainers' threads and the host's memory, to `gpu.csv` and
+`host.jsonl` beside the run,
 and with `PROFILE_STEPS` stamped the loop times that many steps after its
 warm-up and trains on. `mlime train measure` turns the files into the leg's
 steady-state rate, utilisation and phase table.
@@ -954,13 +955,13 @@ def main():
         raise RuntimeError("the session was spent before training could start")
     # The package is importable from here on (`sys.path` above); its samplers
     # watch the whole segment, so any span of it can be measured afterwards.
-    from mlime.train.measure import CpuSampler, GpuSampler
+    from mlime.train.measure import GpuSampler, HostSampler
 
     if PROFILE_STEPS:
         # A recompile inside the window costs an idle card; dynamo's reason
         # for each lands in the log beside the step that paid it.
         env["TORCH_LOGS"] = "recompiles"
-    with GpuSampler(WORKING / "gpu.csv"), CpuSampler(WORKING / "cpu.jsonl"):
+    with GpuSampler(WORKING / "gpu.csv"), HostSampler(WORKING / "host.jsonl"):
         code, seconds = run(
             train_argv(
                 char_table,
