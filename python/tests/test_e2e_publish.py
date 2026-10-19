@@ -8,7 +8,10 @@ does for the calls the publisher makes.
 """
 
 import importlib.util
+import io
 import json
+import subprocess
+import tarfile
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
@@ -18,6 +21,7 @@ import torch
 
 PUBLISHER_PATH = Path(__file__).resolve().parents[2] / "colab" / "e2e-publish.py"
 RUN = "mlime-e2e-rankw01b"
+CACHE = "compile-cache/Tesla-T4-torch2.13.0+cu128.tar"
 
 
 @dataclass
@@ -44,8 +48,12 @@ class FakeBucket:
         self.batches.append(([destination for _, destination in add], list(delete)))
 
     def steps(self) -> list[str]:
-        """The trio directories the bucket holds."""
-        return sorted({path.rsplit("/", 1)[0] for path in self.files})
+        """The run's trio directories the bucket holds."""
+        return sorted({path.rsplit("/", 1)[0] for path in self.files if path.startswith(RUN)})
+
+    def run_batches(self) -> list[tuple[list[str], list[str]]]:
+        """The batches that touched the run's trios, not the compile caches."""
+        return [batch for batch in self.batches if batch != ([CACHE], [])]
 
 
 def load_publisher(
@@ -63,6 +71,12 @@ def load_publisher(
     metadata.parent.mkdir(parents=True, exist_ok=True)
     metadata.write_text(json.dumps({"id": f"lexoliu/{RUN}-s0"}))
     monkeypatch.setattr(module, "METADATA", metadata)
+    # No GPU here: the caches are a directory of the test's, keyed as a T4's.
+    caches = working.parent / "inductor-cache"
+    (caches / "fxgraph").mkdir(parents=True, exist_ok=True)
+    (caches / "fxgraph" / "entry").write_bytes(b"compiled")
+    monkeypatch.setattr(module, "INDUCTOR_CACHE", caches)
+    monkeypatch.setattr(module, "compile_cache_path", lambda: CACHE)
     if bucket is not None:
         monkeypatch.setattr(module, "HfApi", lambda: bucket)
     return module
@@ -99,11 +113,11 @@ def test_each_publish_leaves_exactly_the_newest_whole_trio(
     assert bucket.steps() == [f"{RUN}/step-0000030"]
     publish_once(monkeypatch, working, bucket, 40)
     assert bucket.steps() == [f"{RUN}/step-0000040"]
-    assert set(bucket.files) == {
+    assert {path for path in bucket.files if path.startswith(RUN)} == {
         f"{RUN}/step-0000040/{name}"
         for name in ("checkpoint-paused.pt", "run-config.json", "run-summary.json", "complete")
     }
-    trio, marker, deletion = bucket.batches[-3:]
+    trio, marker, deletion = bucket.run_batches()[-3:]
     assert sorted(trio[0]) == sorted(
         f"{RUN}/step-0000040/{name}"
         for name in ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
@@ -132,7 +146,7 @@ def test_nothing_newer_publishes_nothing(tmp_path: Path, monkeypatch: pytest.Mon
     publish_once(monkeypatch, working, bucket, 30)
     batches = len(bucket.batches)
     publish_once(monkeypatch, working, bucket, 30)
-    assert len(bucket.batches) == batches
+    assert len(bucket.batches) == batches, "neither a trio nor the caches went up again"
     assert bucket.steps() == [f"{RUN}/step-0000030"]
 
 
@@ -156,3 +170,51 @@ def test_a_second_poll_reads_no_checkpoint_again(
     second = publisher.candidates()
     assert [step for _, step in first] == [step for _, step in second] == [30, 40]
     assert loads == [interval / "checkpoint-paused.pt", working / "checkpoint-paused.pt"]
+
+
+def test_the_caches_go_up_once_this_leg_has_logged_its_steps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Packed after the leg's fifth step record, whole lines only, and only once."""
+    working = tmp_path / "working"
+    bucket = FakeBucket()
+    publisher = load_publisher(monkeypatch, working, bucket)
+    monkeypatch.setenv("ONCE", "1")
+    metrics = working / "run" / "metrics.jsonl"
+    metrics.parent.mkdir(parents=True)
+    records = [{"event": "start"}, *({"event": "step", "step": 10 * n} for n in range(1, 5))]
+    metrics.write_text("".join(json.dumps(record) + "\n" for record in records))
+    with metrics.open("a") as log:
+        log.write('{"event": "st')
+    publisher.main()
+    assert CACHE not in bucket.files
+    metrics.write_text("".join(json.dumps(record) + "\n" for record in records))
+    with metrics.open("a") as log:
+        log.write(json.dumps({"event": "step", "step": 50}) + "\n")
+    publisher.main()
+    assert bucket.batches == [([CACHE], [])]
+    with tarfile.open(fileobj=io.BytesIO(bucket.files[CACHE])) as tar:
+        entry = tar.extractfile("./fxgraph/entry")
+        assert entry is not None and entry.read() == b"compiled"
+
+
+def test_the_caches_are_keyed_by_card_and_torch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The card's name is made path-safe; the torch build keeps its local version."""
+    spec = importlib.util.spec_from_file_location("e2e_publish", PUBLISHER_PATH)
+    assert spec is not None and spec.loader is not None
+    publisher = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(publisher)
+    monkeypatch.setattr(
+        publisher.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, 0, stdout="NVIDIA A100-SXM4-40GB\n"
+        ),
+    )
+    monkeypatch.setattr(publisher.importlib.metadata, "version", lambda name: "2.13.0+cu128")
+    assert (
+        publisher.compile_cache_path()
+        == "compile-cache/NVIDIA-A100-SXM4-40GB-torch2.13.0+cu128.tar"
+    )
