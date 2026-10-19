@@ -27,7 +27,8 @@ from the finished run mounted under that name -- v1's dataset
 weights, a fresh optimiser and schedule, and its one epoch runs over
 `TRAIN_SHARDS`. With `RANKING` stamped as well it is a ranking stage (#116):
 every segment adds the sequence-level ranking loss, reading each example's
-other segmentations from the `ime-segment` binary the package dataset ships.
+other segmentations from the `ime-segment` binary mounted beside the inputs
+(`colab/e2e.sh start` builds it from the leg's commit and uploads it).
 `WHOLE_ALPHABET` normalises the per-position loss over every emittable
 character (#121). A finished run is told apart from the run it started from
 by the stage its run-config records.
@@ -38,10 +39,15 @@ cards, and the trainers' threads and the host's memory, to `gpu.csv` and
 and with `PROFILE_STEPS` stamped the loop times that many steps after its
 warm-up and trains on. `mlime train measure` turns the files into the leg's
 steady-state rate, utilisation and phase table.
+
+The code a leg runs is one commit of the public repository, `COMMIT`, fetched
+from GitHub into `CHECKOUT`; the `mlime` package is imported from there, and a
+checkout whose HEAD is not that commit is refused. The run records the commit
+it started on, and a resume on a different one is refused unless the leg is
+stamped `ALLOW_COMMIT_CHANGE`.
 """
 
 import ctypes
-import hashlib
 import json
 import os
 import shutil
@@ -63,12 +69,24 @@ MAX_DEPTH = 4
 #: Which segment of the chain this kernel is; stamped per copy at push time.
 SEGMENT = 0
 
-#: The `source_digest` of the `mlime` package this kernel was stamped against,
-#: or None to run whatever is mounted. `datasets status` reports a new
-#: `mlime-src` version ready before a kernel pushed right after it is sure
-#: to mount it, and a kernel on the previous version can run without a
-#: complaint; with the digest stamped it refuses instead.
-SOURCE_DIGEST = None
+#: The commit of `REPOSITORY` whose `mlime` package this leg runs; stamped per
+#: leg (`colab/e2e.sh start --commit`). A kernel without one refuses to start.
+COMMIT = None
+
+#: Whether this leg may resume a run that recorded a different commit. A code
+#: change inside a run can change what it computes -- the batches, the loss,
+#: the schedule -- with nothing in the checkpoint to say so, so a resume
+#: refuses it unless the leg is stamped to allow it, and the run-config then
+#: records the leg's commit as the run's.
+ALLOW_COMMIT_CHANGE = False
+
+#: Where the code comes from: a public repository, fetched without a token.
+REPOSITORY = "https://github.com/lexoliu/ml-ime.git"
+
+#: The leg's checkout: outside `/kaggle/working`, which a Kaggle segment
+#: publishes as output. On Colab `e2e.sh start` fetches it before staging,
+#: since the stager and the publisher run from it too.
+CHECKOUT = Path("/tmp/ml-ime")
 
 #: Steps after the compile warm-up whose phases the loop times, and how many
 #: of the first of them it also records as a torch.profiler trace
@@ -303,41 +321,57 @@ def parquet_mounts(marker):
     return found["samples"], found["labels"]
 
 
-def source_digest(package):
-    """sha256 over a package's `.py` files: each relative path, then its bytes."""
-    digest = hashlib.sha256()
-    for path in sorted(package.rglob("*.py")):
-        digest.update(str(path.relative_to(package)).encode())
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
+def git(directory, *argv):
+    """`git -C directory argv...`'s output, raising on any failure."""
+    return subprocess.run(
+        ["git", "-C", str(directory), *argv], capture_output=True, text=True, check=True
+    ).stdout.strip()
 
 
-def importable_package():
-    """A directory that can go on `PYTHONPATH` and make `mlime` importable.
+def checkout(commit, directory=CHECKOUT, repository=REPOSITORY):
+    """*commit* checked out at *directory*: fetched alone when absent, verified always.
 
-    The marker is `train/e2e.py`, not just the package: a `mlime-src` dataset
-    pushed before this branch exists still imports, and then the first `e2e`
-    command fails for the wrong reason. With `SOURCE_DIGEST` set, a mounted
-    package that is not the one stamped is refused.
+    Only that commit is fetched, shallow, so a leg pays for one tree and not
+    the history. A checkout already there -- `e2e.sh start` makes it before
+    staging -- must have *commit* as its HEAD and no tracked file changed.
     """
-    try:
-        root = locate("mlime/train/e2e.py")
-    except FileNotFoundError:
-        mount = locate("train/e2e.py", "__init__.py")
-        root = WORKING / "packages"
-        root.mkdir(parents=True, exist_ok=True)
-        link = root / "mlime"
-        if not link.exists():
-            link.symlink_to(mount, target_is_directory=True)
-    digest = source_digest(root / "mlime")
-    print(f"mlime source {digest}", flush=True)
-    if SOURCE_DIGEST is not None and digest != SOURCE_DIGEST:
-        raise RuntimeError(
-            f"the mounted mlime source is {digest}, not the stamped {SOURCE_DIGEST}: "
-            "the kernel was pushed before the new mlime-src version was attached"
-        )
-    return root
+    if commit is None:
+        raise RuntimeError("no COMMIT is stamped; a leg runs one commit of the repository")
+    if not (directory / ".git").exists():
+        directory.mkdir(parents=True)
+        git(directory, "init", "--quiet")
+        git(directory, "remote", "add", "origin", repository)
+        git(directory, "fetch", "--quiet", "--depth", "1", "origin", commit)
+        git(directory, "checkout", "--quiet", "--detach", "FETCH_HEAD")
+    head = git(directory, "rev-parse", "HEAD")
+    if head != commit:
+        raise RuntimeError(f"the checkout at {directory} is at {head}, not the leg's {commit}")
+    changed = git(directory, "status", "--porcelain", "--untracked-files=no")
+    if changed:
+        raise RuntimeError(f"the checkout at {directory} has changed files:\n{changed}")
+    print(f"code: {repository} at {commit}", flush=True)
+    return directory
+
+
+def package_root():
+    """The directory that goes on `PYTHONPATH`: the leg's checkout's `python/src`."""
+    return checkout(COMMIT) / "python" / "src"
+
+
+def refuse_commit_change(config):
+    """Refuse to resume a run recorded on another commit, unless the leg allows it.
+
+    *config* is the run-config of the trio being resumed; a run started before
+    commits were recorded holds none, which is a change like any other.
+    """
+    recorded = config.get("commit")
+    if recorded != COMMIT:
+        if not ALLOW_COMMIT_CHANGE:
+            raise RuntimeError(
+                f"the run recorded commit {recorded}, this leg runs {COMMIT}; a code change "
+                "inside a run is refused unless the leg is stamped ALLOW_COMMIT_CHANGE"
+            )
+        print(f"the run moves from commit {recorded} to {COMMIT}, as allowed", flush=True)
 
 
 def libcuda_link_dir():
@@ -718,7 +752,7 @@ def init_checkpoint():
 
 
 def stage_segmenter():
-    """The package dataset's `ime-segment`, copied out of the read-only mount, executable."""
+    """The mounted `ime-segment`, copied out of the read-only mount, executable."""
     target = WORKING / "bin" / SEGMENTER
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(locate(SEGMENTER) / SEGMENTER, target)
@@ -790,7 +824,8 @@ def previous_segment():
     whose shared run-config fields disagree describe different runs -- the
     refusal `refuse_mismatch` would make inside the checkpoint -- and are
     refused the same way, by field name. The segment stamp is exempt: it
-    differs by construction.
+    differs by construction; so is the commit, which `refuse_commit_change` checks
+    against the trio picked.
     """
     candidates = resume_candidates()
     if not candidates:
@@ -799,7 +834,7 @@ def previous_segment():
         raise FileNotFoundError(
             f"segment {SEGMENT} found no resumable trio mounted; mounts hold {describe()}"
         )
-    shared = set.intersection(*(set(c["config"]) for c in candidates)) - {"segment"}
+    shared = set.intersection(*(set(c["config"]) for c in candidates)) - {"segment", "commit"}
     differing = sorted(
         key
         for key in shared
@@ -866,7 +901,7 @@ def main():
     if RANKING is not None and INIT_FROM is None:
         raise RuntimeError("a ranking stage starts from a finished run; stamp INIT_FROM")
     install()
-    package_root = importable_package()
+    packages = package_root()
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)
     rest_samples, rest_labels = parquet_mounts(REST_MARKER)
     assets = locate("char_pinyin.tsv", "lattice.jsonl")
@@ -877,14 +912,14 @@ def main():
     )
 
     env = dict(os.environ)
-    env["PYTHONPATH"] = str(package_root)
+    env["PYTHONPATH"] = str(packages)
     env["LIBRARY_PATH"] = os.pathsep.join(
         filter(None, (str(libcuda_link_dir()), env.get("LIBRARY_PATH")))
     )
     env["TOKENIZERS_PARALLELISM"] = "false"
     env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     env["TORCHINDUCTOR_CACHE_DIR"] = str(INDUCTOR_CACHE)
-    sys.path.insert(0, str(package_root))
+    sys.path.insert(0, str(packages))
     warm_cache()
 
     char_table = assets / "char_pinyin.tsv"
@@ -936,6 +971,8 @@ def main():
         resume = None
     else:
         resume, config = previous["checkpoint"], previous["config"]
+        refuse_commit_change(config)
+    config["commit"] = COMMIT
     config["segment"] = SEGMENT
     config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(config), flush=True)
@@ -989,6 +1026,7 @@ def main():
     paused = records_of(out / "metrics.jsonl", "paused")
     summary = {
         "segment": SEGMENT,
+        "commit": COMMIT,
         "max_steps": config["max_steps"],
         "resumed_from": None if resume is None else str(resume),
         "first_step": steps[0]["step"],

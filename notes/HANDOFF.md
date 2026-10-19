@@ -70,9 +70,12 @@ leg's resume trio lives in the private bucket `lexoliu/mlime-resume` under
 `<run>/step-<step>/`. The Kaggle copies below are what the Kaggle chain still
 mounts.
 
+The code is not a dataset: a leg runs one commit of this public repository,
+which the VM fetches from GitHub (`colab/e2e.sh start --commit`, default the
+checkout's HEAD, refused when uncommitted or not on origin).
+
 | dataset | holds |
 |---|---|
-| `lexoliu/mlime-src` | the `mlime` Python package from `dev` (on Kaggle, versioned with `--dir-mode tar`, see §5) |
 | `lexoliu/mlime-route-a-assets` | `char_pinyin.tsv`, `emittable.txt`, `syllables.txt`, `typed_spans.txt`, `eval3*.jsonl`, `lattice*.jsonl` |
 | `lexoliu/mlime-run3-v1-samples`, `-labels` | the 10.03M v1 subset and its g2pW labels |
 | `lexoliu/mlime-run3-rest-samples`, `-labels` | the 31.25M rest of run3 and its labels (404 shards each) |
@@ -141,7 +144,7 @@ fixed in PR #35) → harvested 23:44, evaluated overnight.
 ## 5. Gotchas that already cost time (do not rediscover them)
 
 - `kaggle datasets version -p DIR` skips subdirectories unless `--dir-mode tar`;
-  `mlime-src` needs it. Verify with `kaggle datasets files <slug> --page-size 200`
+  a dataset laid out in directories needs it. Verify with `kaggle datasets files <slug> --page-size 200`
   (paginated: follow "Next Page Token"; 200 per page).
 - Both the samples and the labels datasets hold shards of the same name; find a
   mount by its parquet columns (`text` vs `syllables`), never by file name.

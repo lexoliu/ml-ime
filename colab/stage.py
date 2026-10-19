@@ -21,7 +21,6 @@ HUB = Path("/kaggle/hub.py")
 HF_TOKEN = Path("/root/.cache/huggingface/token")
 #: Private Hub dataset repos, named like the Kaggle slugs the kernel mounts.
 DATASETS = (
-    "lexoliu/mlime-src",
     "lexoliu/mlime-route-a-assets",
     "lexoliu/mlime-run3-v1-samples",
     "lexoliu/mlime-run3-rest-samples",
