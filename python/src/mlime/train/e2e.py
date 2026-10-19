@@ -200,6 +200,38 @@ def build_from(
     return model, vocabularies
 
 
+def build_fresh(
+    init_encoder: Path,
+    init_decoder: Path,
+    char_table: Path,
+    *,
+    aux_weight: float,
+    ranking: RankingConfig | None,
+    whole_alphabet: bool,
+) -> tuple[E2EModel, Vocabularies]:
+    """A new e2e model composed from route A's and the reader's checkpoints.
+
+    The two files are most of a gigabyte each, and they live only in this
+    frame, as :func:`build_from`'s checkpoint does: ``initialise`` copies
+    their weights into the model, and nothing holds either once it is built.
+    """
+    encoder_state = torch.load(init_encoder, map_location="cpu", weights_only=False)
+    base_model = RouteAConfig(**_record(encoder_state, "route_a", init_encoder)).base_model
+    vocabularies = Vocabularies.load(char_table, base_model)
+    reader_state = torch.load(init_decoder, map_location="cpu", weights_only=False)
+    model = initialise(
+        encoder_state,
+        reader_state,
+        vocabularies.lexicon,
+        aux_weight,
+        init_encoder,
+        init_decoder,
+        ranking=ranking,
+        whole_alphabet=whole_alphabet,
+    )
+    return model, vocabularies
+
+
 def compile_modules(model: E2EModel, mode: str) -> None:
     """torch.compile the encoder pass and the decoder stack, in place.
 
@@ -312,17 +344,11 @@ def e2e(
     else:
         if init_encoder is None or init_decoder is None:
             raise ValueError("a new run needs both --init-encoder and --init-decoder")
-        encoder_state = torch.load(init_encoder, map_location="cpu", weights_only=False)
-        base_model = RouteAConfig(**_record(encoder_state, "route_a", init_encoder)).base_model
-        vocabularies = Vocabularies.load(paths.char_table, base_model)
-        reader_state = torch.load(init_decoder, map_location="cpu", weights_only=False)
-        model = initialise(
-            encoder_state,
-            reader_state,
-            vocabularies.lexicon,
-            aux_weight,
+        model, vocabularies = build_fresh(
             init_encoder,
             init_decoder,
+            paths.char_table,
+            aux_weight=aux_weight,
             ranking=ranking,
             whole_alphabet=whole_alphabet,
         )
