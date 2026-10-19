@@ -9,8 +9,10 @@ route A works.
 
 from __future__ import annotations
 
+import gc
 import json
 import random
+import weakref
 from collections import Counter
 from dataclasses import replace
 from pathlib import Path
@@ -270,6 +272,53 @@ def test_a_resumed_run_is_the_run_that_was_not_interrupted(
     weights = uninterrupted.state_dict()
     for name, tensor in resumed_model.state_dict().items():
         assert torch.equal(tensor, weights[name]), name
+
+
+def test_a_resumed_run_holds_none_of_its_checkpoint_once_it_trains(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    whole_dir = tmp_path / "whole"
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    train(tiny_model(lexicon), [(stream, collator)], RESUMABLE, whole_dir)
+
+    # A real checkpoint is gigabytes: one kept for the whole run beside the
+    # model it was poured into is what ran a small VM out of memory (#148).
+    loaded: list[weakref.ref[torch.Tensor]] = []
+    load = torch.load
+
+    def tracked_load(*args: Any, **kwargs: Any) -> Any:
+        state = load(*args, **kwargs)
+        if isinstance(state, dict) and "model" in state:
+            loaded.extend(weakref.ref(tensor) for tensor in state["model"].values())
+        return state
+
+    alive_at_first_step: list[int] = []
+    write = MetricLog.write
+
+    def probing_write(self: MetricLog, **record: object) -> None:
+        if record["event"] == "step" and not alive_at_first_step:
+            gc.collect()
+            alive_at_first_step.append(sum(ref() is not None for ref in loaded))
+        write(self, **record)
+
+    monkeypatch.setattr(torch, "load", tracked_load)
+    monkeypatch.setattr(MetricLog, "write", probing_write)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    train(
+        tiny_model(lexicon),
+        [(stream, collator)],
+        RESUMABLE,
+        tmp_path / "resumed",
+        resume=whole_dir / "checkpoint-000003.pt",
+    )
+    assert loaded
+    assert alive_at_first_step == [0]
 
 
 def test_skipping_lands_where_reading_would_have(
