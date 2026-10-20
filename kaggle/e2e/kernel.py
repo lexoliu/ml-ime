@@ -304,13 +304,17 @@ def describe():
 
 
 def locate_all(*markers):
-    """Every mounted directory holding every one of *markers*."""
+    """Every mounted directory holding every one of *markers*, each a file.
+
+    A marker names a file: the mount the Colab driver makes for `ime-segment`
+    is a directory of that name, which must not make its parent the match.
+    """
     if not INPUTS.is_dir():
         raise FileNotFoundError(f"{INPUTS} does not exist; the kernel has no inputs at all")
     return [
         directory
         for directory in directories(INPUTS)
-        if all((directory / marker).exists() for marker in markers)
+        if all((directory / marker).is_file() for marker in markers)
     ]
 
 
