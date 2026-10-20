@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import random
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import torch
@@ -89,13 +89,11 @@ class RankBatch:
 
     def to(self, device: torch.device) -> RankBatch:
         """The same batch with its tensors on *device*."""
-        return RankBatch(
-            rows=self.rows.to(device),
-            owners=self.owners,
-            gold_rows=self.gold_rows,
-            lengths=self.lengths,
-            gold=self.gold,
-        )
+        return replace(self, rows=self.rows.to(device))
+
+    def pin_memory(self) -> RankBatch:
+        """The same batch with its tensors in page-locked host memory."""
+        return replace(self, rows=self.rows.pin_memory())
 
 
 class RankCollator:

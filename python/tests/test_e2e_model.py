@@ -14,20 +14,23 @@ nine characters.
 
 from __future__ import annotations
 
+import gc
 import json
+import weakref
 from dataclasses import asdict, replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
-from conftest import READINGS, StubTokenizer
+from conftest import READINGS, BuiltLane, StubTokenizer
 from transformers import BertConfig
 
 from mlime.gui import DEV_SHARE, digest
 from mlime.train.arbitration import ReadingArbitration
 from mlime.train.charlm_model import CharLmConfig, TransformerCharLm
 from mlime.train.charlm_vocab import BOS, SPECIALS, CharVocab
-from mlime.train.e2e import from_checkpoint, initialise
+from mlime.train.e2e import e2e, from_checkpoint, initialise
 from mlime.train.e2e_eval import (
     RANK_SCALE,
     Observation,
@@ -39,13 +42,14 @@ from mlime.train.e2e_eval import (
 from mlime.train.e2e_model import E2EConfig, E2EModel, emittable_ids
 from mlime.train.emit import CandidateIndex, LatticePath, LatticeRecord
 from mlime.train.lexicon import CandidateSpace, Lexicon, build_lexicon
-from mlime.train.loop import TrainingConfig, train
+from mlime.train.loop import MetricLog, TrainingConfig, train
 from mlime.train.model import (
     RouteAConfig,
     RouteAModel,
     restricted_cross_entropy,
     smoothed_cross_entropy,
 )
+from mlime.train.run import RunPaths, Slices, Vocabularies
 from mlime.train.samples import (
     IGNORE_INDEX,
     BaseTokenizer,
@@ -649,7 +653,7 @@ def test_a_resumed_e2e_run_is_the_run_that_was_not_interrupted(
         short_corpus[0], short_corpus[1], SampleBuilder(lexicon, spans, arbitration, seed=1)
     )
     collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
-    whole = train(uninterrupted, [(stream, collator)], resumable, whole_dir).metrics
+    whole = train(uninterrupted, [BuiltLane(stream, collator)], resumable, whole_dir).metrics
     checkpoint = torch.load(whole_dir / "checkpoint-000003.pt", weights_only=False)
     assert "e2e" in checkpoint and "route_a" not in checkpoint
     assert checkpoint["e2e"]["aux_weight"] == e2e_config.aux_weight
@@ -660,7 +664,7 @@ def test_a_resumed_e2e_run_is_the_run_that_was_not_interrupted(
     )
     resumed = train(
         resumed_model,
-        [(stream, Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)))],
+        [BuiltLane(stream, Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)))],
         resumable,
         tmp_path / "resumed",
         resume=whole_dir / "checkpoint-000003.pt",
@@ -687,7 +691,7 @@ def test_a_resumed_e2e_run_is_the_run_that_was_not_interrupted(
     )
     train(
         route,
-        [(stream, Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)))],
+        [BuiltLane(stream, Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)))],
         resumable,
         tmp_path / "route-a",
     )
@@ -695,7 +699,7 @@ def test_a_resumed_e2e_run_is_the_run_that_was_not_interrupted(
         train(
             tiny_e2e(lexicon, reader_vocab, e2e_config),
             [
-                (
+                BuiltLane(
                     CorpusStream(
                         short_corpus[0],
                         short_corpus[1],
@@ -921,3 +925,80 @@ def test_the_first_compile_is_already_dynamic(
         loss.backward()
     assert int(counters["stats"].get("unique_graphs") or 0) - graphs == 2
     assert int(sum(counters["graph_breaks"].values())) == breaks
+
+
+def test_a_fresh_run_holds_neither_initialisation_checkpoint_once_it_trains(
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: StubTokenizer,
+    reader_vocab: CharVocab,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``e2e()`` from route A's and the reader's checkpoints keeps neither alive.
+
+    The two files are 0.9 and 0.7 GB; held beside the model they were poured
+    into for the whole run, they are what a small VM runs out of memory on
+    (#148, #156). The run goes through ``e2e()`` itself, with only the base
+    model's downloads -- the tokenizer and the BERT config -- replaced by the
+    fixture's.
+    """
+    encoder = RouteAModel.from_config(TINY, lexicon, RouteAConfig(cross_attention_layers=1))
+    init_encoder = tmp_path / "route-a.pt"
+    torch.save({"route_a": asdict(encoder.config), "model": encoder.state_dict()}, init_encoder)
+    reader = TransformerCharLm(len(reader_vocab), READER_TINY)
+    init_decoder = tmp_path / "charlm.pt"
+    torch.save(
+        {
+            "config": asdict(READER_TINY),
+            "vocab": list(reader_vocab.chars),
+            "model": reader.state_dict(),
+        },
+        init_decoder,
+    )
+    vocabularies = Vocabularies(
+        spans=spans,
+        tokenizer=tokenizer,
+        lexicon=lexicon,
+        arbitration=arbitration,
+        syllables=frozenset(s for readings in READINGS.values() for s in readings),
+    )
+    monkeypatch.setattr(Vocabularies, "load", classmethod(lambda cls, *_: vocabularies))
+    monkeypatch.setattr(BertConfig, "from_pretrained", classmethod(lambda cls, *_: TINY))
+
+    loaded: list[weakref.ref[torch.Tensor]] = []
+    load = torch.load
+
+    def tracked_load(*args: Any, **kwargs: Any) -> Any:
+        state = load(*args, **kwargs)
+        if isinstance(state, dict) and "model" in state:
+            loaded.extend(weakref.ref(tensor) for tensor in state["model"].values())
+        return state
+
+    alive_at_first_step: list[int] = []
+    write = MetricLog.write
+
+    def probing_write(self: MetricLog, **record: object) -> None:
+        if record["event"] == "step" and not alive_at_first_step:
+            gc.collect()
+            alive_at_first_step.append(sum(ref() is not None for ref in loaded))
+        write(self, **record)
+
+    monkeypatch.setattr(torch, "load", tracked_load)
+    monkeypatch.setattr(MetricLog, "write", probing_write)
+    samples, labels = corpus
+    e2e(
+        RunPaths(
+            samples=samples, labels=labels, char_table=tmp_path / "unread", out=tmp_path / "run"
+        ),
+        Slices(
+            train=("test-00000.parquet",), held_out=("test-00001.parquet",), max_held_out_examples=8
+        ),
+        TrainingConfig(max_steps=2, token_budget=24, log_every=1, checkpoint_every=2, fp16=False),
+        init_encoder=init_encoder,
+        init_decoder=init_decoder,
+    )
+    assert len(loaded) == len(encoder.state_dict()) + len(reader.state_dict())
+    assert alive_at_first_step == [0]

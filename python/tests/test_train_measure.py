@@ -7,13 +7,15 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime
+from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from mlime.train.measure import (
+    GpuSampler,
     HostSampler,
     gpu_means,
     host_usage,
@@ -74,9 +76,25 @@ def gpu_line(index: int, at: datetime, utilisation: int, throttle: str) -> str:
     return f"{index}, {stamp}, {utilisation}, 1000, 1200, 60, 100.0, {throttle}"
 
 
+@pytest.fixture
+def eastern_clock() -> Iterator[None]:
+    """A reader whose local zone is not the VM's UTC, as on the Mac."""
+    before = os.environ.get("TZ")
+    os.environ["TZ"] = "America/New_York"
+    time.tzset()
+    yield
+    if before is None:
+        del os.environ["TZ"]
+    else:
+        os.environ["TZ"] = before
+    time.tzset()
+
+
+@pytest.mark.usefixtures("eastern_clock")
 def test_gpu_means_cover_only_the_span(tmp_path: Path) -> None:
+    """The log's clock is UTC, read on a machine whose zone is not."""
     log = tmp_path / "gpu.csv"
-    base = datetime(2026, 10, 19, 15, 0, 0)
+    base = datetime(2026, 10, 19, 15, 0, 0, tzinfo=UTC)
     lines = [
         gpu_line(0, base.replace(second=0), 10, "0x0000000000000000"),  # before the span
         gpu_line(0, base.replace(second=5), 60, "0x0000000000000004"),
@@ -91,6 +109,27 @@ def test_gpu_means_cover_only_the_span(tmp_path: Path) -> None:
     assert means["0"]["utilization"] == 70.0
     assert means["0"]["samples"] == 2
     assert means["0"]["throttle_share"] == {"0x0000000000000004": 0.5, "0x0000000000000000": 0.5}
+
+
+def test_the_gpu_sampler_stamps_its_samples_in_utc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    launched: dict[str, Any] = {}
+
+    class Started:
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+    def popen(argv: list[str], **options: Any) -> Started:
+        launched.update(options, argv=argv)
+        return Started()
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    GpuSampler(tmp_path / "gpu.csv").__enter__()
+    assert launched["argv"][0] == "nvidia-smi"
+    assert launched["env"]["TZ"] == "UTC"
 
 
 @pytest.mark.skipif(not Path("/proc/meminfo").is_file(), reason="reads Linux /proc")
@@ -113,6 +152,8 @@ def test_the_host_sampler_follows_a_trainer_through_proc(tmp_path: Path) -> None
         trainer.wait()
     lines = [json.loads(line) for line in log.read_text().splitlines()]
     assert lines[0]["memory_total"] > 0
+    assert lines[0]["cores"] == os.cpu_count()
+    assert lines[0]["clock_ticks"] == os.sysconf("SC_CLK_TCK")
     assert lines[1]["pid"] == trainer.pid
     assert lines[1]["command"].endswith(" mlime")
     samples = [line for line in lines if "time" in line]
@@ -127,10 +168,11 @@ def test_the_host_sampler_follows_a_trainer_through_proc(tmp_path: Path) -> None
 def test_host_usage_splits_cores_by_thread_and_keeps_the_memory_low_and_high(
     tmp_path: Path,
 ) -> None:
-    hertz = os.sysconf("SC_CLK_TCK")
+    # The VM's tick rate and cores, which the machine reading the log need not share.
+    hertz = 250
     log = tmp_path / "host.jsonl"
     samples = [
-        {"memory_total": 1000},
+        {"memory_total": 1000, "cores": 12, "clock_ticks": hertz},
         {"pid": 7, "command": "python3 -m mlime train e2e"},
         {
             "time": 100.0,
@@ -168,6 +210,7 @@ def test_host_usage_splits_cores_by_thread_and_keeps_the_memory_low_and_high(
     log.write_text("".join(json.dumps(s) + "\n" for s in samples))
     usage = host_usage(log, 100.0, 110.0)
     assert usage["busy_percent"] == 50.0
+    assert usage["cores"] == 12
     assert usage["memory_total_bytes"] == 1000
     assert usage["least_available_bytes"] == 400
     assert usage["processes"] == [
@@ -179,6 +222,14 @@ def test_host_usage_splits_cores_by_thread_and_keeps_the_memory_low_and_high(
             "peak_resident_bytes": 500,
         }
     ]
+
+
+def test_a_host_log_without_its_machine_line_is_refused(tmp_path: Path) -> None:
+    log = tmp_path / "host.jsonl"
+    sample = {"time": 1.0, "busy": 0, "total": 0, "available": 1, "threads": [], "resident": []}
+    log.write_text(json.dumps(sample) + "\n" + json.dumps({**sample, "time": 2.0}) + "\n")
+    with pytest.raises(ValueError, match="does not start with the machine's line"):
+        host_usage(log, 0.0, 3.0)
 
 
 def annotation(name: str, at: float, duration: float = 0.0, tid: int = 1) -> dict[str, Any]:
