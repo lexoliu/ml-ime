@@ -7,13 +7,15 @@ import os
 import subprocess
 import sys
 import time
-from datetime import datetime
+from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from mlime.train.measure import (
+    GpuSampler,
     HostSampler,
     gpu_means,
     host_usage,
@@ -74,9 +76,25 @@ def gpu_line(index: int, at: datetime, utilisation: int, throttle: str) -> str:
     return f"{index}, {stamp}, {utilisation}, 1000, 1200, 60, 100.0, {throttle}"
 
 
+@pytest.fixture
+def eastern_clock() -> Iterator[None]:
+    """A reader whose local zone is not the VM's UTC, as on the Mac."""
+    before = os.environ.get("TZ")
+    os.environ["TZ"] = "America/New_York"
+    time.tzset()
+    yield
+    if before is None:
+        del os.environ["TZ"]
+    else:
+        os.environ["TZ"] = before
+    time.tzset()
+
+
+@pytest.mark.usefixtures("eastern_clock")
 def test_gpu_means_cover_only_the_span(tmp_path: Path) -> None:
+    """The log's clock is UTC, read on a machine whose zone is not."""
     log = tmp_path / "gpu.csv"
-    base = datetime(2026, 10, 19, 15, 0, 0)
+    base = datetime(2026, 10, 19, 15, 0, 0, tzinfo=UTC)
     lines = [
         gpu_line(0, base.replace(second=0), 10, "0x0000000000000000"),  # before the span
         gpu_line(0, base.replace(second=5), 60, "0x0000000000000004"),
@@ -91,6 +109,27 @@ def test_gpu_means_cover_only_the_span(tmp_path: Path) -> None:
     assert means["0"]["utilization"] == 70.0
     assert means["0"]["samples"] == 2
     assert means["0"]["throttle_share"] == {"0x0000000000000004": 0.5, "0x0000000000000000": 0.5}
+
+
+def test_the_gpu_sampler_stamps_its_samples_in_utc(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    launched: dict[str, Any] = {}
+
+    class Started:
+        returncode = None
+
+        def poll(self) -> None:
+            return None
+
+    def popen(argv: list[str], **options: Any) -> Started:
+        launched.update(options, argv=argv)
+        return Started()
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    GpuSampler(tmp_path / "gpu.csv").__enter__()
+    assert launched["argv"][0] == "nvidia-smi"
+    assert launched["env"]["TZ"] == "UTC"
 
 
 @pytest.mark.skipif(not Path("/proc/meminfo").is_file(), reason="reads Linux /proc")
