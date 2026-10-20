@@ -410,12 +410,6 @@ class EpochBatches(Iterator[StepBatch]):
         )
 
 
-#: Batches the producer thread keeps ready ahead of the consumer. Two is
-#: enough to hide a collation under a step; deeper would only hold batches a
-#: pause never reaches.
-PREFETCH_DEPTH = 2
-
-
 class Prefetcher(Iterator[Produced]):
     """Runs an :class:`EpochBatches` on a daemon thread into a bounded queue.
 
@@ -428,7 +422,7 @@ class Prefetcher(Iterator[Produced]):
     run's leftover queue entries are dropped, never trained on.
     """
 
-    def __init__(self, batches: EpochBatches, depth: int = PREFETCH_DEPTH):
+    def __init__(self, batches: EpochBatches, depth: int):
         self._queue: queue.Queue[Produced | BaseException] = queue.Queue(maxsize=depth)
         self._stopped = threading.Event()
         self._thread = threading.Thread(
@@ -1006,7 +1000,10 @@ def train(
         else:
             seed_everything(config.seed, global_rank)
             generators = Generators.capture()
-        prefetcher = Prefetcher(batches) if config.prefetch else None
+        # A step takes a whole window of `accumulate` batches from its lane
+        # before it starts; a shallower queue makes every step wait for the
+        # collations it could have overlapped with the step before.
+        prefetcher = Prefetcher(batches, depth=config.accumulate) if config.prefetch else None
         rank_lanes.append(
             RankLane(
                 source=prefetcher if prefetcher is not None else batches.produced_forever(),
