@@ -88,9 +88,77 @@ def write_trio(directory: Path, step: int) -> Path:
     torch.save({"step": step, "positions": [{}, {}]}, directory / "checkpoint-paused.pt")
     (directory / "run-config.json").write_text(json.dumps({"max_steps": 100}))
     (directory / "run-summary.json").write_text(
-        json.dumps({"last_step": step, "checkpoint_step": step})
+        json.dumps({"last_step": step, "checkpoint_step": step, "finished": False})
     )
     return directory
+
+
+def write_finished(working: Path, summary: dict[str, object]) -> list[str]:
+    """What a finished leg leaves in *working*; the outputs' paths under it."""
+    (working / "run").mkdir(parents=True, exist_ok=True)
+    outputs = {
+        "run-config.json": "{}",
+        "run-summary.json": json.dumps(summary),
+        "e2e-lattice-context-on.jsonl": "{}\n",
+        "e2e-lattice-context-on-report.txt": "top-1\n",
+        "eval-lattice-context-on.log": "done\n",
+    }
+    if "evaluated_checkpoint" not in summary:
+        outputs |= {
+            "run/checkpoint-final.pt": "weights",
+            "run/metrics.jsonl": json.dumps({"event": "summary", "finished": True}) + "\n",
+        }
+    for name, text in outputs.items():
+        (working / name).write_text(text)
+    return sorted(outputs)
+
+
+def test_a_finished_run_ships_its_outputs_then_their_marker_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    working = tmp_path / "working"
+    bucket = FakeBucket()
+    outputs = write_finished(working, {"finished": True, "checkpoint_step": 120})
+    publisher = load_publisher(monkeypatch, working, bucket)
+    monkeypatch.setenv("ONCE", "1")
+    publisher.main()
+    final = f"final/{RUN}"
+    files, marker = bucket.run_batches()
+    assert sorted(files[0]) == [f"{final}/{name}" for name in outputs]
+    assert marker[0] == [f"{final}/complete"]
+    assert bucket.files[f"{final}/run/checkpoint-final.pt"] == b"weights"
+    assert json.loads((working / "publish-state.json").read_text())["final_published"]
+
+    again = load_publisher(monkeypatch, working, bucket)
+    batches = len(bucket.batches)
+    again.main()
+    assert len(bucket.batches) == batches, "the final outputs went up again"
+
+
+def test_the_trio_rotation_leaves_a_finished_runs_outputs_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bucket = FakeBucket()
+    bucket.files[f"final/{RUN}/run/checkpoint-final.pt"] = b"weights"
+    bucket.files[f"final/{RUN}/complete"] = b"7\n"
+    publish_once(monkeypatch, tmp_path / "working", bucket, 30)
+    publish_once(monkeypatch, tmp_path / "working", bucket, 40)
+    assert bucket.files[f"final/{RUN}/run/checkpoint-final.pt"] == b"weights"
+    assert bucket.steps() == [f"{RUN}/step-0000040"]
+
+
+def test_a_leg_that_only_evaluated_ships_no_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its checkpoint was mounted from where it already lives."""
+    working = tmp_path / "working"
+    bucket = FakeBucket()
+    outputs = write_finished(working, {"finished": True, "evaluated_checkpoint": "/mnt/x.pt"})
+    publisher = load_publisher(monkeypatch, working, bucket)
+    monkeypatch.setenv("ONCE", "1")
+    publisher.main()
+    assert sorted(bucket.run_batches()[0][0]) == [f"final/{RUN}/{name}" for name in outputs]
+    assert f"final/{RUN}/run/checkpoint-final.pt" not in bucket.files
 
 
 def publish_once(

@@ -111,6 +111,7 @@ def facts(working: Path = WORKING, proc: Path = PROC) -> dict[str, Any]:
         "newest_trio": newest_trio(working),
         "published": publish.get("last_published_step"),
         "publish_error": publish.get("last_error"),
+        "final_published": publish.get("final_published", False),
         "last_step": last_step(working),
     }
 
@@ -134,7 +135,14 @@ def outcome(known: dict[str, Any]) -> tuple[str, Optional[str]]:
     if summary is None:
         return "failed", "the kernel ended without writing run-summary.json; kernel.out says why"
     if summary["finished"]:
-        return "finished", None
+        if not publishes(known) or known["final_published"]:
+            return "finished", None
+        if known["publisher"]:
+            return "publishing", None
+        return "failed", (
+            "the publisher ended with the finished run's outputs unpublished "
+            f"(last error {known['publish_error']})"
+        )
     step = summary["checkpoint_step"]
     if not publishes(known) or (known["published"] is not None and known["published"] >= step):
         return "paused", None
@@ -149,17 +157,18 @@ def outcome(known: dict[str, Any]) -> tuple[str, Optional[str]]:
 def refusal(known: dict[str, Any]) -> Optional[str]:
     """Why releasing the runtime now would lose work, or None when nothing would be lost.
 
-    A leg that publishes must have its newest trio in the bucket. A leg that
-    finished holds the run's final checkpoint and its evaluations on this VM
-    alone, which no publisher ships.
+    A leg that publishes must have its newest trio in the bucket, and once
+    the run has finished, its final checkpoint and evaluations too.
     """
     if known["leg"] is not None and not publishes(known):
         return None
     summary = known["summary"]
     if summary is not None and summary["finished"]:
+        if known["final_published"]:
+            return None
         return (
-            "the run finished on this VM: run/checkpoint-final.pt and the evaluations exist "
-            "only here; fetch them, then stop with --force"
+            "the run finished on this VM and its final checkpoint and evaluations are not in "
+            f"the bucket yet (last error {known['publish_error']})"
         )
     newest = known["newest_trio"]
     if newest is not None and (known["published"] is None or known["published"] < newest):

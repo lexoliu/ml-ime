@@ -175,15 +175,34 @@ def test_a_kernel_that_died_without_a_summary_failed(vm: Vm) -> None:
     assert "run-summary.json" in report["reason"]
 
 
-def test_a_finished_run_is_never_released_without_force(vm: Vm) -> None:
+def test_a_finished_run_has_ended_only_once_its_outputs_are_in_the_bucket(vm: Vm) -> None:
     vm.options()
     vm.process("kernel.pid", "Z")
+    vm.process("publish.pid", "S")
     vm.interval(100)
     vm.published(100)
     vm.summary(finished=True, checkpoint_step=120)
     report = vm.report()
-    assert report["outcome"] == "finished"
-    assert "checkpoint-final.pt" in report["refusal"]
+    assert report["outcome"] == "publishing"
+    assert "final checkpoint" in report["refusal"]
+
+    state = json.loads((vm.working / "publish-state.json").read_text())
+    state["final_published"] = True
+    (vm.working / "publish-state.json").write_text(json.dumps(state))
+    report = vm.report()
+    assert (report["outcome"], report["refusal"]) == ("finished", None)
+
+
+def test_a_publisher_that_died_with_the_final_outputs_unpublished_fails_the_leg(vm: Vm) -> None:
+    vm.options()
+    vm.process("kernel.pid", "Z")
+    vm.process("publish.pid", None)
+    vm.published(100, error="503 Service Unavailable")
+    vm.summary(finished=True, checkpoint_step=120)
+    report = vm.report()
+    assert report["outcome"] == "failed"
+    assert "finished run's outputs unpublished" in report["reason"]
+    assert "503" in report["refusal"]
 
 
 def test_the_probe_beats_the_watchdog_before_it_reports(
