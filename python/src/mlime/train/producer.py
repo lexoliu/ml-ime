@@ -283,14 +283,18 @@ class ProcessProducer(Iterator[Produced]):
                     got: Produced | ProducerFailure = self._items.get(timeout=POLL_SECONDS)
                 except queue.Empty:
                     if not self._process.is_alive() and not self._halt.is_set():
-                        self._hand(
-                            ProducerFailure(
-                                f"the batch producer exited with code {self._process.exitcode} "
-                                "without reporting why"
-                            )
-                        )
+                        self._hand(self._death())
                         return
                     continue
+                except (EOFError, OSError):
+                    # Where tensors cross as file descriptors (Linux), the child
+                    # hands each queued batch's storage over as it is unpickled;
+                    # a child that died cannot, and its death is what failed.
+                    self._process.join(POLL_SECONDS)
+                    if self._process.is_alive():
+                        raise
+                    self._hand(self._death())
+                    return
                 if pin and not isinstance(got, ProducerFailure):
                     got = replace(got, batch=got.batch.pin_memory())
                 self._hand(got)
@@ -298,6 +302,12 @@ class ProcessProducer(Iterator[Produced]):
                     return
         except BaseException:  # ferried to the trainer, which owns the run
             self._hand(ProducerFailure(traceback.format_exc()))
+
+    def _death(self) -> ProducerFailure:
+        """The failure a child that exited without reporting one leaves behind."""
+        return ProducerFailure(
+            f"the batch producer exited with code {self._process.exitcode} without reporting why"
+        )
 
     def _hand(self, item: Produced | ProducerFailure) -> None:
         """Queue *item* for the step, giving up only when the producer is closing."""
