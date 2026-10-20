@@ -753,7 +753,7 @@ def train_count_batches(
     from mlime.train.run import Vocabularies
 
     if workers is None:
-        workers = os.process_cpu_count()
+        workers = os.cpu_count()
         if workers is None:
             raise typer.BadParameter("the cores are not countable here; pass --workers")
     paths = route_a_paths(data_dir, labels, char_table, out.parent)

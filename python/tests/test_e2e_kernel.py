@@ -369,5 +369,5 @@ def test_the_kernels_count_builds_on_every_core(
     (tmp_path / "char_pinyin.tsv").touch()
     result = CliRunner().invoke(cli.app, [str(arg) for arg in argv[command + 1 :]])
     assert isinstance(result.exception, CountedError), result.output
-    assert asked["workers"] == os.process_cpu_count()
+    assert asked["workers"] == os.cpu_count()
     assert asked["world_size"] == 2
