@@ -32,6 +32,7 @@ from mlime.train.e2e_model import E2EConfig, E2EModel, RankingConfig, emittable_
 from mlime.train.e2e_search import (
     Lane,
     SearchGraphs,
+    SearchInputs,
     bucket,
     decode_lanes,
     run_search,
@@ -225,6 +226,33 @@ def test_a_replayed_search_is_the_search_it_captured(lexicon: Lexicon, spans: Sp
             )
             for expected, found in zip(eager, replayed, strict=True):
                 assert torch.equal(expected, found)
+    assert len(graphs.captured) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a CUDA device")
+def test_a_search_past_the_buffers_is_captured_anew(lexicon: Lexicon, spans: SpanVocab) -> None:
+    """A larger search grows the buffers, drops the graphs, and captures its own.
+
+    The dropped graph's outputs are still held, so its pool outlives every
+    graph that used it.
+    """
+    model = ranking_model(lexicon).cuda().eval()
+    graphs = SearchGraphs()
+    small = search_lanes(lexicon, spans)
+    torch.manual_seed(2)
+    reading = ("wo", "ai", "bei", "jing", "zhong", "ai", "wo", "ai", "bei", "jing")
+    large = [*small, admitted_lane(lexicon, spans, 3, reading, TINY.hidden_size)]
+
+    def inputs(lanes: list[Lane]) -> SearchInputs:
+        return search_inputs(lanes, 4, torch.device("cuda"), bucketed=True)
+
+    with torch.no_grad():
+        held = graphs.run(model.decoder, inputs(small))
+        eager = run_search(model.decoder, inputs(large))
+        replayed = graphs.run(model.decoder, inputs(large))
+    assert replayed[0].shape[0] > held[0].shape[0]
+    for expected, found in zip(eager, replayed, strict=True):
+        assert torch.equal(expected, found)
     assert len(graphs.captured) == 1
 
 
