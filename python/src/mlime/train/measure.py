@@ -22,7 +22,7 @@ import subprocess
 import threading
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -69,8 +69,15 @@ class GpuSampler:
         self._process: subprocess.Popen[bytes] | None = None
 
     def __enter__(self) -> GpuSampler:
+        # nvidia-smi stamps its samples in local time with no zone; pinning
+        # the zone makes the log's clock UTC wherever it is read (`gpu_means`).
         with self._log.open("w", encoding="utf-8") as sink:
-            self._process = subprocess.Popen(self._argv, stdout=sink, stderr=subprocess.DEVNULL)
+            self._process = subprocess.Popen(
+                self._argv,
+                stdout=sink,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ, "TZ": "UTC"},
+            )
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -270,7 +277,11 @@ def gpu_means(log: Path, since: float, until: float) -> dict[str, Any]:
         fields = dict(zip(GPU_FIELDS, (f.strip() for f in line.split(",")), strict=False))
         if len(fields) != len(GPU_FIELDS):
             continue  # the line nvidia-smi was writing when it was stopped
-        at = datetime.strptime(fields["timestamp"], "%Y/%m/%d %H:%M:%S.%f").timestamp()
+        at = (
+            datetime.strptime(fields["timestamp"], "%Y/%m/%d %H:%M:%S.%f")
+            .replace(tzinfo=UTC)
+            .timestamp()
+        )
         if since <= at <= until:
             samples[fields["index"]].append(fields)
     if not samples:
