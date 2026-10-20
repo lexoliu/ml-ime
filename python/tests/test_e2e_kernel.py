@@ -371,3 +371,19 @@ def test_the_kernels_count_builds_on_every_core(
     assert isinstance(result.exception, CountedError), result.output
     assert asked["workers"] == os.cpu_count()
     assert asked["world_size"] == 2
+
+
+def test_a_ranking_stage_replays_its_search_from_graphs_when_stamped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    monkeypatch.setattr(kernel, "RANKING", {"weight": 0.05})
+    monkeypatch.setattr(kernel, "SEARCH_GRAPHS", True)
+    assert kernel.ranking_argv(Path("/bin/ime-segment")) == [
+        "--ranking",
+        "--segmenter",
+        "/bin/ime-segment",
+        "--rank-weight",
+        "0.05",
+        "--search-graphs",
+    ]

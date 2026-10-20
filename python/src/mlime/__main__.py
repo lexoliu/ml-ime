@@ -1034,6 +1034,11 @@ def e2e_stamp(
     accumulate: int | None = typer.Option(
         None, help="A stage's micro-batches per optimiser step; v1's by default"
     ),
+    search_graphs: bool = typer.Option(
+        False,
+        "--search-graphs/--no-search-graphs",
+        help="Replay a ranking stage's search from captured CUDA graphs (SEARCH_GRAPHS)",
+    ),
 ) -> None:
     """Write a v2 run's kernel directory: v1's recipe, the run's slug, the v2 sources.
 
@@ -1090,6 +1095,7 @@ def e2e_stamp(
         trace_steps=trace_steps,
         train_shards=tuple(train_shard) if train_shard else None,
         stage=stage,
+        search_graphs=search_graphs,
     )
     recipe = stamp_e2e_v2(source, out, spec)
     typer.echo(f"{out}: {spec.slug}, stamped from {source}")
