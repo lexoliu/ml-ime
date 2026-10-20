@@ -1848,6 +1848,8 @@ version = "0.1.0"
 dependencies = [
  "askama",
  "blake2",
+ "clap",
+ "ime-pinyin",
  "rayon",
  "serde",
  "serde_json",

@@ -29,11 +29,19 @@ top-1 and top-8, character accuracy against the expected text position by
 position, MRR over the top *k*, and how many records produced nothing. The dev
 and test slices are the same records as everywhere else -- the BLAKE2b record
 digest in :mod:`mlime.gui`, verified byte for byte against the Rust oracle.
+
+The ambiguity slice (#150) -- the characters such as 他 / 她 / 它 that later
+input or the context decides -- is not computed here. Its selection and
+metrics live in ``ime-eval``, where ``fused-eval`` measures its own beams with
+them, and :func:`ambiguity_report` hands this evaluation's dump to the same
+code through the ``ime-ambiguity`` binary, so the fused decoder and every
+end-to-end checkpoint are measured on the same positions the same way.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -376,6 +384,39 @@ def evaluate(
         beam_width=beam_width,
     )
     return [(name, reports[name]) for name in names]
+
+
+def ambiguity_report(
+    binary: Path, eval_set: Path, dump: Path, slice_: str, dev_share: float = DEV_SHARE
+) -> str:
+    """The ambiguity slice of *dump*'s records of *slice_*, as ``ime-ambiguity`` reports it.
+
+    *binary* is ``cargo build -p ime-eval --features cli --bin ime-ambiguity``.
+    A dump that lacks a record the slice holds, or was decoded from another
+    eval set, is refused there, and the refusal is raised here with its reason.
+    """
+    result = subprocess.run(
+        [
+            str(binary),
+            "--eval-set",
+            str(eval_set),
+            "--dump",
+            str(dump),
+            "--slice",
+            slice_,
+            "--dev-share",
+            str(dev_share),
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"ime-ambiguity exited {result.returncode} on {dump}: {result.stderr.strip()}"
+        )
+    return result.stdout
 
 
 def resume_dump(dump: Path) -> dict[int, list[str]]:

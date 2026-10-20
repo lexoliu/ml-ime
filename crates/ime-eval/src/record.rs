@@ -93,6 +93,22 @@ impl Slice {
     }
 }
 
+impl std::str::FromStr for Slice {
+    type Err = EvalError;
+
+    /// `all`, `dev` or `test`, as every command spells them.
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "all" => Ok(Self::All),
+            "dev" => Ok(Self::Dev),
+            "test" => Ok(Self::Test),
+            _ => Err(EvalError::UnknownSlice {
+                name: name.to_owned(),
+            }),
+        }
+    }
+}
+
 /// A parsed evaluation set.
 ///
 /// The file is JSON Lines -- one record per line -- so a set can be appended to,
