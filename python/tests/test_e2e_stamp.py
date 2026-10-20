@@ -10,6 +10,7 @@ import json
 import shutil
 from pathlib import Path
 
+import click
 import pytest
 from typer.testing import CliRunner
 
@@ -28,8 +29,11 @@ TEMPLATE = Path(__file__).resolve().parents[2] / "kaggle" / "e2e"
 
 
 def error(output: str) -> str:
-    """A refusal's text with the error box's borders and wrapping taken out."""
-    return " ".join(output.replace("│", " ").split())
+    """A refusal's text with its styling, the error box's borders and wrapping taken out.
+
+    Rich colours the box wherever it detects CI, so the styling goes first.
+    """
+    return " ".join(click.unstyle(output).replace("│", " ").split())
 
 
 def changed_lines(before: str, after: str) -> list[str]:
