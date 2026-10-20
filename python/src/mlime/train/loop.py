@@ -25,14 +25,13 @@ import contextlib
 import json
 import math
 import os
-import queue
 import random
 import shutil
 import sys
-import threading
 import time
+from collections import Counter
 from collections.abc import Collection, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -43,12 +42,16 @@ from torch.nn.parallel import DistributedDataParallel
 from mlime.logging import log
 from mlime.train.lexicon import CandidateSpace
 from mlime.train.model import RouteAModel, count_correct
+from mlime.train.producer import (
+    LaneSource,
+    LocalProducer,
+    ProcessProducer,
+    Produced,
+    StreamPosition,
+)
 from mlime.train.samples import (
     BaseTokenizer,
-    BatchCollator,
     Collator,
-    CorpusStream,
-    StepBatch,
     TrainingExample,
     token_budget_batches,
 )
@@ -92,7 +95,8 @@ class TrainingConfig:
     #: of the per-batch means -- and a recorded stream position counts the
     #: micro-batches consumed.
     accumulate: int = 1
-    #: Build the next batches on a producer thread while the step runs.
+    #: Build each lane's next batches in a process of its own while the step
+    #: runs; off, the trainer collates each batch itself when it needs it.
     prefetch: bool = False
     #: Steps after warm-up to split into per-phase timings. Zero leaves the
     #: loop untouched by the profiler's synchronising marks.
@@ -266,11 +270,19 @@ class Segment:
     checkpoint. Callers have to tell the two apart -- an unfinished run must not
     be scored or reported as a result -- so the loop says which it was rather
     than leaving it to be inferred from a file's existence.
+
+    ``build_counts`` sums what this process's lanes' sample builders kept and
+    dropped. The builders live wherever the batches were made -- with
+    prefetching, in each lane's producer process -- so the loop collects their
+    counts when it stops the producers rather than the caller reading builders
+    it no longer holds. A prefetching producer builds ahead of what was
+    trained on, so its counts include up to a window of batches never consumed.
     """
 
     metrics: Path
     step: int
     finished: bool
+    build_counts: dict[str, int]
 
 
 @dataclass(frozen=True)
@@ -284,188 +296,6 @@ class Accuracy:
     def rate(self) -> float:
         """Share correct; zero when nothing was scored."""
         return self.correct / self.scored if self.scored else 0.0
-
-
-def epoch_groups(
-    stream: CorpusStream, collator: BatchCollator, budget: int, epoch: int
-) -> Iterator[list[TrainingExample]]:
-    """The examples of *epoch*, grouped exactly as the steps of that epoch will be.
-
-    Grouping is not collation, and the two are separated here because three
-    things need the boundaries and none of them needs the tensors: the loop, on
-    its way to collating each group; :meth:`EpochBatches.skip`, walking a resumed
-    stream back to a saved position; and counting how many steps an epoch is
-    worth before a run fixes its schedule.
-
-    The epoch is an argument rather than a detail because it decides what the
-    examples *are*: the augmentation re-samples every epoch, an abbreviated
-    sentence is shorter than a typed-out one, and a batch boundary is a function
-    of the lengths. Counting epoch 0 twice is not counting two epochs.
-    """
-    stream.set_epoch(epoch)
-    return token_budget_batches(iter(stream), budget, collator.max_context_tokens, collator.rows)
-
-
-@dataclass(frozen=True)
-class Produced:
-    """A collated batch, and where the stream stood when it was made.
-
-    ``epoch``/``index`` count the batches produced so far and ``collator_rng``
-    is the collator's generator state just after this batch was collated. A
-    checkpoint taken on this item resumes exactly after it: the batch a
-    re-opened stream produces next is the one an uninterrupted run would have
-    consumed. A prefetching producer carries this per item because the queue
-    may already hold batches a pause never reaches -- the position a checkpoint
-    writes is the last batch *consumed*, not the last one produced.
-    """
-
-    batch: StepBatch
-    epoch: int
-    index: int
-    collator_rng: tuple[Any, ...]
-
-
-class EpochBatches(Iterator[StepBatch]):
-    """The stream as collated batches, epoch after epoch, and where in it we are.
-
-    The position is what makes a run resumable. A rank's batches are its own --
-    it owns its own shards, and how many batches an epoch holds depends on the
-    lengths of the sentences in them -- so "step 4000" says nothing about where
-    to start reading. The epoch and the count of batches taken from it do, and
-    :meth:`skip` walks a fresh stream back to exactly there.
-    """
-
-    def __init__(self, stream: CorpusStream, collator: BatchCollator, budget: int):
-        self.stream = stream
-        self.collator = collator
-        self.budget = budget
-        #: The epoch the batch last yielded came from.
-        self.epoch = stream.epoch
-        #: How many batches of that epoch have been yielded.
-        self.index = 0
-        self._groups = self._open_epoch()
-
-    def __next__(self) -> StepBatch:
-        return self.produce().batch
-
-    def produce(self) -> Produced:
-        """Collate the next group, and record the position it leaves behind."""
-        batch = self.collator(self._next_group())
-        return Produced(
-            batch=batch,
-            epoch=self.epoch,
-            index=self.index,
-            collator_rng=self.collator.rng.getstate(),
-        )
-
-    def produced_forever(self) -> Iterator[Produced]:
-        """This stream as produced items, endlessly -- the no-prefetch path."""
-        while True:
-            yield self.produce()
-
-    def _open_epoch(self) -> Iterator[list[TrainingExample]]:
-        """Start reading :attr:`epoch`, grouped to the budget but not collated."""
-        return epoch_groups(self.stream, self.collator, self.budget, self.epoch)
-
-    def _next_group(self) -> list[TrainingExample]:
-        """The next group of examples, rolling into the next epoch at the end of one."""
-        group = next(self._groups, None)
-        if group is not None:
-            self.index += 1
-            return group
-        if self.index == 0:
-            raise RuntimeError(f"epoch {self.epoch} of the corpus produced no example")
-        self.epoch += 1
-        log.info("epoch finished", epoch=self.epoch, **self.stream.builder.counts.as_dict())
-        self.index = 0
-        self._groups = self._open_epoch()
-        return self._next_group()
-
-    def skip(self, epoch: int, index: int) -> None:
-        """Read forward to *index* batches into *epoch*, building no tensors.
-
-        The examples still have to be built, because building them is what walks
-        the stream, and they are grouped because a group boundary depends on the
-        examples before it. They are not collated: collation is where the padding
-        and the tensors are, and none of it would be looked at.
-        """
-        if epoch < 0 or index < 0:
-            raise ValueError(f"a stream position is not negative, got epoch {epoch} index {index}")
-        started = time.monotonic()
-        self.epoch = epoch
-        self.index = 0
-        self._groups = self._open_epoch()
-        for _ in range(index):
-            self._next_group()
-        if (self.epoch, self.index) != (epoch, index):
-            raise RuntimeError(
-                f"epoch {epoch} ran out before batch {index}, at {self.epoch}/{self.index}: "
-                "this is not the corpus the checkpoint was written from"
-            )
-        log.info(
-            "batch stream skipped",
-            epoch=epoch,
-            index=index,
-            seconds=round(time.monotonic() - started, 1),
-        )
-
-
-class Prefetcher(Iterator[Produced]):
-    """Runs an :class:`EpochBatches` on a daemon thread into a bounded queue.
-
-    Collation is host work -- parquet reads, the tokenizer, the padding -- that
-    overlaps the consumer's device-bound step. It is not free for the step:
-    whatever of it is Python holds the GIL the trainer's threads need to launch
-    kernels and to free the gradients backward hands to ``AccumulateGrad``, so
-    every millisecond of it is a millisecond the step may stall.
-
-    *pin* places each batch in page-locked memory here, off the trainer's
-    thread, so the step's ``non_blocking`` copy really is asynchronous.
-    Exceptions from the producer are ferried to the consumer and raised there,
-    so a broken stream fails at the step that needed the batch, not silently on
-    a thread nobody joins. Call :meth:`close` when the loop is done; a paused
-    run's leftover queue entries are dropped, never trained on.
-    """
-
-    def __init__(self, batches: EpochBatches, depth: int, *, pin: bool):
-        self._queue: queue.Queue[Produced | BaseException] = queue.Queue(maxsize=depth)
-        self._stopped = threading.Event()
-        self._thread = threading.Thread(
-            target=self._fill, args=(batches, pin), daemon=True, name="batch-prefetch"
-        )
-        self._thread.start()
-
-    def _fill(self, batches: EpochBatches, pin: bool) -> None:
-        """Produce until told to stop; a producer failure is queued, not raised here."""
-        while not self._stopped.is_set():
-            try:
-                item: Produced | BaseException = batches.produce()
-                if pin and isinstance(item, Produced):
-                    item = replace(item, batch=item.batch.pin_memory())
-            except BaseException as error:  # ferried to the consumer thread
-                item = error
-            while not self._stopped.is_set():
-                try:
-                    self._queue.put(item, timeout=0.1)
-                    break
-                except queue.Full:
-                    continue
-            if isinstance(item, BaseException):
-                return
-
-    def __iter__(self) -> Prefetcher:
-        return self
-
-    def __next__(self) -> Produced:
-        item = self._queue.get()
-        if isinstance(item, BaseException):
-            raise item
-        return item
-
-    def close(self) -> None:
-        """Stop the producer and wait briefly for it to notice."""
-        self._stopped.set()
-        self._thread.join(timeout=10)
 
 
 def _load_resumed_optimiser(
@@ -836,15 +666,57 @@ class RankLane:
     writes for it.
     """
 
-    source: Iterator[Produced]
-    prefetcher: Prefetcher | None
+    producer: LocalProducer | ProcessProducer
     generators: Generators
     consumed: Produced | None = None
 
-    def close(self) -> None:
-        """Stop the lane's producer, if it has one."""
-        if self.prefetcher is not None:
-            self.prefetcher.close()
+
+def open_lane(
+    source: LaneSource,
+    config: TrainingConfig,
+    resumed: RankState | None,
+    global_rank: int,
+    *,
+    pin: bool,
+) -> RankLane:
+    """Start *source*'s producer at the run's place in it, with the generators that go with it.
+
+    A fresh lane seeds the process-level generators for *global_rank* and
+    snapshots them; a resumed one takes both its stream position and its
+    generators from the checkpoint's *resumed* state.
+    """
+    start = (
+        StreamPosition(resumed.epoch, resumed.index, resumed.random.collator)
+        if resumed is not None
+        else None
+    )
+    producer: LocalProducer | ProcessProducer
+    if config.prefetch:
+        # A step takes a whole window of `accumulate` batches from its lane
+        # before it starts; a shallower queue makes every step wait for the
+        # collations it could have overlapped with the step before.
+        producer = ProcessProducer(
+            source, config.token_budget, start, depth=config.accumulate, pin=pin
+        )
+    else:
+        producer = LocalProducer(source, config.token_budget, start)
+    if resumed is not None:
+        generators = Generators(
+            python=resumed.random.python,
+            torch_cpu=resumed.random.torch_cpu,
+            torch_cuda=resumed.random.torch_cuda,
+        )
+    else:
+        seed_everything(config.seed, global_rank)
+        generators = Generators.capture()
+    return RankLane(producer=producer, generators=generators)
+
+
+def close_lanes(lanes: Sequence[RankLane]) -> None:
+    """Stop every lane's producer, each even when one before it fails to stop."""
+    with contextlib.ExitStack() as stack:
+        for lane in lanes:
+            stack.callback(lane.producer.close)
 
 
 def unwrap(model: nn.Module) -> RouteAModel:
@@ -894,7 +766,7 @@ def evaluate(
 
 def train(
     model: RouteAModel,
-    lanes: Sequence[tuple[CorpusStream, BatchCollator]],
+    lanes: Sequence[LaneSource],
     config: TrainingConfig,
     out_dir: Path,
     distributed: Distributed | None = None,
@@ -903,11 +775,14 @@ def train(
 ) -> Segment:
     """Run towards *config.max_steps* optimiser steps and say what this segment did.
 
-    *lanes* holds one ``(stream, collator)`` pair per virtual rank this process
-    runs as -- ``config.virtual_ranks`` of them, built by the caller as
-    consecutive ranks of the whole world. An optimiser step runs each lane's
-    accumulation window in turn under that lane's own generator state, so a
-    one-process Colab segment computes what a two-process Kaggle segment would.
+    *lanes* holds one lane description per virtual rank this process runs as
+    -- ``config.virtual_ranks`` of them, built by the caller as consecutive
+    ranks of the whole world. An optimiser step runs each lane's accumulation
+    window in turn under that lane's own generator state, so a one-process
+    Colab segment computes what a two-process Kaggle segment would. With
+    *config.prefetch* each lane is opened and collated in a producer process
+    of its own (:class:`~mlime.train.producer.ProcessProducer`); without it,
+    here, batch by batch.
 
     Writes every step's loss to the metrics file rather than printing it, because
     "the loss went down" is a claim that has to be checkable after the kernel has
@@ -929,9 +804,7 @@ def train(
     world = distributed or Distributed()
     virtual = config.virtual_ranks
     if len(lanes) != virtual:
-        raise ValueError(
-            f"train got {len(lanes)} (stream, collator) lanes but virtual_ranks is {virtual}"
-        )
+        raise ValueError(f"train got {len(lanes)} lanes but virtual_ranks is {virtual}")
     if config.checkpoint_minutes is not None and run_config is None:
         raise ValueError("checkpoint_minutes copies the run's own config; pass run_config")
     world.start()
@@ -991,38 +864,6 @@ def train(
             **asdict(config),
         )
 
-    rank_lanes: list[RankLane] = []
-    for index, (stream, collator) in enumerate(lanes):
-        global_rank = world.rank * virtual + index
-        batches = EpochBatches(stream, collator, config.token_budget)
-        if resumed is not None:
-            position = resumed.positions[index]
-            batches.skip(position.epoch, position.index)
-            collator.rng.setstate(position.random.collator)
-            generators = Generators(
-                python=position.random.python,
-                torch_cpu=position.random.torch_cpu,
-                torch_cuda=position.random.torch_cuda,
-            )
-        else:
-            seed_everything(config.seed, global_rank)
-            generators = Generators.capture()
-        # A step takes a whole window of `accumulate` batches from its lane
-        # before it starts; a shallower queue makes every step wait for the
-        # collations it could have overlapped with the step before.
-        prefetcher = (
-            Prefetcher(batches, depth=config.accumulate, pin=device.type == "cuda")
-            if config.prefetch
-            else None
-        )
-        rank_lanes.append(
-            RankLane(
-                source=prefetcher if prefetcher is not None else batches.produced_forever(),
-                prefetcher=prefetcher,
-                generators=generators,
-            )
-        )
-
     step = 0
     if resumed is not None:
         step = resumed.step
@@ -1054,6 +895,24 @@ def train(
         if config.trace_steps
         else None,
     )
+
+    rank_lanes: list[RankLane] = []
+    try:
+        for index, source in enumerate(lanes):
+            rank_lanes.append(
+                open_lane(
+                    source,
+                    config,
+                    resumed.positions[index] if resumed is not None else None,
+                    world.rank * virtual + index,
+                    pin=device.type == "cuda",
+                )
+            )
+    except BaseException:
+        # A lane that failed to open leaves the ones before it running;
+        # they are stopped here, since the loop's own cleanup is not armed yet.
+        close_lanes(rank_lanes)
+        raise
 
     trained.train()
     started = time.monotonic()
@@ -1098,7 +957,9 @@ def train(
     try:
         while True:
             profiler.begin(step - first_step + 2)
-            windows = [[next(lane.source) for _ in range(config.accumulate)] for lane in rank_lanes]
+            windows = [
+                [next(lane.producer) for _ in range(config.accumulate)] for lane in rank_lanes
+            ]
             profiler.mark("batch_wait")
             step_loss: torch.Tensor | None = None
             step_extras: dict[str, torch.Tensor] = {}
@@ -1235,8 +1096,7 @@ def train(
                 if world.is_main:
                     metrics.write(event="interval", step=step, seconds=round(elapsed, 1))
     finally:
-        for lane in rank_lanes:
-            lane.close()
+        close_lanes(rank_lanes)
     if not consumed_any:
         raise RuntimeError("the loop ran no step; nothing was consumed")
     if finished:
@@ -1262,7 +1122,12 @@ def train(
     # of 40 runs on a 4-core Linux box (none of 40 with this order); it goes first.
     del trained
     world.stop()
-    return Segment(metrics=metrics.path, step=step, finished=finished)
+    build_counts: Counter[str] = Counter()
+    for lane in rank_lanes:
+        build_counts.update(lane.producer.counts())
+    return Segment(
+        metrics=metrics.path, step=step, finished=finished, build_counts=dict(build_counts)
+    )
 
 
 def write_profile(profiler: Profiler, world: Distributed, metrics: MetricLog) -> None:

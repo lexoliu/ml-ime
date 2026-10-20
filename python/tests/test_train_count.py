@@ -34,7 +34,7 @@ from mlime.train.count import (
 from mlime.train.e2e_model import RankingConfig
 from mlime.train.labels import LABEL_SCHEMA
 from mlime.train.lexicon import CandidateSpace, Lexicon
-from mlime.train.loop import EpochBatches, epoch_groups
+from mlime.train.producer import EpochBatches, epoch_groups
 from mlime.train.ranking import RankCollator
 from mlime.train.run import RunPaths, Slices, Vocabularies
 from mlime.train.samples import (
