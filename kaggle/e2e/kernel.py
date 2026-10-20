@@ -564,8 +564,6 @@ def ranking_argv(segmenter):
     argv = ["--ranking", "--segmenter", str(segmenter)]
     for name, value in RANKING.items():
         argv += [f"--rank-{name}", str(value)]
-    if SEARCH_GRAPHS:
-        argv.append("--search-graphs")
     return argv
 
 
@@ -651,6 +649,9 @@ def train_argv(
     if LEARNING_RATES is not None:
         argv += ["--base-lr", str(LEARNING_RATES[0]), "--new-lr", str(LEARNING_RATES[1])]
     argv += ranking_argv(segmenter)
+    # The trainer's alone: the count shares `ranking_argv` and has no search.
+    if SEARCH_GRAPHS:
+        argv.append("--search-graphs")
     if WHOLE_ALPHABET:
         argv.append("--whole-alphabet")
     if resume is not None:
