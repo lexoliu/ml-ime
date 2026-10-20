@@ -555,6 +555,23 @@ class Batch:
             ids=self.ids,
         )
 
+    def pin_memory(self) -> Batch:
+        """The same batch in page-locked host memory, so :meth:`to` copies asynchronously.
+
+        From pageable memory a ``non_blocking`` copy is not: the driver stages
+        it through a bounce buffer whose DMA queues behind the stream's work,
+        so the host waits for the device to drain before it can launch the
+        next forward -- a synchronisation per micro-batch, hidden in ``h2d``.
+        """
+        return Batch(
+            **{
+                field.name: getattr(self, field.name).pin_memory()
+                for field in fields(self)
+                if field.name != "ids"
+            },
+            ids=self.ids,
+        )
+
 
 class StepBatch(Protocol):
     """What the training loop reads of a collated step, whatever the model consumes."""
@@ -581,6 +598,10 @@ class StepBatch(Protocol):
 
     def to(self, device: torch.device) -> StepBatch:
         """The same step on *device*."""
+        ...
+
+    def pin_memory(self) -> StepBatch:
+        """The same step in page-locked host memory."""
         ...
 
 

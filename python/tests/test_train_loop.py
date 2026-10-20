@@ -40,6 +40,7 @@ from mlime.train.loop import (
 )
 from mlime.train.measure import measure
 from mlime.train.model import RouteAConfig, RouteAModel
+from mlime.train.ranking import RankBatch
 from mlime.train.samples import (
     IGNORE_INDEX,
     BaseTokenizer,
@@ -591,7 +592,7 @@ def test_a_produced_item_carries_where_to_reopen_the_stream(
     on the last consumed item -- not the last one a prefetcher happened to
     build -- resumes with exactly the batch that would have come next."""
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
-    source = Prefetcher(EpochBatches(stream, collator, RESUMABLE.token_budget), depth=2)
+    source = Prefetcher(EpochBatches(stream, collator, RESUMABLE.token_budget), depth=2, pin=False)
     try:
         items = [next(source) for _ in range(3)]
     finally:
@@ -605,6 +606,79 @@ def test_a_produced_item_carries_where_to_reopen_the_stream(
     continued = replay.produce()
     assert continued.batch.ids == items[1].batch.ids
     assert typed(continued.batch, spans) == typed(items[1].batch, spans)
+
+
+def test_a_pinning_prefetcher_hands_over_the_same_batches_pinned(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pinning is a copy into page-locked memory and nothing else: the items
+    a pinning producer hands over are the plain producer's, position for
+    position, with every tensor of every batch routed through the pin. This
+    host has no CUDA to pin with, so the pin is a recorded copy."""
+    pinned: list[int] = []
+
+    def pin(tensor: torch.Tensor) -> torch.Tensor:
+        copy = tensor.clone()
+        pinned.append(id(copy))
+        return copy
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", pin)
+    produced = {}
+    for flag in (False, True):
+        stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+        source = Prefetcher(EpochBatches(stream, collator, RESUMABLE.token_budget), 2, pin=flag)
+        try:
+            produced[flag] = [next(source) for _ in range(5)]
+        finally:
+            source.close()
+    tensors = [name for name in vars(produced[False][0].batch) if name != "ids"]
+    assert len(tensors) == 13
+    for plain, held in zip(produced[False], produced[True], strict=True):
+        assert (held.epoch, held.index, held.collator_rng) == (
+            plain.epoch,
+            plain.index,
+            plain.collator_rng,
+        )
+        assert held.batch.ids == plain.batch.ids
+        for name in tensors:
+            assert id(getattr(held.batch, name)) in pinned, name
+            assert torch.equal(getattr(held.batch, name), getattr(plain.batch, name)), name
+
+
+def test_a_ranking_batch_pins_its_rows_and_keeps_its_layout(
+    lexicon: Lexicon, spans: SpanVocab, tokenizer: BaseTokenizer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor.clone())
+    rows = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
+        [
+            TrainingExample(
+                id="a",
+                spans=("wo",),
+                span_ids=(spans.id("wo"),),
+                targets=(lexicon.index("我"),),
+                context="北京",
+            )
+        ]
+    )
+    batch = RankBatch(rows=rows, owners=(0,), gold_rows=(0,), lengths=(1,), gold=((3,),))
+    held = batch.pin_memory()
+    assert (held.owners, held.gold_rows, held.lengths, held.gold) == (
+        batch.owners,
+        batch.gold_rows,
+        batch.lengths,
+        batch.gold,
+    )
+    assert held.rows.ids == rows.ids
+    assert all(
+        torch.equal(getattr(held.rows, name), getattr(rows, name))
+        for name in vars(rows)
+        if name != "ids"
+    )
 
 
 def test_a_prefetched_segment_pauses_and_resumes_on_the_consumed_batch(
@@ -660,13 +734,14 @@ def test_a_prefetching_lane_queues_a_whole_window(
 ) -> None:
     """A step takes `accumulate` batches before it starts, so the producer may
     run that far ahead: a shallower queue stalls every step on collations the
-    step before could have hidden (#156's L4 check: 0.30 s of a 2.28 s step)."""
-    depths: list[int] = []
+    step before could have hidden (#156's L4 check: 0.30 s of a 2.28 s step).
+    The producer pins only for a CUDA device; this one is the CPU."""
+    depths: list[tuple[int, bool]] = []
 
     class Recorded(loop.Prefetcher):
-        def __init__(self, batches: EpochBatches, depth: int) -> None:
-            depths.append(depth)
-            super().__init__(batches, depth)
+        def __init__(self, batches: EpochBatches, depth: int, *, pin: bool) -> None:
+            depths.append((depth, pin))
+            super().__init__(batches, depth, pin=pin)
 
     monkeypatch.setattr(loop, "Prefetcher", Recorded)
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
@@ -676,7 +751,7 @@ def test_a_prefetching_lane_queues_a_whole_window(
         replace(RESUMABLE, accumulate=3, prefetch=True),
         tmp_path,
     )
-    assert depths == [3]
+    assert depths == [(3, False)]
 
 
 class UnevenTargets:

@@ -32,7 +32,7 @@ import sys
 import threading
 import time
 from collections.abc import Collection, Iterator, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -413,28 +413,35 @@ class EpochBatches(Iterator[StepBatch]):
 class Prefetcher(Iterator[Produced]):
     """Runs an :class:`EpochBatches` on a daemon thread into a bounded queue.
 
-    Collation is host work -- parquet reads, the tokenizer, the padding -- and
-    the tokenizer releases the GIL inside its call, so the producer's batches
-    overlap the consumer's device-bound step rather than serialising behind it.
+    Collation is host work -- parquet reads, the tokenizer, the padding -- that
+    overlaps the consumer's device-bound step. It is not free for the step:
+    whatever of it is Python holds the GIL the trainer's threads need to launch
+    kernels and to free the gradients backward hands to ``AccumulateGrad``, so
+    every millisecond of it is a millisecond the step may stall.
+
+    *pin* places each batch in page-locked memory here, off the trainer's
+    thread, so the step's ``non_blocking`` copy really is asynchronous.
     Exceptions from the producer are ferried to the consumer and raised there,
     so a broken stream fails at the step that needed the batch, not silently on
     a thread nobody joins. Call :meth:`close` when the loop is done; a paused
     run's leftover queue entries are dropped, never trained on.
     """
 
-    def __init__(self, batches: EpochBatches, depth: int):
+    def __init__(self, batches: EpochBatches, depth: int, *, pin: bool):
         self._queue: queue.Queue[Produced | BaseException] = queue.Queue(maxsize=depth)
         self._stopped = threading.Event()
         self._thread = threading.Thread(
-            target=self._fill, args=(batches,), daemon=True, name="batch-prefetch"
+            target=self._fill, args=(batches, pin), daemon=True, name="batch-prefetch"
         )
         self._thread.start()
 
-    def _fill(self, batches: EpochBatches) -> None:
+    def _fill(self, batches: EpochBatches, pin: bool) -> None:
         """Produce until told to stop; a producer failure is queued, not raised here."""
         while not self._stopped.is_set():
             try:
                 item: Produced | BaseException = batches.produce()
+                if pin and isinstance(item, Produced):
+                    item = replace(item, batch=item.batch.pin_memory())
             except BaseException as error:  # ferried to the consumer thread
                 item = error
             while not self._stopped.is_set():
@@ -1003,7 +1010,11 @@ def train(
         # A step takes a whole window of `accumulate` batches from its lane
         # before it starts; a shallower queue makes every step wait for the
         # collations it could have overlapped with the step before.
-        prefetcher = Prefetcher(batches, depth=config.accumulate) if config.prefetch else None
+        prefetcher = (
+            Prefetcher(batches, depth=config.accumulate, pin=device.type == "cuda")
+            if config.prefetch
+            else None
+        )
         rank_lanes.append(
             RankLane(
                 source=prefetcher if prefetcher is not None else batches.produced_forever(),
