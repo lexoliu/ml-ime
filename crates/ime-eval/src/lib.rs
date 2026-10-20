@@ -7,12 +7,20 @@
 //! the neural model conditions on it, and the difference between the two numbers
 //! is the entire question milestone 3 asks.
 
+mod ambiguity;
+mod dump;
 mod metrics;
 mod record;
 
+pub use ambiguity::{
+    AMBIGUITIES, Ambiguity, AmbiguityReport, AmbiguitySlice, Comparison, Discordance, Listing,
+    Outcome, Position, SetCounts, Verdict,
+};
+pub use dump::{DumpRow, DumpedHypothesis, parse_dump};
 pub use metrics::{Hypothesize, Observation, Report, Request, evaluate};
 pub use record::{EvalRecord, EvalSet, Slice};
 
+use ime_pinyin::SegmentError;
 use thiserror::Error;
 
 /// Why an evaluation set could not be read.
@@ -38,6 +46,64 @@ pub enum EvalError {
     /// The file held no records.
     #[error("the evaluation set holds no records")]
     Empty,
+    /// A `--slice` value was not one of the slice names.
+    #[error("{name:?} is not a slice; expected all, dev or test")]
+    UnknownSlice {
+        /// What was given.
+        name: String,
+    },
+    /// A dump line was not a row of the expected shape.
+    #[error("dump line {line} is not a row")]
+    MalformedDump {
+        /// One-based line number in the file.
+        line: usize,
+        /// What the JSON parser objected to.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// Two dump rows named the same record.
+    #[error("the dump holds record {record} twice")]
+    DuplicateRow {
+        /// The record's index in the evaluation set.
+        record: usize,
+    },
+    /// The dump lacked a record the slice needs.
+    #[error("the dump holds no row for record {record}, which the slice needs")]
+    MissingRow {
+        /// The record's index in the evaluation set.
+        record: usize,
+    },
+    /// A dump row's expected text was not the evaluation set's.
+    #[error(
+        "record {record} expects {expected:?} in the evaluation set but {found:?} in the dump; \
+         the dump was decoded from another set"
+    )]
+    TextMismatch {
+        /// The record's index in the evaluation set.
+        record: usize,
+        /// The evaluation set's text.
+        expected: String,
+        /// The dump's text.
+        found: String,
+    },
+    /// A record's keystrokes could not be segmented at all.
+    #[error("record {record}'s keystrokes cannot be read")]
+    Unreadable {
+        /// The record's index in the evaluation set.
+        record: usize,
+        /// Why the lattice refused them.
+        #[source]
+        source: SegmentError,
+    },
+    /// A member of an ambiguity set is missing from the lexicon.
+    #[error("{character} is in an ambiguity set but not in the lexicon")]
+    UnknownMember {
+        /// The missing character.
+        character: char,
+    },
+    /// Two ambiguity reports judged different records and cannot be paired.
+    #[error("the two reports judged different records; they were not measured on one slice")]
+    DifferentRecords,
 }
 
 #[cfg(test)]

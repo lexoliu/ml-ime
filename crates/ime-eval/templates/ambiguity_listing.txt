@@ -1,0 +1,3 @@
+record	keystrokes	context	wanted	top	rank
+{% for (outcome, record) in rows %}{{ outcome.record }}	{{ record.pinyin }}	{{ record.context.as_deref().unwrap_or("-") }}	{{ record.text }}	{{ outcome.top.as_deref().unwrap_or("-") }}	{% match outcome.rank %}{% when Some(rank) %}{{ rank + 1 }}{% when None %}absent{% endmatch %}
+{% endfor %}

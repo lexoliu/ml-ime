@@ -1,3 +1,4 @@
-{% for section in sections %}emission {{ section.emission }}, weight {{ section.weight|fmt("{:.3}") }}{% if section.corrections %}, typo-weight {{ section.typo_weight|fmt("{:.3}") }}{% endif %}; transition {{ section.transition }}; slice {{ section.slice }}{% if section.selected %} (weight chosen on dev){% endif %}
-{{ section.report }}
+{% for section in sections %}emission {{ section.emission }}, weight {{ section.weight|fmt("{:.3}") }}{% if section.corrections %}, typo-weight {{ section.typo_weight|fmt("{:.3}") }}{% endif %}; transition {{ section.transition }}; slice {{ section.slice.label() }}{% if section.selected %} (weight chosen on dev){% endif %}
+{{ section.report }}{% if let Some(ambiguity) = section.ambiguity %}
+{{ ambiguity }}{% endif %}
 {% endfor %}
