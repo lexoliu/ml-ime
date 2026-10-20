@@ -1065,6 +1065,8 @@ def main():
 
     steps = records_of(out / "metrics.jsonl", "step")
     paused = records_of(out / "metrics.jsonl", "paused")
+    # The trainer's closing record of a finished run.
+    trained = None if paused else records_of(out / "metrics.jsonl", "summary")[-1]
     summary = {
         "segment": SEGMENT,
         "commit": COMMIT,
@@ -1073,8 +1075,8 @@ def main():
         "first_step": steps[0]["step"],
         "last_step": steps[-1]["step"],
         # A logged step is the last *recorded* one; the step the checkpoint
-        # holds is the pause event's own.
-        "checkpoint_step": paused[-1]["step"] if paused else steps[-1]["step"],
+        # holds is the pause event's own, or the trainer's closing record's.
+        "checkpoint_step": paused[-1]["step"] if paused else trained["step"],
         "first_loss": steps[0]["loss"],
         "last_loss": steps[-1]["loss"],
         "train_seconds": round(seconds, 1),
@@ -1101,7 +1103,7 @@ def main():
         drop_numbered_checkpoints(out)
         evaluated = evaluate_lattices(checkpoint, assets, char_table, env)
         summary["evaluated"] = evaluated
-        summary["held_out"] = records_of(out / "metrics.jsonl", "summary")[-1]
+        summary["held_out"] = trained
 
     (WORKING / "run-summary.json").write_text(
         json.dumps(summary, indent=2) + "\n", encoding="utf-8"
