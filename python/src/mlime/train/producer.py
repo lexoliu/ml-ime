@@ -22,12 +22,13 @@ import multiprocessing
 import multiprocessing.connection
 import os
 import queue
+import sys
 import threading
 import time
 import traceback
 from collections.abc import Iterator
 from dataclasses import dataclass, replace
-from typing import Any, Protocol
+from typing import Any, NoReturn, Protocol
 
 import torch
 import torch.multiprocessing
@@ -412,6 +413,22 @@ def _produce(
         # waits for the trainer's close, or its exit, before it leaves.
         stop.wait()
         reports.close()
-        return
+        _leave()
     reports.send(batches.stream.builder.counts.as_dict())
     reports.close()
+    _leave()
+
+
+def _leave() -> NoReturn:
+    """End the child without finalising the interpreter.
+
+    Finalisation ends every daemon thread that wants the GIL back with
+    ``pthread_exit``, which glibc implements as a forced unwind; the queue's
+    feeder thread, still pickling batches nobody will read, can be inside
+    torch's C++ then, and an unwind through a ``noexcept`` frame aborts the
+    process. Everything the child owes is sent by now, and the queued batches
+    are abandoned on purpose.
+    """
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(0)
