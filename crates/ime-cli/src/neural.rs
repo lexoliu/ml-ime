@@ -2581,8 +2581,8 @@ mod tests {
         let lexicon =
             fs::read_to_string(fixtures.join("char_pinyin.tsv")).expect("the table reads");
         // The fixture lexicon's `ni`, `zai` and `wo` segment one way each.
-        // `wozai` is not one of them: its beam sits at the unscored floor,
-        // where the model's few nats vanish into an f32 of a billion.
+        // A record whose beam scores at -1e9 here (`wozai` did) cannot show
+        // the model's few nats: an f32 that large rounds them away.
         let fixture = Fixture::with_contexts(
             &[("niwo", "你我", Some("再")), ("zaini", "再你", None)],
             "你\n再\n我",
