@@ -697,6 +697,14 @@ def records_of(metrics, event):
     ]
 
 
+def write_summary(summary):
+    """Write run-summary.json whole, by rename: the publisher and the waiter poll it."""
+    staged = WORKING / "run-summary.json.partial"
+    staged.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    staged.replace(WORKING / "run-summary.json")
+    print(json.dumps(summary, indent=2), flush=True)
+
+
 def torch_load(path):
     """torch.load with memory-mapping when this torch has it, for header reads."""
     import inspect
@@ -985,10 +993,7 @@ def main():
             "finished": True,
             "evaluated": evaluate_lattices(final, assets, char_table, env),
         }
-        (WORKING / "run-summary.json").write_text(
-            json.dumps(summary, indent=2) + "\n", encoding="utf-8"
-        )
-        print(json.dumps(summary, indent=2), flush=True)
+        write_summary(summary)
         return
 
     previous = previous_segment()
@@ -1105,10 +1110,7 @@ def main():
         summary["evaluated"] = evaluated
         summary["held_out"] = trained
 
-    (WORKING / "run-summary.json").write_text(
-        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
-    )
-    print(json.dumps(summary, indent=2), flush=True)
+    write_summary(summary)
 
 
 if __name__ == "__main__":
