@@ -79,7 +79,7 @@ case $command in
     provision $session ${gpu:+--gpu "$gpu"}
     # Colab mounts an empty, read-only /kaggle/input for its own Kaggle
     # integration; the kernel reads the datasets staged there, so it goes first.
-    printf 'import os, subprocess\nif os.path.ismount("/kaggle/input"):\n    subprocess.run(["umount", "/kaggle/input"], check=True)\nfor d in ("/root/.kaggle", "/root/.cache/huggingface", "/kaggle/input", "/kaggle/working"): os.makedirs(d, exist_ok=True)\n' | colab exec -s $session
+    printf 'import os, subprocess\nif os.path.ismount("/kaggle/input"):\n    subprocess.run(["umount", "/kaggle/input"], check=True)\nfor d in ("/root/.kaggle", "/root/.cache/huggingface", "/kaggle/input", "/kaggle/working"): os.makedirs(d, exist_ok=True)\n' | remote $session
     colab upload -s $session "$HOME/.kaggle/credentials.json" /root/.kaggle/credentials.json
     # Only the access token: the OAuth refresh token stays on the Mac, so no
     # VM ever refreshes it and invalidates the Mac's login.
@@ -88,16 +88,16 @@ case $command in
     colab upload -s $session "$kernel_dir/kernel-metadata.json" /kaggle/kernel-metadata.json
     # The kernel's own `checkout` fetches the commit, so the VM's code and the
     # kernel's check of it are one function.
-    printf 'import runpy\nrunpy.run_path("/kaggle/kernel.py")["checkout"](%s)\n' "'$commit'" | colab exec -s $session
+    printf 'import runpy\nrunpy.run_path("/kaggle/kernel.py")["checkout"](%s)\n' "'$commit'" | remote $session
     # A census counted for the same corpus and batch shape -- by a sibling
     # run, or by an earlier leg (`fetch`) -- spares the GPU the count; the
     # kernel recounts when even one field differs.
     if [ -n "$census" ]; then
-      printf 'import os\nos.makedirs("/kaggle/input/census", exist_ok=True)\n' | colab exec -s $session
+      printf 'import os\nos.makedirs("/kaggle/input/census", exist_ok=True)\n' | remote $session
       colab upload -s $session "$census" /kaggle/input/census/batch-counts.json
     fi
     if [ -n "$segmenter" ]; then
-      printf 'import os\nos.makedirs("/kaggle/input/ime-segment", exist_ok=True)\n' | colab exec -s $session
+      printf 'import os\nos.makedirs("/kaggle/input/ime-segment", exist_ok=True)\n' | remote $session
       colab upload -s $session "$segmenter" /kaggle/input/ime-segment/ime-segment
     fi
     # Staging downloads gigabytes, far past what one `colab exec` waits for,
@@ -106,7 +106,7 @@ case $command in
     stage_argv=$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1:]))' \
       --commit "$commit" --session-seconds "$seconds" ${stage_options[@]+"${stage_options[@]}"})
     printf 'import subprocess, sys\nlog = open("/kaggle/working/stage.out", "ab")\nchild = subprocess.Popen([sys.executable, "%s/colab/e2e-stage.py", *%s], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)\nopen("/kaggle/working/stage.pid", "w").write(f"{child.pid}\\n")\nprint(f"staging started, pid {child.pid}; log /kaggle/working/stage.out")\n' \
-      "$checkout" "$stage_argv" | colab exec -s $session
+      "$checkout" "$stage_argv" | remote $session
     provisioned
     ;;
   wait)
@@ -114,7 +114,7 @@ case $command in
     ;;
   status)
     heartbeat $session
-    printf 'import json, time\nfrom pathlib import Path\np = Path("/kaggle/working")\nfor name in ("stage.out", "kernel.out", "train.log", "publish.out"):\n    f = p / name\n    if f.is_file():\n        print(f"--- {name} ---")\n        print(f.read_text()[-3000:])\nstate = p / "publish-state.json"\nif state.is_file():\n    s = json.loads(state.read_text())\n    if "last_published_at" in s:\n        print(f"last publish: step {s[\"last_published_step\"]}, {round(time.time() - s[\"last_published_at\"])}s ago")\n    if s.get("last_error"):\n        print(f"last publish error: {s[\"last_error\"]}")\nrun = p / "run"\nif run.is_dir():\n    print("intervals:", sorted(d.name for d in run.glob("interval-*")))\n' | colab exec -s $session
+    printf 'import json, time\nfrom pathlib import Path\np = Path("/kaggle/working")\nfor name in ("stage.out", "kernel.out", "train.log", "publish.out"):\n    f = p / name\n    if f.is_file():\n        print(f"--- {name} ---")\n        print(f.read_text()[-3000:])\nstate = p / "publish-state.json"\nif state.is_file():\n    s = json.loads(state.read_text())\n    if "last_published_at" in s:\n        print(f"last publish: step {s[\"last_published_step\"]}, {round(time.time() - s[\"last_published_at\"])}s ago")\n    if s.get("last_error"):\n        print(f"last publish error: {s[\"last_error\"]}")\nrun = p / "run"\nif run.is_dir():\n    print("intervals:", sorted(d.name for d in run.glob("interval-*")))\n' | remote $session
     ;;
   fetch)
     out=${1:?out dir}
@@ -128,7 +128,7 @@ case $command in
     done
     ;;
   publish)
-    printf 'import os, runpy\nos.environ["ONCE"] = "1"\nrunpy.run_path("%s/colab/e2e-publish.py", run_name="__main__")\n' "$checkout" | colab exec -s $session
+    printf 'import os, runpy\nos.environ["ONCE"] = "1"\nrunpy.run_path("%s/colab/e2e-publish.py", run_name="__main__")\n' "$checkout" | COLAB_SECONDS=3600 remote $session
     ;;
   stop)
     force=

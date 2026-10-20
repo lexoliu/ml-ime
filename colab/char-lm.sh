@@ -21,7 +21,7 @@ case $command in
     provision $session --gpu "$gpu"
     # Colab mounts an empty, read-only /kaggle/input for its own Kaggle
     # integration; the kernel reads the datasets staged there, so it goes first.
-    printf 'import os, subprocess\nif os.path.ismount("/kaggle/input"):\n    subprocess.run(["umount", "/kaggle/input"], check=True)\nfor d in ("/root/.cache/huggingface", "/kaggle/input", "/kaggle/working"): os.makedirs(d, exist_ok=True)\n' | colab exec -s $session
+    printf 'import os, subprocess\nif os.path.ismount("/kaggle/input"):\n    subprocess.run(["umount", "/kaggle/input"], check=True)\nfor d in ("/root/.cache/huggingface", "/kaggle/input", "/kaggle/working"): os.makedirs(d, exist_ok=True)\n' | remote $session
     # Only the access token: the OAuth refresh token stays on the Mac, so no
     # VM ever refreshes it and invalidates the Mac's login.
     colab upload -s $session "$HOME/.cache/huggingface/token" /root/.cache/huggingface/token
@@ -32,12 +32,12 @@ case $command in
     for f in kaggle/aria2.py colab/hub.py; do
       colab upload -s $session "$here/$f" "/kaggle/$(basename $f)"
     done
-    printf 'import subprocess, sys\nlog = open("/kaggle/working/stage.out", "ab")\nchild = subprocess.Popen([sys.executable, "/kaggle/stage.py"], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)\nprint(f"staging started, pid {child.pid}; log /kaggle/working/stage.out")\n' | colab exec -s $session
+    printf 'import subprocess, sys\nlog = open("/kaggle/working/stage.out", "ab")\nchild = subprocess.Popen([sys.executable, "/kaggle/stage.py"], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)\nprint(f"staging started, pid {child.pid}; log /kaggle/working/stage.out")\n' | remote $session
     provisioned
     ;;
   status)
     heartbeat $session
-    printf 'from pathlib import Path\np = Path("/kaggle/working")\nfor name in ("stage.out", "kernel.out", "train.log"):\n    f = p / name\n    if f.is_file():\n        print(f"--- {name} ---")\n        print(f.read_text()[-3000:])\nprint("summary:", (p / "run-summary.json").is_file())\n' | colab exec -s $session
+    printf 'from pathlib import Path\np = Path("/kaggle/working")\nfor name in ("stage.out", "kernel.out", "train.log"):\n    f = p / name\n    if f.is_file():\n        print(f"--- {name} ---")\n        print(f.read_text()[-3000:])\nprint("summary:", (p / "run-summary.json").is_file())\n' | remote $session
     ;;
   fetch)
     out=${1:?out dir}

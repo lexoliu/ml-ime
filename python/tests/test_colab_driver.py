@@ -21,15 +21,26 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 
 FAKE_COLAB = """\
-import json, sys
+import json, re, sys, time
 from pathlib import Path
 here = Path(__file__).parent
 calls = here / "calls.jsonl"
 stdin = sys.stdin.read() if sys.argv[1] == "exec" else ""
 with calls.open("a") as log:
     log.write(json.dumps({"argv": sys.argv[1:], "stdin": stdin}) + "\\n")
+hang = here / "hang-exec"
+if sys.argv[1] == "exec" and hang.is_file() and hang.read_text() in stdin:
+    time.sleep(3600)  # the CLI after a dropped connection
 answers = here / "answers.json"
-if sys.argv[1] == "exec" and answers.is_file():
+token = re.search(r'print\\("(remote-ok-[0-9]+)"\\)\\s*$', stdin)
+fail = here / "fail-exec"
+if token:
+    # Like the real CLI: the kernel prints the traceback and the exit is 0.
+    if fail.is_file() and fail.read_text() in stdin:
+        print("RuntimeError: the code raised")
+    else:
+        print(token.group(1))
+elif sys.argv[1] == "exec" and answers.is_file():
     print(json.loads(answers.read_text()).pop(0))
 """
 
@@ -88,13 +99,15 @@ class Driver:
             (self.home / credential).parent.mkdir(parents=True)
             (self.home / credential).write_text("secret")
 
-    def run(self, *argv: str) -> subprocess.CompletedProcess[str]:
+    def run(self, *argv: str, colab_seconds: int | None = None) -> subprocess.CompletedProcess[str]:
+        bound = {} if colab_seconds is None else {"COLAB_SECONDS": str(colab_seconds)}
         return subprocess.run(
             ["bash", str(self.repo / "colab" / "e2e.sh"), str(self.kernel), *argv],
             env={
                 **os.environ,
                 "PATH": f"{self.bin}{os.pathsep}{os.environ['PATH']}",
                 "HOME": str(self.home),
+                **bound,
             },
             capture_output=True,
             text=True,
@@ -111,6 +124,14 @@ class Driver:
         (self.bin / "answers.json").write_text(
             json.dumps(["LEG " + json.dumps(r) for r in reports])
         )
+
+    def fail_exec(self, marker: str) -> None:
+        """The code of the `colab exec` holding *marker* raises on the runtime."""
+        (self.bin / "fail-exec").write_text(marker)
+
+    def hang_exec(self, marker: str) -> None:
+        """The `colab exec` holding *marker* never returns."""
+        (self.bin / "hang-exec").write_text(marker)
 
     def stamp_ranking(self) -> None:
         kernel = self.kernel / "kernel.py"
@@ -172,6 +193,35 @@ def test_a_v2_start_runs_its_commit_on_a_stamped_session_and_builds_no_segmenter
     [fetch] = [c for c in calls if '["checkout"]' in c["stdin"]]
     assert f"[\"checkout\"]('{commit}')" in fetch["stdin"]
     assert stage_argv(calls) == ["--commit", commit, "--session-seconds", "5400", "--no-publish"]
+
+
+def test_a_start_whose_code_raises_on_the_runtime_releases_it(driver: Driver) -> None:
+    """`colab exec` exits 0 when the code raises; the start must still fail and stop."""
+    driver.fail_exec('["checkout"]')
+    done = driver.run("start", "--session-hours", "1", "--no-publish")
+    assert done.returncode != 0
+    assert "did not run to its end" in done.stderr
+    argv = [c["argv"] for c in driver.calls()]
+    assert argv[-1] == ["stop", "-s", "mlime-e2e-v2-t4"]
+    # Nothing after the failed step reached the runtime.
+    assert not any("e2e-stage.py" in c["stdin"] for c in driver.calls())
+
+
+def test_a_watchdog_that_does_not_start_releases_the_runtime(driver: Driver) -> None:
+    driver.fail_exec("/root/watchdog.py")
+    done = driver.run("start", "--session-hours", "1")
+    assert done.returncode != 0
+    assert [c["argv"] for c in driver.calls()][-1] == ["stop", "-s", "mlime-e2e-v2-t4"]
+
+
+def test_a_cli_call_that_never_returns_is_cut_off_and_releases_the_runtime(
+    driver: Driver,
+) -> None:
+    """After a dropped connection the CLI can wait forever; its bound ends the call."""
+    driver.hang_exec("/root/watchdog.py")
+    done = driver.run("start", "--session-hours", "1", colab_seconds=2)
+    assert done.returncode == 124, done.stderr
+    assert [c["argv"] for c in driver.calls()][-1] == ["stop", "-s", "mlime-e2e-v2-t4"]
 
 
 def test_a_ranking_start_ships_the_segmenter_built_from_its_commit(driver: Driver) -> None:
