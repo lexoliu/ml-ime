@@ -4,10 +4,12 @@ A kernel is configured the one way the chain has always configured it: a copy
 whose top-level fields are rewritten as literals. :func:`stamp` is that
 rewrite, shared by the Colab stager -- which stamps each leg's segment, commit
 and session into the copy it runs -- and by :func:`stamp_e2e_v2`, which writes
-a v2 run's kernel directory from ``kaggle/e2e``.
+a v2 run's kernel directory from ``kaggle/e2e``, or a v2 stage's: a run that
+starts from a finished v2 run with its own ranking, shards and schedule.
 
 Standard library only: the stager imports this from the leg's checkout before
-it has installed anything.
+it has installed anything. ``RankingConfig`` is named for the type checker
+alone.
 """
 
 from __future__ import annotations
@@ -16,9 +18,12 @@ import ast
 import json
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from mlime.train.e2e_model import RankingConfig
 
 #: v1's training recipe, field by field, as ``kaggle/e2e/kernel.py`` commits
 #: it. v2 trains exactly this -- only the stream under it differs -- so a v2
@@ -103,6 +108,47 @@ def stamp(source: str, **fields: Any) -> str:
     return source
 
 
+def _v2_name(run: str) -> None:
+    """Refuse *run* unless it is named inside the v2 namespace."""
+    if E2E_V2_RUN.fullmatch(run) is None:
+        raise ValueError(
+            f"{run!r} is not a v2 run name: {E2E_V2_RUN.pattern}, such as mlime-e2e-v2-a100"
+        )
+
+
+@dataclass(frozen=True)
+class E2EV2Stage:
+    """What a v2 stage changes of v1's recipe: where it starts and how it trains.
+
+    A stage starts from the finished v2 run *init_from* (``INIT_FROM``) -- its
+    weights, with a fresh optimiser and schedule -- and with *ranking* adds the
+    sequence-level ranking loss (``RANKING``), which only a stage can: the
+    ranking loss is trained on top of a finished run, never from route A and
+    the reader. *learning_rates* (``LEARNING_RATES``) is the (pretrained, new)
+    pair, None for ``mlime train e2e``'s defaults; *token_budget* and
+    *accumulate* default to v1's.
+    """
+
+    init_from: str
+    ranking: RankingConfig | None = None
+    learning_rates: tuple[float, float] | None = None
+    token_budget: int = V1_RECIPE["TOKEN_BUDGET"]
+    accumulate: int = V1_RECIPE["ACCUMULATE"]
+
+    def __post_init__(self) -> None:
+        _v2_name(self.init_from)
+
+    def fields(self) -> dict[str, Any]:
+        """The recipe fields this stage stamps over v1's."""
+        return {
+            "INIT_FROM": self.init_from,
+            "RANKING": None if self.ranking is None else asdict(self.ranking),
+            "LEARNING_RATES": self.learning_rates,
+            "TOKEN_BUDGET": self.token_budget,
+            "ACCUMULATE": self.accumulate,
+        }
+
+
 @dataclass(frozen=True)
 class E2EV2Run:
     """One v2 run's kernel: its name and what its legs measure and train on.
@@ -110,19 +156,22 @@ class E2EV2Run:
     *profile_steps* and *trace_steps* are the loop's timing window after the
     warm-up (``PROFILE_STEPS``, ``TRACE_STEPS``). *train_shards* narrows the
     epoch to those shards (``TRAIN_SHARDS``): a check that runs a short epoch
-    to ``max_steps`` and through the evaluations on a cheap card.
+    to ``max_steps`` and through the evaluations on a cheap card, or a stage's
+    pick of the corpus. *stage* makes the run a stage; without one it trains
+    v1's recipe exactly.
     """
 
     run: str
     profile_steps: int = 30
     trace_steps: int = 3
     train_shards: tuple[str, ...] | None = None
+    stage: E2EV2Stage | None = None
 
     def __post_init__(self) -> None:
-        if E2E_V2_RUN.fullmatch(self.run) is None:
+        _v2_name(self.run)
+        if self.stage is not None and self.stage.init_from == self.run:
             raise ValueError(
-                f"{self.run!r} is not a v2 run name: {E2E_V2_RUN.pattern}, such as "
-                "mlime-e2e-v2-a100"
+                f"{self.run} cannot start from itself: a stage publishes under its own name"
             )
         if not 0 <= self.trace_steps <= self.profile_steps:
             raise ValueError(
@@ -138,27 +187,35 @@ class E2EV2Run:
         return f"lexoliu/{self.run}-s0"
 
     def fields(self) -> dict[str, Any]:
-        """The kernel fields this run stamps."""
+        """The kernel fields this run stamps beside its recipe."""
         return {
             "PROFILE_STEPS": self.profile_steps,
             "TRACE_STEPS": self.trace_steps,
             "TRAIN_SHARDS": self.train_shards,
         }
 
+    def recipe(self) -> dict[str, Any]:
+        """The recipe this run trains: v1's, with a stage's fields over it."""
+        return {**V1_RECIPE, **({} if self.stage is None else self.stage.fields())}
+
 
 def stamp_e2e_v2(template: Path, out: Path, run: E2EV2Run) -> dict[str, Any]:
     """Write *run*'s kernel directory from the e2e kernel in *template*; return its recipe.
 
-    The copy differs from the template only in the run's own fields, and its
-    metadata names the run's slug and :data:`E2E_V2_SOURCES` alone. A template
-    whose recipe is no longer v1's is refused by field, since v2 is defined as
-    v1's recipe on a different stream.
+    The copy differs from the template only in the run's own fields and a
+    stage's, and its metadata names the run's slug and :data:`E2E_V2_SOURCES`
+    alone. A template whose recipe is no longer v1's is refused by field,
+    since v2 is defined as v1's recipe on a different stream and a stage as
+    v1's recipe with its own fields over it. The recipe returned is the one
+    read back from the copy.
     """
     source = (template / "kernel.py").read_text(encoding="utf-8")
-    recipe = {name: literal(source, name) for name in V1_RECIPE}
-    drifted = sorted(name for name, value in recipe.items() if value != V1_RECIPE[name])
+    committed = {name: literal(source, name) for name in V1_RECIPE}
+    drifted = sorted(name for name, value in committed.items() if value != V1_RECIPE[name])
     if drifted:
         raise ValueError(f"{template / 'kernel.py'} is no longer v1's recipe in {drifted}")
+    stage = {} if run.stage is None else run.stage.fields()
+    kernel = stamp(source, **run.fields(), **stage)
     metadata = json.loads((template / "kernel-metadata.json").read_text(encoding="utf-8"))
     metadata.update(
         id=run.slug,
@@ -167,8 +224,8 @@ def stamp_e2e_v2(template: Path, out: Path, run: E2EV2Run) -> dict[str, Any]:
         kernel_sources=[],
     )
     out.mkdir(parents=True, exist_ok=True)
-    (out / "kernel.py").write_text(stamp(source, **run.fields()), encoding="utf-8")
+    (out / "kernel.py").write_text(kernel, encoding="utf-8")
     (out / "kernel-metadata.json").write_text(
         json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
     )
-    return recipe
+    return {name: literal(kernel, name) for name in V1_RECIPE}

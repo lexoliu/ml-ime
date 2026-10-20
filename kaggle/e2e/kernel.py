@@ -23,12 +23,13 @@ its report -- evaluates that checkpoint and trains nothing.
 
 A stage is the same chain with `INIT_FROM` stamped: the first segment starts
 from the finished run mounted under that name -- v1's dataset
-`lexoliu/mlime-e2e-final`, or the kernel output of an earlier stage -- with its
-weights, a fresh optimiser and schedule, and its one epoch runs over
-`TRAIN_SHARDS`. With `RANKING` stamped as well it is a ranking stage (#116):
-every segment adds the sequence-level ranking loss, reading each example's
-other segmentations from the `ime-segment` binary mounted beside the inputs
-(`colab/e2e.sh start` builds it from the leg's commit and uploads it).
+`lexoliu/mlime-e2e-final`, the kernel output of an earlier stage, or a
+finished v2 run's outputs, which the Colab stager mounts from the resume
+bucket -- with its weights, a fresh optimiser and schedule, and its one epoch
+runs over `TRAIN_SHARDS`. With `RANKING` stamped as well it is a ranking
+stage (#116): every segment adds the sequence-level ranking loss, reading each
+example's other segmentations from the `ime-segment` binary mounted beside the
+inputs (`colab/e2e.sh start` builds it from the leg's commit and uploads it).
 `WHOLE_ALPHABET` normalises the per-position loss over every emittable
 character (#121). A finished run is told apart from the run it started from
 by the stage its run-config records.
@@ -189,9 +190,11 @@ CHECKPOINT_MINUTES = 0
 RANKING = None
 
 #: The mount a stage starts from: a finished run's dataset or kernel-output
-#: slug, such as "mlime-e2e-final" for v1. Its weights start the run with a
-#: fresh optimiser and schedule; None starts from route A and the reader. A
-#: ranking stage always names one. Stamped per push.
+#: slug, such as "mlime-e2e-final" for v1, or a finished v2 run's name, such
+#: as "mlime-e2e-v2-g4", whose final outputs the Colab stager mounts from the
+#: resume bucket. Its weights start the run with a fresh optimiser and
+#: schedule; None starts from route A and the reader. A ranking stage always
+#: names one. Stamped per push.
 INIT_FROM = None
 
 #: Normalise the decoder's per-position loss over every emittable character
