@@ -2,12 +2,15 @@
 
 Collation moved from a loop that wrote each position's candidate row and
 letters as its own small tensor to one gather per field over the batch's
-distinct spans. The batches a run trains on must not move with it: every
-field, its dtype and its shape, the generator state the context coin leaves
-behind, and the refusals. The predecessor is kept here verbatim as the oracle,
-and both run over batches shaped like the corpus's -- ninety-odd rows, full,
-abbreviated and mixed typing over a lexicon wide enough that an initial admits
-hundreds of characters -- clean and under the typo model.
+distinct spans, and the context rows from transformers' tensor conversion
+to one ``torch.tensor`` over the tokenizer's rows. The batches a run trains on
+must not move with either: every field, its dtype and its shape, the
+generator state the context coin leaves behind, and the refusals. The
+predecessor is kept here verbatim as the oracle, both run a real transformers
+fast tokenizer, and both run over batches shaped like the corpus's --
+ninety-odd rows, full, abbreviated and mixed typing over a lexicon wide enough
+that an initial admits hundreds of characters -- clean and under the typo
+model.
 """
 
 from __future__ import annotations
@@ -19,7 +22,8 @@ from pathlib import Path
 
 import pytest
 import torch
-from conftest import StubTokenizer
+from tokenizers import Tokenizer, models, normalizers, pre_tokenizers, processors
+from transformers import PreTrainedTokenizerFast
 
 from mlime.train.lexicon import CandidateSpace, Lexicon, build_lexicon
 from mlime.train.samples import (
@@ -57,8 +61,29 @@ BATCH_FIELDS = (
 )
 
 
+def fast_tokenizer(characters: Sequence[str]) -> PreTrainedTokenizerFast:
+    """A BERT-shaped transformers fast tokenizer over *characters*, one token each."""
+    vocabulary = {"[PAD]": 0, "[UNK]": 1, "[CLS]": 2, "[SEP]": 3, "[MASK]": 4}
+    vocabulary.update({character: index + 5 for index, character in enumerate(characters)})
+    inner = Tokenizer(models.WordPiece(vocabulary, unk_token="[UNK]"))
+    inner.normalizer = normalizers.BertNormalizer(
+        clean_text=True, handle_chinese_chars=True, strip_accents=False, lowercase=False
+    )
+    inner.pre_tokenizer = pre_tokenizers.BertPreTokenizer()
+    inner.post_processor = processors.BertProcessing(("[SEP]", 3), ("[CLS]", 2))
+    return PreTrainedTokenizerFast(
+        tokenizer_object=inner,
+        unk_token="[UNK]",
+        pad_token="[PAD]",
+        cls_token="[CLS]",
+        sep_token="[SEP]",
+        mask_token="[MASK]",
+    )
+
+
 def legacy_collate(
     collator: Collator,
+    tokenizer: PreTrainedTokenizerFast,
     examples: Sequence[TrainingExample],
     contexts: Sequence[str | None],
     context_rows: Sequence[int],
@@ -70,7 +95,6 @@ def legacy_collate(
         raise ValueError(f"{len(examples)} fill rows but {len(context_rows)} context assignments")
     width = max(len(example) for example in examples) + 2
     size = len(examples)
-    tokenizer = collator.tokenizer
     input_ids = torch.full((size, width), tokenizer.pad_token_id, dtype=torch.long)
     attention_mask = torch.zeros((size, width), dtype=torch.long)
     span_ids = torch.zeros((size, width), dtype=torch.long)
@@ -228,9 +252,14 @@ def run_both(
     candidates: CandidateSpace,
     groups: list[list[tuple[TrainingExample, str | None]]],
     shared_contexts: bool,
+    characters: Sequence[str],
 ) -> None:
-    """Collate every group with both implementations, from twin generators."""
-    tokenizer = StubTokenizer()
+    """Collate every group with both implementations, from twin generators.
+
+    The tokenizer knows every other character, so contexts carry unknown
+    tokens as well as known ones.
+    """
+    tokenizer = fast_tokenizer(characters[::2])
     new = Collator(tokenizer, candidates, context_dropout=0.3, max_context_tokens=64, seed=11)
     old = Collator(tokenizer, candidates, context_dropout=0.3, max_context_tokens=64, seed=11)
     for group in groups:
@@ -243,7 +272,8 @@ def run_both(
             contexts = [context for _, context in group]
             rows = list(range(len(group)))
         assert_same_batch(
-            new.collate(examples, contexts, rows), legacy_collate(old, examples, contexts, rows)
+            new.collate(examples, contexts, rows),
+            legacy_collate(old, tokenizer, examples, contexts, rows),
         )
         assert new.rng.getstate() == old.rng.getstate()
 
@@ -275,8 +305,8 @@ def test_clean_batches_match_the_per_position_collation(
     widest = max(len(candidates.resolve(span)) for example, _ in examples for span in example.spans)
     assert widest > 300, "an initial must admit hundreds of characters for the test to bite"
     groups = groups_of(examples, seed=2)
-    run_both(candidates, groups, shared_contexts=False)
-    run_both(candidates, groups, shared_contexts=True)
+    run_both(candidates, groups, shared_contexts=False, characters=list(readings))
+    run_both(candidates, groups, shared_contexts=True, characters=list(readings))
 
 
 def test_typo_batches_match_the_per_position_collation(
@@ -292,12 +322,13 @@ def test_typo_batches_match_the_per_position_collation(
     assert any(span not in spans for example, _ in examples for span in example.spans), (
         "the typo corpus must hold off-inventory spans"
     )
-    run_both(candidates, groups_of(examples, seed=4), shared_contexts=False)
+    run_both(
+        candidates, groups_of(examples, seed=4), shared_contexts=False, characters=list(readings)
+    )
 
 
-def test_refusals_are_the_per_position_collations(
-    lexicon: Lexicon, spans: SpanVocab, tokenizer: StubTokenizer
-) -> None:
+def test_refusals_are_the_per_position_collations(lexicon: Lexicon, spans: SpanVocab) -> None:
+    tokenizer = fast_tokenizer(lexicon.characters)
     candidates = CandidateSpace(spans, lexicon.candidate_mask)
     zhong = lexicon.index("中")
     wo = lexicon.index("我")
@@ -326,7 +357,7 @@ def test_refusals_are_the_per_position_collations(
     for bad in cases:
         group = [fine, bad]
         with pytest.raises(ValueError) as old:
-            legacy_collate(Collator(tokenizer, candidates), group, [None, None], [0, 1])
+            legacy_collate(Collator(tokenizer, candidates), tokenizer, group, [None, None], [0, 1])
         with pytest.raises(ValueError) as new:
             Collator(tokenizer, candidates)(group)
         assert str(new.value) == str(old.value)
