@@ -40,6 +40,7 @@ import random
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from fractions import Fraction
+from itertools import accumulate
 from pathlib import Path
 from typing import Protocol
 
@@ -49,7 +50,7 @@ from torch.utils.data import IterableDataset, get_worker_info
 
 from mlime.data.corpus import Sample
 from mlime.data.shards import shard_paths
-from mlime.data.text import HAN
+from mlime.data.text import all_han
 from mlime.logging import log
 from mlime.train.arbitration import ReadingArbitration
 from mlime.train.labels import keyboard_form
@@ -260,6 +261,11 @@ class SampleBuilder:
         self.candidates = candidates or CandidateSpace(spans, lexicon.candidate_mask)
         self.seed = seed
         self.counts = BuildCounts()
+        #: The reading each (character, annotator syllable) pair settles to,
+        #: and whether the arbitration rewrote it. The pairs number in the tens
+        #: of thousands; folding one afresh -- a regex, three string copies and
+        #: the arbitration lookup -- was the largest part of a sentence's cost.
+        self._settled: dict[tuple[str, str], tuple[str, bool]] = {}
 
     def build(
         self, sample: Sample, syllables: Sequence[str] | None, epoch: int
@@ -268,48 +274,48 @@ class SampleBuilder:
         if syllables is None:
             self.counts.unlabelled += 1
             return None
-        characters = tuple(sample.text)
-        if not all(HAN.match(character) for character in characters):
+        text = sample.text
+        if not all_han(text):
             self.counts.not_all_han += 1
             return None
-        if len(characters) != len(syllables):
+        if len(text) != len(syllables):
             self.counts.length_mismatch += 1
             return None
-        labelled = tuple(keyboard_form(syllable) for syllable in syllables)
-        readings = tuple(
-            self.arbitration.reading(character, label)
-            for character, label in zip(characters, labelled, strict=True)
-        )
-        self.counts.reading_arbitrated += sum(
-            arbitrated != label for arbitrated, label in zip(readings, labelled, strict=True)
-        )
-        if any(reading not in self.spans for reading in readings):
+        known = self._settled
+        readings = []
+        arbitrated = 0
+        for pair in zip(text, syllables, strict=True):
+            settled = known.get(pair)
+            if settled is None:
+                label = keyboard_form(pair[1])
+                reading = self.arbitration.reading(pair[0], label)
+                settled = known[pair] = (reading, reading != label)
+            readings.append(settled[0])
+            arbitrated += settled[1]
+        self.counts.reading_arbitrated += arbitrated
+        if not self.spans.covers(readings):
             self.counts.unknown_span += 1
             return None
-        if not all(self.lexicon.contains(character) for character in characters):
+        targets = self.lexicon.indices(text)
+        if targets is None:
             self.counts.unemittable_character += 1
             return None
 
         rng = example_rng(self.seed, epoch, sample.id)
-        spans = type_syllables(readings, rng, self.augmentation)
+        spans = type_syllables(tuple(readings), rng, self.augmentation)
         if self.noise is not None:
             # The styles choose *which* keys the typist meant to press and the
             # noise model then slips them -- corrupting before the abbreviation
             # would let the initial of a typoed syllable erase the slip.
             spans = self.noise.maybe_corrupt(spans, rng).spans
-        span_ids = tuple(self.spans.id_or_unknown(span) for span in spans)
-        targets = tuple(self.lexicon.index(character) for character in characters)
-        if not all(
-            self.candidates.admits(span, target)
-            for span, target in zip(spans, targets, strict=True)
-        ):
+        if not self.candidates.admits_all(spans, targets):
             self.counts.target_not_admitted += 1
             return None
         self.counts.kept += 1
         return TrainingExample(
             id=sample.id,
             spans=spans,
-            span_ids=span_ids,
+            span_ids=tuple(self.spans.id_or_unknown(span) for span in spans),
             targets=targets,
             context=sample.context,
         )
@@ -363,6 +369,17 @@ def interleave(shards: Sequence[Path]) -> list[Path]:
     return [shard for *_, shard in sorted(keyed)]
 
 
+def first_row(offset: int, reader: int, readers: int) -> int:
+    """The first row of a shard starting at global row *offset* that *reader* takes.
+
+    The readers stride the shards' concatenation: reader *i* takes the global
+    rows ``i, i + readers, ...``, so within a shard it takes every
+    *readers*-th row from this one on. A result past the shard's end means the
+    reader takes nothing there.
+    """
+    return (reader - offset) % readers
+
+
 class CorpusStream(IterableDataset[TrainingExample]):
     """The corpus as an epoch-reaugmented stream of examples.
 
@@ -408,6 +425,11 @@ class CorpusStream(IterableDataset[TrainingExample]):
         self.shards = interleave(self.shards)
         self.rows = [shard_rows(shard) for shard in self.shards]
 
+    @property
+    def offsets(self) -> list[int]:
+        """The global row each shard starts at, in reading order."""
+        return list(accumulate(self.rows[:-1], initial=0))
+
     def set_epoch(self, epoch: int) -> None:
         """Re-augment from the next pass on."""
         self.epoch = epoch
@@ -421,10 +443,8 @@ class CorpusStream(IterableDataset[TrainingExample]):
 
     def __iter__(self) -> Iterator[TrainingExample]:
         index, readers = self._reader()
-        offset = 0
-        for shard, rows in zip(self.shards, self.rows, strict=True):
-            first = (index - offset) % readers
-            offset += rows
+        for shard, rows, offset in zip(self.shards, self.rows, self.offsets, strict=True):
+            first = first_row(offset, index, readers)
             if first >= rows:
                 continue
             for sample, syllables in read_pair(shard, self.labels_dir, first, readers):
@@ -448,9 +468,14 @@ class BaseTokenizer(Protocol):
         padding: bool,
         truncation: bool,
         max_length: int,
-        return_tensors: str,
-    ) -> Mapping[str, torch.Tensor]:
-        """Encode a batch of strings into ``input_ids`` and ``attention_mask``."""
+    ) -> Mapping[str, list[list[int]]]:
+        """Encode a batch of strings into padded ``input_ids`` and ``attention_mask`` rows.
+
+        Rows rather than tensors: transformers' own tensor conversion walks
+        every token in Python before it builds the tensor, and the collator's
+        one ``torch.tensor`` over the rows is the same int64 tensor at half
+        the batch's tokenizer time.
+        """
         ...
 
 
@@ -535,6 +560,23 @@ class Batch:
             ids=self.ids,
         )
 
+    def pin_memory(self) -> Batch:
+        """The same batch in page-locked host memory, so :meth:`to` copies asynchronously.
+
+        From pageable memory a ``non_blocking`` copy is not: the driver stages
+        it through a bounce buffer whose DMA queues behind the stream's work,
+        so the host waits for the device to drain before it can launch the
+        next forward -- a synchronisation per micro-batch, hidden in ``h2d``.
+        """
+        return Batch(
+            **{
+                field.name: getattr(self, field.name).pin_memory()
+                for field in fields(self)
+                if field.name != "ids"
+            },
+            ids=self.ids,
+        )
+
 
 class StepBatch(Protocol):
     """What the training loop reads of a collated step, whatever the model consumes."""
@@ -561,6 +603,10 @@ class StepBatch(Protocol):
 
     def to(self, device: torch.device) -> StepBatch:
         """The same step on *device*."""
+        ...
+
+    def pin_memory(self) -> StepBatch:
+        """The same step in page-locked host memory."""
         ...
 
 
@@ -614,10 +660,37 @@ class Collator:
         self.context_dropout = context_dropout
         self.max_context_tokens = max_context_tokens
         self.rng = random.Random(seed)
+        #: Each span's candidate row and padded letters, built on first sight.
+        #: The batch gathers copies out of them; nothing it holds aliases them.
+        self._candidates: dict[str, torch.Tensor] = {}
+        self._letters: dict[str, torch.Tensor] = {}
 
     def rows(self, example: TrainingExample) -> int:
         """One: an example is one row of the fill tower."""
         return 1
+
+    def _candidate_row(self, span: str) -> torch.Tensor:
+        """The emission ids *span* admits, as the row a batch gathers."""
+        row = self._candidates.get(span)
+        if row is None:
+            row = self._candidates[span] = torch.tensor(
+                self.candidates.resolve(span), dtype=torch.long
+            )
+        return row
+
+    def _letter_row(self, span: str, example_id: str) -> None:
+        """Check *span*'s keys once and keep them padded to the letter width."""
+        if span in self._letters:
+            return
+        if len(span) > MAX_SPAN_LETTERS:
+            raise ValueError(
+                f"example {example_id} holds a {len(span)}-letter span {span!r}; "
+                f"the letter encoding reads at most {MAX_SPAN_LETTERS}"
+            )
+        keys = [letter_id(letter) for letter in span]
+        self._letters[span] = torch.tensor(
+            keys + [LETTER_PAD] * (MAX_SPAN_LETTERS - len(keys)), dtype=torch.long
+        )
 
     def __call__(self, examples: Sequence[TrainingExample]) -> Batch:
         """Collate *examples*, keeping each one's context with probability 1-p."""
@@ -642,60 +715,58 @@ class Collator:
             raise ValueError(
                 f"{len(examples)} fill rows but {len(context_rows)} context assignments"
             )
-        width = max(len(example) for example in examples) + 2
+        lengths = [len(example) for example in examples]
+        width = max(lengths) + 2
         size = len(examples)
-        input_ids = torch.full((size, width), self.tokenizer.pad_token_id, dtype=torch.long)
-        attention_mask = torch.zeros((size, width), dtype=torch.long)
-        span_ids = torch.zeros((size, width), dtype=torch.long)
-        span_positions = torch.zeros((size, width), dtype=torch.bool)
-        targets = torch.full((size, width), IGNORE_INDEX, dtype=torch.long)
-
-        candidate_lists = [
-            [self.candidates.resolve(span) for span in example.spans] for example in examples
+        # Each distinct span of the batch is looked up once -- its candidate
+        # row and its letters are properties of the span, not of the position
+        # -- and the positions then gather them in one indexing op apiece. A
+        # batch is some ninety rows and eight hundred positions; building it
+        # a position at a time was ~1,700 small tensors, all of it Python
+        # holding the GIL the training step needs to launch its kernels.
+        slots: dict[str, int] = {}
+        slot_of_position = [
+            slots.setdefault(span, len(slots)) for example in examples for span in example.spans
         ]
-        candidate_width = max(
-            (len(row) for example_lists in candidate_lists for row in example_lists),
-            default=1,
-        )
-        candidate_ids = torch.zeros((size, width, candidate_width), dtype=torch.long)
-        candidate_counts = torch.zeros((size, width), dtype=torch.long)
-        span_letters = torch.full((size, width, MAX_SPAN_LETTERS), LETTER_PAD, dtype=torch.long)
+        listed = [self._candidate_row(span) for span in slots]
+        for example in examples:
+            for span in example.spans:
+                self._letter_row(span, example.id)
+            for span, target in zip(example.spans, example.targets, strict=True):
+                if target != IGNORE_INDEX and not self.candidates.admits(span, int(target)):
+                    raise ValueError(f"example {example.id} has a target its span does not admit")
 
-        for row, example in enumerate(examples):
-            length = len(example)
-            input_ids[row, 0] = self.tokenizer.cls_token_id
-            input_ids[row, 1 : length + 1] = self.tokenizer.mask_token_id
-            input_ids[row, length + 1] = self.tokenizer.sep_token_id
-            attention_mask[row, : length + 2] = 1
-            row_spans = torch.tensor(example.span_ids, dtype=torch.long)
-            row_targets = torch.tensor(example.targets, dtype=torch.long)
-            for column, (span, listed) in enumerate(
-                zip(example.spans, candidate_lists[row], strict=True)
-            ):
-                if len(span) > MAX_SPAN_LETTERS:
-                    raise ValueError(
-                        f"example {example.id} holds a {len(span)}-letter span {span!r}; "
-                        f"the letter encoding reads at most {MAX_SPAN_LETTERS}"
-                    )
-                candidate_ids[row, column + 1, : len(listed)] = torch.tensor(
-                    listed, dtype=torch.long
-                )
-                candidate_counts[row, column + 1] = len(listed)
-                span_letters[row, column + 1, : len(span)] = torch.tensor(
-                    [letter_id(letter) for letter in span], dtype=torch.long
-                )
-            scored = row_targets != IGNORE_INDEX
-            admitted = torch.tensor(
-                [
-                    self.candidates.admits(span, int(target))
-                    for span, target in zip(example.spans, example.targets, strict=True)
-                ]
-            )
-            if not bool(admitted[scored].all()):
-                raise ValueError(f"example {example.id} has a target its span does not admit")
-            span_ids[row, 1 : length + 1] = row_spans
-            span_positions[row, 1 : length + 1] = True
-            targets[row, 1 : length + 1] = row_targets
+        # Row-major over the typed columns ``1..length``: a boolean index walks
+        # the positions in exactly the order the examples list them.
+        span_lengths = torch.tensor(lengths, dtype=torch.long)
+        columns = torch.arange(width)
+        span_positions = (columns >= 1) & (columns <= span_lengths[:, None])
+        input_ids = torch.full((size, width), self.tokenizer.pad_token_id, dtype=torch.long)
+        input_ids[span_positions] = self.tokenizer.mask_token_id
+        input_ids[:, 0] = self.tokenizer.cls_token_id
+        input_ids[torch.arange(size), span_lengths + 1] = self.tokenizer.sep_token_id
+        attention_mask = (columns < span_lengths[:, None] + 2).long()
+        span_ids = torch.zeros((size, width), dtype=torch.long)
+        span_ids[span_positions] = torch.tensor(
+            [span_id for example in examples for span_id in example.span_ids], dtype=torch.long
+        )
+        targets = torch.full((size, width), IGNORE_INDEX, dtype=torch.long)
+        targets[span_positions] = torch.tensor(
+            [target for example in examples for target in example.targets], dtype=torch.long
+        )
+
+        slot_index = torch.tensor(slot_of_position, dtype=torch.long)
+        table = torch.nn.utils.rnn.pad_sequence(listed, batch_first=True, padding_value=0)
+        candidate_ids = torch.zeros((size, width, table.shape[1]), dtype=torch.long)
+        candidate_ids[span_positions] = table[slot_index]
+        candidate_counts = torch.zeros((size, width), dtype=torch.long)
+        candidate_counts[span_positions] = torch.tensor(
+            [row.numel() for row in listed], dtype=torch.long
+        )[slot_index]
+        span_letters = torch.full((size, width, MAX_SPAN_LETTERS), LETTER_PAD, dtype=torch.long)
+        span_letters[span_positions] = torch.stack([self._letters[span] for span in slots])[
+            slot_index
+        ]
 
         kept: list[str] = []
         has_context = torch.zeros(len(contexts), dtype=torch.float)
@@ -708,7 +779,6 @@ class Collator:
             padding=True,
             truncation=True,
             max_length=self.max_context_tokens,
-            return_tensors="pt",
         )
         # The device code indexes the scored positions rather than finding
         # them: the nonzero and the check that they sit inside the span columns
@@ -724,8 +794,8 @@ class Collator:
             span_positions=span_positions,
             targets=targets,
             scored=scored_positions,
-            context_ids=encoded["input_ids"],
-            context_mask=encoded["attention_mask"],
+            context_ids=torch.tensor(encoded["input_ids"], dtype=torch.long),
+            context_mask=torch.tensor(encoded["attention_mask"], dtype=torch.long),
             has_context=has_context,
             context_rows=torch.tensor(context_rows, dtype=torch.long),
             candidate_ids=candidate_ids,
@@ -773,25 +843,66 @@ def token_budget_batches(
     over its examples alone would let a batch of long full-pinyin sentences run
     to twice the rows of the batch beside it.
     """
-    if budget <= 0:
-        raise ValueError(f"the token budget must be positive, got {budget}")
+    packer = BudgetPacker(budget)
     batch: list[TrainingExample] = []
-    fill = context = filled = 0
     for example in examples:
-        cost = 1 if rows is None else rows(example)
-        wide = max(fill, len(example) + 2)
-        deep = max(context, _context_width(example, max_context_tokens))
-        if batch and wide * (filled + cost) + deep * (len(batch) + 1) > budget:
+        fill, context = example_shape(example, max_context_tokens)
+        if packer.add(fill, context, 1 if rows is None else rows(example)):
             yield batch
             batch = []
-            filled = 0
-            wide = len(example) + 2
-            deep = _context_width(example, max_context_tokens)
         batch.append(example)
-        fill, context = wide, deep
-        filled += cost
     if batch:
         yield batch
+
+
+class BudgetPacker:
+    """:func:`token_budget_batches`' grouping, one example's shape at a time.
+
+    The grouping is greedy and sequential -- whether an example opens a new
+    batch depends on every example before it in the batch -- but it reads
+    nothing of an example except its two widths and its rows. Kept apart from
+    the examples, it is what the batch census replays over shapes measured in
+    other processes, so the census and the loop group with one implementation.
+    """
+
+    def __init__(self, budget: int) -> None:
+        if budget <= 0:
+            raise ValueError(f"the token budget must be positive, got {budget}")
+        self.budget = budget
+        #: Batches closed so far; :attr:`batches` adds the open one.
+        self.closed = 0
+        self._fill = self._context = self._rows = self._examples = 0
+
+    def add(self, fill: int, context: int, rows: int) -> bool:
+        """Place one example; true when it opens a new batch, closing the one before.
+
+        *fill* and *context* are its padded widths (:func:`example_shape`),
+        *rows* how many rows at the fill width it costs.
+        """
+        wide = max(self._fill, fill)
+        deep = max(self._context, context)
+        opens = (
+            self._examples > 0
+            and wide * (self._rows + rows) + deep * (self._examples + 1) > self.budget
+        )
+        if opens:
+            self.closed += 1
+            self._rows = self._examples = 0
+            wide, deep = fill, context
+        self._examples += 1
+        self._fill, self._context = wide, deep
+        self._rows += rows
+        return opens
+
+    @property
+    def batches(self) -> int:
+        """Every batch so far, the open one included."""
+        return self.closed + (self._examples > 0)
+
+
+def example_shape(example: TrainingExample, max_context_tokens: int) -> tuple[int, int]:
+    """The fill and context widths *example* pads a batch to, sentinels included."""
+    return len(example) + 2, _context_width(example, max_context_tokens)
 
 
 def _context_width(example: TrainingExample, max_context_tokens: int) -> int:

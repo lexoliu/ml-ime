@@ -150,6 +150,11 @@ class SpanVocab:
             raise KeyError("the typed-span table has no reserved unknown span")
         return self._unknown_id
 
+    def covers(self, spans: Iterable[str]) -> bool:
+        """Whether every one of *spans* is in the inventory."""
+        ids = self._ids
+        return all(span in ids for span in spans)
+
     def id_or_unknown(self, span: str) -> int:
         """The id of *span*, or the reserved unknown id for an off-inventory span.
 

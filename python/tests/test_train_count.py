@@ -9,23 +9,32 @@ tests hold it to that by counting the same corpus both ways.
 from __future__ import annotations
 
 import json
+import random
 import stat
 import sys
+from collections import Counter
 from dataclasses import asdict, replace
 from pathlib import Path
 
+import polars as pl
+from conftest import READINGS
+
+from mlime.data.corpus import SAMPLE_SCHEMA, Sample
 from mlime.train.arbitration import ReadingArbitration
 from mlime.train.count import (
     CENSUS_VERSION,
+    BatchCensus,
     CountSpec,
+    RankBatches,
     census_mismatches,
     count_batches,
     matching_census,
     ranking_shape,
 )
 from mlime.train.e2e_model import RankingConfig
+from mlime.train.labels import LABEL_SCHEMA
 from mlime.train.lexicon import CandidateSpace, Lexicon
-from mlime.train.loop import EpochBatches
+from mlime.train.producer import EpochBatches, epoch_groups
 from mlime.train.ranking import RankCollator
 from mlime.train.run import RunPaths, Slices, Vocabularies
 from mlime.train.samples import (
@@ -506,3 +515,184 @@ def test_a_v1_shaped_census_is_refused_and_recounted(
         reuse_census=stored,
     )
     assert recounted.steps_for_epochs == counted.steps_for_epochs
+
+
+#: Sources of a real corpus, each with shards of uneven length: the reading
+#: order interleaves them, and the stride's offset into each shard depends on
+#: every shard read before it.
+REAL_SHAPED = {"news": (37, 52, 11), "wiki-rest": (64, 29), "dialogue": (45,), "moegirl": (8, 70)}
+
+
+def real_shaped_corpus(root: Path) -> tuple[Path, Path, tuple[str, ...]]:
+    """Shards in the corpus's schema whose rows exercise every path a build takes.
+
+    Sentences of one to fourteen characters, contexts from none to past the
+    context budget, and rows the builder drops for each of its reasons: no
+    label (missing or refused), a non-Han character, a length mismatch, and a reading
+    the arbitration rewrites (和 labelled ``han``).
+    """
+    rng = random.Random(7)
+    characters = sorted(READINGS)
+    samples_dir, labels_dir = root / "samples", root / "labels"
+    samples_dir.mkdir(parents=True)
+    labels_dir.mkdir()
+    names = []
+    for source, lengths in REAL_SHAPED.items():
+        for number, rows in enumerate(lengths):
+            name = f"{source}-{number:05d}.parquet"
+            names.append(name)
+            samples, labels = [], []
+            for index in range(rows):
+                text = "".join(rng.choice(characters) for _ in range(rng.randint(1, 14)))
+                readings = [f"{rng.choice(READINGS[c])}{rng.randint(1, 4)}" for c in text]
+                draw = rng.random()
+                if draw < 0.03:
+                    text = text[:-1] + "a"
+                elif draw < 0.06:
+                    readings = [*readings[:-1], "han2", "he2"]
+                elif draw < 0.1 and "和" in text:
+                    readings[text.index("和")] = "han4"
+                context = (
+                    None
+                    if rng.random() < 0.3
+                    else "".join(rng.choice(characters) for _ in range(rng.randint(0, 90)))
+                )
+                sample = Sample(
+                    id=f"{source}-{number}-{index}", source=source, text=text, context=context
+                )
+                samples.append(sample.row())
+                if draw > 0.97:
+                    continue
+                refused = draw > 0.95
+                labels.append(
+                    {
+                        "id": sample.id,
+                        "syllables": None if refused else readings,
+                        "refusal": "refused" if refused else None,
+                    }
+                )
+            pl.DataFrame(samples, schema=SAMPLE_SCHEMA).write_parquet(samples_dir / name)
+            pl.DataFrame(labels, schema=LABEL_SCHEMA).write_parquet(labels_dir / name)
+    return samples_dir, labels_dir, tuple(sorted(names))
+
+
+def serial_census(
+    vocabularies: Vocabularies,
+    paths: RunPaths,
+    shards: tuple[str, ...],
+    world_size: int,
+    epochs: int,
+    collator: BatchCollator,
+) -> BatchCensus:
+    """The census the training loop's own readers make, one rank after another."""
+    ranks, tallies = [], Counter[str]()
+    for rank in range(world_size):
+        builder = vocabularies.builder(None, SEED)
+        stream = vocabularies.stream(paths, shards, builder, rank, world_size)
+        counted = [
+            sum(1 for _ in epoch_groups(stream, collator, BUDGET, epoch)) for epoch in range(epochs)
+        ]
+        ranks.append(RankBatches(rank=rank, epochs=counted, total=sum(counted)))
+        tallies.update(builder.counts.as_dict())
+    return BatchCensus(
+        world_size=world_size,
+        epochs=epochs,
+        token_budget=BUDGET,
+        max_context_tokens=DEFAULT_CONTEXT_TOKENS,
+        seed=SEED,
+        augmentation=asdict(Augmentation()),
+        shards=list(shards),
+        ranks=ranks,
+        accumulate=1,
+        steps_for_epochs=min(rank.total for rank in ranks),
+        census_version=CENSUS_VERSION,
+        build_counts=dict(tallies),
+    )
+
+
+def test_the_census_is_the_loops_own_count_at_any_number_of_workers(
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    samples_dir, labels_dir, shards = real_shaped_corpus(tmp_path / "corpus")
+    paths = census_paths((samples_dir, labels_dir), tmp_path)
+    vocabularies = Vocabularies(
+        spans=spans,
+        tokenizer=tokenizer,
+        lexicon=lexicon,
+        arbitration=arbitration,
+        syllables=frozenset(),
+    )
+    for world_size in (2, 3):
+        serial = serial_census(
+            vocabularies,
+            paths,
+            shards,
+            world_size,
+            epochs=2,
+            collator=vocabularies.collator(0.0, DEFAULT_CONTEXT_TOKENS, SEED),
+        )
+        # Every drop reason and the arbitration occur, so the counters are
+        # compared on something.
+        assert all(serial.build_counts[name] > 0 for name in DROPS), serial.build_counts
+        for workers in (1, 2, 3):
+            census = count_batches(
+                vocabularies,
+                paths,
+                Slices(train=shards, held_out=()),
+                token_budget=BUDGET,
+                seed=SEED,
+                world_size=world_size,
+                epochs=2,
+                workers=workers,
+            )
+            assert asdict(census) == asdict(serial), (world_size, workers)
+
+
+#: The builder's counters the real-shaped corpus must exercise.
+#: A refused label reaches the builder as no label, so it lands in
+#: ``unlabelled``; ``refused`` is never raised there.
+DROPS = ("unlabelled", "not_all_han", "length_mismatch", "reading_arbitrated")
+
+
+def test_a_ranking_census_reads_the_segmenter_in_every_worker(
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    paths = census_paths(corpus, tmp_path)
+    segmenter = two_readings(tmp_path / "segment", spans)
+    vocabularies = Vocabularies(
+        spans=spans,
+        tokenizer=tokenizer,
+        lexicon=lexicon,
+        arbitration=arbitration,
+        syllables=frozenset(),
+    )
+    plain = vocabularies.collator(0.0, DEFAULT_CONTEXT_TOKENS, SEED)
+    serial = serial_census(
+        vocabularies,
+        paths,
+        SHARDS,
+        2,
+        epochs=1,
+        collator=RankCollator.launch(plain, segmenter, spans, RANKING),
+    )
+    census = count_batches(
+        vocabularies,
+        paths,
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+        world_size=2,
+        ranking=RANKING,
+        segmenter=segmenter,
+        workers=2,
+    )
+    assert asdict(census) == asdict(replace(serial, ranking=ranking_shape(RANKING)))

@@ -22,7 +22,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from conftest import StubTokenizer
+from conftest import BuiltLane, StubTokenizer
 from test_e2e_model import READER_TINY, TINY, example
 
 from mlime.train.arbitration import ReadingArbitration
@@ -361,12 +361,12 @@ def test_a_resumed_ranking_run_is_the_run_that_was_not_interrupted(
         seed=3,
     )
 
-    def lane() -> tuple[CorpusStream, RankCollator]:
+    def lane() -> BuiltLane:
         stream = CorpusStream(
             short_corpus[0], short_corpus[1], SampleBuilder(lexicon, spans, arbitration, seed=1)
         )
         collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
-        return stream, RankCollator(collator, greedy_readings(spans), spans, RANKING)
+        return BuiltLane(stream, RankCollator(collator, greedy_readings(spans), spans, RANKING))
 
     def losses(metrics: Path) -> list[float]:
         return [

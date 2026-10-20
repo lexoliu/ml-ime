@@ -1,9 +1,13 @@
 """Stage the e2e kernel's inputs on a Colab VM and start it detached.
 
-Runs on the VM as its own process, which `colab/e2e.sh start` launches
-(logging to `/kaggle/working/stage.out`) after it has uploaded the Hugging
-Face token, the Kaggle credentials, the kernel script, its metadata and the
-checkpoint publisher. It recreates the mount layout the Kaggle kernel expects
+Runs on the VM as its own process, from the leg's checkout of the repository,
+which `colab/e2e.sh start` fetches and then launches this from (logging to
+`/kaggle/working/stage.out`) once it has uploaded the Hugging Face token, the
+Kaggle credentials, the kernel script and its metadata; the publisher, the Hub
+and output fetchers run from the same checkout. Its options -- the commit, the
+session's length, the run to resume and whether to publish -- are recorded in
+`/kaggle/working/leg.json` before anything else, where the waiter's probe
+reads them. It recreates the mount layout the Kaggle kernel expects
 under `/kaggle/input/<name>`: every dataset and every finished run the kernel
 starts from comes from the private Hub dataset repo of the same name, all of
 them in one `aria2c` run (`hub.py`). The resume point is the newest
@@ -11,16 +15,20 @@ them in one `aria2c` run (`hub.py`). The resume point is the newest
 `lexoliu/mlime-resume` bucket and the latest COMPLETE Kaggle segment's output.
 On a GPU it also restores the inductor caches an earlier leg on the same card
 and torch packed into the bucket (#140), so the kernel does not compile again.
-It stamps the segment number and the interval checkpoint cadence into the
-kernel, launches it detached, and launches the publisher beside it: every
-interval trio lands in the bucket, so a VM that dies without warning loses
-minutes of training, not the leg.
+It stamps the segment number, the interval checkpoint cadence, the session's
+length and the commit into the kernel, launches it detached, and launches the
+publisher beside it: every interval trio lands in the bucket, so a VM that
+dies without warning loses minutes of training, not the leg.
+
+    python3 e2e-stage.py --commit SHA --session-seconds N
+                         [--resume-from RUN] [--no-publish] [--segment-steps N]
+                         [--allow-commit-change]
 """
 
+import argparse
 import importlib.util
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -32,16 +40,23 @@ INPUTS = Path("/kaggle/input")
 WORKING = Path("/kaggle/working")
 KERNEL = Path("/kaggle/kernel.py")
 METADATA = Path("/kaggle/kernel-metadata.json")
-PUBLISHER = Path("/kaggle/e2e-publish.py")
-OUTPUT = Path("/kaggle/output.py")
-HUB = Path("/kaggle/hub.py")
-ARIA2 = Path("/kaggle/aria2.py")
+#: The leg's options, as this stager parsed them; the waiter's probe reads them.
+LEG = WORKING / "leg.json"
+#: This file's directory in the leg's checkout, and the drivers beside it.
+HERE = Path(__file__).resolve().parent
+PUBLISHER = HERE / "e2e-publish.py"
+HUB = HERE / "hub.py"
+OUTPUT = HERE.parent / "kaggle" / "output.py"
+ARIA2 = HERE.parent / "kaggle" / "aria2.py"
+# The checkout's `mlime.stamp`, the one kernel rewrite the repository has; it
+# is standard library only, so it imports before anything is installed.
+sys.path.insert(0, str(HERE.parent / "python" / "src"))
+from mlime.stamp import literal, stamp  # noqa: E402
+
 HF_TOKEN = Path("/root/.cache/huggingface/token")
 #: The files of a kernel output the kernel reads: a finished run's final
 #: checkpoint and config, and a paused segment's trio.
-KERNEL_READS = (
-    r"^(run-config\.json|run-summary\.json|checkpoint-paused\.pt|run/checkpoint-final\.pt)$"
-)
+KERNEL_READS = r"^(run-config\.json|run-summary\.json|checkpoint-paused\.pt|run/checkpoint-final\.pt)$"
 RESUME_MARKERS = ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
 #: Transfers in flight while staging: the Hub repos, the resume trio, the
 #: compile caches and the latest Kaggle segment's probe.
@@ -51,10 +66,19 @@ STAGING_TRANSFERS = 4
 CHECKPOINT_MINUTES = 20
 
 
-def bucket_trio(publisher, api, run):
-    """Download the run's whole trio from the resume bucket, or None before its first."""
+def bucket_trio(publisher, api, run, required):
+    """Download *run*'s whole trio from the resume bucket, or None before its first.
+
+    A leg started `--resume-from` another run *requires* that run's trio: one
+    missing would start the leg fresh instead, on a schedule nobody asked for.
+    """
     steps = publisher.published_steps(api, run)
     if not steps:
+        if required:
+            raise FileNotFoundError(
+                f"{publisher.BUCKET}/{run}: no whole trio to resume from; "
+                "--resume-from names a run that has published one"
+            )
         print(f"{publisher.BUCKET}/{run}: no trio published yet", flush=True)
         return None
     prefix = publisher.trio_prefix(run, steps[-1])
@@ -74,16 +98,26 @@ def compile_caches(publisher, api):
         print("no GPU: nothing compiles, so no compile caches", flush=True)
         return
     path = publisher.compile_cache_path()
-    entries = api.list_bucket_tree(publisher.BUCKET, prefix=f"{publisher.CACHE_PREFIX}/")
+    entries = api.list_bucket_tree(
+        publisher.BUCKET, prefix=f"{publisher.CACHE_PREFIX}/"
+    )
     if not any(entry.type == "file" and entry.path == path for entry in entries):
-        print(f"{publisher.BUCKET}/{path}: not packed yet; the kernel compiles", flush=True)
+        print(
+            f"{publisher.BUCKET}/{path}: not packed yet; the kernel compiles",
+            flush=True,
+        )
         return
     archive = publisher.INDUCTOR_CACHE.with_suffix(".tar")
-    api.download_bucket_files(publisher.BUCKET, [(path, archive)], raise_on_missing_files=True)
+    api.download_bucket_files(
+        publisher.BUCKET, [(path, archive)], raise_on_missing_files=True
+    )
     with tarfile.open(archive) as tar:
         tar.extractall(publisher.INDUCTOR_CACHE, filter="data")
     archive.unlink()
-    print(f"{publisher.BUCKET}/{path}: restored under {publisher.INDUCTOR_CACHE}", flush=True)
+    print(
+        f"{publisher.BUCKET}/{path}: restored under {publisher.INDUCTOR_CACHE}",
+        flush=True,
+    )
 
 
 def kernel_status(slug):
@@ -123,7 +157,9 @@ def latest_segment(base):
             break
         lowered = status.lower()
         if "running" in lowered or "queued" in lowered:
-            raise RuntimeError(f"{slug} is {status}; refusing to start a second lineage")
+            raise RuntimeError(
+                f"{slug} is {status}; refusing to start a second lineage"
+            )
         if "complete" in lowered:
             latest = slug
         n += 1
@@ -141,7 +177,8 @@ def kernel_output(slug):
     mount = INPUTS / slug.split("/")[1]
     mount.mkdir(parents=True, exist_ok=True)
     subprocess.run(
-        [sys.executable, str(OUTPUT), slug, str(mount), "--pattern", KERNEL_READS], check=True
+        [sys.executable, str(OUTPUT), slug, str(mount), "--pattern", KERNEL_READS],
+        check=True,
     )
     print(f"{slug}: output staged under {mount}", flush=True)
     return mount
@@ -158,7 +195,9 @@ def step_of(trio):
     """The step the checkpoint itself records; a summary's field can lag it."""
     import torch
 
-    state = torch.load(trio / "checkpoint-paused.pt", map_location="cpu", weights_only=False)
+    state = torch.load(
+        trio / "checkpoint-paused.pt", map_location="cpu", weights_only=False
+    )
     return int(state["step"])
 
 
@@ -168,19 +207,10 @@ def trios():
     for directory in [INPUTS, *[d for d in INPUTS.rglob("*") if d.is_dir()]]:
         if all((directory / marker).is_file() for marker in RESUME_MARKERS):
             config = json.loads((directory / "run-config.json").read_text())
-            found.append((directory, int(config.get("segment", -1)), step_of(directory)))
+            found.append(
+                (directory, int(config.get("segment", -1)), step_of(directory))
+            )
     return found
-
-
-def stamp(source, **fields):
-    """Rewrite a ``NAME = value`` kernel line per field, refusing a missing one."""
-    for key, value in fields.items():
-        source, count = re.subn(
-            rf"^{key} = .*$", f"{key} = {value}", source, count=1, flags=re.MULTILINE
-        )
-        if count != 1:
-            raise RuntimeError(f"{KERNEL} holds no `{key} =` line to stamp")
-    return source
 
 
 def launch(argv, log_name, pid_name):
@@ -195,33 +225,86 @@ def launch(argv, log_name, pid_name):
         start_new_session=True,
     )
     (WORKING / pid_name).write_text(f"{child.pid}\n")
-    print(f"{' '.join(argv)} started, pid {child.pid}; log {WORKING / log_name}", flush=True)
+    print(
+        f"{' '.join(argv)} started, pid {child.pid}; log {WORKING / log_name}",
+        flush=True,
+    )
 
 
-def main():
-    # The Hub client with bucket support, and aria2c, which `hub.py` and
-    # `output.py` download with.
-    installs = [
-        subprocess.Popen(
-            [sys.executable, "-m", "pip", "install", "-q", "-U", "kaggle", "huggingface_hub"]
-        ),
-        subprocess.Popen(["apt-get", "install", "-y", "-q", "aria2"]),
-    ]
-    for install in installs:
-        if install.wait() != 0:
-            raise subprocess.CalledProcessError(install.returncode, install.args)
-    for credential in (HF_TOKEN, Path("/root/.kaggle/credentials.json")):
-        if not credential.is_file():
-            raise FileNotFoundError(f"upload {credential.name} to {credential} first")
-    for uploaded in (KERNEL, METADATA, PUBLISHER, OUTPUT, HUB, ARIA2):
-        if not uploaded.is_file():
-            raise FileNotFoundError(f"upload {uploaded.name} to {uploaded} first")
+def requirements(kernel):
+    """The kernel's pinned `REQUIREMENTS`, read from its source without running it."""
+    return list(literal(kernel.read_text(), "REQUIREMENTS"))
+
+
+def options(argv=None):
+    """The leg's options; the commit and the session's length have no default."""
+    parser = argparse.ArgumentParser(description="Stage and start one e2e leg.")
+    parser.add_argument("--commit", required=True, help="The commit the leg runs")
+    parser.add_argument(
+        "--session-seconds",
+        required=True,
+        type=int,
+        help="How long this runtime is held; the kernel pauses inside it",
+    )
+    parser.add_argument(
+        "--resume-from", help="Resume this run's newest trio, not the leg's own"
+    )
+    parser.add_argument("--no-publish", action="store_true", help="Run no publisher")
+    parser.add_argument(
+        "--segment-steps",
+        type=int,
+        help="Pause after this many steps of the leg, as a check does",
+    )
+    parser.add_argument(
+        "--allow-commit-change",
+        action="store_true",
+        help="Let this leg resume a run recorded on a different commit",
+    )
+    parsed = parser.parse_args(argv)
+    if parsed.session_seconds <= 0:
+        parser.error(
+            f"--session-seconds must be positive, got {parsed.session_seconds}"
+        )
+    if parsed.segment_steps is not None and parsed.segment_steps <= 0:
+        parser.error(f"--segment-steps must be positive, got {parsed.segment_steps}")
+    return parsed
+
+
+def stamps(leg, segment):
+    """The kernel fields this leg stamps."""
+    return {
+        "SEGMENT": segment,
+        "CHECKPOINT_MINUTES": CHECKPOINT_MINUTES,
+        "SESSION_SECONDS": leg.session_seconds,
+        "SEGMENT_STEPS": leg.segment_steps,
+        "COMMIT": leg.commit,
+        "ALLOW_COMMIT_CHANGE": leg.allow_commit_change,
+    }
+
+
+def main(argv=None):
+    leg = options(argv)
+    WORKING.mkdir(parents=True, exist_ok=True)
+    LEG.write_text(json.dumps(vars(leg), indent=2) + "\n", encoding="utf-8")
+    for needed in (HF_TOKEN, Path("/root/.kaggle/credentials.json"), KERNEL, METADATA):
+        if not needed.is_file():
+            raise FileNotFoundError(f"upload {needed.name} to {needed} first")
+    # aria2c, which `hub.py` and `output.py` download with, beside the Python
+    # packages: the Kaggle client, then the kernel's pins over whatever it
+    # pulled in. The Hub client this stager and the publisher import is the
+    # kernel's pinned one, so the kernel's own install moves nothing under a
+    # publisher that is already running.
+    apt = subprocess.Popen(["apt-get", "install", "-y", "-q", "aria2"])
+    pip = [sys.executable, "-m", "pip", "install", "-q"]
+    subprocess.run([*pip, "-U", "kaggle"], check=True)
+    subprocess.run([*pip, "--no-deps", *requirements(KERNEL)], check=True)
+    if apt.wait() != 0:
+        raise subprocess.CalledProcessError(apt.returncode, apt.args)
     # Imported only now: the Hub client is the one just installed, and
-    # `hub.py` finds `aria2.py` beside it.
-    sys.path.insert(0, str(HUB.parent))
+    # `hub.py` imports `aria2.py` from the checkout's kaggle/.
+    sys.path[:0] = [str(HUB.parent), str(ARIA2.parent)]
     import hub
     from huggingface_hub import HfApi
-    WORKING.mkdir(parents=True, exist_ok=True)
 
     # The run's names -- its Kaggle segments and its place in the resume
     # bucket -- come from the stamped kernel's slug, the way the publisher
@@ -236,10 +319,16 @@ def main():
     # transfer at a time leaves most of the VM's bandwidth unused. The
     # finished runs a stage starts from (`INIT_FROM`) are Hub repos too.
     repos = [*metadata["dataset_sources"], *metadata["kernel_sources"]]
+    # --resume-from races another run's checkpoint under this run's name, so
+    # two cards can start one leg from the same trio.
+    if leg.resume_from is not None:
+        resumed_run, required = leg.resume_from, True
+    else:
+        resumed_run, required = publisher.run_name(METADATA), False
     with ThreadPoolExecutor(max_workers=STAGING_TRANSFERS) as pool:
         transfers = [
             pool.submit(hub.download, repos, INPUTS),
-            pool.submit(bucket_trio, publisher, api, publisher.run_name(METADATA)),
+            pool.submit(bucket_trio, publisher, api, resumed_run, required),
             pool.submit(compile_caches, publisher, api),
             pool.submit(stage_latest_segment, base),
         ]
@@ -254,8 +343,7 @@ def main():
     picked = max(candidates, key=lambda candidate: candidate[2], default=None)
     segment = 0 if picked is None else picked[1] + 1
     KERNEL.write_text(
-        stamp(KERNEL.read_text(), SEGMENT=segment, CHECKPOINT_MINUTES=CHECKPOINT_MINUTES),
-        encoding="utf-8",
+        stamp(KERNEL.read_text(), **stamps(leg, segment)), encoding="utf-8"
     )
     print(
         f"segment {segment}; resume candidates: "
@@ -264,7 +352,10 @@ def main():
     )
 
     launch([sys.executable, str(KERNEL)], "kernel.out", "kernel.pid")
-    launch([sys.executable, str(PUBLISHER)], "publish.out", "publish.pid")
+    # A check publishes nothing: its trios would enter the run's lineage.
+    if not leg.no_publish:
+        launch([sys.executable, str(PUBLISHER)], "publish.out", "publish.pid")
 
 
-main()
+if __name__ == "__main__":
+    main()

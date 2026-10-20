@@ -7,6 +7,7 @@ the stamp a push applies.
 
 import importlib.util
 import json
+import os
 from pathlib import Path
 from types import ModuleType
 
@@ -237,6 +238,7 @@ def test_every_switch_the_kernel_passes_is_an_option_of_train_e2e(
     monkeypatch.setattr(kernel, "LEARNING_RATES", (2e-5, 2e-5))
     monkeypatch.setattr(kernel, "TYPOS", True)
     monkeypatch.setattr(kernel, "ACTIVATION_CHECKPOINTING", True)
+    monkeypatch.setattr(kernel, "SEGMENT_STEPS", 70)
     argv = kernel.train_argv(
         tmp_path / "char_pinyin.tsv",
         tmp_path / "run",
@@ -255,3 +257,117 @@ def test_every_switch_the_kernel_passes_is_an_option_of_train_e2e(
     train = group.commands["train"]
     assert isinstance(train, TyperGroup)
     train.commands["e2e"].make_context("e2e", [str(arg) for arg in argv[command + 3 :]])
+
+
+def commit_repository(root: Path) -> tuple[Path, str]:
+    """A repository with one commit holding `python/src/mlime/__init__.py`, and that commit."""
+    import subprocess
+
+    def git(*argv: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(root), "-c", "commit.gpgsign=false", *argv],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+
+    (root / "python" / "src" / "mlime").mkdir(parents=True)
+    (root / "python" / "src" / "mlime" / "__init__.py").write_text("")
+    git("init", "--quiet", "-b", "dev")
+    git("-c", "user.email=t@invalid", "-c", "user.name=t", "add", ".")
+    git("-c", "user.email=t@invalid", "-c", "user.name=t", "commit", "--quiet", "-m", "one")
+    return root, git("rev-parse", "HEAD")
+
+
+def test_the_leg_fetches_its_commit_and_refuses_any_other_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kernel = load_kernel(monkeypatch, tmp_path / "input", segment=0)
+    origin, commit = commit_repository(tmp_path / "origin")
+    checkout = tmp_path / "checkout"
+    assert kernel.checkout(commit, checkout, str(origin)) == checkout
+    assert (checkout / "python" / "src" / "mlime" / "__init__.py").is_file()
+    # A second call verifies the checkout already there.
+    assert kernel.checkout(commit, checkout, str(origin)) == checkout
+
+    (checkout / "python" / "src" / "mlime" / "__init__.py").write_text("changed = True\n")
+    with pytest.raises(RuntimeError, match="changed files"):
+        kernel.checkout(commit, checkout, str(origin))
+    with pytest.raises(RuntimeError, match=f"not the leg's {'0' * 40}"):
+        kernel.checkout("0" * 40, checkout, str(origin))
+    with pytest.raises(RuntimeError, match="no COMMIT is stamped"):
+        kernel.checkout(None, checkout, str(origin))
+
+    monkeypatch.setattr(kernel, "COMMIT", commit)
+    monkeypatch.setattr(kernel, "CHECKOUT", tmp_path / "fresh")
+    monkeypatch.setattr(kernel, "REPOSITORY", str(origin))
+    monkeypatch.setattr(kernel.checkout, "__defaults__", (tmp_path / "fresh", str(origin)))
+    assert kernel.package_root() == tmp_path / "fresh" / "python" / "src"
+
+
+def test_a_resume_refuses_a_commit_the_run_did_not_record(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kernel = load_kernel(monkeypatch, tmp_path, segment=1)
+    monkeypatch.setattr(kernel, "COMMIT", "b" * 40)
+    kernel.refuse_commit_change({"commit": "b" * 40})
+    with pytest.raises(RuntimeError, match=f"recorded commit {'a' * 40}"):
+        kernel.refuse_commit_change({"commit": "a" * 40})
+    # v1's run-config records no commit: that is a change like any other.
+    with pytest.raises(RuntimeError, match="recorded commit None"):
+        kernel.refuse_commit_change({"max_steps": 10})
+    monkeypatch.setattr(kernel, "ALLOW_COMMIT_CHANGE", True)
+    kernel.refuse_commit_change({"commit": "a" * 40})
+
+
+def test_trios_of_one_run_on_two_allowed_commits_still_resume(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The commit is checked against the trio picked, not between candidates."""
+    kernel = load_kernel(monkeypatch, tmp_path, segment=3)
+    older = trio(tmp_path / "mlime-e2e-v2-s1", step=10)
+    newer = trio(tmp_path / "mlime-e2e-v2-resume", step=20)
+    for mount, commit in ((older, "a" * 40), (newer, "b" * 40)):
+        config = json.loads((mount / "run-config.json").read_text())
+        (mount / "run-config.json").write_text(json.dumps({**config, "commit": commit}))
+    picked = kernel.previous_segment()
+    assert picked is not None and picked["mount"] == newer
+
+
+def test_the_kernels_count_builds_on_every_core(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`count-batches` as the kernel runs it counts with one worker per usable core.
+
+    The kernel passes no `--workers`, so the command's default is what sizes
+    the census to the card's VM: twelve processes on an A100's, two on a T4's.
+    """
+    from typer.testing import CliRunner
+
+    import mlime.__main__ as cli
+    import mlime.train.count as count
+    from mlime.train.run import Slices, Vocabularies
+
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    argv = kernel.count_argv(tmp_path / "char_pinyin.tsv", tmp_path / "batch-counts.json", None)
+    command = argv.index("mlime")
+    assert argv[command + 1 : command + 3] == ["train", "count-batches"]
+    assert "--workers" not in argv
+
+    asked: dict[str, object] = {}
+
+    class CountedError(Exception):
+        pass
+
+    def counting(*args: object, **kwargs: object) -> None:
+        asked.update(kwargs)
+        raise CountedError
+
+    monkeypatch.setattr(count, "count_batches", counting)
+    monkeypatch.setattr(Vocabularies, "load", classmethod(lambda cls, *_: None))
+    monkeypatch.setattr(cli, "route_a_slices", lambda *_: Slices(train=("a",), held_out=()))
+    (tmp_path / "char_pinyin.tsv").touch()
+    result = CliRunner().invoke(cli.app, [str(arg) for arg in argv[command + 1 :]])
+    assert isinstance(result.exception, CountedError), result.output
+    assert asked["workers"] == os.cpu_count()
+    assert asked["world_size"] == 2
