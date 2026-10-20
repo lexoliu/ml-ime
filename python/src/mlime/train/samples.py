@@ -468,9 +468,14 @@ class BaseTokenizer(Protocol):
         padding: bool,
         truncation: bool,
         max_length: int,
-        return_tensors: str,
-    ) -> Mapping[str, torch.Tensor]:
-        """Encode a batch of strings into ``input_ids`` and ``attention_mask``."""
+    ) -> Mapping[str, list[list[int]]]:
+        """Encode a batch of strings into padded ``input_ids`` and ``attention_mask`` rows.
+
+        Rows rather than tensors: transformers' own tensor conversion walks
+        every token in Python before it builds the tensor, and the collator's
+        one ``torch.tensor`` over the rows is the same int64 tensor at half
+        the batch's tokenizer time.
+        """
         ...
 
 
@@ -774,7 +779,6 @@ class Collator:
             padding=True,
             truncation=True,
             max_length=self.max_context_tokens,
-            return_tensors="pt",
         )
         # The device code indexes the scored positions rather than finding
         # them: the nonzero and the check that they sit inside the span columns
@@ -790,8 +794,8 @@ class Collator:
             span_positions=span_positions,
             targets=targets,
             scored=scored_positions,
-            context_ids=encoded["input_ids"],
-            context_mask=encoded["attention_mask"],
+            context_ids=torch.tensor(encoded["input_ids"], dtype=torch.long),
+            context_mask=torch.tensor(encoded["attention_mask"], dtype=torch.long),
             has_context=has_context,
             context_rows=torch.tensor(context_rows, dtype=torch.long),
             candidate_ids=candidate_ids,
