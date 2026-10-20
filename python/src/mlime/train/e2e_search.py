@@ -197,8 +197,8 @@ class SearchGraphs:
     to :func:`bucket` shapes, so a run captures a few graphs an octave of lane
     count and length. Every graph's inputs are views of one set of flat
     buffers, grown when a larger shape arrives (which drops the graphs that
-    baked the old addresses), and every graph's working memory comes from one
-    shared pool: searches never overlap, so neither costs more than the
+    baked the old addresses), and every live graph's working memory comes from
+    one shared pool: searches never overlap, so neither costs more than the
     largest search alone.
     """
 
@@ -223,7 +223,11 @@ class SearchGraphs:
                 log.info(
                     "search buffers grown, graphs dropped", buffer=name, graphs=len(self.captured)
                 )
-            self.captured.clear()
+                self.captured.clear()
+                # PyTorch refuses a capture into a pool no live graph holds,
+                # and the dropped graphs' pool lives on until the memory it
+                # handed out is freed; the next graphs take a pool of their own.
+                self.pool = torch.cuda.graph_pool_handle()
             flat = self.flat[name]
         return flat[: like.numel()].view(like.shape)
 
