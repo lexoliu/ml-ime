@@ -158,7 +158,9 @@ class E2EV2Run:
     epoch to those shards (``TRAIN_SHARDS``): a check that runs a short epoch
     to ``max_steps`` and through the evaluations on a cheap card, or a stage's
     pick of the corpus. *stage* makes the run a stage; without one it trains
-    v1's recipe exactly.
+    v1's recipe exactly. *search_graphs* replays a ranking stage's search from
+    captured CUDA graphs (``SEARCH_GRAPHS``): how the run computes, not what it
+    trains, so it is no part of the recipe.
     """
 
     run: str
@@ -166,6 +168,7 @@ class E2EV2Run:
     trace_steps: int = 3
     train_shards: tuple[str, ...] | None = None
     stage: E2EV2Stage | None = None
+    search_graphs: bool = False
 
     def __post_init__(self) -> None:
         _v2_name(self.run)
@@ -173,6 +176,8 @@ class E2EV2Run:
             raise ValueError(
                 f"{self.run} cannot start from itself: a stage publishes under its own name"
             )
+        if self.search_graphs and (self.stage is None or self.stage.ranking is None):
+            raise ValueError("only a ranking stage has a search to replay from CUDA graphs")
         if not 0 <= self.trace_steps <= self.profile_steps:
             raise ValueError(
                 f"the trace covers steps of the profile window: 0 <= {self.trace_steps} "
@@ -192,6 +197,7 @@ class E2EV2Run:
             "PROFILE_STEPS": self.profile_steps,
             "TRACE_STEPS": self.trace_steps,
             "TRAIN_SHARDS": self.train_shards,
+            "SEARCH_GRAPHS": self.search_graphs,
         }
 
     def recipe(self) -> dict[str, Any]:

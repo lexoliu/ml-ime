@@ -201,6 +201,11 @@ INIT_FROM = None
 #: rather than the span's candidates (#121). Stamped per push.
 WHOLE_ALPHABET = False
 
+#: Replay the ranking loss's beam search from captured CUDA graphs (#137);
+#: the search answers as the eager one does, so it is how the stage runs, not
+#: what it trains. Only a ranking stage has the search. Stamped per push.
+SEARCH_GRAPHS = False
+
 #: The training shards a run makes its epoch over; None trains on every
 #: mounted shard but the held-out ones. Stamped per push.
 TRAIN_SHARDS = None
@@ -555,6 +560,8 @@ def ranking_argv(segmenter):
     argv = ["--ranking", "--segmenter", str(segmenter)]
     for name, value in RANKING.items():
         argv += [f"--rank-{name}", str(value)]
+    if SEARCH_GRAPHS:
+        argv.append("--search-graphs")
     return argv
 
 
@@ -952,6 +959,8 @@ def main():
     started = time.monotonic()
     if RANKING is not None and INIT_FROM is None:
         raise RuntimeError("a ranking stage starts from a finished run; stamp INIT_FROM")
+    if SEARCH_GRAPHS and RANKING is None:
+        raise RuntimeError("only a ranking stage has a search to replay; stamp RANKING")
     install()
     packages = package_root()
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)
