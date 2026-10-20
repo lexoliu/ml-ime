@@ -104,8 +104,8 @@ SEGMENT_STEPS = None
 #: budget cannot fit -- the kernel flag for it, off until the sweep says so.
 ACTIVATION_CHECKPOINTING = False
 
-#: Collate the next batches on a producer thread while the step runs, for the
-#: real chain too; smoke v3's table is what this is checked against.
+#: Collate each lane's next batches in a producer process while the step runs,
+#: for the real chain too; smoke v3's table is what this is checked against.
 PREFETCH = True
 
 #: Micro-batches an optimiser step accumulates over. The step count, the

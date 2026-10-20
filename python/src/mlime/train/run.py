@@ -32,6 +32,7 @@ from mlime.data.pinyin_tables import TYPO_MODEL_PATH
 from mlime.data.shards import shard_paths
 from mlime.logging import log
 from mlime.train.arbitration import ReadingArbitration
+from mlime.train.e2e_model import RankingConfig
 from mlime.train.lexicon import CandidateSpace, Lexicon, build_lexicon, read_char_readings
 from mlime.train.loop import (
     Accuracy,
@@ -43,10 +44,12 @@ from mlime.train.loop import (
     train,
 )
 from mlime.train.model import RouteAConfig, RouteAModel
+from mlime.train.ranking import RankCollator
 from mlime.train.samples import (
     DEFAULT_CONTEXT_TOKENS,
     Augmentation,
     BaseTokenizer,
+    BatchCollator,
     Collator,
     CorpusStream,
     SampleBuilder,
@@ -307,6 +310,55 @@ class Vocabularies:
         )
 
 
+@dataclass(frozen=True)
+class LaneRanking:
+    """The sequence-level loss of #116, and the ``ime-segment`` binary its rows come from."""
+
+    config: RankingConfig
+    segmenter: Path
+
+
+@dataclass(frozen=True)
+class CorpusLane:
+    """One training lane, described by the files and numbers that rebuild it.
+
+    The loop opens a lane wherever its batches are made -- with prefetching, in
+    a producer process of its own -- so the lane travels as this picklable
+    recipe rather than as the stream and collator it builds: a ranking
+    collator owns a running segmenter, and the tables are cheaper to load again
+    than to ship. Opening it twice builds the same lane twice, which is what
+    lets a producer process stand in for the trainer's own.
+    """
+
+    paths: RunPaths
+    base_model: str
+    shards: tuple[str, ...]
+    augmentation: Augmentation
+    seed: int
+    rank: int
+    world_size: int
+    context_dropout: float
+    max_context_tokens: int
+    ranking: LaneRanking | None = None
+
+    def open(self) -> tuple[CorpusStream, BatchCollator]:
+        """Load the tables, then build this lane's stream and collator over them."""
+        vocabularies = Vocabularies.load(self.paths.char_table, self.base_model)
+        builder = vocabularies.builder(self.augmentation, self.seed)
+        stream = vocabularies.stream(self.paths, self.shards, builder, self.rank, self.world_size)
+        collator = vocabularies.collator(
+            self.context_dropout,
+            self.max_context_tokens,
+            self.seed,
+            typos=self.augmentation.typos,
+        )
+        if self.ranking is None:
+            return stream, collator
+        return stream, RankCollator.launch(
+            collator, self.ranking.segmenter, vocabularies.spans, self.ranking.config
+        )
+
+
 def held_out_examples(
     paths: RunPaths,
     builder: SampleBuilder,
@@ -361,10 +413,16 @@ def route_a(
     model = RouteAModel.from_pretrained(route, lexicon, spans, vocabularies.vocabulary)
 
     augmented = augmentation or Augmentation()
-    builder = vocabularies.builder(augmented, training.seed)
-    stream = vocabularies.stream(paths, slices.train, builder, world.rank, world.world_size)
-    collator = vocabularies.collator(
-        context_dropout, max_context_tokens, training.seed, typos=augmented.typos
+    lane = CorpusLane(
+        paths=paths,
+        base_model=route.base_model,
+        shards=slices.train,
+        augmentation=augmented,
+        seed=training.seed,
+        rank=world.rank,
+        world_size=world.world_size,
+        context_dropout=context_dropout,
+        max_context_tokens=max_context_tokens,
     )
     # The letter encoder only earns its weights under the noise model; off, it
     # stays frozen at zero so the fill tower is exactly the pre-letter one and
@@ -390,10 +448,10 @@ def route_a(
                 resume=str(resume) if resume is not None else None,
             )
 
-    segment = train(model, [(stream, collator)], training, paths.out, world, resume)
+    segment = train(model, [lane], training, paths.out, world, resume)
     losses = step_losses(segment.metrics)
     if not segment.finished:
-        return paused_run(segment, losses, model.gates(), builder.counts.as_dict(), world)
+        return paused_run(segment, losses, model.gates(), world)
     evaluation = held_out_examples(
         paths, vocabularies.builder(augmented, training.seed + 1), slices
     )
@@ -430,7 +488,7 @@ def route_a(
                 accuracy_without_context=without_context.rate,
                 scored_characters=with_context.scored,
                 gates=result.gates,
-                build_counts=builder.counts.as_dict(),
+                build_counts=segment.build_counts,
             )
     log.info(
         "route A run finished",
@@ -448,7 +506,6 @@ def paused_run(
     segment: Segment,
     losses: list[float],
     gates: list[float],
-    build_counts: dict[str, int],
     world: Distributed,
 ) -> RunResult:
     """The result of a segment that spent its wall budget before the last step.
@@ -469,7 +526,7 @@ def paused_run(
                 last_loss=losses[-1],
                 logged_steps=len(losses),
                 gates=gates,
-                build_counts=build_counts,
+                build_counts=segment.build_counts,
             )
     log.info(
         "route A segment paused on its wall budget",

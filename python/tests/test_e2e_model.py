@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 import torch
-from conftest import READINGS, StubTokenizer
+from conftest import READINGS, BuiltLane, StubTokenizer
 from transformers import BertConfig
 
 from mlime.gui import DEV_SHARE, digest
@@ -653,7 +653,7 @@ def test_a_resumed_e2e_run_is_the_run_that_was_not_interrupted(
         short_corpus[0], short_corpus[1], SampleBuilder(lexicon, spans, arbitration, seed=1)
     )
     collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
-    whole = train(uninterrupted, [(stream, collator)], resumable, whole_dir).metrics
+    whole = train(uninterrupted, [BuiltLane(stream, collator)], resumable, whole_dir).metrics
     checkpoint = torch.load(whole_dir / "checkpoint-000003.pt", weights_only=False)
     assert "e2e" in checkpoint and "route_a" not in checkpoint
     assert checkpoint["e2e"]["aux_weight"] == e2e_config.aux_weight
@@ -664,7 +664,7 @@ def test_a_resumed_e2e_run_is_the_run_that_was_not_interrupted(
     )
     resumed = train(
         resumed_model,
-        [(stream, Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)))],
+        [BuiltLane(stream, Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)))],
         resumable,
         tmp_path / "resumed",
         resume=whole_dir / "checkpoint-000003.pt",
@@ -691,7 +691,7 @@ def test_a_resumed_e2e_run_is_the_run_that_was_not_interrupted(
     )
     train(
         route,
-        [(stream, Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)))],
+        [BuiltLane(stream, Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)))],
         resumable,
         tmp_path / "route-a",
     )
@@ -699,7 +699,7 @@ def test_a_resumed_e2e_run_is_the_run_that_was_not_interrupted(
         train(
             tiny_e2e(lexicon, reader_vocab, e2e_config),
             [
-                (
+                BuiltLane(
                     CorpusStream(
                         short_corpus[0],
                         short_corpus[1],

@@ -15,6 +15,8 @@ on a corpus of its own would prove nothing about the loop.
 
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import polars as pl
@@ -25,6 +27,7 @@ from mlime.data.corpus import SAMPLE_SCHEMA, Sample
 from mlime.train.arbitration import ReadingArbitration
 from mlime.train.labels import LABEL_SCHEMA
 from mlime.train.lexicon import Lexicon, build_lexicon
+from mlime.train.samples import BatchCollator, CorpusStream
 from mlime.train.spans import SpanVocab
 
 #: Four sentences whose readings exercise a homophone choice and a polyphone.
@@ -96,6 +99,41 @@ class StubTokenizer:
             )
         )
         inner.save(path)
+
+
+@dataclass(frozen=True)
+class BuiltLane:
+    """A lane whose stream and collator the test already built.
+
+    Opened in the test's own process (no prefetch) it hands back these very
+    objects, so a test can still reach into them; a producer process gets a
+    pickled copy, built the same way.
+    """
+
+    stream: CorpusStream
+    collator: BatchCollator
+
+    def open(self) -> tuple[CorpusStream, BatchCollator]:
+        """The stream and collator, as they were built."""
+        return self.stream, self.collator
+
+
+@dataclass(frozen=True)
+class SleepingLane:
+    """A lane that never finishes opening: a producer stuck before its first batch.
+
+    *marker*, when given, is a file created on entry, so a test can tell the
+    producer has reached the lane.
+    """
+
+    marker: str | None = None
+
+    def open(self) -> tuple[CorpusStream, BatchCollator]:
+        """Sleep far past any bound a test waits for."""
+        if self.marker is not None:
+            Path(self.marker).touch()
+        time.sleep(3600)
+        raise AssertionError("a sleeping lane was left running for an hour")
 
 
 @pytest.fixture(name="spans")

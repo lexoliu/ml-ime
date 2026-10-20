@@ -559,7 +559,7 @@ def train_e2e(
     prefetch: bool = typer.Option(
         False,
         "--prefetch/--no-prefetch",
-        help="Collate the next batches on a producer thread while the step runs",
+        help="Collate each lane's next batches in a producer process while the step runs",
     ),
     profile_steps: int = typer.Option(
         0,
