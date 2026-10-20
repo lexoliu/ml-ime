@@ -12,7 +12,6 @@ itself.
 from __future__ import annotations
 
 import functools
-from collections import Counter
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -28,8 +27,10 @@ from mlime.train.e2e_model import E2EConfig, E2EModel, RankingConfig, emittable_
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import Distributed, MetricLog, TrainingConfig, evaluate, train
 from mlime.train.model import RouteAConfig
-from mlime.train.ranking import RankCollator, RankingE2EModel
+from mlime.train.ranking import RankingE2EModel
 from mlime.train.run import (
+    CorpusLane,
+    LaneRanking,
     RunPaths,
     RunResult,
     Slices,
@@ -40,7 +41,7 @@ from mlime.train.run import (
     paused_run,
     step_losses,
 )
-from mlime.train.samples import DEFAULT_CONTEXT_TOKENS, Augmentation, BatchCollator
+from mlime.train.samples import DEFAULT_CONTEXT_TOKENS, Augmentation
 
 
 def _record(state: dict[str, Any], key: str, path: Path | str) -> dict[str, Any]:
@@ -200,6 +201,38 @@ def build_from(
     return model, vocabularies
 
 
+def build_fresh(
+    init_encoder: Path,
+    init_decoder: Path,
+    char_table: Path,
+    *,
+    aux_weight: float,
+    ranking: RankingConfig | None,
+    whole_alphabet: bool,
+) -> tuple[E2EModel, Vocabularies]:
+    """A new e2e model composed from route A's and the reader's checkpoints.
+
+    The two files are most of a gigabyte each, and they live only in this
+    frame, as :func:`build_from`'s checkpoint does: ``initialise`` copies
+    their weights into the model, and nothing holds either once it is built.
+    """
+    encoder_state = torch.load(init_encoder, map_location="cpu", weights_only=False)
+    base_model = RouteAConfig(**_record(encoder_state, "route_a", init_encoder)).base_model
+    vocabularies = Vocabularies.load(char_table, base_model)
+    reader_state = torch.load(init_decoder, map_location="cpu", weights_only=False)
+    model = initialise(
+        encoder_state,
+        reader_state,
+        vocabularies.lexicon,
+        aux_weight,
+        init_encoder,
+        init_decoder,
+        ranking=ranking,
+        whole_alphabet=whole_alphabet,
+    )
+    return model, vocabularies
+
+
 def compile_modules(model: E2EModel, mode: str) -> None:
     """torch.compile the encoder pass and the decoder stack, in place.
 
@@ -312,17 +345,11 @@ def e2e(
     else:
         if init_encoder is None or init_decoder is None:
             raise ValueError("a new run needs both --init-encoder and --init-decoder")
-        encoder_state = torch.load(init_encoder, map_location="cpu", weights_only=False)
-        base_model = RouteAConfig(**_record(encoder_state, "route_a", init_encoder)).base_model
-        vocabularies = Vocabularies.load(paths.char_table, base_model)
-        reader_state = torch.load(init_decoder, map_location="cpu", weights_only=False)
-        model = initialise(
-            encoder_state,
-            reader_state,
-            vocabularies.lexicon,
-            aux_weight,
+        model, vocabularies = build_fresh(
             init_encoder,
             init_decoder,
+            paths.char_table,
+            aux_weight=aux_weight,
             ranking=ranking,
             whole_alphabet=whole_alphabet,
         )
@@ -333,32 +360,27 @@ def e2e(
         compile_modules(model, training.compile_mode)
     lexicon, tokenizer = vocabularies.lexicon, vocabularies.tokenizer
 
-    # One (stream, collator) lane per rank this process stands for: lane j of
-    # a process takes the shard deal of world rank `rank * virtual + j`, and
-    # every lane's collator starts from the same seed -- exactly the objects a
-    # real world of `world_size * virtual` ranks would have built.
+    # One lane per rank this process stands for: lane j of a process takes
+    # the shard deal of world rank `rank * virtual + j`, and every lane's
+    # collator starts from the same seed -- exactly the objects a real world
+    # of `world_size * virtual` ranks would have built.
     virtual = training.virtual_ranks
     total_world = world.world_size * virtual
-    builders = [vocabularies.builder(augmented, training.seed) for _ in range(virtual)]
-
-    def lane_collator() -> BatchCollator:
-        collator = vocabularies.collator(
-            context_dropout, max_context_tokens, training.seed, typos=augmented.typos
-        )
-        if ranking is None or segmenter is None:
-            return collator
-        return RankCollator.launch(collator, segmenter, vocabularies.spans, ranking)
-
+    lane_ranking = (
+        LaneRanking(ranking, segmenter) if ranking is not None and segmenter is not None else None
+    )
     lanes = [
-        (
-            vocabularies.stream(
-                paths,
-                slices.train,
-                builders[index],
-                world.rank * virtual + index,
-                total_world,
-            ),
-            lane_collator(),
+        CorpusLane(
+            paths=paths,
+            base_model=model.config.base_model,
+            shards=slices.train,
+            augmentation=augmented,
+            seed=training.seed,
+            rank=world.rank * virtual + index,
+            world_size=total_world,
+            context_dropout=context_dropout,
+            max_context_tokens=max_context_tokens,
+            ranking=lane_ranking,
         )
         for index in range(virtual)
     ]
@@ -390,11 +412,8 @@ def e2e(
 
     segment = train(model, lanes, training, paths.out, world, resume, run_config=run_config)
     losses = step_losses(segment.metrics)
-    build_counts: Counter[str] = Counter()
-    for builder in builders:
-        build_counts.update(builder.counts.as_dict())
     if not segment.finished:
-        return paused_run(segment, losses, model.gates(), dict(build_counts), world)
+        return paused_run(segment, losses, model.gates(), world)
     evaluation = held_out_examples(
         paths, vocabularies.builder(augmented, training.seed + 1), slices
     )
@@ -431,7 +450,7 @@ def e2e(
                 accuracy_without_context=without_context.rate,
                 scored_characters=with_context.scored,
                 gates=result.gates,
-                build_counts=dict(build_counts),
+                build_counts=segment.build_counts,
             )
     log.info(
         "e2e run finished",

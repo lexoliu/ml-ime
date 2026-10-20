@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from conftest import READINGS, StubTokenizer
+from conftest import READINGS, BuiltLane, StubTokenizer
 from transformers import BertConfig
 
 from mlime.data.corpus import Sample
@@ -377,7 +377,7 @@ def test_a_pre_letter_checkpoint_resumes_a_typo_run(
 ) -> None:
     samples_dir, labels_dir = short_corpus
 
-    def lane(typos: bool) -> tuple[CorpusStream, Collator]:
+    def lane(typos: bool) -> BuiltLane:
         noise = always_typos() if typos else None
         space = CandidateSpace(
             spans,
@@ -385,7 +385,7 @@ def test_a_pre_letter_checkpoint_resumes_a_typo_run(
             CorrectionTable(noise, load_syllables(SYLLABLES)) if noise is not None else None,
             lexicon.homophones,
         )
-        return (
+        return BuiltLane(
             CorpusStream(
                 samples_dir,
                 labels_dir,

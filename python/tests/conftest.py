@@ -15,17 +15,19 @@ on a corpus of its own would prove nothing about the loop.
 
 from __future__ import annotations
 
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import polars as pl
 import pytest
-import torch
 from tokenizers import Tokenizer, models
 
 from mlime.data.corpus import SAMPLE_SCHEMA, Sample
 from mlime.train.arbitration import ReadingArbitration
 from mlime.train.labels import LABEL_SCHEMA
 from mlime.train.lexicon import Lexicon, build_lexicon
+from mlime.train.samples import BatchCollator, CorpusStream
 from mlime.train.spans import SpanVocab
 
 #: Four sentences whose readings exercise a homophone choice and a polyphone.
@@ -67,21 +69,21 @@ class StubTokenizer:
         padding: bool,
         truncation: bool,
         max_length: int,
-        return_tensors: str,
-    ) -> dict[str, torch.Tensor]:
+    ) -> dict[str, list[list[int]]]:
         """Encode each string as ``[CLS] <one id per character> [SEP]``, padded."""
         encoded = [
-            [self.cls_token_id, *(ord(character) % 90 + 10 for character in item[:max_length])]
+            [
+                self.cls_token_id,
+                *(ord(character) % 90 + 10 for character in item[:max_length]),
+                self.sep_token_id,
+            ]
             for item in text
         ]
-        width = max(len(row) + 1 for row in encoded)
-        ids = torch.zeros((len(encoded), width), dtype=torch.long)
-        mask = torch.zeros((len(encoded), width), dtype=torch.long)
-        for row, tokens in enumerate(encoded):
-            ids[row, : len(tokens)] = torch.tensor(tokens, dtype=torch.long)
-            ids[row, len(tokens)] = self.sep_token_id
-            mask[row, : len(tokens) + 1] = 1
-        return {"input_ids": ids, "attention_mask": mask}
+        width = max(len(row) for row in encoded)
+        return {
+            "input_ids": [row + [self.pad_token_id] * (width - len(row)) for row in encoded],
+            "attention_mask": [[1] * len(row) + [0] * (width - len(row)) for row in encoded],
+        }
 
     def save(self, path: str) -> None:
         """Write a minimal tokenizer.json: the sentinels and nothing else."""
@@ -97,6 +99,41 @@ class StubTokenizer:
             )
         )
         inner.save(path)
+
+
+@dataclass(frozen=True)
+class BuiltLane:
+    """A lane whose stream and collator the test already built.
+
+    Opened in the test's own process (no prefetch) it hands back these very
+    objects, so a test can still reach into them; a producer process gets a
+    pickled copy, built the same way.
+    """
+
+    stream: CorpusStream
+    collator: BatchCollator
+
+    def open(self) -> tuple[CorpusStream, BatchCollator]:
+        """The stream and collator, as they were built."""
+        return self.stream, self.collator
+
+
+@dataclass(frozen=True)
+class SleepingLane:
+    """A lane that never finishes opening: a producer stuck before its first batch.
+
+    *marker*, when given, is a file created on entry, so a test can tell the
+    producer has reached the lane.
+    """
+
+    marker: str | None = None
+
+    def open(self) -> tuple[CorpusStream, BatchCollator]:
+        """Sleep far past any bound a test waits for."""
+        if self.marker is not None:
+            Path(self.marker).touch()
+        time.sleep(3600)
+        raise AssertionError("a sleeping lane was left running for an hour")
 
 
 @pytest.fixture(name="spans")

@@ -3,8 +3,9 @@
 A run measures itself while it trains. Its step records carry wall-clock
 times; its profiled window writes a phase table to the metrics and,
 optionally, a torch.profiler trace; and the kernel samples the GPUs
-(`GpuSampler`, `gpu.csv`) and the trainer's threads (`CpuSampler`,
-`cpu.jsonl`) beside it for the whole segment. :func:`measure` reads those
+(`GpuSampler`, `gpu.csv`) and the host -- the trainers' threads and the
+machine's memory (`HostSampler`, `host.jsonl`) -- beside it for the whole
+segment. :func:`measure` reads those
 files back and reports the run's steady state -- the unprofiled steps after
 its window and its last recompile -- so two cards, or two versions of the
 code, compare on steps they actually trained.
@@ -21,7 +22,7 @@ import subprocess
 import threading
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +38,7 @@ GPU_FIELDS = (
     "clocks_throttle_reasons.active",
 )
 
-#: The processes whose threads `CpuSampler` follows: the trainers, the
+#: The processes `HostSampler` follows: the trainers, the
 #: launcher that spawns them, and the segmenter they read readings from.
 TRAINER_COMMANDS = ("mlime", "torch.distributed.run", "ime-segment")
 
@@ -68,8 +69,15 @@ class GpuSampler:
         self._process: subprocess.Popen[bytes] | None = None
 
     def __enter__(self) -> GpuSampler:
+        # nvidia-smi stamps its samples in local time with no zone; pinning
+        # the zone makes the log's clock UTC wherever it is read (`gpu_means`).
         with self._log.open("w", encoding="utf-8") as sink:
-            self._process = subprocess.Popen(self._argv, stdout=sink, stderr=subprocess.DEVNULL)
+            self._process = subprocess.Popen(
+                self._argv,
+                stdout=sink,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ, "TZ": "UTC"},
+            )
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -88,14 +96,20 @@ class GpuSampler:
             self._process.wait()
 
 
-class CpuSampler:
-    """The trainers' CPU time, per thread, sampled from `/proc` into JSON lines.
+class HostSampler:
+    """The trainers' CPU time and the host's memory, sampled from `/proc` into JSON lines.
 
     A card idling because the thread that launches its work is out of CPU
-    shows up here and nowhere in the device's own numbers. Each sample line
-    holds the machine's busy and total jiffies and the cumulative user+system
-    ticks of every thread of a `TRAINER_COMMANDS` process; a process's
-    command is written once, the first time it is seen.
+    shows up here and nowhere in the device's own numbers, and so does a
+    trainer the kernel's OOM killer is about to take: it dies by SIGKILL with
+    no traceback, and only the memory leading up to it says why. The first
+    line describes the machine -- its total memory, its cores and its clock
+    ticks per second -- so the log reads the same off the VM that wrote it.
+    Each sample line holds the
+    machine's busy and total jiffies, its available memory, the cumulative
+    user+system ticks of every thread of a `TRAINER_COMMANDS` process and
+    each such process's resident bytes; a process's command is written once,
+    the first time it is seen.
     """
 
     def __init__(self, log: Path, interval: float = 5.0):
@@ -129,11 +143,25 @@ class CpuSampler:
                 sink.write(json.dumps({"pid": pid, "command": command}) + "\n")
         return self._commands[pid] is not None
 
-    def _threads(self, sink: Any) -> list[tuple[int, int, int]]:
+    @staticmethod
+    def _meminfo(field: str) -> int:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            name, value = line.split(":", 1)
+            if name == field:
+                return int(value.split()[0]) * 1024
+        raise KeyError(f"/proc/meminfo has no {field}")
+
+    def _processes(self, sink: Any) -> tuple[list[tuple[int, int, int]], list[tuple[int, int]]]:
         ticks = []
+        resident = []
+        page = os.sysconf("SC_PAGE_SIZE")
         for process in Path("/proc").glob("[0-9]*"):
             pid = int(process.name)
             if not self._followed(pid, sink):
+                continue
+            try:
+                resident.append((pid, int((process / "statm").read_text().split()[1]) * page))
+            except OSError:  # the process ended between the listing and the read
                 continue
             for task in process.glob("task/[0-9]*/stat"):
                 try:
@@ -142,23 +170,32 @@ class CpuSampler:
                     continue
                 rest = text[text.rindex(")") + 2 :].split()
                 ticks.append((pid, int(task.parent.name), int(rest[11]) + int(rest[12])))
-        return ticks
+        return ticks, resident
 
     def _run(self) -> None:
         with self._log.open("w", encoding="utf-8") as sink:
+            machine = {
+                "memory_total": self._meminfo("MemTotal"),
+                "cores": os.cpu_count(),
+                "clock_ticks": os.sysconf("SC_CLK_TCK"),
+            }
+            sink.write(json.dumps(machine) + "\n")
             while not self._stopped.is_set():
                 busy, total = self._machine()
-                threads = self._threads(sink)
-                sink.write(
-                    json.dumps(
-                        {"time": time.time(), "busy": busy, "total": total, "threads": threads}
-                    )
-                    + "\n"
-                )
+                threads, resident = self._processes(sink)
+                sample = {
+                    "time": time.time(),
+                    "busy": busy,
+                    "total": total,
+                    "available": self._meminfo("MemAvailable"),
+                    "threads": threads,
+                    "resident": resident,
+                }
+                sink.write(json.dumps(sample) + "\n")
                 sink.flush()
                 self._stopped.wait(self._interval)
 
-    def __enter__(self) -> CpuSampler:
+    def __enter__(self) -> HostSampler:
         self._thread.start()
         return self
 
@@ -240,7 +277,11 @@ def gpu_means(log: Path, since: float, until: float) -> dict[str, Any]:
         fields = dict(zip(GPU_FIELDS, (f.strip() for f in line.split(",")), strict=False))
         if len(fields) != len(GPU_FIELDS):
             continue  # the line nvidia-smi was writing when it was stopped
-        at = datetime.strptime(fields["timestamp"], "%Y/%m/%d %H:%M:%S.%f").timestamp()
+        at = (
+            datetime.strptime(fields["timestamp"], "%Y/%m/%d %H:%M:%S.%f")
+            .replace(tzinfo=UTC)
+            .timestamp()
+        )
         if since <= at <= until:
             samples[fields["index"]].append(fields)
     if not samples:
@@ -264,15 +305,20 @@ def gpu_means(log: Path, since: float, until: float) -> dict[str, Any]:
     return means
 
 
-def cpu_usage(log: Path, since: float, until: float) -> dict[str, Any]:
-    """Machine busy percent and each trainer process's cores over the span.
+def host_usage(log: Path, since: float, until: float) -> dict[str, Any]:
+    """Machine busy percent, memory, and each trainer process's cores over the span.
 
     A process's cores split into its main thread's and the rest's: the main
-    thread is the one that launches device work.
+    thread is the one that launches device work. Memory is the least the
+    machine had available and each process's largest resident size.
     """
+    header, *lines = log.read_text(encoding="utf-8").splitlines()
+    machine = json.loads(header)
+    if "memory_total" not in machine:
+        raise ValueError(f"{log} does not start with the machine's line: {header}")
     commands = {}
     samples = []
-    for line in log.read_text(encoding="utf-8").splitlines():
+    for line in lines:
         record = json.loads(line)
         if "command" in record:
             commands[record["pid"]] = record["command"]
@@ -280,22 +326,28 @@ def cpu_usage(log: Path, since: float, until: float) -> dict[str, Any]:
             samples.append(record)
     if len(samples) < 2:
         raise ValueError(
-            f"{log} holds {len(samples)} CPU samples inside the span; a usage needs two"
+            f"{log} holds {len(samples)} host samples inside the span; a usage needs two"
         )
     first, last = samples[0], samples[-1]
     seconds = last["time"] - first["time"]
-    hertz = os.sysconf("SC_CLK_TCK")
+    hertz = machine["clock_ticks"]
     before = {(pid, tid): ticks for pid, tid, ticks in first["threads"]}
     cores: dict[int, dict[str, float]] = defaultdict(lambda: {"main": 0.0, "other": 0.0})
     for pid, tid, ticks in last["threads"]:
         used = (ticks - before.get((pid, tid), ticks)) / hertz / seconds
         cores[pid]["main" if tid == pid else "other"] += used
     busiest = sorted(cores.items(), key=lambda kv: -(kv[1]["main"] + kv[1]["other"]))
+    resident: dict[int, int] = defaultdict(int)
+    for sample in samples:
+        for pid, size in sample["resident"]:
+            resident[pid] = max(resident[pid], size)
     return {
         "busy_percent": round(
             100 * (last["busy"] - first["busy"]) / (last["total"] - first["total"]), 1
         ),
-        "cores": os.cpu_count(),
+        "cores": machine["cores"],
+        "memory_total_bytes": machine["memory_total"],
+        "least_available_bytes": min(sample["available"] for sample in samples),
         "samples": len(samples),
         "processes": [
             {
@@ -303,6 +355,7 @@ def cpu_usage(log: Path, since: float, until: float) -> dict[str, Any]:
                 "command": commands.get(pid, "?"),
                 "main_cores": round(used["main"], 2),
                 "other_cores": round(used["other"], 2),
+                "peak_resident_bytes": resident[pid],
             }
             for pid, used in busiest
             if used["main"] + used["other"] > 0.01
@@ -416,14 +469,14 @@ def trace_summary(path: Path) -> dict[str, Any]:
 def measure(
     run_dir: Path,
     gpu_log: Path | None = None,
-    cpu_log: Path | None = None,
+    host_log: Path | None = None,
     trace: Path | None = None,
     from_step: int = 0,
 ) -> dict[str, Any]:
     """The steady state of the run in *run_dir*, from the files the run left.
 
     Rates come from the step records, from *from_step* on at the earliest;
-    the GPU and CPU logs, when given, are cut to the same wall-clock span;
+    the GPU and host logs, when given, are cut to the same wall-clock span;
     the profile record's phase table and *trace*, when given, say where the
     profiled steps spent their time.
     """
@@ -445,8 +498,8 @@ def measure(
     }
     if gpu_log is not None:
         report["gpu"] = gpu_means(gpu_log, since, until)
-    if cpu_log is not None:
-        report["cpu"] = cpu_usage(cpu_log, since, until)
+    if host_log is not None:
+        report["host"] = host_usage(host_log, since, until)
     if profile is not None:
         report["profile"] = {k: profile[k] for k in profile if k not in ("event", "window")}
     if trace is not None:
