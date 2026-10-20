@@ -10,13 +10,30 @@ import json
 import shutil
 from pathlib import Path
 
+import click
 import pytest
 from typer.testing import CliRunner
 
 from mlime.__main__ import app
-from mlime.stamp import E2E_V2_SOURCES, V1_RECIPE, E2EV2Run, literal, stamp, stamp_e2e_v2
+from mlime.stamp import (
+    E2E_V2_SOURCES,
+    V1_RECIPE,
+    E2EV2Run,
+    E2EV2Stage,
+    literal,
+    stamp,
+    stamp_e2e_v2,
+)
 
 TEMPLATE = Path(__file__).resolve().parents[2] / "kaggle" / "e2e"
+
+
+def error(output: str) -> str:
+    """A refusal's text with its styling, the error box's borders and wrapping taken out.
+
+    Rich colours the box wherever it detects CI, so the styling goes first.
+    """
+    return " ".join(click.unstyle(output).replace("│", " ").split())
 
 
 def changed_lines(before: str, after: str) -> list[str]:
@@ -88,3 +105,107 @@ def test_a_stamp_lands_as_a_literal_or_is_refused() -> None:
     # HELD_OUT's default spans lines: rewriting its first one would break it.
     with pytest.raises(SyntaxError):
         stamp(source, HELD_OUT=("x.parquet",))
+
+
+#: #132's weight-0.05 stage of v2, as `mlime e2e stamp` takes it.
+STAGE_ARGV = [
+    "--init-from",
+    "mlime-e2e-v2-g4",
+    "--ranking",
+    "--rank-segmentations",
+    "8",
+    "--rank-beam",
+    "4",
+    "--rank-negatives",
+    "8",
+    "--rank-weight",
+    "0.05",
+    "--base-lr",
+    "2e-5",
+    "--new-lr",
+    "2e-5",
+    "--token-budget",
+    "12288",
+    "--accumulate",
+    "2",
+    "--train-shard",
+    "news-00000.parquet",
+    "--train-shard",
+    "wiki-rest-00070.parquet",
+]
+
+
+def test_a_stage_is_v1s_recipe_with_only_the_stages_fields_stamped(tmp_path: Path) -> None:
+    out = tmp_path / "rankw005"
+    argv = ["e2e", "stamp", "mlime-e2e-v2-g4-rankw005", "--out", str(out), *STAGE_ARGV]
+    result = CliRunner().invoke(app, argv)
+    assert result.exit_code == 0, result.output
+    template = (TEMPLATE / "kernel.py").read_text()
+    kernel = (out / "kernel.py").read_text()
+    ranking = {"segmentations": 8, "beam": 4, "negatives": 8, "weight": 0.05}
+    stage = {
+        "INIT_FROM": "mlime-e2e-v2-g4",
+        "RANKING": ranking,
+        "LEARNING_RATES": (2e-5, 2e-5),
+        "TOKEN_BUDGET": 12288,
+        "ACCUMULATE": 2,
+    }
+    shards = ("news-00000.parquet", "wiki-rest-00070.parquet")
+    run = {"PROFILE_STEPS": 30, "TRACE_STEPS": 3, "TRAIN_SHARDS": shards}
+    assert sorted(changed_lines(template, kernel)) == sorted(
+        f"{name} = {value!r}" for name, value in {**stage, **run}.items()
+    )
+    for name, value in V1_RECIPE.items():
+        stamped = stage.get(name, value)
+        assert literal(kernel, name) == stamped, name
+        assert f"  {name} = {stamped!r}" in result.output
+    assert "a stage of mlime-e2e-v2-g4" in result.output
+
+    metadata = json.loads((out / "kernel-metadata.json").read_text())
+    assert metadata["id"] == "lexoliu/mlime-e2e-v2-g4-rankw005-s0"
+    assert metadata["dataset_sources"] == list(E2E_V2_SOURCES)
+    assert metadata["kernel_sources"] == []
+
+
+def test_a_stage_without_ranking_keeps_v1s_budget_and_rates(tmp_path: Path) -> None:
+    """A stage changes only what it names; the rest of its recipe is v1's."""
+    recipe = stamp_e2e_v2(
+        TEMPLATE,
+        tmp_path / "control",
+        E2EV2Run(run="mlime-e2e-v2-g4-control", stage=E2EV2Stage(init_from="mlime-e2e-v2-g4")),
+    )
+    assert recipe == {**V1_RECIPE, "INIT_FROM": "mlime-e2e-v2-g4"}
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--ranking"],
+        ["--ranking", "--rank-weight", "0.05"],
+        ["--base-lr", "2e-5", "--new-lr", "2e-5"],
+        ["--token-budget", "12288"],
+        ["--accumulate", "2"],
+    ],
+)
+def test_a_stages_options_without_its_start_are_refused(tmp_path: Path, options: list[str]) -> None:
+    """A plain v2 run is v1's recipe; ranking above all needs a finished run to start from."""
+    out = tmp_path / "plain"
+    argv = ["e2e", "stamp", "mlime-e2e-v2-g4-rankw005", "--out", str(out), *options]
+    result = CliRunner().invoke(app, argv)
+    assert result.exit_code == 2, result.output
+    assert "pass --init-from" in error(result.output)
+    assert not out.exists()
+
+
+def test_a_stage_starts_from_another_finished_v2_run_with_whole_rates(tmp_path: Path) -> None:
+    out = tmp_path / "stage"
+    argv = ["e2e", "stamp", "mlime-e2e-v2-g4-rankw005", "--out", str(out)]
+    half = ["--init-from", "mlime-e2e-v2-g4", "--base-lr", "2e-5"]
+    result = CliRunner().invoke(app, [*argv, *half])
+    assert result.exit_code == 2, result.output
+    assert "learning rates are a pair" in error(result.output)
+    assert not out.exists()
+    with pytest.raises(ValueError, match="not a v2 run name"):
+        E2EV2Stage(init_from="mlime-e2e-final")
+    with pytest.raises(ValueError, match="cannot start from itself"):
+        E2EV2Run(run="mlime-e2e-v2-g4", stage=E2EV2Stage(init_from="mlime-e2e-v2-g4"))

@@ -190,3 +190,119 @@ def test_a_v2_run_never_resumes_v1s_segments_or_trios(
     for taken in ("mlime-e2e", "mlime-e2e-rankw005", "mlime-e2e-v2", "mlime-e2e-v2-A100"):
         with pytest.raises(ValueError, match="not a v2 run name"):
             E2EV2Run(run=taken)
+
+
+#: The finished v2 run #132's stages start from.
+PARENT = "mlime-e2e-v2-g4"
+
+
+def final_outputs(run: str, stage: dict[str, object], marked: bool) -> dict[str, bytes]:
+    """*run*'s final outputs as the publisher leaves them, its marker last."""
+    prefix = f"final/{run}"
+    config = {"max_steps": 12000, "epochs": 1, **stage, "commit": "c" * 40, "segment": 4}
+    files = {
+        f"{prefix}/run/checkpoint-final.pt": b"final weights",
+        f"{prefix}/run/metrics.jsonl": b"{}\n",
+        f"{prefix}/run-config.json": json.dumps(config).encode(),
+        f"{prefix}/run-summary.json": json.dumps({"finished": True}).encode(),
+        f"{prefix}/e2e-lattice-context-on.jsonl": b"{}\n",
+        f"{prefix}/eval-lattice-context-on.log": b"",
+    }
+    if marked:
+        files[f"{prefix}/complete"] = b"6\n"
+    return files
+
+
+def stage_kernel(tmp_path: Path) -> Path:
+    """#132's weight-0.05 stage of :data:`PARENT`, stamped from the committed kernel."""
+    from mlime.stamp import E2EV2Run, E2EV2Stage, stamp_e2e_v2
+    from mlime.train.e2e_model import RankingConfig
+
+    stage = E2EV2Stage(
+        init_from=PARENT,
+        ranking=RankingConfig(weight=0.05),
+        learning_rates=(2e-5, 2e-5),
+        token_budget=12288,
+        accumulate=2,
+    )
+    out = tmp_path / "rankw005"
+    stamp_e2e_v2(
+        COLAB.parent / "kaggle" / "e2e", out, E2EV2Run(run=f"{PARENT}-rankw005", stage=stage)
+    )
+    return out / "kernel.py"
+
+
+def test_only_a_v2_stage_stages_its_start_from_the_bucket(
+    stager: ModuleType, tmp_path: Path
+) -> None:
+    """v1's finished run is a Hub repo the metadata mounts; a v2 run's lives in the bucket."""
+    from mlime.stamp import E2EV2Run, stamp, stamp_e2e_v2
+
+    assert stager.init_from_bucket(stage_kernel(tmp_path)) == PARENT
+    plain = tmp_path / "plain"
+    stamp_e2e_v2(COLAB.parent / "kaggle" / "e2e", plain, E2EV2Run(run="mlime-e2e-v2-a100"))
+    assert stager.init_from_bucket(plain / "kernel.py") is None
+    v1_stage = tmp_path / "v1-stage.py"
+    template = (COLAB.parent / "kaggle" / "e2e" / "kernel.py").read_text()
+    v1_stage.write_text(stamp(template, INIT_FROM="mlime-e2e-final"))
+    assert stager.init_from_bucket(v1_stage) is None
+
+
+def test_a_stage_mounts_its_finished_v2_run_where_the_kernel_starts_from_it(
+    stager: ModuleType,
+    publisher: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stager's mount is the kernel's start, never its result or a trio to resume.
+
+    Only what the kernel reads is downloaded. The stage's own paused trio,
+    staged beside it on a later leg, is what that leg resumes, and the
+    stage's own finished run is told apart from its parent by the stage its
+    run-config records.
+    """
+    import torch
+
+    kernel = load("stage_kernel", stage_kernel(tmp_path))
+    monkeypatch.setattr(kernel, "INPUTS", stager.INPUTS)
+    parent_stage = {"ranking": None, "whole_alphabet": False, "init_from": None}
+    bucket = FakeBucket(final_outputs(PARENT, parent_stage, marked=True))
+    mount = stager.bucket_final(publisher, bucket, PARENT)
+    assert mount == stager.INPUTS / PARENT
+    staged = sorted(str(p.relative_to(mount)) for p in mount.rglob("*") if p.is_file())
+    assert staged == sorted(stager.FINAL_READS)
+
+    assert kernel.init_checkpoint() == mount / "run" / "checkpoint-final.pt"
+    assert kernel.finished_checkpoint() is None
+    assert kernel.previous_segment() is None
+    assert stager.trios() == []
+
+    run = f"{PARENT}-rankw005"
+    trio = whole_trio(run, 300)
+    paused = tmp_path / "paused.pt"
+    torch.save({"step": 300, "positions": [{}, {}]}, paused)
+    trio[f"{run}/step-0000300/checkpoint-paused.pt"] = paused.read_bytes()
+    config = {"max_steps": 900, "epochs": 1, **kernel.stage(), "segment": 0}
+    trio[f"{run}/step-0000300/run-config.json"] = json.dumps(config).encode()
+    resume = stager.bucket_trio(publisher, FakeBucket(trio), run, False)
+    picked = kernel.previous_segment()
+    assert picked is not None and picked["mount"] == resume and picked["step"] == 300
+    assert kernel.init_checkpoint() == mount / "run" / "checkpoint-final.pt"
+
+    own = stager.INPUTS / f"{run}-s1"
+    (own / "run").mkdir(parents=True)
+    (own / "run" / "checkpoint-final.pt").write_bytes(b"stage weights")
+    (own / "run-config.json").write_text(json.dumps(config))
+    assert kernel.finished_checkpoint() == own / "run" / "checkpoint-final.pt"
+    assert kernel.init_checkpoint() == mount / "run" / "checkpoint-final.pt"
+
+
+def test_a_stage_refuses_a_v2_run_whose_final_outputs_are_not_whole(
+    stager: ModuleType, publisher: ModuleType
+) -> None:
+    """Without the marker the outputs may be half uploaded; nothing is staged from them."""
+    stage = {"ranking": None, "whole_alphabet": False, "init_from": None}
+    bucket = FakeBucket(final_outputs(PARENT, stage, marked=False))
+    with pytest.raises(FileNotFoundError, match=f"final/{PARENT}: no `complete` marker"):
+        stager.bucket_final(publisher, bucket, PARENT)
+    assert not (stager.INPUTS / PARENT).exists()
