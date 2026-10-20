@@ -107,7 +107,10 @@ e2e kernel (`kaggle/e2e`, or a run stamped from it with `mlime e2e stamp`).
 [--profile-steps N] [--trace-steps N]` writes a v2 run's directory: v1's recipe
 (refused when `kaggle/e2e` no longer holds it), the run's own slug, so its
 trios and segments are its own, and the v2 sources alone (the assets, the four
-shard repos and `mlime-e2e-init`). The
+shard repos and `mlime-e2e-init`). With `--init-from <finished v2 run>` the run
+is a stage of that run, and `--ranking --rank-*`, `--base-lr --new-lr`,
+`--token-budget` and `--accumulate` set the only fields of v1's recipe it
+changes; without `--init-from` they are refused. The
 code is one commit of this public repository: the VM fetches `--commit`
 (default HEAD, refused when this checkout has uncommitted changes or no branch
 of origin holds it) from GitHub, the kernel imports `mlime` from that checkout
@@ -116,9 +119,11 @@ on a different commit than the run's is refused unless the leg is started
 `--allow-commit-change`. `--session-hours` is required: the stager stamps it
 as `SESSION_SECONDS`, so the leg pauses inside the session it was given.
 `colab/e2e-stage.py`, run from the checkout, downloads, all at once, the private Hugging Face dataset
-repos named like its `dataset_sources` and `kernel_sources` (a stage's
-`INIT_FROM`), the run's newest trio in the `lexoliu/mlime-resume` bucket, and
-the newest complete Kaggle segment's output, then launches the kernel and
+repos named like its `dataset_sources` and `kernel_sources` (a v1 stage's
+`INIT_FROM`), the run's newest trio in the `lexoliu/mlime-resume` bucket, the
+newest complete Kaggle segment's output, and for a v2 stage the final
+checkpoint and config of its `INIT_FROM` from `final/<run>/` in the bucket
+(refused without that run's `complete` marker), then launches the kernel and
 `colab/e2e-publish.py`, which puts each interval checkpoint in the bucket so a
 lost VM costs minutes. Once a leg has logged fifty steps the publisher also packs
 inductor's caches (`TORCHINDUCTOR_CACHE_DIR=/tmp/inductor-cache`) into the
