@@ -230,7 +230,13 @@ def test_fetch_brings_back_the_census_and_the_samplers(driver: Driver, tmp_path:
     done = driver.run("fetch", str(tmp_path / "out"))
     assert done.returncode == 0, done.stderr
     fetched = {c["argv"][-2] for c in driver.calls() if c["argv"][0] == "download"}
-    for name in ("batch-counts.json", "gpu.csv", "host.jsonl", "run/metrics.jsonl"):
+    for name in (
+        "batch-counts.json",
+        "gpu.csv",
+        "host.jsonl",
+        "run/metrics.jsonl",
+        "run/trace-rank0.json",
+    ):
         assert f"/kaggle/working/{name}" in fetched
 
 

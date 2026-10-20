@@ -121,8 +121,9 @@ case $command in
     mkdir -p "$out"
     # batch-counts.json is the census the next run of the same shape is
     # started with (`start --census`); gpu.csv and host.jsonl are what
-    # `mlime train measure` reads beside the metrics.
-    for f in batch-counts.json run-summary.json run-config.json leg.json train.log count.log kernel.out stage.out publish.out publish-state.json gpu.csv host.jsonl run/metrics.jsonl; do
+    # `mlime train measure` reads beside the metrics, and the trace of the
+    # profile window is its `--trace` (one process on a Colab GPU: rank 0).
+    for f in batch-counts.json run-summary.json run-config.json leg.json train.log count.log kernel.out stage.out publish.out publish-state.json gpu.csv host.jsonl run/metrics.jsonl run/trace-rank0.json; do
       colab download -s $session "/kaggle/working/$f" "$out/$(basename "$f")" || echo "not on the VM yet: $f"
     done
     ;;
