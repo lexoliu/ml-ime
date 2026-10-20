@@ -634,10 +634,37 @@ class Collator:
         self.context_dropout = context_dropout
         self.max_context_tokens = max_context_tokens
         self.rng = random.Random(seed)
+        #: Each span's candidate row and padded letters, built on first sight.
+        #: The batch gathers copies out of them; nothing it holds aliases them.
+        self._candidates: dict[str, torch.Tensor] = {}
+        self._letters: dict[str, torch.Tensor] = {}
 
     def rows(self, example: TrainingExample) -> int:
         """One: an example is one row of the fill tower."""
         return 1
+
+    def _candidate_row(self, span: str) -> torch.Tensor:
+        """The emission ids *span* admits, as the row a batch gathers."""
+        row = self._candidates.get(span)
+        if row is None:
+            row = self._candidates[span] = torch.tensor(
+                self.candidates.resolve(span), dtype=torch.long
+            )
+        return row
+
+    def _letter_row(self, span: str, example_id: str) -> None:
+        """Check *span*'s keys once and keep them padded to the letter width."""
+        if span in self._letters:
+            return
+        if len(span) > MAX_SPAN_LETTERS:
+            raise ValueError(
+                f"example {example_id} holds a {len(span)}-letter span {span!r}; "
+                f"the letter encoding reads at most {MAX_SPAN_LETTERS}"
+            )
+        keys = [letter_id(letter) for letter in span]
+        self._letters[span] = torch.tensor(
+            keys + [LETTER_PAD] * (MAX_SPAN_LETTERS - len(keys)), dtype=torch.long
+        )
 
     def __call__(self, examples: Sequence[TrainingExample]) -> Batch:
         """Collate *examples*, keeping each one's context with probability 1-p."""
@@ -662,60 +689,58 @@ class Collator:
             raise ValueError(
                 f"{len(examples)} fill rows but {len(context_rows)} context assignments"
             )
-        width = max(len(example) for example in examples) + 2
+        lengths = [len(example) for example in examples]
+        width = max(lengths) + 2
         size = len(examples)
-        input_ids = torch.full((size, width), self.tokenizer.pad_token_id, dtype=torch.long)
-        attention_mask = torch.zeros((size, width), dtype=torch.long)
-        span_ids = torch.zeros((size, width), dtype=torch.long)
-        span_positions = torch.zeros((size, width), dtype=torch.bool)
-        targets = torch.full((size, width), IGNORE_INDEX, dtype=torch.long)
-
-        candidate_lists = [
-            [self.candidates.resolve(span) for span in example.spans] for example in examples
+        # Each distinct span of the batch is looked up once -- its candidate
+        # row and its letters are properties of the span, not of the position
+        # -- and the positions then gather them in one indexing op apiece. A
+        # batch is some ninety rows and eight hundred positions; building it
+        # a position at a time was ~1,700 small tensors, all of it Python
+        # holding the GIL the training step needs to launch its kernels.
+        slots: dict[str, int] = {}
+        slot_of_position = [
+            slots.setdefault(span, len(slots)) for example in examples for span in example.spans
         ]
-        candidate_width = max(
-            (len(row) for example_lists in candidate_lists for row in example_lists),
-            default=1,
-        )
-        candidate_ids = torch.zeros((size, width, candidate_width), dtype=torch.long)
-        candidate_counts = torch.zeros((size, width), dtype=torch.long)
-        span_letters = torch.full((size, width, MAX_SPAN_LETTERS), LETTER_PAD, dtype=torch.long)
+        listed = [self._candidate_row(span) for span in slots]
+        for example in examples:
+            for span in example.spans:
+                self._letter_row(span, example.id)
+            for span, target in zip(example.spans, example.targets, strict=True):
+                if target != IGNORE_INDEX and not self.candidates.admits(span, int(target)):
+                    raise ValueError(f"example {example.id} has a target its span does not admit")
 
-        for row, example in enumerate(examples):
-            length = len(example)
-            input_ids[row, 0] = self.tokenizer.cls_token_id
-            input_ids[row, 1 : length + 1] = self.tokenizer.mask_token_id
-            input_ids[row, length + 1] = self.tokenizer.sep_token_id
-            attention_mask[row, : length + 2] = 1
-            row_spans = torch.tensor(example.span_ids, dtype=torch.long)
-            row_targets = torch.tensor(example.targets, dtype=torch.long)
-            for column, (span, listed) in enumerate(
-                zip(example.spans, candidate_lists[row], strict=True)
-            ):
-                if len(span) > MAX_SPAN_LETTERS:
-                    raise ValueError(
-                        f"example {example.id} holds a {len(span)}-letter span {span!r}; "
-                        f"the letter encoding reads at most {MAX_SPAN_LETTERS}"
-                    )
-                candidate_ids[row, column + 1, : len(listed)] = torch.tensor(
-                    listed, dtype=torch.long
-                )
-                candidate_counts[row, column + 1] = len(listed)
-                span_letters[row, column + 1, : len(span)] = torch.tensor(
-                    [letter_id(letter) for letter in span], dtype=torch.long
-                )
-            scored = row_targets != IGNORE_INDEX
-            admitted = torch.tensor(
-                [
-                    self.candidates.admits(span, int(target))
-                    for span, target in zip(example.spans, example.targets, strict=True)
-                ]
-            )
-            if not bool(admitted[scored].all()):
-                raise ValueError(f"example {example.id} has a target its span does not admit")
-            span_ids[row, 1 : length + 1] = row_spans
-            span_positions[row, 1 : length + 1] = True
-            targets[row, 1 : length + 1] = row_targets
+        # Row-major over the typed columns ``1..length``: a boolean index walks
+        # the positions in exactly the order the examples list them.
+        span_lengths = torch.tensor(lengths, dtype=torch.long)
+        columns = torch.arange(width)
+        span_positions = (columns >= 1) & (columns <= span_lengths[:, None])
+        input_ids = torch.full((size, width), self.tokenizer.pad_token_id, dtype=torch.long)
+        input_ids[span_positions] = self.tokenizer.mask_token_id
+        input_ids[:, 0] = self.tokenizer.cls_token_id
+        input_ids[torch.arange(size), span_lengths + 1] = self.tokenizer.sep_token_id
+        attention_mask = (columns < span_lengths[:, None] + 2).long()
+        span_ids = torch.zeros((size, width), dtype=torch.long)
+        span_ids[span_positions] = torch.tensor(
+            [span_id for example in examples for span_id in example.span_ids], dtype=torch.long
+        )
+        targets = torch.full((size, width), IGNORE_INDEX, dtype=torch.long)
+        targets[span_positions] = torch.tensor(
+            [target for example in examples for target in example.targets], dtype=torch.long
+        )
+
+        slot_index = torch.tensor(slot_of_position, dtype=torch.long)
+        table = torch.nn.utils.rnn.pad_sequence(listed, batch_first=True, padding_value=0)
+        candidate_ids = torch.zeros((size, width, table.shape[1]), dtype=torch.long)
+        candidate_ids[span_positions] = table[slot_index]
+        candidate_counts = torch.zeros((size, width), dtype=torch.long)
+        candidate_counts[span_positions] = torch.tensor(
+            [row.numel() for row in listed], dtype=torch.long
+        )[slot_index]
+        span_letters = torch.full((size, width, MAX_SPAN_LETTERS), LETTER_PAD, dtype=torch.long)
+        span_letters[span_positions] = torch.stack([self._letters[span] for span in slots])[
+            slot_index
+        ]
 
         kept: list[str] = []
         has_context = torch.zeros(len(contexts), dtype=torch.float)
