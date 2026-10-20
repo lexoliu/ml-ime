@@ -387,3 +387,17 @@ def test_a_ranking_stage_replays_its_search_from_graphs_when_stamped(
         "0.05",
         "--search-graphs",
     ]
+
+
+def test_the_segmenter_is_found_in_the_directory_named_after_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The Colab driver mounts `ime-segment` at `<inputs>/ime-segment/ime-segment`."""
+    kernel = load_kernel(monkeypatch, tmp_path / "input", segment=0)
+    mount = tmp_path / "input" / "ime-segment"
+    mount.mkdir(parents=True)
+    (mount / "ime-segment").write_bytes(b"#!/bin/sh\n")
+    monkeypatch.setattr(kernel, "WORKING", tmp_path / "working")
+    staged = kernel.stage_segmenter()
+    assert staged == tmp_path / "working" / "bin" / "ime-segment"
+    assert staged.read_bytes() == b"#!/bin/sh\n"
