@@ -22,6 +22,7 @@ import pytest
 import torch
 from transformers import BertConfig
 
+from mlime.train import loop
 from mlime.train.arbitration import ReadingArbitration
 from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.loop import (
@@ -590,7 +591,7 @@ def test_a_produced_item_carries_where_to_reopen_the_stream(
     on the last consumed item -- not the last one a prefetcher happened to
     build -- resumes with exactly the batch that would have come next."""
     stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
-    source = Prefetcher(EpochBatches(stream, collator, RESUMABLE.token_budget))
+    source = Prefetcher(EpochBatches(stream, collator, RESUMABLE.token_budget), depth=2)
     try:
         items = [next(source) for _ in range(3)]
     finally:
@@ -646,6 +647,36 @@ def test_a_prefetched_segment_pauses_and_resumes_on_the_consumed_batch(
     weights = uninterrupted.state_dict()
     for name, tensor in resumed_model.state_dict().items():
         assert torch.equal(tensor, weights[name]), name
+
+
+def test_a_prefetching_lane_queues_a_whole_window(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A step takes `accumulate` batches before it starts, so the producer may
+    run that far ahead: a shallower queue stalls every step on collations the
+    step before could have hidden (#156's L4 check: 0.30 s of a 2.28 s step)."""
+    depths: list[int] = []
+
+    class Recorded(loop.Prefetcher):
+        def __init__(self, batches: EpochBatches, depth: int) -> None:
+            depths.append(depth)
+            super().__init__(batches, depth)
+
+    monkeypatch.setattr(loop, "Prefetcher", Recorded)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    train(
+        tiny_model(lexicon),
+        [(stream, collator)],
+        replace(RESUMABLE, accumulate=3, prefetch=True),
+        tmp_path,
+    )
+    assert depths == [3]
 
 
 class UnevenTargets:
