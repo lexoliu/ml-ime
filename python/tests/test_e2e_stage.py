@@ -103,6 +103,8 @@ def test_a_leg_without_its_commit_or_session_length_is_refused(stager: ModuleTyp
         stager.options(["--session-seconds", "3600"])
     with pytest.raises(SystemExit):
         stager.options(["--commit", "a" * 40, "--session-seconds", "0"])
+    with pytest.raises(SystemExit):
+        stager.options(["--commit", "a" * 40, "--session-seconds", "3600", "--segment-steps", "0"])
 
 
 def test_the_leg_stamps_its_commit_and_session_into_the_kernel(
@@ -110,7 +112,15 @@ def test_the_leg_stamps_its_commit_and_session_into_the_kernel(
 ) -> None:
     """Each stamp lands on its own line as a literal the kernel reads back."""
     leg = stager.options(
-        ["--commit", "c" * 40, "--session-seconds", "5400", "--allow-commit-change"]
+        [
+            "--commit",
+            "c" * 40,
+            "--session-seconds",
+            "5400",
+            "--segment-steps",
+            "70",
+            "--allow-commit-change",
+        ]
     )
     kernel = Path(__file__).resolve().parents[2] / "kaggle" / "e2e" / "kernel.py"
     stamped = tmp_path / "kernel.py"
@@ -118,9 +128,15 @@ def test_the_leg_stamps_its_commit_and_session_into_the_kernel(
     module = load("stamped_kernel", stamped)
     assert module.COMMIT == "c" * 40
     assert module.SESSION_SECONDS == 5400
+    assert module.SEGMENT_STEPS == 70
     assert module.ALLOW_COMMIT_CHANGE is True
     assert module.SEGMENT == 3
     assert module.CHECKPOINT_MINUTES == stager.CHECKPOINT_MINUTES
+    # A leg that names no count runs to its clock, whatever the leg before it set.
+    unbounded = stager.options(["--commit", "c" * 40, "--session-seconds", "5400"])
+    restamped = tmp_path / "restamped.py"
+    restamped.write_text(stager.stamp(stamped.read_text(), **stager.stamps(unbounded, 4)))
+    assert load("restamped_kernel", restamped).SEGMENT_STEPS is None
     with pytest.raises(KeyError, match="no `MISSING =` line"):
         stager.stamp(kernel.read_text(), MISSING=1)
 

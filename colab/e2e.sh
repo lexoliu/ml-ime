@@ -2,7 +2,8 @@
 # Run a Colab leg of an e2e kernel through the Colab CLI.
 #
 #   colab/e2e.sh <kernel dir> start --session-hours H [--commit REV] [--gpu G|--cpu]
-#                [--census FILE] [--resume-from RUN] [--no-publish] [--allow-commit-change]
+#                [--census FILE] [--resume-from RUN] [--no-publish] [--segment-steps N]
+#                [--allow-commit-change]
 #                                                provision, fetch the code, stage, launch
 #   colab/e2e.sh <kernel dir> wait --deadline SECONDS [--interval SECONDS]
 #                                                beat the watchdog until the leg ends
@@ -58,6 +59,8 @@ case $command in
       --resume-from) stage_options+=(--resume-from "$2"); shift 2;;
       # A check leaves the run's lineage in the bucket untouched.
       --no-publish) stage_options+=(--no-publish); shift;;
+      # A check pauses after a fixed count of steps, not on the clock.
+      --segment-steps) stage_options+=(--segment-steps "$2"); shift 2;;
       --allow-commit-change) stage_options+=(--allow-commit-change); shift;;
       *) echo "unknown argument $1" >&2; exit 2;;
     esac; done

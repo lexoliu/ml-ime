@@ -21,7 +21,8 @@ publisher beside it: every interval trio lands in the bucket, so a VM that
 dies without warning loses minutes of training, not the leg.
 
     python3 e2e-stage.py --commit SHA --session-seconds N
-                         [--resume-from RUN] [--no-publish] [--allow-commit-change]
+                         [--resume-from RUN] [--no-publish] [--segment-steps N]
+                         [--allow-commit-change]
 """
 
 import argparse
@@ -250,6 +251,11 @@ def options(argv=None):
     )
     parser.add_argument("--no-publish", action="store_true", help="Run no publisher")
     parser.add_argument(
+        "--segment-steps",
+        type=int,
+        help="Pause after this many steps of the leg, as a check does",
+    )
+    parser.add_argument(
         "--allow-commit-change",
         action="store_true",
         help="Let this leg resume a run recorded on a different commit",
@@ -259,6 +265,8 @@ def options(argv=None):
         parser.error(
             f"--session-seconds must be positive, got {parsed.session_seconds}"
         )
+    if parsed.segment_steps is not None and parsed.segment_steps <= 0:
+        parser.error(f"--segment-steps must be positive, got {parsed.segment_steps}")
     return parsed
 
 
@@ -268,6 +276,7 @@ def stamps(leg, segment):
         "SEGMENT": segment,
         "CHECKPOINT_MINUTES": CHECKPOINT_MINUTES,
         "SESSION_SECONDS": leg.session_seconds,
+        "SEGMENT_STEPS": leg.segment_steps,
         "COMMIT": leg.commit,
         "ALLOW_COMMIT_CHANGE": leg.allow_commit_change,
     }
