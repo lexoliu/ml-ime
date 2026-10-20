@@ -14,8 +14,47 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  # Each job below runs only when something it reads changed. A change to this
+  # workflow, and a push to main, runs them all.
+  changes:
+    name: changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.areas.outputs.rust }}
+      python: ${{ steps.areas.outputs.python }}
+      tables: ${{ steps.areas.outputs.tables }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: areas
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ -z "$BASE" ]; then
+            printf '%s=true\n' rust python tables >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed=$(git diff --name-only "$BASE"...HEAD)
+          printf '%s\n' "$changed"
+          area() {
+            if printf '%s\n' "$changed" | grep -qE "^(\.github/workflows/ci\.yml\$|$2)"; then
+              echo "$1=true"
+            else
+              echo "$1=false"
+            fi >> "$GITHUB_OUTPUT"
+          }
+          # Rust reads nothing outside crates/.
+          area rust 'crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$'
+          # The Python tests read the Rust side's tables and fixtures.
+          area python 'python/|colab/|kaggle/|crates/[^/]+/data/|crates/[^/]+/tests/fixtures/'
+          # The generator and what it writes.
+          area tables 'python/|crates/ime-pinyin/data/'
+
   rust:
     name: rust / ${{ matrix.os }}
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -38,6 +77,8 @@ jobs:
 
   python:
     name: python
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
     runs-on: ubuntu-latest
     # The suite takes about four minutes; a hung test once held this job for six hours.
     timeout-minutes: 20
@@ -57,6 +98,8 @@ jobs:
 
   generated-tables:
     name: generated tables are current
+    needs: changes
+    if: needs.changes.outputs.tables == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

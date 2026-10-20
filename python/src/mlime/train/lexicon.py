@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -108,6 +108,14 @@ class Lexicon:
         the sample builder asks for it once per character of every sentence.
         """
         return self._reverse[character]
+
+    def indices(self, characters: Iterable[str]) -> tuple[int, ...] | None:
+        """Every character's emission index, or ``None`` when one is not emittable."""
+        reverse = self._reverse
+        try:
+            return tuple([reverse[character] for character in characters])
+        except KeyError:
+            return None
 
     def contains(self, character: str) -> bool:
         """Whether *character* is emittable at all."""
@@ -268,6 +276,18 @@ class CandidateSpace:
     def admits(self, span: str, emission_id: int) -> bool:
         """Whether *span* may stand for the character at *emission_id*."""
         return emission_id in self._lookup(span)
+
+    def admits_all(self, spans: Sequence[str], emission_ids: Sequence[int]) -> bool:
+        """Whether every span admits the character at its position: :meth:`admits` in bulk."""
+        cache = self._cache
+        for span, emission_id in zip(spans, emission_ids, strict=True):
+            cached = cache.get(span)
+            if cached is None:
+                self.resolve(span)
+                cached = cache[span]
+            if emission_id not in cached[0]:
+                return False
+        return True
 
     def _lookup(self, span: str) -> frozenset[int]:
         """The membership set behind :meth:`resolve`, cached with it."""

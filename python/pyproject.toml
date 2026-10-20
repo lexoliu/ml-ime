@@ -3,6 +3,7 @@ name = "mlime"
 version = "0.1.0"
 description = "Data pipeline and training for ml-ime, a context-conditioned neural Chinese pinyin input method"
 requires-python = ">=3.12"
+license = "MIT OR Apache-2.0"
 dependencies = [
     "pypinyin>=0.53",
     "polars>=1.17",

@@ -20,8 +20,15 @@ the bucket under `compile-cache/<gpu>-torch<version>.tar`; the next leg on the
 same card and torch restores them and starts training without compiling again
 (#140).
 
-What it last did -- step and time of the last publish, or the last error -- is
-written to `publish-state.json`, which `e2e.sh status` reads.
+A finished run leaves no trio but its final checkpoint and evaluations, which
+exist on this VM alone. Once the kernel has written the finished summary --
+its last act -- they go to `final/<run>/`, outside the run's trio directory
+the rotation clears, with a `complete` marker written after them; the waiter
+reports the run finished, and `stop` releases the VM, only once it is there.
+
+What it last did -- step and time of the last publish, whether the final
+outputs are up, or the last error -- is written to `publish-state.json`,
+which `e2e.sh status` and the waiter read.
 """
 
 import importlib.metadata
@@ -35,7 +42,7 @@ import tempfile
 import time
 from pathlib import Path
 
-import httpx2
+import httpx
 from huggingface_hub import HfApi
 
 WORKING = Path("/kaggle/working")
@@ -49,6 +56,8 @@ BUCKET = "lexoliu/mlime-resume"
 COMPLETE = "complete"
 #: How often the publisher looks for a newer trio than the one it last sent.
 POLL_SECONDS = 60
+#: The bucket directory finished runs' outputs live in, one directory per run.
+FINAL_PREFIX = "final"
 #: Where the kernel points inductor's caches (`TORCHINDUCTOR_CACHE_DIR`):
 #: outside the working directory, which a Kaggle segment publishes as output.
 INDUCTOR_CACHE = Path("/tmp/inductor-cache")
@@ -229,16 +238,75 @@ def publish(api, run, trio):
     return step
 
 
+def final_prefix(run):
+    """Where *run*'s final outputs live in the bucket."""
+    return f"{FINAL_PREFIX}/{run}"
+
+
+def final_published(api, run):
+    """Whether *run*'s final outputs are whole in the bucket."""
+    marker = f"{final_prefix(run)}/{COMPLETE}"
+    entries = api.list_bucket_tree(BUCKET, prefix=f"{final_prefix(run)}/", recursive=True)
+    return any(entry.type == "file" and entry.path == marker for entry in entries)
+
+
+def finished_summary():
+    """The kernel's summary once the run has finished, else None.
+
+    The kernel writes it by rename, after the evaluations, as its last act.
+    """
+    path = WORKING / "run-summary.json"
+    if not path.is_file():
+        return None
+    summary = json.loads(path.read_text())
+    return summary if summary["finished"] else None
+
+
+def final_outputs(summary):
+    """What a finished leg leaves on this VM alone.
+
+    A leg that only evaluated a finished run mounted its checkpoint from where
+    it already lives; a leg that trained the run wrote it here.
+    """
+    trained = [] if "evaluated_checkpoint" in summary else [
+        RUN / "checkpoint-final.pt",
+        RUN / "metrics.jsonl",
+    ]
+    return [
+        *trained,
+        WORKING / "run-config.json",
+        WORKING / "run-summary.json",
+        *sorted(WORKING.glob("e2e-*")),
+        *sorted(WORKING.glob("eval-*.log")),
+    ]
+
+
+def publish_final(api, run, summary):
+    """Upload a finished run's outputs, then their marker."""
+    prefix = final_prefix(run)
+    outputs = final_outputs(summary)
+    api.batch_bucket_files(
+        BUCKET, add=[(path, f"{prefix}/{path.relative_to(WORKING)}") for path in outputs]
+    )
+    api.batch_bucket_files(BUCKET, add=[(f"{len(outputs)}\n".encode(), f"{prefix}/{COMPLETE}")])
+    print(f"published the finished run's {len(outputs)} outputs to {BUCKET}/{prefix}", flush=True)
+
+
 def main():
     once = os.environ.get("ONCE") == "1"
     api = HfApi()
     run = run_name(METADATA)
     published = None
+    final = None
     caches_published = False
     while True:
         try:
             if published is None:
                 published = max(published_steps(api, run), default=-1)
+            if final is None:
+                final = final_published(api, run)
+                if final:
+                    record_state(final_published=True)
             found = candidates()
             newest = found[-1] if found else None
             if newest is not None and newest[1] > published:
@@ -249,11 +317,17 @@ def main():
             if not caches_published and compiled():
                 publish_compile_cache(api)
                 caches_published = True
-        except (httpx2.HTTPError, OSError) as error:
+            summary = None if final else finished_summary()
+            if summary is not None:
+                publish_final(api, run, summary)
+                final = True
+                record_state(final_published=True, final_published_at=time.time())
+        except (httpx.HTTPError, OSError) as error:
             # A publish failure is transient until it is not: say so, keep
             # polling, and leave the error where status can read it. What the
             # bucket holds is read again, since a failure can stop mid-publish.
             published = None
+            final = None
             record_state(last_error=f"{error}", last_error_at=time.time())
             print(f"publish failed: {error}", flush=True)
         if once:

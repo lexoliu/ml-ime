@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -35,12 +36,14 @@ lexicon_app = typer.Typer(
 )
 train_app = typer.Typer(help="Route A training and the labels it needs", no_args_is_help=True)
 eval_app = typer.Typer(help="Experiments over the decoder's output", no_args_is_help=True)
+e2e_app = typer.Typer(help="The end-to-end model's runs", no_args_is_help=True)
 app.add_typer(corpus_app, name="corpus")
 app.add_typer(g2p_app, name="g2p")
 app.add_typer(export_app, name="export")
 app.add_typer(lexicon_app, name="lexicon")
 app.add_typer(train_app, name="train")
 app.add_typer(eval_app, name="eval")
+app.add_typer(e2e_app, name="e2e")
 
 #: A polyphone-dense sentence: 重 chong/zhong, 还 huan/hai, 得 de/dei, 绿 lv.
 PROBE_SENTENCE = "他还了钱还差一点，我得到了那件重要的绿色东西"
@@ -561,7 +564,7 @@ def train_e2e(
     prefetch: bool = typer.Option(
         False,
         "--prefetch/--no-prefetch",
-        help="Collate the next batches on a producer thread while the step runs",
+        help="Collate each lane's next batches in a producer process while the step runs",
     ),
     profile_steps: int = typer.Option(
         0,
@@ -735,6 +738,12 @@ def train_count_batches(
     rank_beam: int = RANK_BEAM,
     rank_negatives: int = RANK_NEGATIVES,
     rank_weight: float = RANK_WEIGHT,
+    workers: int | None = typer.Option(
+        None,
+        "--workers",
+        help="Processes that build the examples; every core this process may use "
+        "when omitted. The census does not depend on it",
+    ),
     verbose: bool = VERBOSE,
 ) -> None:
     """Count the steps *epochs* of the training shards come to, for --max-steps.
@@ -749,6 +758,10 @@ def train_count_batches(
     from mlime.train.count import count_batches
     from mlime.train.run import Vocabularies
 
+    if workers is None:
+        workers = os.cpu_count()
+        if workers is None:
+            raise typer.BadParameter("the cores are not countable here; pass --workers")
     paths = route_a_paths(data_dir, labels, char_table, out.parent)
     census = count_batches(
         Vocabularies.load(paths.char_table, base_model),
@@ -764,6 +777,7 @@ def train_count_batches(
             ranking, rank_segmentations, rank_beam, rank_negatives, rank_weight
         ),
         segmenter=segmenter,
+        workers=workers,
     )
     census.write(out)
     typer.echo(
@@ -979,6 +993,53 @@ def export_route_a(
     model, _, step = load_model(checkpoint, lexicon, torch.device("cpu"))
     graph, manifest = export_onnx(model, step, lexicon, spans, tokenizer, out, quantize)
     typer.echo(f"{graph}\n{manifest}")
+
+
+@e2e_app.command("stamp")
+def e2e_stamp(
+    run: str = typer.Argument(..., help="The run's name, such as mlime-e2e-v2-a100"),
+    out: Path = typer.Option(..., "--out", help="The kernel directory to write"),
+    profile_steps: int = typer.Option(
+        30, help="Steps after the warm-up the loop times (PROFILE_STEPS)"
+    ),
+    trace_steps: int = typer.Option(
+        3, help="Of those, how many it records as a torch.profiler trace (TRACE_STEPS)"
+    ),
+    train_shard: list[str] = typer.Option(
+        None,
+        "--train-shard",
+        help="Train on this shard only; repeatable. Omitted, every shard but the held-out",
+    ),
+    template: Path | None = typer.Option(
+        None, help="The e2e kernel directory to stamp from; kaggle/e2e by default"
+    ),
+) -> None:
+    """Write a v2 run's kernel directory: v1's recipe, the run's slug, the v2 sources.
+
+    `colab/e2e.sh <out> start` runs it; every leg carries the one slug and the
+    stager stamps each leg's segment, commit and session into its copy.
+    """
+    from mlime.locate import find_upwards
+    from mlime.stamp import E2E_V2_SOURCES, E2EV2Run, stamp_e2e_v2
+
+    source = template or find_upwards(Path("kaggle") / "e2e")
+    if source is None:
+        raise typer.BadParameter("no kaggle/e2e above the working directory; pass --template")
+    spec = E2EV2Run(
+        run=run,
+        profile_steps=profile_steps,
+        trace_steps=trace_steps,
+        train_shards=tuple(train_shard) if train_shard else None,
+    )
+    recipe = stamp_e2e_v2(source, out, spec)
+    typer.echo(f"{out}: {spec.slug}, stamped from {source}")
+    typer.echo("v1's recipe, as the template commits it:")
+    for name, value in recipe.items():
+        typer.echo(f"  {name} = {value!r}")
+    typer.echo("this run's fields:")
+    for name, value in spec.fields().items():
+        typer.echo(f"  {name} = {value!r}")
+    typer.echo("sources: " + ", ".join(E2E_V2_SOURCES))
 
 
 @eval_app.command("rescore")

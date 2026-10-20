@@ -15,6 +15,43 @@
 # runtime touches the heartbeat each time it looks at it (`heartbeat`).
 
 watchdog=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/watchdog.py
+colab_cli=$(type -P colab) || { echo "the Colab CLI (colab) is not on PATH" >&2; exit 2; }
+deadline=$(type -P gtimeout || type -P timeout) || {
+  echo "GNU timeout is not on PATH (gtimeout from coreutils on macOS)" >&2
+  exit 2
+}
+
+# The Colab CLI, bounded. After a dropped connection the CLI can wait forever,
+# and a call that never returns never reaches the ERR trap that releases the
+# runtime -- a start once hung for hours on a billed L4 that way. Each call
+# ends within its subcommand's bound, or COLAB_SECONDS for a call known to
+# run longer, and a call cut off fails like any other.
+colab() {
+  local seconds
+  case $1 in
+    sessions | stop) seconds=120 ;;
+    new | upload | download) seconds=900 ;;
+    *) seconds=600 ;;
+  esac
+  "$deadline" --kill-after=15 "${COLAB_SECONDS:-$seconds}" "$colab_cli" "$@"
+}
+
+# Run the Python on stdin in SESSION's kernel and fail when it does not finish.
+# `colab exec` hands the code to the runtime's IPython kernel and exits 0 even
+# when the code raises, so its status says only that the code was delivered.
+# Success is a token printed after the code's last statement, which a raise
+# never reaches; the code's own output is passed through.
+remote() {
+  local session=$1 token output
+  token="remote-ok-$RANDOM$RANDOM$RANDOM"
+  output=$({ cat; printf '\nprint("%s")\n' "$token"; } | colab exec -s "$session") || return
+  if ! printf '%s\n' "$output" | grep -qxF "$token"; then
+    printf '%s\n' "$output" >&2
+    echo "the code sent to $session did not run to its end" >&2
+    return 1
+  fi
+  printf '%s\n' "$output" | grep -vxF "$token" || true
+}
 
 provision() {
   local session=$1
@@ -26,12 +63,14 @@ provision() {
   trap "release_on_failure $session" ERR
   colab new -s "$session" "$@"
   colab upload -s "$session" "$watchdog" /root/watchdog.py
-  printf 'import subprocess, sys\nlog = open("/root/watchdog.out", "ab")\nchild = subprocess.Popen([sys.executable, "/root/watchdog.py"], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)\nprint(f"watchdog started, pid {child.pid}")\n' | colab exec -s "$session"
+  # A watchdog that died on start would leave the runtime with nothing to
+  # release it, so the start waits to see it still running.
+  printf 'import subprocess, sys, time\nlog = open("/root/watchdog.out", "ab")\nchild = subprocess.Popen([sys.executable, "/root/watchdog.py"], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)\ntime.sleep(3)\nif child.poll() is not None:\n    raise SystemExit(f"the watchdog exited {child.returncode} on start; see /root/watchdog.out")\nprint(f"watchdog running, pid {child.pid}")\n' | remote "$session"
 }
 
 # The controller's beat: run on every look at the runtime.
 heartbeat() {
-  printf 'from pathlib import Path\nPath("/root/heartbeat").touch()\n' | colab exec -s "$1" > /dev/null
+  printf 'from pathlib import Path\nPath("/root/heartbeat").touch()\n' | remote "$1" > /dev/null
 }
 
 release_on_failure() {

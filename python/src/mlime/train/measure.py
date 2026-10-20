@@ -22,7 +22,7 @@ import subprocess
 import threading
 import time
 from collections import Counter, defaultdict
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -69,8 +69,15 @@ class GpuSampler:
         self._process: subprocess.Popen[bytes] | None = None
 
     def __enter__(self) -> GpuSampler:
+        # nvidia-smi stamps its samples in local time with no zone; pinning
+        # the zone makes the log's clock UTC wherever it is read (`gpu_means`).
         with self._log.open("w", encoding="utf-8") as sink:
-            self._process = subprocess.Popen(self._argv, stdout=sink, stderr=subprocess.DEVNULL)
+            self._process = subprocess.Popen(
+                self._argv,
+                stdout=sink,
+                stderr=subprocess.DEVNULL,
+                env={**os.environ, "TZ": "UTC"},
+            )
         return self
 
     def __exit__(self, *_: object) -> None:
@@ -96,7 +103,9 @@ class HostSampler:
     shows up here and nowhere in the device's own numbers, and so does a
     trainer the kernel's OOM killer is about to take: it dies by SIGKILL with
     no traceback, and only the memory leading up to it says why. The first
-    line holds the machine's total memory. Each sample line holds the
+    line describes the machine -- its total memory, its cores and its clock
+    ticks per second -- so the log reads the same off the VM that wrote it.
+    Each sample line holds the
     machine's busy and total jiffies, its available memory, the cumulative
     user+system ticks of every thread of a `TRAINER_COMMANDS` process and
     each such process's resident bytes; a process's command is written once,
@@ -165,7 +174,12 @@ class HostSampler:
 
     def _run(self) -> None:
         with self._log.open("w", encoding="utf-8") as sink:
-            sink.write(json.dumps({"memory_total": self._meminfo("MemTotal")}) + "\n")
+            machine = {
+                "memory_total": self._meminfo("MemTotal"),
+                "cores": os.cpu_count(),
+                "clock_ticks": os.sysconf("SC_CLK_TCK"),
+            }
+            sink.write(json.dumps(machine) + "\n")
             while not self._stopped.is_set():
                 busy, total = self._machine()
                 threads, resident = self._processes(sink)
@@ -263,7 +277,11 @@ def gpu_means(log: Path, since: float, until: float) -> dict[str, Any]:
         fields = dict(zip(GPU_FIELDS, (f.strip() for f in line.split(",")), strict=False))
         if len(fields) != len(GPU_FIELDS):
             continue  # the line nvidia-smi was writing when it was stopped
-        at = datetime.strptime(fields["timestamp"], "%Y/%m/%d %H:%M:%S.%f").timestamp()
+        at = (
+            datetime.strptime(fields["timestamp"], "%Y/%m/%d %H:%M:%S.%f")
+            .replace(tzinfo=UTC)
+            .timestamp()
+        )
         if since <= at <= until:
             samples[fields["index"]].append(fields)
     if not samples:
@@ -294,24 +312,25 @@ def host_usage(log: Path, since: float, until: float) -> dict[str, Any]:
     thread is the one that launches device work. Memory is the least the
     machine had available and each process's largest resident size.
     """
+    header, *lines = log.read_text(encoding="utf-8").splitlines()
+    machine = json.loads(header)
+    if "memory_total" not in machine:
+        raise ValueError(f"{log} does not start with the machine's line: {header}")
     commands = {}
     samples = []
-    memory_total = None
-    for line in log.read_text(encoding="utf-8").splitlines():
+    for line in lines:
         record = json.loads(line)
-        if "memory_total" in record:
-            memory_total = record["memory_total"]
-        elif "command" in record:
+        if "command" in record:
             commands[record["pid"]] = record["command"]
         elif since <= record["time"] <= until:
             samples.append(record)
     if len(samples) < 2:
         raise ValueError(
-            f"{log} holds {len(samples)} CPU samples inside the span; a usage needs two"
+            f"{log} holds {len(samples)} host samples inside the span; a usage needs two"
         )
     first, last = samples[0], samples[-1]
     seconds = last["time"] - first["time"]
-    hertz = os.sysconf("SC_CLK_TCK")
+    hertz = machine["clock_ticks"]
     before = {(pid, tid): ticks for pid, tid, ticks in first["threads"]}
     cores: dict[int, dict[str, float]] = defaultdict(lambda: {"main": 0.0, "other": 0.0})
     for pid, tid, ticks in last["threads"]:
@@ -326,8 +345,8 @@ def host_usage(log: Path, since: float, until: float) -> dict[str, Any]:
         "busy_percent": round(
             100 * (last["busy"] - first["busy"]) / (last["total"] - first["total"]), 1
         ),
-        "cores": os.cpu_count(),
-        "memory_total_bytes": memory_total,
+        "cores": machine["cores"],
+        "memory_total_bytes": machine["memory_total"],
         "least_available_bytes": min(sample["available"] for sample in samples),
         "samples": len(samples),
         "processes": [
