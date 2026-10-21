@@ -74,49 +74,68 @@ class SearchInputs:
 def search_inputs(
     lanes: Sequence[Lane], beam_width: int, device: torch.device, *, bucketed: bool
 ) -> SearchInputs:
-    """Pad *lanes* into the tensors a search reads; with *bucketed*, to :func:`bucket` sizes.
-
-    The extra lanes a bucket adds admit nothing, so every row of theirs stays
-    at minus infinity, and the extra positions are the ragged search's ended
-    steps.
-    """
+    """Pad *lanes* into the tensors a search reads; with *bucketed*, to :func:`bucket` sizes."""
     lengths = [lane.length for lane in lanes]
-    length = max(lengths)
-    if bucketed:
-        length = bucket(length)
-        filler = lanes[0]
-        padding = bucket(len(lanes)) - len(lanes)
-        lanes = [
-            *lanes,
-            *[
-                Lane(-1, filler.vectors[:1], torch.zeros_like(filler.candidates[:1]))
-                for _ in range(padding)
-            ],
-        ]
-        lengths += [1] * padding
     vectors = nn.utils.rnn.pad_sequence([lane.vectors for lane in lanes], batch_first=True)
     masks = nn.utils.rnn.pad_sequence([lane.candidates for lane in lanes], batch_first=True)
-    vectors = nn.functional.pad(vectors, (0, 0, 0, length - vectors.shape[1]))
-    masks = nn.functional.pad(masks, (0, 0, 0, length - masks.shape[1]))
+    return padded_inputs(
+        vectors.to(device),
+        masks.to(device),
+        torch.tensor(lengths).to(device),
+        lengths,
+        beam_width,
+        bucketed=bucketed,
+    )
+
+
+def padded_inputs(
+    vectors: torch.Tensor,
+    masks: torch.Tensor,
+    lane_lengths: torch.Tensor,
+    lengths: Sequence[int],
+    beam_width: int,
+    *,
+    bucketed: bool,
+) -> SearchInputs:
+    """Lanes already padded to one length, as a search reads them.
+
+    ``vectors [L, T, enc]`` are zero and ``masks [L, T, E]`` false past each
+    lane's own length; ``lane_lengths [L]`` are those lengths on the device
+    and *lengths* the same on the host, which every shape is decided from,
+    so nothing is read back. With *bucketed* the lanes and positions are
+    padded to :func:`bucket` sizes: the extra lanes admit nothing, so every
+    row of theirs stays at minus infinity, and the extra positions are the
+    ragged search's ended steps.
+    """
+    length = max(lengths)
+    lengths = list(lengths)
+    if bucketed:
+        length = bucket(length)
+        padding = bucket(len(lengths)) - len(lengths)
+        lane_lengths = torch.cat([lane_lengths, lane_lengths.new_ones(padding)])
+        lengths += [1] * padding
+    lanes = len(lengths) - vectors.shape[0]
+    vectors = nn.functional.pad(vectors, (0, 0, 0, length - vectors.shape[1], 0, lanes))
+    masks = nn.functional.pad(masks, (0, 0, 0, length - masks.shape[1], 0, lanes))
     return SearchInputs(
-        vectors=vectors.to(device),
-        masks=masks.to(device),
-        lane_lengths=torch.tensor(lengths).to(device),
+        vectors=vectors,
+        masks=masks,
+        lane_lengths=lane_lengths,
         ragged=min(lengths) != length,
         width=beam_width,
     )
 
 
-def run_search(
-    decoder: Decoder, inputs: SearchInputs
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The whole search on the device: ``parents``, ``choices [T, L, W]`` and the final scores.
+def run_search(decoder: Decoder, inputs: SearchInputs) -> tuple[torch.Tensor, torch.Tensor]:
+    """The whole search on the device: each beam's sentence ``[L, W, T]`` and score ``[L, W]``.
 
     Every lane owns a block of ``beam_width`` rows from the first step, the
     unused ones at a score of minus infinity, so the row layout never changes
     and a lane's beams read its encoder keys and values as one block, computed
-    once per lane. Nothing here reads back to the host, so the whole search
-    can be captured as one CUDA graph (:class:`SearchGraphs`).
+    once per lane. The sentences are walked back through each step's parents
+    on the device too, past a lane's own length as the free steps' emission
+    0. Nothing here reads back to the host, so the whole search can be
+    captured as one CUDA graph (:class:`SearchGraphs`).
     """
     vectors, masks = inputs.vectors, inputs.masks
     device = vectors.device
@@ -185,7 +204,23 @@ def run_search(
         )
         parents.append(parent)
         choices.append(choice)
-    return torch.stack(parents), torch.stack(choices), scores
+    return walk_back(torch.stack(parents), torch.stack(choices)), scores
+
+
+def walk_back(parents: torch.Tensor, choices: torch.Tensor) -> torch.Tensor:
+    """``[L, W, T]``: each final beam's emissions, read back from ``parents``/``choices [T, L, W]``.
+
+    ``parents`` names each step's beam within its lane's block, so a beam's
+    sentence is a gather a step, last to first, on the device.
+    """
+    length, count, width = choices.shape
+    beam = torch.arange(width, device=choices.device).expand(count, width)
+    steps = []
+    for position in range(length - 1, -1, -1):
+        steps.append(choices[position].gather(1, beam))
+        beam = parents[position].gather(1, beam)
+    steps.reverse()
+    return torch.stack(steps, dim=2)
 
 
 class SearchGraphs:
@@ -231,9 +266,7 @@ class SearchGraphs:
             flat = self.flat[name]
         return flat[: like.numel()].view(like.shape)
 
-    def run(
-        self, decoder: Decoder, inputs: SearchInputs
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def run(self, decoder: Decoder, inputs: SearchInputs) -> tuple[torch.Tensor, torch.Tensor]:
         """:func:`run_search` over *inputs*, from this shape's captured graph."""
         autocast = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None
         key = (inputs.masks.shape, inputs.vectors.dtype, inputs.ragged, inputs.width, autocast)
@@ -266,8 +299,8 @@ class SearchGraphs:
             )
         graph, _, outputs = captured
         graph.replay()
-        parents, choices, scores = outputs
-        return parents, choices, scores
+        sequences, scores = outputs
+        return sequences, scores
 
     def _capture(
         self, decoder: Decoder, static: SearchInputs, autocast: torch.dtype | None
@@ -278,7 +311,7 @@ class SearchGraphs:
         it, so the casts are taken inside, uncached, like every other kernel.
         """
 
-        def search() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        def search() -> tuple[torch.Tensor, torch.Tensor]:
             if autocast is None:
                 return run_search(decoder, static)
             with torch.autocast("cuda", dtype=autocast, cache_enabled=False):
@@ -293,6 +326,15 @@ class SearchGraphs:
         with torch.cuda.graph(graph, pool=self.pool):
             outputs = search()
         return graph, static, outputs
+
+
+def search(
+    decoder: Decoder, inputs: SearchInputs, graphs: SearchGraphs | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`run_search` over *inputs*, replayed from *graphs* when given."""
+    if graphs is None:
+        return run_search(decoder, inputs)
+    return graphs.run(decoder, inputs)
 
 
 def decode_lanes(
@@ -323,42 +365,24 @@ def decode_lanes(
     """
     decoder = model.decoder
     inputs = search_inputs(lanes, beam_width, decoder.emit_ids.device, bucketed=graphs is not None)
-    if graphs is None:
-        parents, choices, scores = run_search(decoder, inputs)
-    else:
-        parents, choices, scores = graphs.run(decoder, inputs)
-    return walk_back(parents, choices, scores, lanes)
+    sequences, scores = search(decoder, inputs, graphs)
+    return hypotheses(sequences, scores, [lane.length for lane in lanes])
 
 
-def walk_back(
-    parents: torch.Tensor,
-    choices: torch.Tensor,
-    scores: torch.Tensor,
-    lanes: Sequence[Lane],
+def hypotheses(
+    sequences: torch.Tensor, scores: torch.Tensor, lengths: Sequence[int]
 ) -> list[list[tuple[list[int], float]]]:
-    """Each lane's hypotheses, read back from a search's parents and choices.
+    """Each lane's finite hypotheses, read back to the host and cut to its own length.
 
-    Lanes past ``lanes`` -- a bucket's padding -- are not read; each
-    sequence is cut back to its own lane's length.
+    Lanes past *lengths* -- a bucket's padding -- are not read.
     """
-    # Plain lists: the walk back reads one element at a time, which a tensor
-    # charges a dispatch for.
-    parent_steps: list[list[list[int]]] = parents.tolist()
-    choice_steps: list[list[list[int]]] = choices.tolist()
-    final: list[list[float]] = scores.tolist()
-    length = len(parent_steps)
-    decoded: list[list[tuple[list[int], float]]] = []
-    for lane, own in enumerate(lane.length for lane in lanes):
-        hypotheses = []
-        for beam, score in enumerate(final[lane]):
-            if score == float("-inf"):
-                continue
-            sequence = []
-            row = beam
-            for position in range(length - 1, -1, -1):
-                sequence.append(choice_steps[position][lane][row])
-                row = parent_steps[position][lane][row]
-            sequence.reverse()
-            hypotheses.append((sequence[:own], score))
-        decoded.append(hypotheses)
-    return decoded
+    found: list[list[list[int]]] = sequences[: len(lengths)].tolist()
+    final: list[list[float]] = scores[: len(lengths)].tolist()
+    return [
+        [
+            (sequence[:own], score)
+            for sequence, score in zip(found[lane], final[lane], strict=True)
+            if score != float("-inf")
+        ]
+        for lane, own in enumerate(lengths)
+    ]

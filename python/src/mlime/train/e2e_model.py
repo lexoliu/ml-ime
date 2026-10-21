@@ -583,11 +583,9 @@ class E2EModel(RouteAModel):
             raise ValueError("no new parameters found; the naming convention has drifted")
         return [{"params": base, "lr": base_lr}, {"params": new, "lr": new_lr}]
 
-    def gates(self) -> list[float]:
+    def gate_parameters(self) -> list[nn.Parameter]:
         """The encoder's context gates, then each decoder block's cross gate."""
-        return super().gates() + [
-            float(layer.gate.detach()) for layer in self.decoder.gated_layers()
-        ]
+        return super().gate_parameters() + [layer.gate for layer in self.decoder.gated_layers()]
 
     def _scored(self, batch: Batch) -> _Scored | None:
         """The scored positions' logits for both heads, ``[P, E]`` apiece.
