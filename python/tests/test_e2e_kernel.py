@@ -240,6 +240,13 @@ def test_every_switch_the_kernel_passes_is_an_option_of_train_e2e(
     monkeypatch.setattr(kernel, "ACTIVATION_CHECKPOINTING", True)
     monkeypatch.setattr(kernel, "SEGMENT_STEPS", 70)
     monkeypatch.setattr(kernel, "SEARCH_GRAPHS", True)
+    monkeypatch.setattr(
+        kernel,
+        "CONTEXT_TOWER",
+        {"tower": "Qwen/Qwen3-0.6B-Base", "revision": "abc", "lora_rank": 0, "lora_alpha": 16.0},
+    )
+    monkeypatch.setattr(kernel, "CONTEXT_WARM_UP", True)
+    monkeypatch.setattr(kernel, "TOWER_GRAPHS", True)
     argv = kernel.train_argv(
         tmp_path / "char_pinyin.tsv",
         tmp_path / "run",

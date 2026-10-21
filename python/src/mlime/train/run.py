@@ -44,6 +44,7 @@ from mlime.train.loop import (
     train,
 )
 from mlime.train.model import RouteAConfig, RouteAModel
+from mlime.train.qwen_tower import QwenContextConfig, load_context_tokenizer
 from mlime.train.ranking import RankCollator
 from mlime.train.samples import (
     DEFAULT_CONTEXT_TOKENS,
@@ -51,6 +52,7 @@ from mlime.train.samples import (
     BaseTokenizer,
     BatchCollator,
     Collator,
+    ContextTokenizer,
     CorpusStream,
     SampleBuilder,
     TrainingExample,
@@ -207,7 +209,7 @@ def build_lexicon_for(char_table: Path, tokenizer: BaseTokenizer, spans: SpanVoc
 
 @dataclass(frozen=True)
 class Vocabularies:
-    """The four tables everything a run does is indexed by.
+    """The tables everything a run does is indexed by.
 
     They belong together because they are built from one another: the lexicon is
     the pinyin table intersected with the *base model's* vocabulary, so it cannot
@@ -216,24 +218,34 @@ class Vocabularies:
     against those same spans. Anything that reads the corpus the way a run reads
     it -- training, and counting what training will do -- needs all four, built
     the same way, which is why they are assembled once here rather than gathered
-    again at each call site.
+    again at each call site. The context tokenizer is the one the run's
+    context tower reads: the base model's own for MacBERT's, Qwen's BPE for
+    Qwen's.
     """
 
     spans: SpanVocab
     tokenizer: BaseTokenizer
+    context_tokenizer: ContextTokenizer
     lexicon: Lexicon
     arbitration: ReadingArbitration
     syllables: frozenset[str]
 
     @classmethod
-    def load(cls, char_table: Path, base_model: str) -> Vocabularies:
-        """Load the span table, the tokenizer, the lexicon over both, and the arbitration."""
+    def load(
+        cls, char_table: Path, base_model: str, context: QwenContextConfig | None
+    ) -> Vocabularies:
+        """Load the span table, both tokenizers, the lexicon, and the arbitration.
+
+        *context* is the Qwen tower the run's context is read by, or None for
+        the base model's own.
+        """
         spans = SpanVocab.load()
         tokenizer = load_tokenizer(base_model)
         readings = read_char_readings(char_table)
         return cls(
             spans=spans,
             tokenizer=tokenizer,
+            context_tokenizer=tokenizer if context is None else load_context_tokenizer(context),
             lexicon=build_lexicon(readings, vocabulary_of(tokenizer), spans),
             arbitration=ReadingArbitration.load(spans),
             syllables=frozenset(
@@ -303,6 +315,7 @@ class Vocabularies:
         """The collator a run of these settings pads its batches with."""
         return Collator(
             self.tokenizer,
+            self.context_tokenizer,
             self.candidate_space(typos),
             context_dropout=context_dropout,
             max_context_tokens=max_context_tokens,
@@ -340,10 +353,12 @@ class CorpusLane:
     context_dropout: float
     max_context_tokens: int
     ranking: LaneRanking | None = None
+    #: The Qwen tower the lane's contexts are tokenised for; None for MacBERT's.
+    context: QwenContextConfig | None = None
 
     def open(self) -> tuple[CorpusStream, BatchCollator]:
         """Load the tables, then build this lane's stream and collator over them."""
-        vocabularies = Vocabularies.load(self.paths.char_table, self.base_model)
+        vocabularies = Vocabularies.load(self.paths.char_table, self.base_model, self.context)
         builder = vocabularies.builder(self.augmentation, self.seed)
         stream = vocabularies.stream(self.paths, self.shards, builder, self.rank, self.world_size)
         collator = vocabularies.collator(
@@ -408,7 +423,7 @@ def route_a(
     """
     route = route or RouteAConfig()
     world = Distributed.from_environment()
-    vocabularies = Vocabularies.load(paths.char_table, route.base_model)
+    vocabularies = Vocabularies.load(paths.char_table, route.base_model, None)
     spans, tokenizer, lexicon = vocabularies.spans, vocabularies.tokenizer, vocabularies.lexicon
     model = RouteAModel.from_pretrained(route, lexicon, spans, vocabularies.vocabulary)
 
@@ -458,10 +473,10 @@ def route_a(
     device = world.device
     candidates = vocabularies.candidate_space(augmented.typos)
     with_context = evaluate(
-        model, evaluation, tokenizer, device, training.token_budget, True, candidates
+        model, evaluation, tokenizer, tokenizer, device, training.token_budget, True, candidates
     )
     without_context = evaluate(
-        model, evaluation, tokenizer, device, training.token_budget, False, candidates
+        model, evaluation, tokenizer, tokenizer, device, training.token_budget, False, candidates
     )
     result = RunResult(
         metrics=segment.metrics,

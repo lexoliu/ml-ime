@@ -100,7 +100,7 @@ def rank_batch(
 ) -> RankBatch:
     """The two sentences, typed out, with the first one's context kept."""
     collator = Collator(
-        tokenizer, CandidateSpace(spans, lexicon.candidate_mask), context_dropout=0.0
+        tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask), context_dropout=0.0
     )
     first = example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing"))
     first = type(first)(**{**vars(first), "context": "北京"})
@@ -111,7 +111,7 @@ def rank_batch(
 def test_an_example_costs_its_readings_and_the_paths_it_ranks(
     lexicon: Lexicon, spans: SpanVocab, tokenizer: StubTokenizer
 ) -> None:
-    collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
+    collator = Collator(tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
     typed = example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing"))
     two = RankCollator(collator, lambda keys: READINGS[keys], spans, RANKING)
     # Two readings, then the gold path, the gold sentence on the other
@@ -376,7 +376,7 @@ def random_case(
         )
     readings = iter(plan)
     collator = Collator(
-        tokenizer, CandidateSpace(spans, lexicon.candidate_mask), context_dropout=0.0
+        tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask), context_dropout=0.0
     )
     ranking = replace(RANKING, beam=width, negatives=negatives)
     batch = RankCollator(collator, lambda _: next(readings), spans, ranking)(examples)
@@ -898,7 +898,7 @@ COLLIDING = {
 def colliding_batch(lexicon: Lexicon, spans: SpanVocab, tokenizer: StubTokenizer) -> RankBatch:
     """Four examples whose readings collide, for a forward that exercises every merge."""
     collator = Collator(
-        tokenizer, CandidateSpace(spans, lexicon.candidate_mask), context_dropout=0.0
+        tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask), context_dropout=0.0
     )
     examples = [
         example(spans, lexicon, "中钟重", ("zhong", "zhong", "zhong")),
@@ -1112,7 +1112,7 @@ def test_a_resumed_ranking_run_is_the_run_that_was_not_interrupted(
         stream = CorpusStream(
             short_corpus[0], short_corpus[1], SampleBuilder(lexicon, spans, arbitration, seed=1)
         )
-        collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
+        collator = Collator(tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
         return BuiltLane(stream, RankCollator(collator, greedy_readings(spans), spans, RANKING))
 
     def losses(metrics: Path) -> list[float]:

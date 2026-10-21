@@ -31,8 +31,12 @@ stage (#116): every segment adds the sequence-level ranking loss, reading each
 example's other segmentations from the `ime-segment` binary mounted beside the
 inputs (`colab/e2e.sh start` builds it from the leg's commit and uploads it).
 `WHOLE_ALPHABET` normalises the per-position loss over every emittable
-character (#121). A finished run is told apart from the run it started from
-by the stage its run-config records.
+character (#121). With `CONTEXT_TOWER` stamped, the stage reads the context
+with Qwen instead of MacBERT (#222): the first segment swaps the tower into
+the finished run's weights, from Qwen's release at the pinned revision, and
+`CONTEXT_WARM_UP` trains only the context path, which is S0. `TOWER_GRAPHS`
+replays the frozen tower from captured CUDA graphs. A finished run is told
+apart from the run it started from by the stage its run-config records.
 
 A leg measures itself while it trains: `GpuSampler` and `HostSampler` log the
 cards, and the trainers' threads and the host's memory, to `gpu.csv` and
@@ -212,6 +216,20 @@ SEARCH_GRAPHS = False
 #: The training shards a run makes its epoch over; None trains on every
 #: mounted shard but the held-out ones. Stamped per push.
 TRAIN_SHARDS = None
+
+#: The Qwen model that reads the context in place of MacBERT (#222), as
+#: `mlime train e2e`'s `--context-*` options: a dict of `tower`, `revision`,
+#: `lora_rank` (0 keeps it frozen) and `lora_alpha`. A stage swaps it into
+#: `INIT_FROM`'s weights. None keeps MacBERT's. Stamped per push.
+CONTEXT_TOWER = None
+
+#: Train only the context path -- the gated cross-attention blocks and what
+#: the tower adds -- with the rest of `INIT_FROM`'s model frozen (S0).
+CONTEXT_WARM_UP = False
+
+#: Replay a frozen Qwen tower's forward from captured CUDA graphs; how the
+#: stage runs, not what it trains. Stamped per push.
+TOWER_GRAPHS = False
 
 #: The (pretrained, new) learning rates; None keeps `mlime train e2e`'s.
 LEARNING_RATES = None
@@ -472,12 +490,19 @@ def warm_cache():
     """Download the base model's small files once, before the ranks race for them.
 
     Only the config and the tokenizer: both towers' *weights* come from the
-    initial checkpoints, so the pretrained tensors are never fetched.
+    initial checkpoints, so the pretrained tensors are never fetched. A Qwen
+    context tower is fetched whole at its revision: the stage's first segment
+    swaps its released weights in, and every build reads its config and
+    tokenizer.
     """
     from transformers import AutoTokenizer, BertConfig
 
     BertConfig.from_pretrained("hfl/chinese-macbert-base")
     AutoTokenizer.from_pretrained("hfl/chinese-macbert-base")
+    if CONTEXT_TOWER is not None:
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(CONTEXT_TOWER["tower"], revision=CONTEXT_TOWER["revision"])
     print("base files cached", flush=True)
 
 
@@ -544,20 +569,48 @@ def start_argv(initials, init_e2e):
 
 def stage():
     """What tells this kernel's runs apart, as its run-config records it."""
-    return {"ranking": RANKING, "whole_alphabet": WHOLE_ALPHABET, "init_from": INIT_FROM}
+    return {
+        "ranking": RANKING,
+        "whole_alphabet": WHOLE_ALPHABET,
+        "init_from": INIT_FROM,
+        "context_tower": CONTEXT_TOWER,
+        "context_warm_up": CONTEXT_WARM_UP,
+    }
 
 
 def stage_of(config):
     """The stage a mounted run-config records.
 
     v1's run-config predates the stage fields and records none of them; it is
-    the plain run from route A and the reader.
+    the plain run from route A and the reader. A run before #222 records no
+    context tower: it read its context with MacBERT.
     """
     return {
         "ranking": config.get("ranking"),
         "whole_alphabet": config.get("whole_alphabet", False),
         "init_from": config.get("init_from"),
+        "context_tower": config.get("context_tower"),
+        "context_warm_up": config.get("context_warm_up", False),
     }
+
+
+def context_argv():
+    """The context tower's switches, the same on every segment of a run."""
+    argv = []
+    if CONTEXT_TOWER is not None:
+        argv += [
+            "--context-tower",
+            CONTEXT_TOWER["tower"],
+            "--context-revision",
+            CONTEXT_TOWER["revision"],
+            "--context-lora-rank",
+            str(CONTEXT_TOWER["lora_rank"]),
+            "--context-lora-alpha",
+            str(CONTEXT_TOWER["lora_alpha"]),
+        ]
+    if CONTEXT_WARM_UP:
+        argv.append("--context-warm-up")
+    return argv
 
 
 def ranking_argv(segmenter):
@@ -660,6 +713,9 @@ def train_argv(
         argv.append("--search-graphs")
     if WHOLE_ALPHABET:
         argv.append("--whole-alphabet")
+    argv += context_argv()
+    if TOWER_GRAPHS:
+        argv.append("--tower-graphs")
     if resume is not None:
         argv += ["--resume", str(resume)]
     if ACTIVATION_CHECKPOINTING:
@@ -972,6 +1028,10 @@ def main():
         raise RuntimeError("a ranking stage starts from a finished run; stamp INIT_FROM")
     if SEARCH_GRAPHS and RANKING is None:
         raise RuntimeError("only a ranking stage has a search to replay; stamp RANKING")
+    if (CONTEXT_TOWER is not None or CONTEXT_WARM_UP) and INIT_FROM is None:
+        raise RuntimeError("a context tower is swapped into a finished run; stamp INIT_FROM")
+    if TOWER_GRAPHS and (CONTEXT_TOWER is None or CONTEXT_TOWER["lora_rank"]):
+        raise RuntimeError("only a frozen Qwen tower is replayed from graphs; stamp CONTEXT_TOWER")
     install()
     packages = package_root()
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)
