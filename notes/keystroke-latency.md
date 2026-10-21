@@ -617,11 +617,12 @@ foreign batch, and hits shrink the live miss batch.
 Two instruments ship for the M1 to answer it directly:
 
 - `cargo test --release -p ime-lm --no-run` produces the `charlm-*`
-  test binary; `CHARLM_FIXTURES=<dir>/fixtures ./charlm-*
+  test binary; `CHARLM_FIXTURES=<dir> ./charlm-*
   int8_scores_do_not_depend_on_batchmates --exact` runs the
-  solo-vs-128-row-batch bit assertion against the committed fixtures
-  (the env override is what makes the binary portable — it bakes the
-  build machine's manifest dir otherwise).
+  solo-vs-128-row-batch bit assertion against a copy of the fixtures
+  `ime-fixtures` assembles under its `OUT_DIR/charlm` (the env override
+  is what makes the binary portable — it bakes the build machine's
+  `OUT_DIR` otherwise).
 - `ime-cli replay --probe <eval-index>` replays one record with the
   LM's real `advance` calls recorded: at the first keystroke the
   incremental and baseline candidate lists differ it prints both
