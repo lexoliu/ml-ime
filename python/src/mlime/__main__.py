@@ -571,6 +571,11 @@ def train_e2e(
         "--profile-steps",
         help="Steps after warm-up to time per phase; written to stdout and metrics",
     ),
+    profile_start: int = typer.Option(
+        0,
+        "--profile-start",
+        help="The run's step the profiled window opens at, at the earliest (after warm-up)",
+    ),
     trace_steps: int = typer.Option(
         0,
         "--trace-steps",
@@ -640,6 +645,7 @@ def train_e2e(
                 accumulate=accumulate,
                 prefetch=prefetch,
                 profile_steps=profile_steps,
+                profile_start=profile_start,
                 trace_steps=trace_steps,
                 compile=compile,
                 compile_mode=compile_mode,
@@ -1002,6 +1008,10 @@ def e2e_stamp(
     profile_steps: int = typer.Option(
         30, help="Steps after the warm-up the loop times (PROFILE_STEPS)"
     ),
+    profile_start: int = typer.Option(
+        0,
+        help="The run's step the timed window opens at, at the earliest (PROFILE_START)",
+    ),
     trace_steps: int = typer.Option(
         3, help="Of those, how many it records as a torch.profiler trace (TRACE_STEPS)"
     ),
@@ -1092,6 +1102,7 @@ def e2e_stamp(
     spec = E2EV2Run(
         run=run,
         profile_steps=profile_steps,
+        profile_start=profile_start,
         trace_steps=trace_steps,
         train_shards=tuple(train_shard) if train_shard else None,
         stage=stage,

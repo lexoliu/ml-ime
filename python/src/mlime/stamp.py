@@ -154,7 +154,8 @@ class E2EV2Run:
     """One v2 run's kernel: its name and what its legs measure and train on.
 
     *profile_steps* and *trace_steps* are the loop's timing window after the
-    warm-up (``PROFILE_STEPS``, ``TRACE_STEPS``). *train_shards* narrows the
+    warm-up (``PROFILE_STEPS``, ``TRACE_STEPS``), opening at the run's step
+    *profile_start* at the earliest (``PROFILE_START``). *train_shards* narrows the
     epoch to those shards (``TRAIN_SHARDS``): a check that runs a short epoch
     to ``max_steps`` and through the evaluations on a cheap card, or a stage's
     pick of the corpus. *stage* makes the run a stage; without one it trains
@@ -165,6 +166,7 @@ class E2EV2Run:
 
     run: str
     profile_steps: int = 30
+    profile_start: int = 0
     trace_steps: int = 3
     train_shards: tuple[str, ...] | None = None
     stage: E2EV2Stage | None = None
@@ -178,6 +180,8 @@ class E2EV2Run:
             )
         if self.search_graphs and (self.stage is None or self.stage.ranking is None):
             raise ValueError("only a ranking stage has a search to replay from CUDA graphs")
+        if self.profile_start < 0:
+            raise ValueError(f"the window opens at a step, not {self.profile_start}")
         if not 0 <= self.trace_steps <= self.profile_steps:
             raise ValueError(
                 f"the trace covers steps of the profile window: 0 <= {self.trace_steps} "
@@ -195,6 +199,7 @@ class E2EV2Run:
         """The kernel fields this run stamps beside its recipe."""
         return {
             "PROFILE_STEPS": self.profile_steps,
+            "PROFILE_START": self.profile_start,
             "TRACE_STEPS": self.trace_steps,
             "TRAIN_SHARDS": self.train_shards,
             "SEARCH_GRAPHS": self.search_graphs,

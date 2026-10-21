@@ -411,3 +411,58 @@ def test_the_segmenter_is_found_in_the_directory_named_after_it(
     staged = kernel.stage_segmenter()
     assert staged == tmp_path / "working" / "bin" / "ime-segment"
     assert staged.read_bytes() == b"#!/bin/sh\n"
+
+
+def test_the_window_start_reaches_the_trainer_from_the_stamp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`mlime e2e stamp --profile-start` lands in the kernel, its argv, and the trainer's config."""
+    from typer.testing import CliRunner
+
+    import mlime.train.e2e
+    from mlime.__main__ import app
+    from mlime.train.loop import TrainingConfig
+
+    out = tmp_path / "kernel"
+    argv = ["e2e", "stamp", "mlime-e2e-v2-g4-trace", "--out", str(out)]
+    argv += ["--profile-steps", "30", "--profile-start", "400", "--trace-steps", "3"]
+    result = CliRunner().invoke(app, argv)
+    assert result.exit_code == 0, result.output
+    assert "  PROFILE_START = 400" in result.output
+
+    spec = importlib.util.spec_from_file_location("stamped_kernel", out / "kernel.py")
+    assert spec is not None and spec.loader is not None
+    kernel = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(kernel)
+    assert (kernel.PROFILE_STEPS, kernel.PROFILE_START, kernel.TRACE_STEPS) == (30, 400, 3)
+    monkeypatch.setattr(kernel, "TRAIN_SHARDS", ("news-00000.parquet",))
+    command = kernel.train_argv(
+        tmp_path / "char_pinyin.tsv",
+        tmp_path / "run",
+        max_steps=100,
+        wall_budget=None,
+        start=None,
+        resume=None,
+        token_budget=12288,
+        profile_steps=kernel.PROFILE_STEPS,
+        profile_start=kernel.PROFILE_START,
+        trace_steps=kernel.TRACE_STEPS,
+    )
+
+    seen: list[TrainingConfig] = []
+
+    class ReachedError(Exception):
+        """The trainer was called; the test has what it came for."""
+
+    def trainer(*args: object, **_: object) -> None:
+        training = args[2]
+        assert isinstance(training, TrainingConfig)
+        seen.append(training)
+        raise ReachedError
+
+    monkeypatch.setattr(mlime.train.e2e, "e2e", trainer)
+    mlime_at = command.index("mlime")
+    result = CliRunner().invoke(app, [str(arg) for arg in command[mlime_at + 1 :]])
+    assert isinstance(result.exception, ReachedError), result.output
+    (training,) = seen
+    assert (training.profile_steps, training.profile_start, training.trace_steps) == (30, 400, 3)
