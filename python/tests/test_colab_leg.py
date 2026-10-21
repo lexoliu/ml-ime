@@ -7,6 +7,7 @@ with canned probe reports and a fake clock, and once through a fake `colab`
 executable to cover the real `colab exec` round trip.
 """
 
+import ast
 import importlib.util
 import json
 import os
@@ -345,7 +346,14 @@ def test_the_waiter_probes_the_vm_through_colab_exec(tmp_path: Path) -> None:
     )
     assert done.returncode == 10, done.stdout + done.stderr
     calls = [json.loads(line) for line in (fake / "calls.jsonl").read_text().splitlines()]
-    assert [call["argv"] for call in calls] == [["exec", "-s", "mlime-e2e-v2-t4"]] * 3
+    probe = ["exec", "-s", "mlime-e2e-v2-t4", "--timeout", str(control.PROBE_SECONDS)]
+    assert [call["argv"] for call in calls] == [probe] * 3
     # The probe runs the checkout's leg.py, which beats before it reports.
     assert calls[0]["stdin"] == control.PROBE
     assert f"{control.CHECKOUT}/colab/leg.py" in control.PROBE
+
+
+def test_the_probe_leaves_the_kernel_nothing_to_display() -> None:
+    # IPython displays a cell that ends in an expression; leg.py's globals do
+    # not survive its printer.
+    assert not isinstance(ast.parse(control.PROBE).body[-1], ast.Expr)
