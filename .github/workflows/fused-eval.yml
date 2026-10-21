@@ -15,9 +15,16 @@ on:
       contexts:
         description: The context settings to run, as a JSON list
         default: '["on", "off"]'
+      run:
+        description: >
+          The score set to decode: its sections keep their progress and reports
+          under evals/<run> in the bucket, and read their score files from the
+          inputs' folder of the same name (scores for the default)
+        default: fused
 
 env:
   CARGO_TERM_COLOR: always
+  SCORES: ${{ inputs.run == 'fused' && 'scores' || inputs.run }}
   HF_HUB_VERSION: "1.28.0"
   INPUTS: lexoliu/mlime-fused-eval-inputs
 
@@ -50,14 +57,14 @@ jobs:
           --repo-type dataset --local-dir inputs
           --include ngram.bin --include emittable.txt --include "eval3*.jsonl"
           --include "char-lm-int8-pages/*"
-          --include "scores/scores-lattice*-context-${{ matrix.context }}.jsonl.gz"
+          --include "$SCORES/scores-lattice*-context-${{ matrix.context }}.jsonl.gz"
       - name: Restore the progress
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: >
           uv run --no-project --with "huggingface_hub==$HF_HUB_VERSION"
           python .github/scripts/fused-eval-bucket.py get out/progress
-          "evals/fused/${{ matrix.twin }}-context-${{ matrix.context }}/progress"
+          "evals/${{ inputs.run }}/${{ matrix.twin }}-context-${{ matrix.context }}/progress"
       - name: Decode
         env:
           TWIN: ${{ matrix.twin }}
@@ -72,7 +79,7 @@ jobs:
           timeout "${DECODE_MINUTES}m" target/release/ime-cli fused-eval --model inputs/ngram.bin \
             --lm inputs/char-lm-int8-pages --lm-weight 1 \
             --eval-set "inputs/$set_" --emittable inputs/emittable.txt \
-            --scores "inputs/scores/scores-$lattice-context-$CONTEXT.jsonl.gz" "${context[@]}" \
+            --scores "inputs/$SCORES/scores-$lattice-context-$CONTEXT.jsonl.gz" "${context[@]}" \
             --select-on-dev --weight 0.75 --weight 1 --weight 1.5 \
             --dump out/dump --progress out/progress > report.txt
           mv report.txt out/report.txt
@@ -85,4 +92,4 @@ jobs:
         run: >
           uv run --no-project --with "huggingface_hub==$HF_HUB_VERSION"
           python .github/scripts/fused-eval-bucket.py put out
-          "evals/fused/${{ matrix.twin }}-context-${{ matrix.context }}"
+          "evals/${{ inputs.run }}/${{ matrix.twin }}-context-${{ matrix.context }}"
