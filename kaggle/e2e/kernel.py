@@ -91,9 +91,12 @@ CHECKOUT = Path("/tmp/ml-ime")
 
 #: Steps after the compile warm-up whose phases the loop times, and how many
 #: of the first of them it also records as a torch.profiler trace
-#: (`run/trace-rank<r>.json`, ~60 MB a step). The run trains on past the
+#: (`run/trace-rank<r>.json`, ~60 MB a step). The window opens at the run's
+#: step `PROFILE_START` at the earliest, so it can sit in the steady state
+#: rather than among the search-graph captures. The run trains on past the
 #: window; `mlime train measure` reads it back with the samplers' logs.
 PROFILE_STEPS = 0
+PROFILE_START = 0
 TRACE_STEPS = 0
 
 #: Steps this segment trains before it pauses, or None for the wall budget
@@ -579,6 +582,7 @@ def train_argv(
     prefetch=PREFETCH,
     accumulate=ACCUMULATE,
     profile_steps=0,
+    profile_start=0,
     trace_steps=0,
     compile=COMPILE,
     compile_mode=COMPILE_MODE,
@@ -636,6 +640,8 @@ def train_argv(
         argv += ["--compile", "--compile-mode", str(compile_mode)]
     if profile_steps:
         argv += ["--profile-steps", str(profile_steps)]
+    if profile_start:
+        argv += ["--profile-start", str(profile_start)]
     if trace_steps:
         argv += ["--trace-steps", str(trace_steps)]
     if wall_budget is not None:
@@ -1074,6 +1080,7 @@ def main():
                 resume,
                 TOKEN_BUDGET,
                 profile_steps=PROFILE_STEPS,
+                profile_start=PROFILE_START,
                 trace_steps=TRACE_STEPS,
                 nproc=nproc,
                 virtual_ranks=virtual,
