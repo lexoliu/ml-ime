@@ -22,19 +22,23 @@
 //! `--out` gets one tab-separated line per timed call under a header; the
 //! run's median and p95 go to the log.
 
+#[cfg(target_os = "macos")]
 use std::path::PathBuf;
 
 /// How many candidates a row's request carries — the median homophone count
 /// over the syllable inventory, `pressure`'s stand-in for one lattice
 /// position.
+#[cfg(target_os = "macos")]
 const CANDIDATES: usize = 94;
 
 /// The prelude every call's beams descend from: fixed, so every build steps
 /// over the same history.
+#[cfg(target_os = "macos")]
 const CONTEXT: &str =
     "现在我们在测试输入法的每一步延迟，看看在真实的上下文长度下模型一步需要多长时间才能给出候选";
 
 /// The command line.
+#[cfg(target_os = "macos")]
 struct Args {
     dir: PathBuf,
     rows: usize,
@@ -43,6 +47,7 @@ struct Args {
     out: Option<PathBuf>,
 }
 
+#[cfg(target_os = "macos")]
 fn args() -> Args {
     const USAGE: &str = "usage: metal_step <resident-pages export> --rows N [--warmup N] [--iters N] [--out samples.tsv]";
     let mut args = std::env::args().skip(1);
@@ -77,6 +82,7 @@ fn args() -> Args {
 }
 
 /// The nearest-rank *p*-quantile of an ascending slice.
+#[cfg(target_os = "macos")]
 #[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -179,6 +185,5 @@ fn main() {
 
 #[cfg(not(target_os = "macos"))]
 fn main() {
-    let _ = (args, quantile, CANDIDATES, CONTEXT);
     panic!("the Metal step exists only on macOS");
 }
