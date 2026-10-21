@@ -28,7 +28,6 @@ done
 Kaggle runs two kernels at once per account and allows 30 GPU-hours a week, so
 push two, and the next two when those finish.
 | `route-a-v2` | two epochs over all of run3 as a chain of segments; segment 0 counts the steps, every segment trains on a wall budget and pauses resumably |
-| `char-lm` | a character language model over the same 41M lines (`mlime train char-lm`, 2×T4 DDP, wall budget; the kernel's `MODEL` picks the architecture, a 12-layer transformer since `notes/generate-ceiling.md`, the LSTM of `notes/char-lm-v1.md` before it), exported to ONNX (`charlm.onnx`, `prefill.onnx`, the `charlm.weights` shared weights file, `charlm.json`) for `ime-cli fused-eval --lm`. A run longer than one session resumes: push the next session with the previous output added as a kernel source and it continues from that output's `run/charlm.pt` |
 | `e2e` | the end-to-end model of issue #88 (`mlime train e2e`, 2×T4 DDP, wall budget, same segment chain as `route-a-v2`): route A's towers and the transformer reader initialised from `lexoliu/mlime-e2e-init`, decoded by its own beam search with `mlime eval e2e` on the finishing segment. Every segment logs its cards to `gpu.csv` and its trainers' threads and the host's memory to `host.jsonl`; a nonzero `PROFILE_STEPS` (the first `TRACE_STEPS` of them traced) times that many steps after the warm-up and trains on, and `mlime train measure` reads the leg's steady-state rate, utilisation and phase table back from those files; `ACTIVATION_CHECKPOINTING` recomputes the encoder towers when nothing fits. With `INIT_FROM` stamped, the same chain starts from the finished run mounted under that name (`mlime-e2e-final` for v1, or an earlier stage's kernel output) and trains one epoch over `TRAIN_SHARDS`; `WHOLE_ALPHABET` normalises the per-position loss over every emittable character (#121). With `RANKING` stamped as well, it is the ranking stage of #116: it adds the sequence-level ranking loss, and reads segmentations from `ime-segment`, which `colab/e2e.sh start` builds from the leg's commit (`cargo build --release -p ime-pinyin --bin ime-segment --target x86_64-unknown-linux-musl`; `.cargo/config.toml` links it with rust-lld) and uploads beside the inputs |
 
 ## Chaining a training run
@@ -53,55 +52,17 @@ abbreviated and mixed typing), with context on and off, and writes
 `run-summary.json` with `"finished": true`; one that pauses says which segment
 to push next.
 
-## Keeping the chain moving without a session
+## Colab
 
-`kaggle/chain.sh` runs hourly from launchd on the Mac mini
-(`~/Library/LaunchAgents/cool.lexo.mlime-chain.plist`, one log line per run in
-`data/route-a-v2/chain.log`). Whenever the highest pushed segment is COMPLETE it
-downloads that segment's output once into `data/route-a-v2/s<n>`, evaluates the
-segment that finished the run with `kaggle/finish.sh` (six fused evals, results
-in `s<n>/results.md`), and otherwise pushes the next segment; a refused push
-(quota, an expired token) is retried an hour later. Only the notes stay manual.
-`notes/HANDOFF.md` is the operator's manual.
-
-The chain is the same for `e2e`, parameterised rather than copied:
-
-```
-kaggle/chain.sh --slug lexoliu/mlime-e2e-s --kernel-dir kaggle/e2e \
-                --data-dir data/e2e --finish none
-```
-
-`--finish none` is because the e2e kernel evaluates in-kernel (the trigram
-fusion `finish.sh` performs does not apply): the chain only gathers the
-segment's `e2e-*-report.txt` files into `s<n>/results.md`. Bare
-`kaggle/chain.sh` is route A v2, unchanged.
-
-A segment that would reach `max_steps` but could not also fit the scoring pauses
-early (`SCORING_RESERVE_SECONDS`), so the run always finishes in a segment with
-room to score. To spend a partial quota week, stamp `SESSION_SECONDS` smaller at
-push time the way `SEGMENT` is stamped.
-The chain itself pushes a segment only with `MLIME_SESSION_HOURS` (default 12)
-of quota left; set it lower in the job's environment when the next segment
-needs less, as the last segment of a run that pauses with an hour to go does.
-
-## The same kernel on Colab
-
-`colab/char-lm.sh` runs `char-lm/kernel.py` unchanged on a Colab GPU through the
+`colab/e2e.sh` runs the e2e kernel on a Colab GPU through the
 [Colab CLI](https://github.com/googlecolab/google-colab-cli) (`uv tool install
-google-colab-cli`, then `colab usage` once to log in). `start` provisions the
-runtime (an A100 by default), uploads the Hugging Face token and the kernel,
-and runs `colab/stage.py` on the VM, which downloads the four datasets from
-their private Hugging Face repos into `/kaggle/input/<slug>` and launches the
-kernel as a detached process; `status`, `fetch <dir>` and `stop` follow. Both launchers
-provision through `colab/provision.sh`: `start` refuses a session name that is already running,
-and a step that fails after the runtime exists stops that runtime and names the step, so a
-failed start leaves nothing billing and can simply be run again. The kernel sizes itself to
-the GPUs it finds (one rank per GPU, `TOKENS_PER_STEP` split across them), so
-one A100 trains the same batches as Kaggle's two T4s in roughly a third of the
-time, for about 35 compute units.
+google-colab-cli`, then `colab usage` once to log in). It provisions through
+`colab/provision.sh`: `start` refuses a session name that is already running,
+and a step that fails after the runtime exists stops that runtime and names the
+step, so a failed start leaves nothing billing and can simply be run again.
 
 `colab/e2e.sh <kernel dir> start --session-hours H [--commit REV] [--gpu G|--cpu]
-[--census FILE] [--resume-from RUN] [--no-publish]` does the same for a stamped
+[--census FILE] [--resume-from RUN] [--no-publish]` starts a leg of a stamped
 e2e kernel (`kaggle/e2e`, or a run stamped from it with `mlime e2e stamp`).
 `mlime e2e stamp mlime-e2e-v2-<card> --out DIR [--train-shard S ...]
 [--profile-steps N] [--trace-steps N]` writes a v2 run's directory: v1's recipe
@@ -140,11 +101,11 @@ exits with the leg's end, read from the processes, `run-summary.json` and
 failed, 13 past the deadline, 14 runtime lost. `stop` refuses while the newest
 trio is unpublished or a finished run lives only on the VM (`--force` releases
 it anyway); `status`, `fetch <dir>` (the census `batch-counts.json`, the
-metrics and both samplers' logs among them) and `publish` follow. Both drivers upload only
+metrics and both samplers' logs among them) and `publish` follow. The driver uploads only
 the Hugging Face access token, never the OAuth refresh token, so no VM can
 refresh it out from under the Mac's login.
 
-Both stagers fetch the Hub repos with `colab/hub.py`: every file of every repo
+The stager fetches the Hub repos with `colab/hub.py`: every file of every repo
 over its `resolve` URL in one `aria2c` run, 32 files at once. The Hub client's
 `snapshot_download` spends about two seconds on each file before its first
 byte, and the e2e inputs are some 1,700 shards: staged that way a leg waited
