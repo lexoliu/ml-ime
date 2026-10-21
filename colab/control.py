@@ -65,7 +65,8 @@ def probe(session: str) -> Optional[dict[str, Any]]:
     """The VM's `leg.py` report, or None when the probe did not answer."""
     try:
         done = subprocess.run(
-            ["colab", "exec", "-s", session],
+            # The CLI ends a cell after its own timeout, 30 s unless told.
+            ["colab", "exec", "-s", session, "--timeout", str(PROBE_SECONDS)],
             input=PROBE,
             capture_output=True,
             text=True,

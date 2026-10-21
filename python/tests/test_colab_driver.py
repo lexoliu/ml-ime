@@ -193,6 +193,16 @@ def test_a_v2_start_runs_its_commit_on_a_stamped_session_and_builds_no_segmenter
     [fetch] = [c for c in calls if '["checkout"]' in c["stdin"]]
     assert f"[\"checkout\"]('{commit}')" in fetch["stdin"]
     assert stage_argv(calls) == ["--commit", commit, "--session-seconds", "5400", "--no-publish"]
+    # The CLI's own exec timeout is 30 s unless told; every cell gets its bound.
+    assert {tuple(c["argv"][3:]) for c in calls if c["argv"][0] == "exec"} == {("--timeout", "600")}
+
+
+def test_a_longer_bound_reaches_the_cli_s_exec_timeout(driver: Driver) -> None:
+    done = driver.run("start", "--session-hours", "1", "--no-publish", colab_seconds=3600)
+    assert done.returncode == 0, done.stderr
+    execs = [c["argv"] for c in driver.calls() if c["argv"][0] == "exec"]
+    assert execs
+    assert all(argv[3:] == ["--timeout", "3600"] for argv in execs)
 
 
 def test_a_start_whose_code_raises_on_the_runtime_releases_it(driver: Driver) -> None:
