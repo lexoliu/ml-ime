@@ -23,12 +23,13 @@ its report -- evaluates that checkpoint and trains nothing.
 
 A stage is the same chain with `INIT_FROM` stamped: the first segment starts
 from the finished run mounted under that name -- v1's dataset
-`lexoliu/mlime-e2e-final`, or the kernel output of an earlier stage -- with its
-weights, a fresh optimiser and schedule, and its one epoch runs over
-`TRAIN_SHARDS`. With `RANKING` stamped as well it is a ranking stage (#116):
-every segment adds the sequence-level ranking loss, reading each example's
-other segmentations from the `ime-segment` binary mounted beside the inputs
-(`colab/e2e.sh start` builds it from the leg's commit and uploads it).
+`lexoliu/mlime-e2e-final`, the kernel output of an earlier stage, or a
+finished v2 run's outputs, which the Colab stager mounts from the resume
+bucket -- with its weights, a fresh optimiser and schedule, and its one epoch
+runs over `TRAIN_SHARDS`. With `RANKING` stamped as well it is a ranking
+stage (#116): every segment adds the sequence-level ranking loss, reading each
+example's other segmentations from the `ime-segment` binary mounted beside the
+inputs (`colab/e2e.sh start` builds it from the leg's commit and uploads it).
 `WHOLE_ALPHABET` normalises the per-position loss over every emittable
 character (#121). A finished run is told apart from the run it started from
 by the stage its run-config records.
@@ -90,9 +91,12 @@ CHECKOUT = Path("/tmp/ml-ime")
 
 #: Steps after the compile warm-up whose phases the loop times, and how many
 #: of the first of them it also records as a torch.profiler trace
-#: (`run/trace-rank<r>.json`, ~60 MB a step). The run trains on past the
+#: (`run/trace-rank<r>.json`, ~60 MB a step). The window opens at the run's
+#: step `PROFILE_START` at the earliest, so it can sit in the steady state
+#: rather than among the search-graph captures. The run trains on past the
 #: window; `mlime train measure` reads it back with the samplers' logs.
 PROFILE_STEPS = 0
+PROFILE_START = 0
 TRACE_STEPS = 0
 
 #: Steps this segment trains before it pauses, or None for the wall budget
@@ -189,14 +193,21 @@ CHECKPOINT_MINUTES = 0
 RANKING = None
 
 #: The mount a stage starts from: a finished run's dataset or kernel-output
-#: slug, such as "mlime-e2e-final" for v1. Its weights start the run with a
-#: fresh optimiser and schedule; None starts from route A and the reader. A
-#: ranking stage always names one. Stamped per push.
+#: slug, such as "mlime-e2e-final" for v1, or a finished v2 run's name, such
+#: as "mlime-e2e-v2-g4", whose final outputs the Colab stager mounts from the
+#: resume bucket. Its weights start the run with a fresh optimiser and
+#: schedule; None starts from route A and the reader. A ranking stage always
+#: names one. Stamped per push.
 INIT_FROM = None
 
 #: Normalise the decoder's per-position loss over every emittable character
 #: rather than the span's candidates (#121). Stamped per push.
 WHOLE_ALPHABET = False
+
+#: Replay the ranking loss's beam search from captured CUDA graphs (#137);
+#: the search answers as the eager one does, so it is how the stage runs, not
+#: what it trains. Only a ranking stage has the search. Stamped per push.
+SEARCH_GRAPHS = False
 
 #: The training shards a run makes its epoch over; None trains on every
 #: mounted shard but the held-out ones. Stamped per push.
@@ -296,13 +307,17 @@ def describe():
 
 
 def locate_all(*markers):
-    """Every mounted directory holding every one of *markers*."""
+    """Every mounted directory holding every one of *markers*, each a file.
+
+    A marker names a file: the mount the Colab driver makes for `ime-segment`
+    is a directory of that name, which must not make its parent the match.
+    """
     if not INPUTS.is_dir():
         raise FileNotFoundError(f"{INPUTS} does not exist; the kernel has no inputs at all")
     return [
         directory
         for directory in directories(INPUTS)
-        if all((directory / marker).exists() for marker in markers)
+        if all((directory / marker).is_file() for marker in markers)
     ]
 
 
@@ -567,6 +582,7 @@ def train_argv(
     prefetch=PREFETCH,
     accumulate=ACCUMULATE,
     profile_steps=0,
+    profile_start=0,
     trace_steps=0,
     compile=COMPILE,
     compile_mode=COMPILE_MODE,
@@ -624,6 +640,8 @@ def train_argv(
         argv += ["--compile", "--compile-mode", str(compile_mode)]
     if profile_steps:
         argv += ["--profile-steps", str(profile_steps)]
+    if profile_start:
+        argv += ["--profile-start", str(profile_start)]
     if trace_steps:
         argv += ["--trace-steps", str(trace_steps)]
     if wall_budget is not None:
@@ -637,6 +655,9 @@ def train_argv(
     if LEARNING_RATES is not None:
         argv += ["--base-lr", str(LEARNING_RATES[0]), "--new-lr", str(LEARNING_RATES[1])]
     argv += ranking_argv(segmenter)
+    # The trainer's alone: the count shares `ranking_argv` and has no search.
+    if SEARCH_GRAPHS:
+        argv.append("--search-graphs")
     if WHOLE_ALPHABET:
         argv.append("--whole-alphabet")
     if resume is not None:
@@ -949,6 +970,8 @@ def main():
     started = time.monotonic()
     if RANKING is not None and INIT_FROM is None:
         raise RuntimeError("a ranking stage starts from a finished run; stamp INIT_FROM")
+    if SEARCH_GRAPHS and RANKING is None:
+        raise RuntimeError("only a ranking stage has a search to replay; stamp RANKING")
     install()
     packages = package_root()
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)
@@ -1057,6 +1080,7 @@ def main():
                 resume,
                 TOKEN_BUDGET,
                 profile_steps=PROFILE_STEPS,
+                profile_start=PROFILE_START,
                 trace_steps=TRACE_STEPS,
                 nproc=nproc,
                 virtual_ranks=virtual,

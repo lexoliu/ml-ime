@@ -8,9 +8,13 @@ and output fetchers run from the same checkout. Its options -- the commit, the
 session's length, the run to resume and whether to publish -- are recorded in
 `/kaggle/working/leg.json` before anything else, where the waiter's probe
 reads them. It recreates the mount layout the Kaggle kernel expects
-under `/kaggle/input/<name>`: every dataset and every finished run the kernel
-starts from comes from the private Hub dataset repo of the same name, all of
-them in one `aria2c` run (`hub.py`). The resume point is the newest
+under `/kaggle/input/<name>`: every dataset comes from the private Hub
+dataset repo of the same name, all of them in one `aria2c` run (`hub.py`). The
+finished run a stage starts from (`INIT_FROM`) is a Hub repo too when it is
+v1's; a finished v2 run's outputs are in the `lexoliu/mlime-resume` bucket
+under `final/<run>/`, where the publisher put them, and the checkpoint and
+config the kernel reads mount at `/kaggle/input/<run>` -- once its `complete`
+marker says they are whole. The resume point is the newest
 `checkpoint-paused` trio by step among the run's trio in the
 `lexoliu/mlime-resume` bucket and the latest COMPLETE Kaggle segment's output.
 On a GPU it also restores the inductor caches an earlier leg on the same card
@@ -51,16 +55,20 @@ ARIA2 = HERE.parent / "kaggle" / "aria2.py"
 # The checkout's `mlime.stamp`, the one kernel rewrite the repository has; it
 # is standard library only, so it imports before anything is installed.
 sys.path.insert(0, str(HERE.parent / "python" / "src"))
-from mlime.stamp import literal, stamp  # noqa: E402
+from mlime.stamp import E2E_V2_RUN, literal, stamp  # noqa: E402
 
 HF_TOKEN = Path("/root/.cache/huggingface/token")
 #: The files of a kernel output the kernel reads: a finished run's final
 #: checkpoint and config, and a paused segment's trio.
 KERNEL_READS = r"^(run-config\.json|run-summary\.json|checkpoint-paused\.pt|run/checkpoint-final\.pt)$"
 RESUME_MARKERS = ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
+#: What a stage reads of the finished v2 run it starts from (the kernel's
+#: `init_checkpoint`): its final checkpoint and the config recording its stage.
+FINAL_READS = ("run/checkpoint-final.pt", "run-config.json")
 #: Transfers in flight while staging: the Hub repos, the resume trio, the
-#: compile caches and the latest Kaggle segment's probe.
-STAGING_TRANSFERS = 4
+#: compile caches, the latest Kaggle segment's probe and the finished v2 run
+#: a stage starts from.
+STAGING_TRANSFERS = 5
 #: The cadence a Colab leg checkpoints at: the VM can die without warning, so
 #: the trio it would hand the next leg is re-written every twenty minutes.
 CHECKPOINT_MINUTES = 20
@@ -86,6 +94,32 @@ def bucket_trio(publisher, api, run, required):
     api.download_bucket_files(
         publisher.BUCKET,
         [(f"{prefix}/{marker}", mount / marker) for marker in RESUME_MARKERS],
+        raise_on_missing_files=True,
+    )
+    print(f"{publisher.BUCKET}/{prefix}: staged under {mount}", flush=True)
+    return mount
+
+
+def bucket_final(publisher, api, run):
+    """Download what a stage reads of finished v2 *run*'s outputs; return their mount.
+
+    The mount is named after the run, which is how the kernel's
+    `init_checkpoint` finds it. A run without its `complete` marker is still
+    publishing, or never finished; a stage started from part of it would
+    train from whatever arrived, so that refuses.
+    """
+    prefix = publisher.final_prefix(run)
+    if not publisher.final_published(api, run):
+        raise FileNotFoundError(
+            f"{publisher.BUCKET}/{prefix}: no `{publisher.COMPLETE}` marker; INIT_FROM "
+            "names a v2 run whose final outputs are whole in the bucket"
+        )
+    mount = INPUTS / run
+    for name in FINAL_READS:
+        (mount / name).parent.mkdir(parents=True, exist_ok=True)
+    api.download_bucket_files(
+        publisher.BUCKET,
+        [(f"{prefix}/{name}", mount / name) for name in FINAL_READS],
         raise_on_missing_files=True,
     )
     print(f"{publisher.BUCKET}/{prefix}: staged under {mount}", flush=True)
@@ -236,6 +270,18 @@ def requirements(kernel):
     return list(literal(kernel.read_text(), "REQUIREMENTS"))
 
 
+def init_from_bucket(kernel):
+    """The finished v2 run the stamped *kernel* starts from, or None.
+
+    A finished run outside the v2 namespace -- v1's dataset, or a v1 stage's
+    kernel output -- mounts with the metadata's sources instead.
+    """
+    init_from = literal(kernel.read_text(), "INIT_FROM")
+    if init_from is None or E2E_V2_RUN.fullmatch(init_from) is None:
+        return None
+    return init_from
+
+
 def options(argv=None):
     """The leg's options; the commit and the session's length have no default."""
     parser = argparse.ArgumentParser(description="Stage and start one e2e leg.")
@@ -317,8 +363,10 @@ def main(argv=None):
     metadata = json.loads(METADATA.read_text())
     # Every input downloads at once: the GPU is billed while it waits, and one
     # transfer at a time leaves most of the VM's bandwidth unused. The
-    # finished runs a stage starts from (`INIT_FROM`) are Hub repos too.
+    # finished run a stage starts from (`INIT_FROM`) is a Hub repo when it is
+    # v1's, and a v2 run's final outputs in the bucket.
     repos = [*metadata["dataset_sources"], *metadata["kernel_sources"]]
+    finished_v2 = init_from_bucket(KERNEL)
     # --resume-from races another run's checkpoint under this run's name, so
     # two cards can start one leg from the same trio.
     if leg.resume_from is not None:
@@ -332,6 +380,8 @@ def main(argv=None):
             pool.submit(compile_caches, publisher, api),
             pool.submit(stage_latest_segment, base),
         ]
+        if finished_v2 is not None:
+            transfers.append(pool.submit(bucket_final, publisher, api, finished_v2))
         for transfer in as_completed(transfers):
             transfer.result()
 

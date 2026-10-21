@@ -146,9 +146,13 @@ enum Command {
         /// computed live by the towers instead of read from a score file.
         #[arg(long)]
         route_a: Option<PathBuf>,
-        /// Score the records without their contexts: every record's gate is
-        /// zeroed, the `context off` score file's live twin.
-        #[arg(long, requires = "route_a")]
+        /// Decode the records without their contexts: no transition is given
+        /// a record's context, and the emissions come from a score file
+        /// emitted without it (`--scores`, taken on the caller's word: the
+        /// file cannot say) or from the towers with every record's gate
+        /// zeroed (`--route-a`). The report and the progress key say the run
+        /// is context-off.
+        #[arg(long)]
         no_context: bool,
         /// Intra-op threads for the towers' sessions on the per-record path;
         /// a lockstep run (a GPU backend or `--batch` above one) takes all of
@@ -536,7 +540,8 @@ struct FusedRun<'a> {
     scores: Option<&'a Path>,
     /// The towers' export directory, when emissions are computed live.
     route_a: Option<&'a Path>,
-    /// Whether live emissions read the record's context.
+    /// Whether the decoder reads the record's context: the towers' gate, the
+    /// score file's claim, and every transition's start.
     with_context: bool,
     /// Intra-op threads per towers session on the per-record path.
     route_a_threads: NonZeroUsize,
@@ -652,18 +657,23 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
         },
     };
     let corrections = run.search.corrections(&table)?;
-    let progress = run.progress.map(|dir| neural::Progress {
-        dir,
-        model: run.model,
-        lm: run.lm,
-        stop_after: None,
-    });
+    let progress = run
+        .progress
+        .map(|dir| -> Result<_> {
+            Ok(neural::Progress {
+                dir,
+                build: neural::Build::current()?,
+                model: run.model,
+                lm: run.lm,
+                stop_after: None,
+            })
+        })
+        .transpose()?;
     let rendered = neural::fused_eval(
         run.eval_set,
         run.scores,
-        run.route_a
-            .zip(towers.as_ref())
-            .map(|(path, towers)| (path, towers, run.with_context)),
+        run.route_a.zip(towers.as_ref()),
+        run.with_context,
         run.emittable,
         run.unscored,
         run.weights,

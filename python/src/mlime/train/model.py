@@ -414,9 +414,15 @@ class RouteAModel(nn.Module):
             layers.append(layer)
         return layers
 
+    def gate_parameters(self) -> list[nn.Parameter]:
+        """Each context gate the model learns, in the order :meth:`gates` reports them."""
+        return [layer.gate for layer in self.gated_layers()]
+
     def gates(self) -> list[float]:
-        """The current gate value of each cross-attention layer."""
-        return [float(layer.gate.detach()) for layer in self.gated_layers()]
+        """The current value of each gate, read back in one transfer."""
+        gates = [gate.detach() for gate in self.gate_parameters()]
+        values: list[float] = torch.stack(gates).tolist() if gates else []
+        return values
 
     def enable_encoder_checkpointing(self) -> None:
         """Recompute each encoder layer in backward instead of storing it.

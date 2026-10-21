@@ -394,12 +394,12 @@ def ranking_settings(
     weight: float | None,
 ) -> RankingConfig | None:
     """The ranking loss's settings from its switch and its ``--rank-*`` knobs."""
-    from mlime.train.e2e_model import RankingConfig
-
     if not ranking:
         if any(value is not None for value in (segmentations, beam, negatives, weight)):
             raise typer.BadParameter("the --rank-* options set the ranking loss; pass --ranking")
         return None
+    from mlime.train.e2e_model import RankingConfig
+
     default = RankingConfig()
     return RankingConfig(
         segmentations=default.segmentations if segmentations is None else segmentations,
@@ -523,6 +523,11 @@ def train_e2e(
         help="Normalise the decoder's per-position loss over every emittable character "
         "rather than the position's candidates",
     ),
+    search_graphs: bool = typer.Option(
+        False,
+        "--search-graphs/--no-search-graphs",
+        help="Replay the ranking loss's beam search from captured CUDA graphs",
+    ),
     typos: bool = typer.Option(
         False,
         "--typos/--no-typos",
@@ -565,6 +570,11 @@ def train_e2e(
         0,
         "--profile-steps",
         help="Steps after warm-up to time per phase; written to stdout and metrics",
+    ),
+    profile_start: int = typer.Option(
+        0,
+        "--profile-start",
+        help="The run's step the profiled window opens at, at the earliest (after warm-up)",
     ),
     trace_steps: int = typer.Option(
         0,
@@ -635,6 +645,7 @@ def train_e2e(
                 accumulate=accumulate,
                 prefetch=prefetch,
                 profile_steps=profile_steps,
+                profile_start=profile_start,
                 trace_steps=trace_steps,
                 compile=compile,
                 compile_mode=compile_mode,
@@ -654,6 +665,7 @@ def train_e2e(
             ranking=ranking_config,
             segmenter=segmenter,
             whole_alphabet=whole_alphabet,
+            search_graphs=search_graphs,
         )
     except torch.cuda.OutOfMemoryError as error:
         # The peak is recorded even at the crash, and the cache freed before
@@ -996,6 +1008,10 @@ def e2e_stamp(
     profile_steps: int = typer.Option(
         30, help="Steps after the warm-up the loop times (PROFILE_STEPS)"
     ),
+    profile_start: int = typer.Option(
+        0,
+        help="The run's step the timed window opens at, at the earliest (PROFILE_START)",
+    ),
     trace_steps: int = typer.Option(
         3, help="Of those, how many it records as a torch.profiler trace (TRACE_STEPS)"
     ),
@@ -1007,27 +1023,97 @@ def e2e_stamp(
     template: Path | None = typer.Option(
         None, help="The e2e kernel directory to stamp from; kaggle/e2e by default"
     ),
+    init_from: str | None = typer.Option(
+        None,
+        help="Make the run a stage of this finished v2 run, such as mlime-e2e-v2-g4 (INIT_FROM)",
+    ),
+    ranking: bool = RANKING,
+    rank_segmentations: int = RANK_SEGMENTATIONS,
+    rank_beam: int = RANK_BEAM,
+    rank_negatives: int = RANK_NEGATIVES,
+    rank_weight: float = RANK_WEIGHT,
+    base_lr: float | None = typer.Option(
+        None, help="A stage's rate for the pretrained weights; with --new-lr (LEARNING_RATES)"
+    ),
+    new_lr: float | None = typer.Option(
+        None, help="A stage's rate for the weights e2e adds; with --base-lr (LEARNING_RATES)"
+    ),
+    token_budget: int | None = typer.Option(
+        None, help="A stage's padded positions per micro-batch per rank; v1's by default"
+    ),
+    accumulate: int | None = typer.Option(
+        None, help="A stage's micro-batches per optimiser step; v1's by default"
+    ),
+    search_graphs: bool = typer.Option(
+        False,
+        "--search-graphs/--no-search-graphs",
+        help="Replay a ranking stage's search from captured CUDA graphs (SEARCH_GRAPHS)",
+    ),
 ) -> None:
     """Write a v2 run's kernel directory: v1's recipe, the run's slug, the v2 sources.
 
     `colab/e2e.sh <out> start` runs it; every leg carries the one slug and the
-    stager stamps each leg's segment, commit and session into its copy.
+    stager stamps each leg's segment, commit and session into its copy. With
+    `--init-from` the run is a stage of that finished v2 run, and the stage's
+    options -- the ranking loss, the learning rates, the token budget and the
+    accumulation -- are the only fields of v1's recipe it changes; without it
+    they are refused, since a plain v2 run is v1's recipe exactly.
     """
     from mlime.locate import find_upwards
-    from mlime.stamp import E2E_V2_SOURCES, E2EV2Run, stamp_e2e_v2
+    from mlime.stamp import E2E_V2_SOURCES, E2EV2Run, E2EV2Stage, stamp_e2e_v2
 
     source = template or find_upwards(Path("kaggle") / "e2e")
     if source is None:
         raise typer.BadParameter("no kaggle/e2e above the working directory; pass --template")
+    ranking_config = ranking_settings(
+        ranking, rank_segmentations, rank_beam, rank_negatives, rank_weight
+    )
+    recipe_options = {
+        "--ranking": ranking_config,
+        "--base-lr": base_lr,
+        "--new-lr": new_lr,
+        "--token-budget": token_budget,
+        "--accumulate": accumulate,
+    }
+    stage = None
+    if init_from is None:
+        given = [option for option, value in recipe_options.items() if value is not None]
+        if given:
+            raise typer.BadParameter(
+                f"{', '.join(given)} set a stage's recipe, and a stage starts from a finished "
+                "run; pass --init-from"
+            )
+    else:
+        if (base_lr is None) != (new_lr is None):
+            raise typer.BadParameter(
+                "a stage's learning rates are a pair; pass --base-lr and --new-lr"
+            )
+        overrides = {
+            name: value
+            for name, value in (("token_budget", token_budget), ("accumulate", accumulate))
+            if value is not None
+        }
+        stage = E2EV2Stage(
+            init_from=init_from,
+            ranking=ranking_config,
+            learning_rates=None if base_lr is None or new_lr is None else (base_lr, new_lr),
+            **overrides,
+        )
     spec = E2EV2Run(
         run=run,
         profile_steps=profile_steps,
+        profile_start=profile_start,
         trace_steps=trace_steps,
         train_shards=tuple(train_shard) if train_shard else None,
+        stage=stage,
+        search_graphs=search_graphs,
     )
     recipe = stamp_e2e_v2(source, out, spec)
     typer.echo(f"{out}: {spec.slug}, stamped from {source}")
-    typer.echo("v1's recipe, as the template commits it:")
+    if stage is None:
+        typer.echo("v1's recipe, as the template commits it:")
+    else:
+        typer.echo(f"a stage of {stage.init_from}; v1's recipe with its fields over it:")
     for name, value in recipe.items():
         typer.echo(f"  {name} = {value!r}")
     typer.echo("this run's fields:")
@@ -1052,9 +1138,16 @@ def eval_rescore(
 
     from openai.types.shared import ReasoningEffort
 
+    from mlime.endpoint import UnfinishedError
     from mlime.rescore import rescore
 
-    report = rescore(dump, eval_set, picks, concurrency, cast(ReasoningEffort, effort))
+    try:
+        report = rescore(dump, eval_set, picks, concurrency, cast(ReasoningEffort, effort))
+    except UnfinishedError as error:
+        # No summary for a slice with unanswered records: it would count
+        # the endpoint's failures as the model's wrong answers.
+        typer.echo(f"unfinished: {error}", err=True)
+        raise typer.Exit(1) from error
     typer.echo(report.render())
     if out is not None:
         out.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")
@@ -1079,11 +1172,18 @@ def eval_generate(
 
     from openai.types.shared import ReasoningEffort
 
+    from mlime.endpoint import UnfinishedError
     from mlime.generate import generate
 
-    report = generate(
-        dump, eval_set, answers, concurrency, cast(ReasoningEffort, effort), with_hypotheses
-    )
+    try:
+        report = generate(
+            dump, eval_set, answers, concurrency, cast(ReasoningEffort, effort), with_hypotheses
+        )
+    except UnfinishedError as error:
+        # No summary for a slice with unanswered records: it would count
+        # the endpoint's failures as the model's wrong answers.
+        typer.echo(f"unfinished: {error}", err=True)
+        raise typer.Exit(1) from error
     typer.echo(report.render())
     if out is not None:
         out.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")
@@ -1108,6 +1208,30 @@ def eval_rime(
     typer.echo(report.render())
     if out is not None:
         write_report(report, out)
+
+
+@eval_app.command("drift")
+def eval_drift(
+    dump: Path = typer.Option(..., help="A --dump file: fused-eval's or `eval e2e`'s"),
+    eval_set: Path = typer.Option(..., help="The eval set the dump was decoded from"),
+    samples: Path = typer.Option(
+        Path("data/run3_pool/samples"), help="Directory of the sample shards rarity is read off"
+    ),
+    slice_: str = typer.Option("test", "--slice", help="test (default), dev or all"),
+    dev_share: float = typer.Option(0.0905, help="Share of the set that is development data"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Count the top-1 answers by kind and how rare the substituted characters are."""
+    configure(verbose)
+    from mlime.drift import FrequencyRanks, measure
+    from mlime.rescore import read_dump
+
+    if slice_ not in ("dev", "test", "all"):
+        raise typer.BadParameter("--slice must be dev, test or all")
+    ranks = FrequencyRanks.from_shards(list(samples.glob("*.parquet")))
+    typer.echo(f"sample: {samples}, {ranks.characters:,} characters, {len(ranks.ranks):,} distinct")
+    drift = measure(read_dump(dump, eval_set), eval_set, ranks, slice_, dev_share)
+    typer.echo(f"slice: {slice_}\n{drift.render()}")
 
 
 @eval_app.command("e2e")
