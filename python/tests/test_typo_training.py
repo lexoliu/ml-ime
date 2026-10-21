@@ -240,7 +240,7 @@ def test_candidate_space_widens_over_corrections(
 def test_the_batch_carries_letters_and_candidate_lists(
     lexicon: Lexicon, spans: SpanVocab, tokenizer: StubTokenizer
 ) -> None:
-    batch = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
+    batch = Collator(tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
         [example(lexicon, spans, "我爱", ("wo", "ai"))]
     )
     letters = batch.span_letters[0]
@@ -261,21 +261,21 @@ def test_a_typoed_span_collates_under_the_typo_space(
 ) -> None:
     typoed = example(lexicon, spans, "中", ("zhpng",))
     space = CandidateSpace(spans, lexicon.candidate_mask, corrections, lexicon.homophones)
-    batch = Collator(tokenizer, space)([typoed])
+    batch = Collator(tokenizer, tokenizer, space)([typoed])
     assert batch.span_letters[0, 1, :5].tolist() == [25, 7, 15, 13, 6]
     count = int(batch.candidate_counts[0, 1])
     assert count == len(space.resolve("zhpng")) > 0
     assert lexicon.index("中") in batch.candidate_ids[0, 1, :count].tolist()
     # Under the clean space the same example is refused, as typos always were.
     with pytest.raises(ValueError, match="target its span does not admit"):
-        Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))([typoed])
+        Collator(tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask))([typoed])
 
 
 def test_candidates_at_rebuilds_the_mask(
     lexicon: Lexicon, spans: SpanVocab, tokenizer: StubTokenizer
 ) -> None:
     model = tiny_model(lexicon)
-    batch = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
+    batch = Collator(tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
         [example(lexicon, spans, "中我", ("zhong", "wo"))]
     )
     positions = torch.arange(batch.span_ids.numel())
@@ -319,7 +319,7 @@ def test_a_pre_letter_checkpoint_loads_and_is_bit_identical(
     assert bool((resumed.letter_encoder.project.weight == 0).all())
     assert bool((resumed.span_embeddings.weight[spans.unknown_id] == 0).all())
 
-    batch = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
+    batch = Collator(tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
         [example(lexicon, spans, "我爱北京", ("wo", "ai", "bei", "jing"))]
     )
     with torch.no_grad():
@@ -399,7 +399,7 @@ def test_a_pre_letter_checkpoint_resumes_a_typo_run(
                     candidates=space,
                 ),
             ),
-            Collator(tokenizer, space),
+            Collator(tokenizer, tokenizer, space),
         )
 
     # Three clean steps, then the checkpoint rewritten the way the pre-#103

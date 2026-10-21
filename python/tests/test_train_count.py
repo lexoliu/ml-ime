@@ -80,7 +80,7 @@ def batches_in_first_epoch(
     With a *segmenter*, the loop's collator is the ranking one over it.
     """
     samples_dir, labels_dir = corpus
-    plain = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
+    plain = Collator(tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
     collator: BatchCollator = (
         plain if segmenter is None else RankCollator.launch(plain, segmenter, spans, RANKING)
     )
@@ -115,6 +115,7 @@ def test_the_count_is_the_number_of_batches_the_loop_would_take(
         Vocabularies(
             spans=spans,
             tokenizer=tokenizer,
+            context_tokenizer=tokenizer,
             lexicon=lexicon,
             arbitration=arbitration,
             syllables=frozenset(),
@@ -171,6 +172,7 @@ def test_a_ranking_count_weighs_each_example_by_every_row_it_costs(
     vocabularies = Vocabularies(
         spans=spans,
         tokenizer=tokenizer,
+        context_tokenizer=tokenizer,
         lexicon=lexicon,
         arbitration=arbitration,
         syllables=frozenset(),
@@ -218,6 +220,7 @@ def test_every_rank_is_counted_over_the_shards_it_owns(
         Vocabularies(
             spans=spans,
             tokenizer=tokenizer,
+            context_tokenizer=tokenizer,
             lexicon=lexicon,
             arbitration=arbitration,
             syllables=frozenset(),
@@ -250,6 +253,7 @@ def test_a_census_covers_every_epoch_and_is_read_back_from_its_file(
         Vocabularies(
             spans=spans,
             tokenizer=tokenizer,
+            context_tokenizer=tokenizer,
             lexicon=lexicon,
             arbitration=arbitration,
             syllables=frozenset(),
@@ -286,6 +290,7 @@ def test_accumulation_divides_micro_batches_into_steps(
     vocabularies = Vocabularies(
         spans=spans,
         tokenizer=tokenizer,
+        context_tokenizer=tokenizer,
         lexicon=lexicon,
         arbitration=arbitration,
         syllables=frozenset(),
@@ -338,6 +343,7 @@ def test_a_stored_census_is_used_when_the_configuration_matches(
     vocabularies = Vocabularies(
         spans=spans,
         tokenizer=tokenizer,
+        context_tokenizer=tokenizer,
         lexicon=lexicon,
         arbitration=arbitration,
         syllables=frozenset(),
@@ -381,6 +387,7 @@ def test_a_stored_census_is_refused_when_one_field_differs(
     vocabularies = Vocabularies(
         spans=spans,
         tokenizer=tokenizer,
+        context_tokenizer=tokenizer,
         lexicon=lexicon,
         arbitration=arbitration,
         syllables=frozenset(),
@@ -437,6 +444,7 @@ def test_a_census_without_a_version_is_refused(
     vocabularies = Vocabularies(
         spans=spans,
         tokenizer=tokenizer,
+        context_tokenizer=tokenizer,
         lexicon=lexicon,
         arbitration=arbitration,
         syllables=frozenset(),
@@ -479,6 +487,7 @@ def test_a_v1_shaped_census_is_refused_and_recounted(
     vocabularies = Vocabularies(
         spans=spans,
         tokenizer=tokenizer,
+        context_tokenizer=tokenizer,
         lexicon=lexicon,
         arbitration=arbitration,
         syllables=frozenset(),
@@ -622,6 +631,7 @@ def test_the_census_is_the_loops_own_count_at_any_number_of_workers(
     vocabularies = Vocabularies(
         spans=spans,
         tokenizer=tokenizer,
+        context_tokenizer=tokenizer,
         lexicon=lexicon,
         arbitration=arbitration,
         syllables=frozenset(),
@@ -671,6 +681,7 @@ def test_a_ranking_census_reads_the_segmenter_in_every_worker(
     vocabularies = Vocabularies(
         spans=spans,
         tokenizer=tokenizer,
+        context_tokenizer=tokenizer,
         lexicon=lexicon,
         arbitration=arbitration,
         syllables=frozenset(),

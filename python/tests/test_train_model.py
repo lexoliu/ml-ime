@@ -72,7 +72,7 @@ def make_batch_fixture(
         kept = [example for example in examples if example is not None]
         assert len(kept) == 2
         return Collator(
-            tokenizer, CandidateSpace(spans, lexicon.candidate_mask), context_dropout=0.0
+            tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask), context_dropout=0.0
         )(kept)
 
     return build

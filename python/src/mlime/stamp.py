@@ -44,6 +44,8 @@ V1_RECIPE: dict[str, Any] = {
     "WHOLE_ALPHABET": False,
     "TYPOS": False,
     "ACTIVATION_CHECKPOINTING": False,
+    "CONTEXT_TOWER": None,
+    "CONTEXT_WARM_UP": False,
 }
 
 #: What a v2 leg mounts, each a Hugging Face dataset repo the stager downloads:
@@ -64,6 +66,9 @@ E2E_V2_SOURCES = (
 #: a v2 run can never resume or publish under v1's ``mlime-e2e`` or a stage's
 #: name.
 E2E_V2_RUN = re.compile(r"mlime-e2e-v2-[a-z0-9]+(-[a-z0-9]+)*")
+
+#: What a stamped ``CONTEXT_TOWER`` holds: the kernel's ``--context-*`` options.
+CONTEXT_TOWER_FIELDS = frozenset({"tower", "revision", "lora_rank", "lora_alpha"})
 
 
 def literal(source: str, name: str) -> Any:
@@ -126,7 +131,11 @@ class E2EV2Stage:
     ranking loss is trained on top of a finished run, never from route A and
     the reader. *learning_rates* (``LEARNING_RATES``) is the (pretrained, new)
     pair, None for ``mlime train e2e``'s defaults; *token_budget* and
-    *accumulate* default to v1's.
+    *accumulate* default to v1's. *context_tower* (``CONTEXT_TOWER``) reads
+    the context with a Qwen model, swapped in over *init_from*'s MacBERT tower
+    (#222): its ``tower`` and ``revision``, and a ``lora_rank`` and
+    ``lora_alpha`` where 0 keeps it frozen. *context_warm_up*
+    (``CONTEXT_WARM_UP``) trains only the context path, which is S0.
     """
 
     init_from: str
@@ -134,9 +143,16 @@ class E2EV2Stage:
     learning_rates: tuple[float, float] | None = None
     token_budget: int = V1_RECIPE["TOKEN_BUDGET"]
     accumulate: int = V1_RECIPE["ACCUMULATE"]
+    context_tower: dict[str, Any] | None = None
+    context_warm_up: bool = False
 
     def __post_init__(self) -> None:
         _v2_name(self.init_from)
+        if self.context_tower is not None and set(self.context_tower) != CONTEXT_TOWER_FIELDS:
+            raise ValueError(
+                f"a context tower names {sorted(CONTEXT_TOWER_FIELDS)}, "
+                f"got {sorted(self.context_tower)}"
+            )
 
     def fields(self) -> dict[str, Any]:
         """The recipe fields this stage stamps over v1's."""
@@ -146,6 +162,8 @@ class E2EV2Stage:
             "LEARNING_RATES": self.learning_rates,
             "TOKEN_BUDGET": self.token_budget,
             "ACCUMULATE": self.accumulate,
+            "CONTEXT_TOWER": self.context_tower,
+            "CONTEXT_WARM_UP": self.context_warm_up,
         }
 
 
@@ -161,7 +179,9 @@ class E2EV2Run:
     pick of the corpus. *stage* makes the run a stage; without one it trains
     v1's recipe exactly. *search_graphs* replays a ranking stage's search from
     captured CUDA graphs (``SEARCH_GRAPHS``): how the run computes, not what it
-    trains, so it is no part of the recipe.
+    trains, so it is no part of the recipe. *tower_graphs* replays a frozen
+    Qwen context tower's forward from captured CUDA graphs (``TOWER_GRAPHS``),
+    the same kind of choice.
     """
 
     run: str
@@ -171,6 +191,7 @@ class E2EV2Run:
     train_shards: tuple[str, ...] | None = None
     stage: E2EV2Stage | None = None
     search_graphs: bool = False
+    tower_graphs: bool = False
 
     def __post_init__(self) -> None:
         _v2_name(self.run)
@@ -180,6 +201,9 @@ class E2EV2Run:
             )
         if self.search_graphs and (self.stage is None or self.stage.ranking is None):
             raise ValueError("only a ranking stage has a search to replay from CUDA graphs")
+        tower = None if self.stage is None else self.stage.context_tower
+        if self.tower_graphs and (tower is None or tower["lora_rank"]):
+            raise ValueError("only a frozen Qwen context tower has a forward to replay")
         if self.profile_start < 0:
             raise ValueError(f"the window opens at a step, not {self.profile_start}")
         if not 0 <= self.trace_steps <= self.profile_steps:
@@ -203,6 +227,7 @@ class E2EV2Run:
             "TRACE_STEPS": self.trace_steps,
             "TRAIN_SHARDS": self.train_shards,
             "SEARCH_GRAPHS": self.search_graphs,
+            "TOWER_GRAPHS": self.tower_graphs,
         }
 
     def recipe(self) -> dict[str, Any]:
