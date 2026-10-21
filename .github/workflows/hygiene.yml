@@ -1,0 +1,51 @@
+name: Repository hygiene
+
+# Data and binaries never enter the repository (#229): a pull request into dev
+# fails when it adds or modifies a file under data/, a binary, a file with a
+# data or model extension, or a file above 1 MB. A documentation image, kept
+# small, is the one binary allowed.
+
+on:
+  pull_request:
+    branches: [dev]
+
+permissions:
+  contents: read
+
+jobs:
+  files:
+    name: Repository hygiene
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: No data, binaries or large files
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          LIMIT: 1048576
+        run: |
+          set -euo pipefail
+          failed=0
+          reject() { echo "::error file=$1::$2"; failed=1; }
+          while IFS=$'\t' read -r added _ path; do
+            size=$(git cat-file -s "HEAD:$path")
+            case "$path" in
+              data/*) reject "$path" "data/ is never committed" ;;
+            esac
+            case "$path" in
+              *.gz|*.onnx|*.weights|*.pt|*.bin|*.npz|*.npy|*.safetensors|*.parquet)
+                reject "$path" "data and model files are fetched or generated, never committed" ;;
+            esac
+            if [ "$size" -gt "$LIMIT" ]; then
+              reject "$path" "$size bytes is above the $LIMIT-byte limit"
+            fi
+            if [ "$added" = - ]; then
+              case "$path" in
+                *.webp|*.avif|*.png|*.jpg|*.svg) ;;
+                *) reject "$path" "binary file" ;;
+              esac
+            fi
+          done < <(git diff --numstat --diff-filter=AM "$BASE...HEAD")
+          exit "$failed"
