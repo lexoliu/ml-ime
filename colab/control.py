@@ -39,7 +39,9 @@ from zoneinfo import ZoneInfo
 
 #: Where the VM checks out the leg's commit (the kernel's `CHECKOUT`).
 CHECKOUT = "/tmp/ml-ime"
-PROBE = f'import runpy\nrunpy.run_path("{CHECKOUT}/colab/leg.py", run_name="__main__")\n'
+#: Bound to a name: IPython displays a cell's last value, and printing leg.py's
+#: globals raises inside IPython's printer on the runtime's Python.
+PROBE = f'import runpy\nleg = runpy.run_path("{CHECKOUT}/colab/leg.py", run_name="__main__")\n'
 ENDS = {"paused": 10, "finished": 11, "failed": 12}
 DEADLINE = 13
 LOST = 14
@@ -63,7 +65,8 @@ def probe(session: str) -> Optional[dict[str, Any]]:
     """The VM's `leg.py` report, or None when the probe did not answer."""
     try:
         done = subprocess.run(
-            ["colab", "exec", "-s", session],
+            # The CLI ends a cell after its own timeout, 30 s unless told.
+            ["colab", "exec", "-s", session, "--timeout", str(PROBE_SECONDS)],
             input=PROBE,
             capture_output=True,
             text=True,

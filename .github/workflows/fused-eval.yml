@@ -1,0 +1,72 @@
+name: fused-eval
+
+# The fused decoder of notes/char-lm-v2.md -- the trigram and the int8 reader
+# at lm-weight 1 over route A v2's s6 scores -- on every eval3 twin, its weight
+# chosen on dev and then the test slice, with its beams dumped (#170). The
+# inputs come from a private dataset, and the reports and dumps go to the
+# private resume bucket: this repository is public and the dumps hold eval3's
+# text, so nothing is uploaded as an artifact.
+
+on:
+  workflow_dispatch:
+    inputs:
+      contexts:
+        description: The context settings to run, as a JSON list
+        default: '["on", "off"]'
+
+env:
+  CARGO_TERM_COLOR: always
+  HF_HUB_VERSION: "1.28.0"
+  INPUTS: lexoliu/mlime-fused-eval-inputs
+
+jobs:
+  section:
+    name: fused-eval / ${{ matrix.twin }} / context ${{ matrix.context }}
+    runs-on: ubuntu-latest
+    # A section was 20-26 minutes on 8 vCPU; the runner has 4.
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        twin: [full, abbreviated, mixed]
+        context: ${{ fromJSON(inputs.contexts) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: fused-eval
+      - run: cargo build --release --locked -p ime-cli
+      - uses: astral-sh/setup-uv@v5
+      - name: Fetch the inputs
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: >
+          uvx --from "huggingface_hub==$HF_HUB_VERSION" hf download "$INPUTS"
+          --repo-type dataset --local-dir inputs
+          --include ngram.bin --include emittable.txt --include "eval3*.jsonl"
+          --include "char-lm-int8-pages/*"
+          --include "scores/scores-lattice*-context-${{ matrix.context }}.jsonl.gz"
+      - name: Decode
+        env:
+          TWIN: ${{ matrix.twin }}
+          CONTEXT: ${{ matrix.context }}
+        run: |
+          if [ "$TWIN" = full ]; then set_=eval3.jsonl; lattice=lattice; else set_=eval3-$TWIN.jsonl; lattice=lattice-$TWIN; fi
+          context=(); [ "$CONTEXT" = off ] && context=(--no-context)
+          mkdir -p out
+          git rev-parse HEAD > out/commit
+          target/release/ime-cli fused-eval --model inputs/ngram.bin \
+            --lm inputs/char-lm-int8-pages --lm-weight 1 \
+            --eval-set "inputs/$set_" --emittable inputs/emittable.txt \
+            --scores "inputs/scores/scores-$lattice-context-$CONTEXT.jsonl.gz" "${context[@]}" \
+            --select-on-dev --weight 0.75 --weight 1 --weight 1.5 \
+            --dump out/dump > out/report.txt
+          cat out/report.txt
+      - name: Publish to the bucket
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: >
+          uv run --no-project --with "huggingface_hub==$HF_HUB_VERSION"
+          python .github/scripts/fused-eval-publish.py out
+          "evals/fused/${{ matrix.twin }}-context-${{ matrix.context }}"
