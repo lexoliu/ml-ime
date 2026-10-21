@@ -927,6 +927,52 @@ def test_the_first_compile_is_already_dynamic(
     assert int(sum(counters["graph_breaks"].values())) == breaks
 
 
+def test_a_larger_micro_batch_compiles_no_graph_of_its_own(
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    tokenizer: StubTokenizer,
+    reader_vocab: CharVocab,
+    e2e_config: E2EConfig,
+) -> None:
+    """The rows of a micro-batch are as dynamic as its widths from the first compile.
+
+    Doubling the token budget doubles the rows a micro-batch holds, never
+    the kinds of shape: batches of two, three and six rows at three widths --
+    a small budget's micro-batches, then a doubled one's -- share one graph
+    per callable, with no graph break.
+    """
+    from torch._dynamo.utils import counters
+
+    model = tiny_e2e(lexicon, reader_vocab, e2e_config)
+    model.encode = torch.compile(  # type: ignore[method-assign]
+        model.encode, dynamic=True, backend="eager"
+    )
+    model.decoder.forward = torch.compile(  # type: ignore[method-assign]
+        model.decoder.forward, dynamic=True, backend="eager"
+    )
+    collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
+    sentences = [
+        ("我爱", ("wo", "ai")),
+        ("我爱北", ("wo", "ai", "bei")),
+        ("我爱北京", ("wo", "ai", "bei", "jing")),
+    ]
+    examples = [example(spans, lexicon, text, pinyin) for text, pinyin in sentences]
+    batches = [
+        collator(group)
+        for group in (examples[:2], examples, [*examples, *examples], examples[1:] * 3)
+    ]
+    assert [batch.size for batch in batches] == [2, 3, 6, 6]
+    graphs = int(counters["stats"].get("unique_graphs") or 0)
+    breaks = sum(counters["graph_breaks"].values())
+    model.train()
+    for batch in batches:
+        loss = model(batch).loss
+        assert loss is not None
+        loss.backward()
+    assert int(counters["stats"].get("unique_graphs") or 0) - graphs == 2
+    assert int(sum(counters["graph_breaks"].values())) == breaks
+
+
 def test_a_fresh_run_holds_neither_initialisation_checkpoint_once_it_trains(
     corpus: tuple[Path, Path],
     lexicon: Lexicon,
