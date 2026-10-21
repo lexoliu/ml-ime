@@ -40,6 +40,11 @@ LEXICON_SCHEMA = pl.Schema(
 )
 
 
+#: The kinds of knowledge the Sogou dictionaries are filed under. The knowledge
+#: lexicon (``mlime lexicon knowledge``) adds the title lists' own categories.
+KNOWLEDGE_CATEGORIES = ("idiom", "person", "place", "organisation", "work", "internet")
+
+
 @dataclass(frozen=True)
 class ScelDict:
     """A known Sogou dictionary with its provenance and quality metadata."""
@@ -48,6 +53,16 @@ class ScelDict:
     slug: str
     name: str
     quality: str
+    #: What kind of knowledge the dictionary lists, as the knowledge slice of
+    #: eval3 reports it: one of :data:`KNOWLEDGE_CATEGORIES`.
+    category: str
+
+    def __post_init__(self) -> None:
+        if self.category not in KNOWLEDGE_CATEGORIES:
+            raise ValueError(
+                f"dictionary {self.slug} has category {self.category!r}, "
+                f"not one of {KNOWLEDGE_CATEGORIES}"
+            )
 
     @property
     def download_url(self) -> str:
@@ -66,12 +81,105 @@ DICTS: dict[str, ScelDict] = {
             slug="wangluo-liuxing-xinci",
             name="网络流行新词",
             quality="premium — manually reviewed 2026-08-26, very high quality internet vocabulary",
+            category="internet",
         ),
         ScelDict(
             id=177287,
             slug="bilibili-wanggeng",
             name="哔哩网梗",
             quality="unreviewed — bilibili meme vocabulary, appears reasonable",
+            category="internet",
+        ),
+        ScelDict(
+            id=15097,
+            slug="chengyu-suyu",
+            name="成语俗语【官方推荐】",
+            quality="Sogou official recommendation",
+            category="idiom",
+        ),
+        ScelDict(
+            id=75076,
+            slug="sanzi-chengyu",
+            name="三字成语【官方推荐】",
+            quality="Sogou official recommendation",
+            category="idiom",
+        ),
+        ScelDict(
+            id=15209,
+            slug="mingxing",
+            name="明星【官方推荐】",
+            quality="Sogou official recommendation",
+            category="person",
+        ),
+        ScelDict(
+            id=20658,
+            slug="geshou-renming",
+            name="歌手人名大全【官方推荐】",
+            quality="Sogou official recommendation",
+            category="person",
+        ),
+        ScelDict(
+            id=161621,
+            slug="thuocl-lishi-renming",
+            name="THUOCL_历史人名",
+            quality="Tsinghua's THUOCL list of historical names, as uploaded to Sogou",
+            category="person",
+        ),
+        ScelDict(
+            id=11314,
+            slug="xingzheng-quhua",
+            name="全国县及县以上行政区划地名",
+            quality="the most downloaded place-name list of the 城市信息 category",
+            category="place",
+        ),
+        ScelDict(
+            id=11508,
+            slug="fengjing-mingsheng",
+            name="中国风景名胜",
+            quality="the most downloaded scenic-site list of the 城市信息 category",
+            category="place",
+        ),
+        ScelDict(
+            id=3867,
+            slug="guojia-shoudu",
+            name="世界所有国家及其首都",
+            quality="countries and capitals; unreviewed",
+            category="place",
+        ),
+        ScelDict(
+            id=22421,
+            slug="zhengfu-jigou",
+            name="政府机关团体机构大全【官方推荐】",
+            quality="Sogou official recommendation",
+            category="organisation",
+        ),
+        ScelDict(
+            id=20647,
+            slug="gaodeng-yuanxiao",
+            name="中国高等院校（大学）大全【官方推荐】",
+            quality="Sogou official recommendation",
+            category="organisation",
+        ),
+        ScelDict(
+            id=20652,
+            slug="remen-dianying",
+            name="热门电影大全",
+            quality="the most downloaded list of the 电影电视 category",
+            category="work",
+        ),
+        ScelDict(
+            id=22408,
+            slug="dianshiju-ming",
+            name="电视剧名大全",
+            quality="the second most downloaded list of the 电影电视 category",
+            category="work",
+        ),
+        ScelDict(
+            id=22537,
+            slug="dongman-mingcheng",
+            name="动漫名称大全",
+            quality="the most downloaded general list of the 动漫 category",
+            category="work",
         ),
     )
 }

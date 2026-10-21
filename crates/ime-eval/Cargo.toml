@@ -9,11 +9,16 @@ rust-version.workspace = true
 
 [features]
 default = []
-# The `ime-ambiguity` binary, which rescores dumps on the command line.
+# The `ime-ambiguity` and `ime-knowledge` binaries, which rescore dumps on
+# the command line.
 cli = ["dep:clap"]
 
 [[bin]]
 name = "ime-ambiguity"
+required-features = ["cli"]
+
+[[bin]]
+name = "ime-knowledge"
 required-features = ["cli"]
 
 [dependencies]

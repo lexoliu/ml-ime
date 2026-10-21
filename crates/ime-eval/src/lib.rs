@@ -8,17 +8,26 @@
 //! is the entire question milestone 3 asks.
 
 mod ambiguity;
+#[cfg(feature = "cli")]
+pub mod cli;
 mod dump;
+mod knowledge;
 mod metrics;
 mod record;
+mod slice;
 
 pub use ambiguity::{
-    AMBIGUITIES, Ambiguity, AmbiguityReport, AmbiguitySlice, Comparison, Discordance, Listing,
-    Outcome, Position, SetCounts, Verdict,
+    AMBIGUITIES, Ambiguity, AmbiguityReport, AmbiguitySlice, Comparison, Outcome, Position,
+    SetCounts, Verdict,
 };
 pub use dump::{DumpRow, DumpedHypothesis, parse_dump};
+pub use knowledge::{
+    Counts, Entity, JudgedPosition, KnowledgeComparison, KnowledgeLexicon, KnowledgeOutcome,
+    KnowledgeReport, KnowledgeSlice, MIN_ENTRY_CHARACTERS, Paired,
+};
 pub use metrics::{Hypothesize, Observation, Report, Request, evaluate};
 pub use record::{EvalRecord, EvalSet, Slice};
+pub use slice::{Answer, Discordance, Listing};
 
 use ime_pinyin::SegmentError;
 use thiserror::Error;
@@ -101,9 +110,37 @@ pub enum EvalError {
         /// The missing character.
         character: char,
     },
-    /// Two ambiguity reports judged different records and cannot be paired.
+    /// Two slice reports judged different records and cannot be paired.
     #[error("the two reports judged different records; they were not measured on one slice")]
     DifferentRecords,
+    /// A knowledge lexicon line was not `word<TAB>category`.
+    #[error("lexicon line {line} is not `word<TAB>category`")]
+    MalformedEntry {
+        /// One-based line number in the file.
+        line: usize,
+    },
+    /// A knowledge lexicon entry was shorter than the slice allows.
+    #[error(
+        "lexicon line {line}: {word:?} is shorter than {} characters",
+        knowledge::MIN_ENTRY_CHARACTERS
+    )]
+    ShortEntry {
+        /// One-based line number in the file.
+        line: usize,
+        /// The entry.
+        word: String,
+    },
+    /// A knowledge lexicon held an entry twice.
+    #[error("lexicon line {line}: {word:?} appears twice")]
+    DuplicateEntry {
+        /// One-based line number of the second appearance.
+        line: usize,
+        /// The entry.
+        word: String,
+    },
+    /// A knowledge lexicon held no entries.
+    #[error("the knowledge lexicon holds no entries")]
+    EmptyLexicon,
 }
 
 #[cfg(test)]

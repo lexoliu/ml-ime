@@ -10,15 +10,14 @@
 //! own beams through the same code, and the end-to-end evaluation calls this
 //! binary on its dump, so every system is measured identically.
 
-use std::error::Error;
 use std::fmt::Write as _;
-use std::fs;
 use std::io::{self, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use askama::Template as _;
 use clap::Parser;
+use ime_eval::cli::{chain, read};
 use ime_eval::{AmbiguityReport, AmbiguitySlice, EvalSet, Slice, parse_dump};
 use ime_pinyin::{Lexicon, SyllableTable};
 
@@ -44,23 +43,6 @@ struct Args {
     /// answer and the wanted sentence's rank in the dump.
     #[arg(long)]
     by_record: bool,
-}
-
-fn read(path: &Path, what: &str) -> Result<String, String> {
-    fs::read_to_string(path)
-        .map_err(|error| format!("could not read the {what} at {}: {error}", path.display()))
-}
-
-/// *error* and every cause behind it, on one line.
-fn chain(error: &dyn Error) -> String {
-    let mut message = error.to_string();
-    let mut cause = error.source();
-    while let Some(inner) = cause {
-        message.push_str(": ");
-        message.push_str(&inner.to_string());
-        cause = inner.source();
-    }
-    message
 }
 
 fn run(args: &Args) -> Result<String, String> {
