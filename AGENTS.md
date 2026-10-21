@@ -86,6 +86,9 @@ table does not load, so an export and the decoder always move together.
   work is shaped wrong — too few rows a step, too few records in flight, a serial stage — and
   the shape is fixed before the run continues. Check utilisation once the run has warmed up and
   again at every wake, and record it with the run.
+- A performance measurement on a training card is training: every configuration starts from
+  the run's checkpoint and keeps its own, and the winner continues from its checkpoint. A leg
+  that is thrown away buys the same steps and discards them.
 - A grid never repeats a configuration already shown to be redundant. Once a cheaper
   configuration has matched the expensive one on the dev slice, the grid runs the cheaper one and
   the expensive one is a single check.
