@@ -2,13 +2,13 @@
 
 ## Verdict
 
-The ranking term pays at a small weight. The best end-to-end model so far is #127's fine-tuned checkpoint with a ranking stage at weight 0.1, chosen on dev (#130, below). It beats the fused decoder on abbreviated input and trails it by about a point on the other two styles. Test slices, context on, top-1:
+The ranking term pays at a small weight. The best end-to-end model so far is e2e v2 with a ranking stage at weight 0.05, chosen on dev (#132, below). It beats the fused decoder on abbreviated input and trails it by 0.72 points on full pinyin and 0.12 on mixed input. Test slices, context on, top-1:
 
-| style | ranked at 0.1 (#130) | fine-tuned (#127) | ranked at 1.0 (#116) | v1 | fused |
-|---|---|---|---|---|---|
-| full | **77.06%** | 75.37% | 74.40% | 73.52% | 78.16% |
-| abbreviated | **29.01%** | 26.63% | 22.14% | 25.05% | 28.26% |
-| mixed | **37.73%** | 35.69% | 32.04% | 34.70% | 38.54% |
+| style | v2 ranked at 0.05 (#132) | v2 (#155) | ranked at 0.1 (#130) | fine-tuned (#127) | ranked at 1.0 (#116) | v1 | fused |
+|---|---|---|---|---|---|---|---|
+| full | **77.44%** | 75.77% | 77.06% | 75.37% | 74.40% | 73.52% | 78.16% |
+| abbreviated | 28.89% | 27.31% | **29.01%** | 26.63% | 22.14% | 25.05% | 28.26% |
+| mixed | **38.42%** | 36.84% | 37.73% | 35.69% | 32.04% | 34.70% | 38.54% |
 
 The sections below record each run in order. The first verdict, written after #116 alone, follows.
 
@@ -461,7 +461,82 @@ The estimate was 6.2 h of training each: it assumed 1.1M examples at #116's 49 e
 
 The first harvest of weight 0.1 broke off with the Mac mini's disk at 15 GB free. The kernel output carried the run's numbered checkpoint beside the final one, 3.5 GB that nothing reads. A finished run now publishes only its final checkpoint (#131).
 
+## The ranking stage on e2e v2 (#132)
+
+e2e v2 (#155) is one epoch from v1's initialisation on the interleaved stream (#133). Two ranking stages start from its final checkpoint, `INIT_FROM = "mlime-e2e-v2-g4"`, at weights 0.05 and 0.1. Everything else is #130's recipe: 8 segmentations, beam 4, 8 negatives, the candidates-only per-position term, learning rates (2e-5, 2e-5), 12,288 tokens per rank × 2 ranks × accumulate 2, one epoch over the 20-pick (22 shards, 1,192,633 examples). The interleaved stream balances the ranks to 23,585 and 23,567 micro-batches, so the epoch is 11,784 optimiser steps and none are dropped. Both ran on a Colab G4 as one process of two virtual ranks with the search replayed from CUDA graphs (#137): `mlime-e2e-v2-rank-g4` at 6ae0132 and `mlime-e2e-v2-rank01-g4` at 066850c, which adds #181 and changes nothing that is computed.
+
+Held-out per-position accuracy (with / without context) is 92.30% / 90.02% at 0.05 and 92.18% / 89.83% at 0.1, against v2's 92.14% / 89.92%.
+
+### Choosing on dev
+
+Dev slice, top-1. Weight 0 is v2 itself:
+
+| style | context on: 0 / 0.05 / 0.1 | context off: 0 / 0.05 / 0.1 |
+|---|---|---|
+| full | 77.51% / **80.72%** / 80.52% | 72.89% / 74.30% / **74.50%** |
+| abbreviated | 28.42% / **29.89%** / 28.00% | 18.74% / **20.00%** / 19.79% |
+| mixed | 36.36% / 39.26% / **39.88%** | 26.86% / 30.37% / **30.79%** |
+
+Both weights beat v2 on every style. Weight 0.05 is chosen: with context on it answers 734 of the 1,457 dev records right against 727 at 0.1. That margin is small, and with context off it is 612 against 614 the other way. Between 0.05 and 0.1 the dev slice cannot tell the weights apart.
+
+### Results at weight 0.05
+
+Test slice, context on:
+
+| style | metric | weight 0.05 | v2 | fused |
+|---|---|---|---|---|
+| full | top-1 | 77.44% (+1.67) | 75.77% | **78.16%** |
+| full | top-8 | **91.96%** (+0.99) | 90.97% | 82.53% |
+| full | character | 95.61% (+1.23) | 94.38% | |
+| abbreviated | top-1 | **28.89%** (+1.58) | 27.31% | 28.26% |
+| abbreviated | top-8 | **44.20%** (+0.64) | 43.56% | 34.10% |
+| abbreviated | character | 68.14% (+1.83) | 66.31% | |
+| mixed | top-1 | 38.42% (+1.58) | 36.84% | **38.54%** |
+| mixed | top-8 | **54.65%** (+1.31) | 53.34% | 47.53% |
+| mixed | character | 76.25% (+2.02) | 74.23% | |
+
+Test slice, context off, top-1: 70.82% / 18.16% / 28.74% on full / abbreviated / mixed, against v2's 69.41% / 17.05% / 27.97% and the fused decoder's 71.85% / 17.27% / 29.14% (#168). Weight 0.1 on test is level with 0.05: 77.34% / 29.19% / 38.44% with context on, 70.94% / 17.98% / 28.45% with context off.
+
+The top-1 answers on the test slice, context on, by kind, and the rarity of the substituted characters, measured as in the tables above (`mlime eval drift`):
+
+| style | run | right / same length / other length | unseen in the sample | median frequency rank |
+|---|---|---|---|---|
+| full | v2 | 3,809 / 1,096 / 122 | 3.1% | 420 |
+| full | 0.05 | 3,893 / 1,116 / 18 | 4.5% | 452.5 |
+| full | 0.1 | 3,888 / 1,124 / 15 | 4.4% | 456 |
+| abbreviated | v2 | 1,379 / 2,955 / 716 | 6.3% | 258 |
+| abbreviated | 0.05 | 1,459 / 3,131 / 460 | 7.0% | 288 |
+| abbreviated | 0.1 | 1,474 / 3,151 / 425 | 7.2% | 310 |
+| mixed | v2 | 1,857 / 2,616 / 568 | 7.0% | 268 |
+| mixed | 0.05 | 1,937 / 2,774 / 330 | 7.6% | 309 |
+| mixed | 0.1 | 1,938 / 2,790 / 313 | 7.5% | 326 |
+
+The earlier tables count every record. Over every record these shares move by at most 0.2 points.
+
+### What it says
+
+The ranking stage pays on v2 as it did on #127. At 0.05 it adds 1.58–1.67 points of test top-1 with context on and 0.77–1.41 with context off. No earlier end-to-end checkpoint comes as close to the fused decoder on full and mixed input. With context on it beats the fused decoder on abbreviated input by 0.63 points and trails it by 0.72 on full pinyin and 0.12 on mixed. With context off it beats it on abbreviated input by 0.89 and trails by 1.03 and 0.40. #149's first two acceptance criteria are not met yet.
+
+The drift toward rare characters is back, at about the size #130 found. The share of substituted characters unseen in the sample rises from 3.1% to 4.5% on full pinyin, from 6.3% to 7.0% on abbreviated input and from 7.0% to 7.6% on mixed. #130 measured rises of 1.1, 0.7 and 0.3 points at 0.1 on #127. It does not grow between 0.05 and 0.1: the unseen shares are within 0.2 points of each other. Only the median rank creeps up on abbreviated and mixed input (288 → 310 and 309 → 326). In this range the drift is a fixed cost of having the ranking term, not a function of its weight.
+
+Where the segmentation gain goes differs by style. On full pinyin, 84 of the 104 answers that stop being wrong-length become right. On abbreviated and mixed input only 80 of 256 and 80 of 238 do, and the rest become right-length wrong answers. That is where the fused decoder's lead on mixed input is left, and where the drift costs most.
+
+### Cost
+
+| leg | commit | rate | GPU | training time |
+|---|---|---|---|---|
+| 0.05 | 6ae0132 | 0.542 s/step over steps 300–2130 | 85.2% busy, 304 W, no throttling | 6,789 s |
+| 0.1 | 066850c | 0.478 s/step over steps 1530–1960 | 97.1% busy, 346 W, no throttling | 5,925 s |
+
+#181 removed the ranking step's device syncs. The steady rate is 12% faster and the card went from 85% to 97% busy. Over the whole run the same 11,780 steps took 13% less training time, two minutes of it the first step's compile (203 s against 84 s). Each of the six evaluations took 86–97 s on the same card.
+
+### Reproduce
+
+1. Stamp the kernel: `uv run --project python mlime e2e stamp mlime-e2e-v2-rank-g4 --out <dir> --init-from mlime-e2e-v2-g4 --ranking --rank-weight 0.05 --base-lr 2e-5 --new-lr 2e-5 --token-budget 12288 --accumulate 2 --search-graphs`, with one `--train-shard` for each of the 20-pick's 22 shards (the `train_shards` of `run-config.json` below).
+2. Run it: `colab/e2e.sh <dir> start --session-hours 5 --gpu G4`, then `colab/e2e.sh <dir> wait --deadline 18000` until it finishes. The final checkpoint, `run-config.json` and the six evaluations with their dumps are in the `lexoliu/mlime-resume` bucket under `final/mlime-e2e-v2-rank-g4/` (`final/mlime-e2e-v2-rank01-g4/` for 0.1).
+3. The drift table, per twin and run: `uv run --project python mlime eval drift --dump <final>/e2e-lattice-context-on.jsonl --eval-set data/run3_pool/eval3.jsonl --slice test`, with `-abbreviated` and `-mixed` in both names for the other twins. It reproduces #130's table exactly with `--slice all`.
+
 ## Next
 
-- **The weight below 0.1 (#132).** The same stage at weight 0.05 decides whether the optimum lies lower. It needs about 7.7 GPU-session hours, more than this week's remaining quota, so it is pushed after the 2026-10-23 reset.
-- **The stream's dealing and order (#133).** Deal below shard granularity so the ranks balance to within a micro-batch, and interleave the sources throughout the epoch, so a future full epoch neither drops examples nor ends on one tail of the corpus.
+- **More ranking data at 0.05 (#149).** The dev gain holds on v2 and the drift does not grow with the weight, so the next stage trains the ranking term at 0.05 on more than the 20-pick. It continues only while the dev gain holds and the drift, measured as here against the 0.05 rows, does not grow.
+- **Where right-length wrong answers come from.** On abbreviated and mixed input two thirds of the segmentation gain becomes right-length wrong answers. The hypothesis is #116's: the term's negatives come from a beam of 4 over 8 readings, so on spans that admit hundreds of characters it never offers most of them as negatives. That is the place to look for the remaining gap to the fused decoder on mixed input.
