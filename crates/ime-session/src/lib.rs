@@ -11,9 +11,14 @@
 //! A session is single-threaded by contract: it is called from the input
 //! method's keystroke handler, one event at a time. The models it borrows are
 //! the shared, thread-per-caller kind the engine carries.
+//!
+//! [`KeySession`] is the end-to-end network's session (#216): it reads the
+//! raw keys and lists only legal readings of them, through the constrained
+//! search over keys.
 
 mod cache;
 mod fused;
+mod keyed;
 
 use ime_decode::{
     BeamOptions, Breakdown, Candidates, DecodeError, Emission, Hypothesis, Record, Transition,
@@ -28,6 +33,9 @@ use thiserror::Error;
 
 pub use cache::{CacheReport, Cached};
 pub use fused::{EngineStats, Fused, FusedConfig, Timed, TransitionStats};
+pub use keyed::{
+    KeyCandidate, KeyCommit, KeyEngine, KeySession, KeySessionError, KeySessionOptions,
+};
 
 /// What produces the scores for one keystroke's decode.
 ///

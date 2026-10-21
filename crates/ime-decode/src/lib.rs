@@ -9,10 +9,16 @@
 //! model was constrained by, with a transition term supplying the agreement. The
 //! n-gram baseline is the same search with the emission term switched off
 //! ([`Uniform`]), which is what makes the two routes comparable.
+//!
+//! [`keyed`] is the end-to-end network's search (#216): a beam over the raw
+//! keys, constrained by the legality automaton instead of a list of readings.
 
 mod beam;
 mod candidates;
 mod emissions;
+pub mod keyed;
+#[cfg(any(test, feature = "mock"))]
+pub mod mock;
 mod score;
 
 pub use beam::{BeamOptions, Breakdown, Hypothesis, Record, decode_many, decode_many_stats};

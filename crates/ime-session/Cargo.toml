@@ -17,6 +17,7 @@ ime-pinyin.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+ime-decode = { workspace = true, features = ["mock"] }
 ort.workspace = true
 
 [lints]
