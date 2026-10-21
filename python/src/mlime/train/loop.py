@@ -101,6 +101,12 @@ class TrainingConfig:
     #: Steps after warm-up to split into per-phase timings. Zero leaves the
     #: loop untouched by the profiler's synchronising marks.
     profile_steps: int = 0
+    #: The run's step the profiled window opens at, at the earliest: the
+    #: window waits for the warm-up and for this step, whichever comes later,
+    #: so a run can time and trace its steady state rather than the steps
+    #: right after the compile, where a ranking run is still capturing its
+    #: search graphs.
+    profile_start: int = 0
     #: The first of the profiled steps to also record as a torch.profiler
     #: trace, one Chrome trace per rank in the run directory, with each
     #: phase boundary a ``phase.<name>`` event. The trace shows what the
@@ -141,6 +147,8 @@ class TrainingConfig:
             raise ValueError(f"accumulate must be at least 1, got {self.accumulate}")
         if self.profile_steps < 0:
             raise ValueError(f"profile_steps must not be negative, got {self.profile_steps}")
+        if self.profile_start < 0:
+            raise ValueError(f"profile_start must not be negative, got {self.profile_start}")
         if not 0 <= self.trace_steps <= self.profile_steps:
             raise ValueError(
                 f"trace_steps must be within the {self.profile_steps} profiled steps, "
@@ -394,7 +402,8 @@ class Profiler:
     ``trace`` is a number of steps and where to write them: the window's
     first that many steps also run under torch.profiler, and the trace is
     exported once they are done, every mark leaving a ``phase.<name>`` event
-    at the moment its phase ended.
+    at the moment its phase ended. ``start`` is the run's step the window
+    opens at, at the earliest; the steps before it count as warm-up.
     """
 
     def __init__(
@@ -405,9 +414,12 @@ class Profiler:
         dynamic: bool = False,
         sync_check: bool = True,
         trace: tuple[int, Path] | None = None,
+        start: int = 0,
     ):
         self.device = device
         self.steps = steps
+        self.start = start
+        self.first_step: int | None = None
         self.dynamic = dynamic
         self.sync_check = sync_check
         self._trace = trace
@@ -431,15 +443,22 @@ class Profiler:
             _dynamo_breaks() - self._breaks_at_begin,
         )
 
-    def begin(self, local_step: int) -> None:
-        """Start a step: collect it when it lands inside the profiled window."""
+    def begin(self, local_step: int, run_step: int) -> None:
+        """Start a step: collect it when it lands inside the profiled window.
+
+        *local_step* counts this segment's steps from one, *run_step* is the
+        number the run's metrics give the step.
+        """
         warmed = self._warmed if self.dynamic else local_step > PROFILE_WARMUP_STEPS
-        collect = self.steps > 0 and warmed and len(self.records) < self.steps
+        collect = (
+            self.steps > 0 and warmed and run_step >= self.start and len(self.records) < self.steps
+        )
         if not collect:
             self.warmup_steps += 1
         self._current = {} if collect else None
         if collect and not self._window:
             self._window.append(time.time())
+            self.first_step = run_step
         if collect and not self.records and self._trace is not None:
             activities = [torch.profiler.ProfilerActivity.CPU]
             if self.device.type == "cuda":
@@ -536,6 +555,7 @@ class Profiler:
         return {
             "steps": len(self.records),
             "warmup_steps": self.warmup_steps,
+            "first_step": self.first_step,
             "window": self._window,
             # The allocator's high-water mark so far: the window comes after
             # the warm-up, so the shapes the run trains on have all been seen.
@@ -894,6 +914,7 @@ def train(
         trace=(config.trace_steps, out_dir / f"trace-rank{world.rank}.json")
         if config.trace_steps
         else None,
+        start=config.profile_start,
     )
 
     rank_lanes: list[RankLane] = []
@@ -956,7 +977,7 @@ def train(
 
     try:
         while True:
-            profiler.begin(step - first_step + 2)
+            profiler.begin(step - first_step + 2, step + 1)
             windows = [
                 [next(lane.producer) for _ in range(config.accumulate)] for lane in rank_lanes
             ]
@@ -1029,12 +1050,21 @@ def train(
             if world.is_main and (step % config.log_every == 0 or step == first_step):
                 if step_loss is None:  # unreachable: every micro-batch raises or contributes
                     raise RuntimeError("a step held no scored position")
-                loss_now = float(step_loss)
+                # The logged numbers stay on the device until here and come
+                # back in one transfer: each read is a wait for the queue.
+                read: list[float] = torch.stack(
+                    [
+                        step_loss.float(),
+                        *(extra.float() for extra in step_extras.values()),
+                        *(gate.detach().float() for gate in model.gate_parameters()),
+                    ]
+                ).tolist()
+                loss_now = read[0]
                 record = {
                     "event": "step",
                     "step": step,
                     "loss": loss_now,
-                    **{name: float(extra) for name, extra in step_extras.items()},
+                    **dict(zip(step_extras, read[1 : 1 + len(step_extras)], strict=True)),
                     "lr": scheduler.get_last_lr()[0],
                     "new_lr": scheduler.get_last_lr()[1],
                     "examples": sum(item.batch.size for item in windows[0]),
@@ -1044,7 +1074,7 @@ def train(
                     # Wall clock, to match a span of steps against samples
                     # taken outside the process (nvidia-smi, /proc).
                     "time": round(time.time(), 3),
-                    "gates": model.gates(),
+                    "gates": read[1 + len(step_extras) :],
                 }
                 first_logged_loss = loss_now if first_logged_loss is None else first_logged_loss
                 last_logged_loss = loss_now
@@ -1343,6 +1373,7 @@ SEGMENT_FIELDS = frozenset(
         "segment_steps",
         "prefetch",
         "profile_steps",
+        "profile_start",
         "trace_steps",
         "agree_every",
         "compile",

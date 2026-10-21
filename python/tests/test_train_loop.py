@@ -25,6 +25,7 @@ from transformers import BertConfig
 
 from mlime.train import loop
 from mlime.train.arbitration import ReadingArbitration
+from mlime.train.e2e_model import RankingConfig
 from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.loop import (
     PHASES,
@@ -46,7 +47,7 @@ from mlime.train.producer import (
     ProcessProducer,
     StreamPosition,
 )
-from mlime.train.ranking import RankBatch
+from mlime.train.ranking import RankCollator
 from mlime.train.samples import (
     IGNORE_INDEX,
     BaseTokenizer,
@@ -662,31 +663,41 @@ def test_a_ranking_batch_pins_its_rows_and_keeps_its_layout(
     lexicon: Lexicon, spans: SpanVocab, tokenizer: BaseTokenizer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor.clone())
-    rows = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
-        [
-            TrainingExample(
-                id="a",
-                spans=("wo",),
-                span_ids=(spans.id("wo"),),
-                targets=(lexicon.index("我"),),
-                context="北京",
-            )
-        ]
+    example = TrainingExample(
+        id="a",
+        spans=("wo",),
+        span_ids=(spans.id("wo"),),
+        targets=(lexicon.index("我"),),
+        context="北京",
     )
-    batch = RankBatch(rows=rows, owners=(0,), gold_rows=(0,), lengths=(1,), gold=((3,),))
+    collator = RankCollator(
+        Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)),
+        lambda _: [("w",)],
+        spans,
+        RankingConfig(segmentations=8, beam=4, negatives=8, weight=1.0),
+    )
+    batch = collator([example])
     held = batch.pin_memory()
-    assert (held.owners, held.gold_rows, held.lengths, held.gold) == (
+    assert (held.owners, held.gold_rows, held.lengths) == (
         batch.owners,
         batch.gold_rows,
         batch.lengths,
-        batch.gold,
     )
-    assert held.rows.ids == rows.ids
+    assert held.rows.ids == batch.rows.ids
     assert all(
-        torch.equal(getattr(held.rows, name), getattr(rows, name))
-        for name in vars(rows)
+        torch.equal(getattr(held.rows, name), getattr(batch.rows, name))
+        for name in vars(batch.rows)
         if name != "ids"
     )
+    for name, value in vars(batch.layout).items():
+        kept = getattr(held.layout, name)
+        if isinstance(value, torch.Tensor):
+            assert kept is not value and torch.equal(kept, value), name
+        else:
+            assert kept == value, name
+    # One example of two readings: its gold path, then a block of the gold
+    # sentence on the other reading and min(8, 4 * 2) negatives.
+    assert (held.layout.items, held.layout.slots, held.layout.hypotheses) == (1 + 9, 10, 8)
 
 
 def test_a_prefetched_segment_pauses_and_resumes_on_the_consumed_batch(
@@ -906,7 +917,7 @@ def test_a_profiled_run_writes_the_phase_table(
     assert segment.finished and segment.step == 16
     profiled = records(segment.metrics, "profile")
     assert len(profiled) == 1
-    assert profiled[0]["steps"] == 2
+    assert (profiled[0]["steps"], profiled[0]["first_step"]) == (2, 11)
     window_closed = profiled[0]["window"][1]
     after = [r for r in records(segment.metrics, "step") if r["time"] > window_closed]
     assert [r["step"] for r in after] == [13, 14, 15, 16]
@@ -917,6 +928,36 @@ def test_a_profiled_run_writes_the_phase_table(
     assert set(profiled[0]["phases"]) == set(PHASES)
     for phase in profiled[0]["phases"].values():
         assert phase["p95"] >= phase["mean"] >= 0.0
+
+
+def test_a_profile_window_opens_at_its_start_step(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """A window given a start waits for it, and measuring reads the steps after it.
+
+    Past the warm-up the start decides; inside the warm-up the warm-up does.
+    """
+    config = replace(RESUMABLE, max_steps=18, profile_steps=2, profile_start=14)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    segment = train(tiny_model(lexicon), [BuiltLane(stream, collator)], config, tmp_path / "late")
+    (profiled,) = records(segment.metrics, "profile")
+    assert (profiled["first_step"], profiled["steps"], profiled["warmup_steps"]) == (14, 2, 13)
+    steady = measure(tmp_path / "late")
+    assert (steady["rate"]["first_step"], steady["rate"]["last_step"]) == (16, 18)
+    assert steady["profile"]["first_step"] == 14
+
+    early = replace(config, max_steps=14, profile_start=3)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    segment = train(tiny_model(lexicon), [BuiltLane(stream, collator)], early, tmp_path / "early")
+    (profiled,) = records(segment.metrics, "profile")
+    assert profiled["first_step"] == 1 + loop.PROFILE_WARMUP_STEPS
+    with pytest.raises(ValueError, match="profile_start"):
+        replace(RESUMABLE, profile_start=-1)
 
 
 def test_a_traced_run_writes_its_first_profiled_steps_as_a_trace(
