@@ -595,7 +595,8 @@ def test_a_search_past_the_buffers_is_captured_anew(lexicon: Lexicon, spans: Spa
         held = graphs.run(model.decoder, inputs(small))
         eager = run_search(model.decoder, inputs(large))
         replayed = graphs.run(model.decoder, inputs(large))
-    assert replayed[0].shape[0] > held[0].shape[0]
+    # The sequences are [lanes, beam, positions]: the longer lane grows the positions.
+    assert replayed[0].shape[-1] > held[0].shape[-1]
     for expected, found in zip(eager, replayed, strict=True):
         assert torch.equal(expected, found)
     assert len(graphs.captured) == 1
