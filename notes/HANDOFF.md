@@ -17,13 +17,10 @@ Read this file, then `notes/route-a-v1.md`, `notes/v2-data-prep.md` and
   steps on Kaggle 2×T4 as a chain of seven kernels that resumed each other,
   finished 2026-09-19 (segment 6) and evaluated into
   `data/route-a-v2/s6/results.md`; the write-up is `notes/route-a-v2.md`.
-- **Still running**: launchd on this Mac mini runs `kaggle/chain.sh` hourly;
-  with the run finished every pass logs "the run is finished at segment 6".
-  A v3 run is a new segment 0 (§3, §4.3); the chain then pushes, harvests and
-  evaluates it the same way.
-- **What a person does**: read `data/route-a-v2/chain.log`, follow section 5
-  when something breaks, and turn a finished run's `results.md` into a
-  `notes/route-a-v<n>.md` (section 4).
+- **Nothing runs unattended**: a training leg runs on Colab through
+  `colab/e2e.sh` (§3) and is watched by its own `wait`.
+- **What a person does**: follow section 5 when something breaks, and turn a
+  finished run's evaluations into a note under `notes/` (section 4).
 - **Rules**: never push to `dev` or `main`; one issue per problem, one PR per
   issue targeting `dev`, squash-merged by the operator once CI is green;
   commits must be signed (configured on this machine). Documentation is
@@ -67,8 +64,7 @@ outputs at about 12 MiB/s. Push a new version with
 finished runs a stage starts from are repos too (`lexoliu/mlime-e2e-stage2-s0`:
 `run-config.json`, `run-summary.json`, `run/checkpoint-final.pt`), and a Colab
 leg's resume trio lives in the private bucket `lexoliu/mlime-resume` under
-`<run>/step-<step>/`. The Kaggle copies below are what the Kaggle chain still
-mounts.
+`<run>/step-<step>/`.
 
 The code is not a dataset: a leg runs one commit of this public repository,
 which the VM fetches from GitHub (`colab/e2e.sh start --commit`, default the
@@ -94,44 +90,21 @@ scores all three lattices with context on and off into
 `scores-<lattice>-context-<on|off>.jsonl.gz`, with `"finished": true` in
 `run-summary.json`.
 
-## 3. The automatic chain (what runs without anyone)
+## 3. Running a leg
 
-`~/Library/LaunchAgents/cool.lexo.mlime-chain.plist` runs
-`kaggle/chain.sh` every hour (`launchctl list | grep mlime-chain` to see it;
-`launchctl unload/load <plist>` to stop/start). Each run, logged one line to
-`data/route-a-v2/chain.log`:
-
-1. finds the highest pushed segment n;
-2. if it is RUNNING/QUEUED: waits; if ERROR: logs "a person has to look" and stops;
-3. if COMPLETE and `data/route-a-v2/s<n>/harvested` is absent: downloads the
-   output there (2–5 GB, includes the checkpoint), writes the `harvested` stamp
-   once the whole download succeeded (a download that breaks off is redone next
-   hour) and logs the summary;
-4. if that summary says `"finished": true`: runs `kaggle/finish.sh
-   data/route-a-v2/s<n>` (≈15 min on the M1 since PR #38) which writes
-   `results.md` there, then
-   stops pushing;
-5. otherwise pushes segment n+1, but only when `kaggle quota` shows at least
-   12 h left (a session started into less is killed before it pauses); a
-   refused push (token lapsed) is retried next hour. A segment that ERRORed
-   (typically killed by the quota) is re-pushed once a full session of quota is
-   back, at most three times, after which the log says "a person has to look".
-
-What actually happened: s4 (4 h session, Sep 16) → quota reset Fri Sep 18
-20:00 EDT → s5 pushed at 21:05, paused at 237,960 → s6 pushed Sat Sep 19
-09:07, finished at 244,797 and scored, COMPLETE by 13:00 → the first harvest
-broke off inside the 2.6 GB checkpoint and was mistaken for done (issue #34,
-fixed in PR #35) → harvested 23:44, evaluated overnight.
+`colab/e2e.sh <kernel dir> start` provisions a Colab runtime, stages the leg's
+inputs and launches the kernel; `wait --deadline S` watches it and exits with
+how the leg ended; `fetch` and `stop` follow (`kaggle/README.md` §Colab). The
+kernel is stamped with `mlime e2e stamp`. Nothing outlives its controller: the
+runtime's watchdog releases it ten minutes after the last probe.
 
 ## 4. What a person still does
 
-1. **Watch** `tail data/route-a-v2/chain.log` once a day. "a person has to
-   look" means a kernel errored: `kaggle kernels output lexoliu/mlime-route-a-v2-s<n>
-   -p /tmp/x` and read `mlime-route-a-v2-s<n>.log` (JSON lines; the Python
-   traceback is near the end).
-2. **When `results.md` appears** in the finished segment's directory: write
-   `notes/route-a-v2.md` in the style of `notes/route-a-v1.md` (training
-   table from the segments' `run-summary.json` files, the results table, what
+1. **When a leg fails** (`wait` exits 12): `fetch` it and read `kernel.out`
+   and `train.log`; the traceback is near the end.
+2. **When a run finishes**: write its note under `notes/` in the style of
+   `notes/route-a-v1.md` (training table from the legs' `run-summary.json`
+   files, the results table, what
    the numbers say, next steps), via issue → PR → merge (§7). Compare against
    the v1 numbers in `notes/route-a-v1.md` and the trigram baselines in
    `notes/v2-data-prep.md`.
@@ -180,8 +153,8 @@ target/release/ime-cli fused-eval --model data/run3/ngram.bin \
 ```
 
 `--lm <dir>` points at the `prefill.onnx` + `charlm.onnx` + `charlm.weights`
-+ `charlm.json` set that `mlime export char-lm` writes (the `char-lm` Kaggle
-kernel produces it): the graphs' initializers live in the external weights
++ `charlm.json` set that `mlime export char-lm` writes (from a `mlime train char-lm`
+checkpoint): the graphs' initializers live in the external weights
 file the manifest's `weights` table maps name-by-name (one `charlm.weights`
 shared by both graphs, or `charlm.weights` + `prefill.weights` when their
 tensor names differ), so `ime-lm` maps it once and shares it across the
@@ -206,8 +179,7 @@ with `luna_pinyin_simp.custom.yaml` disabling the user dictionary
 (`notes/commercial-baselines.md`).
 
 `eval3-abbreviated.jsonl` / `eval3-mixed.jsonl` pair with
-`scores-lattice-abbreviated-*` / `scores-lattice-mixed-*`. `kaggle/finish.sh
-<segment dir>` does all of this and writes `results.md`.
+`scores-lattice-abbreviated-*` / `scores-lattice-mixed-*`.
 
 ## 7. Repository workflow
 

@@ -22,7 +22,7 @@ ime-cli fused-eval: beam search over the emissions with a transition —
 notes/<stage>.md
 ```
 
-The character LM is trained with `mlime train char-lm` (Kaggle, resumable across sessions) and
+The character LM is trained with `mlime train char-lm` (resumable across sessions) and
 exported with `mlime export char-lm`: `charlm.onnx` (one step over a batch of beams),
 `prefill.onnx` (the context once per record), the external weights files, and `charlm.json`, the
 manifest that names every tensor. `ime-lm` loads that directory; a graph without its manifest
@@ -41,7 +41,7 @@ table does not load, so an export and the decoder always move together.
 | `crates/ime-cli` | the command line: `fused-eval`, `train-ngram`, and the rest |
 | `crates/ime-corpus`, `ime-g2p`, `ime-synth` | corpus fetching, dual pinyin annotation, grounded synthesis of slang usage |
 | `python/` | the `mlime` CLI (uv project): corpus, labels, training, export, `eval generate` / `eval rime` |
-| `kaggle/`, `colab/` | the training kernels and the chain that keeps them running; `kaggle/README.md` |
+| `kaggle/`, `colab/` | the training kernels and the Colab launcher; `kaggle/README.md` |
 | `notes/` | the record; `notes/HANDOFF.md` is the operator's manual and the list of gotchas |
 | `macos/ContextProbe` | the accessibility probe for reading the host application's text |
 | `data/` | everything generated or downloaded: eval sets, score files, models, exports, run outputs; never committed |
