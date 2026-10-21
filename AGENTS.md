@@ -95,3 +95,28 @@ table does not load, so an export and the decoder always move together.
 - The decoder's shape is the product's: one sentence, eight beams a step. Its per-step cost is
   the input method's latency, so the levers there are bytes per weight and a faster backend, not
   more threads.
+
+## GPUs
+
+- No Devin, local or cloud, works on this repository: its code runs straight on expensive GPUs,
+  so it is written by a coordinating session or an Opus subagent and reviewed before any GPU
+  runs it.
+- Training runs only on an A100 or a G4, never an H100. A T4 or L4 checks GPU training code for
+  correctness and trains nothing: its legs publish nothing and their weights are discarded. Code
+  that is not GPU training code is covered by unit tests, not GPU checks.
+- No A100 or G4 training starts without the owner's explicit permission, asked with the
+  correctness and performance checks complete and the expected training time.
+- Every Colab runtime carries the watchdog; nothing outlives its controller. Cost is stated in
+  compute units, together with time.
+- `data/` is not regenerable and is never deleted without asking.
+- The e2e step is bound by kernel launches, so the host's cores decide the card, and memory is
+  never the limit (about 10 GB of VRAM). The G4 (RTX PRO 6000 Blackwell, 96 GB, 48-core host)
+  costs about 9 CU/h and is the training card: 0.355 s/step on the v2 epoch at 91.5%
+  utilisation, 0.542 s/step on the ranking stage at 85%. The A100 40 GB (12-core host, 5.3 CU/h)
+  starves on launches: 0.719 s/step at 75%. The L4 is power-capped at 72 W, so a launch
+  optimisation shows nothing on it. #155 holds the comparison.
+- Colab sessions are run from the Mac mini, the only machine whose `colab` resolves their
+  names. The owner watches one with
+  `ssh -t lexoliu@lexos-mac-mini 'TERM=xterm-256color /Users/lexoliu/.local/bin/colab ssh -s <session>'`.
+  `colab exec` exits 0 when the remote code raises; `colab/provision.sh`'s `remote` reports the
+  real outcome.
