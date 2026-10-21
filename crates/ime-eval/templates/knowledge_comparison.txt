@@ -1,0 +1,5 @@
+against baseline      records                 entities                characters
+                      gained  lost    z       gained  lost    z       gained  lost    z
+--------------------  ------  ------  ------  ------  ------  ------  ------  ------  ------
+{% for (label, p) in rows %}{{ label }}{{ p.records.gained|fmt("{:<6}") }}  {{ p.records.lost|fmt("{:<6}") }}  {{ p.records.z()|fmt("{:<6.2}") }}  {{ p.entities.gained|fmt("{:<6}") }}  {{ p.entities.lost|fmt("{:<6}") }}  {{ p.entities.z()|fmt("{:<6.2}") }}  {{ p.positions.gained|fmt("{:<6}") }}  {{ p.positions.lost|fmt("{:<6}") }}  {{ p.positions.z()|fmt("{:.2}") }}
+{% endfor %}

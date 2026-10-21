@@ -20,13 +20,9 @@
 use crate::EvalError;
 use crate::dump::DumpRow;
 use crate::record::{EvalRecord, EvalSet, Slice};
+use crate::slice::{Answer, Discordance, Listing, Selection, Spelling, pad, rate, same_records};
 use askama::Template;
-use ime_pinyin::{CharId, Lexicon, Segment, SegmentLattice, SegmentOptions, SyllableTable};
-use rayon::iter::{
-    IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
-};
-use std::borrow::Cow;
-use std::collections::HashMap;
+use ime_pinyin::{CharId, Lexicon, SyllableTable};
 
 /// Characters typed alike that only the surrounding text tells apart.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -61,16 +57,6 @@ pub const AMBIGUITIES: [Ambiguity; 2] = [
     },
 ];
 
-/// How the slice reads keystrokes: abbreviations on, no half-typed tail, the
-/// default costs -- `emit-lattice`'s defaults. `max_paths` plays no part,
-/// since [`SegmentLattice::cheapest_reading`] searches every edge.
-fn reading_options() -> SegmentOptions {
-    SegmentOptions {
-        allow_incomplete_tail: false,
-        ..SegmentOptions::default()
-    }
-}
-
 /// One position of the slice.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Position {
@@ -83,12 +69,7 @@ pub struct Position {
 /// Where the slice falls in an evaluation set.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AmbiguitySlice {
-    /// Per record, in set order, the slice positions it holds; empty when it
-    /// holds none.
-    positions: Vec<Vec<Position>>,
-    /// Per record, whether its text holds a set character but its keystrokes
-    /// spell no reading of the text, so no position of it can be judged.
-    unspelled: Vec<bool>,
+    selection: Selection<Position>,
 }
 
 impl AmbiguitySlice {
@@ -121,18 +102,11 @@ impl AmbiguitySlice {
                     .collect::<Result<Vec<_>, _>>()
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let options = reading_options();
-        let selected = set
-            .records()
-            .par_iter()
-            .enumerate()
-            .map(|(index, record)| select_record(index, record, table, lexicon, &members, &options))
-            .collect::<Result<Vec<_>, _>>()?;
-        let (positions, unspelled) = selected.into_iter().unzip();
-        Ok(Self {
-            positions,
-            unspelled,
-        })
+        let selection =
+            Selection::select(set, table, lexicon, candidates, |spelling, position| {
+                undecided(spelling, position, &members)
+            })?;
+        Ok(Self { selection })
     }
 
     /// The slice positions of the record at *index* of the set; empty when it
@@ -143,7 +117,7 @@ impl AmbiguitySlice {
     /// If *index* is not a record of the set the slice was selected from.
     #[must_use]
     pub fn positions(&self, index: usize) -> &[Position] {
-        &self.positions[index]
+        self.selection.positions(index)
     }
 
     /// Judge the dumped beams of the records of *slice* that hold slice
@@ -164,107 +138,45 @@ impl AmbiguitySlice {
         dev_share: f64,
         rows: &[DumpRow],
     ) -> Result<AmbiguityReport, EvalError> {
-        let mut by_record = HashMap::with_capacity(rows.len());
-        for row in rows {
-            if by_record.insert(row.record, row).is_some() {
-                return Err(EvalError::DuplicateRow { record: row.record });
-            }
-        }
-        let mut report = AmbiguityReport::default();
-        for (index, record) in set.records().iter().enumerate() {
-            if !slice.holds(record, dev_share) {
-                continue;
-            }
-            if self.unspelled[index] {
-                report.unspelled += 1;
-                continue;
-            }
-            let positions = &self.positions[index];
-            if positions.is_empty() {
-                continue;
-            }
-            let row = by_record
-                .get(&index)
-                .ok_or(EvalError::MissingRow { record: index })?;
-            if row.text != record.text {
-                return Err(EvalError::TextMismatch {
-                    record: index,
-                    expected: record.text.clone(),
-                    found: row.text.clone(),
-                });
-            }
-            report.fold(Outcome::new(index, record, positions, row));
+        let judged = self.selection.judged(set, slice, dev_share, rows)?;
+        let mut report = AmbiguityReport {
+            unspelled: judged.unspelled,
+            ..AmbiguityReport::default()
+        };
+        for record in judged.records {
+            report.fold(Outcome::new(
+                record.index,
+                record.record,
+                record.positions,
+                record.row,
+            ));
         }
         Ok(report)
     }
 }
 
-/// One record's slice positions, and whether its text could not be spelled
-/// from its keystrokes.
-fn select_record(
-    index: usize,
-    record: &EvalRecord,
-    table: &SyllableTable,
-    lexicon: &Lexicon,
-    members: &[Vec<CharId>],
-    options: &SegmentOptions,
-) -> Result<(Vec<Position>, bool), EvalError> {
-    let text: Vec<char> = record.text.chars().collect();
-    let candidates: Vec<Position> = text
-        .iter()
+/// The positions of *record* whose expected character is a set member.
+fn candidates(record: &EvalRecord) -> Vec<Position> {
+    record
+        .text
+        .chars()
         .enumerate()
         .filter_map(|(index, character)| {
             AMBIGUITIES
                 .iter()
-                .position(|ambiguity| ambiguity.characters.contains(character))
+                .position(|ambiguity| ambiguity.characters.contains(&character))
                 .map(|ambiguity| Position { index, ambiguity })
         })
-        .collect();
-    if candidates.is_empty() {
-        return Ok((Vec::new(), false));
-    }
-    let Some(ids) = text
-        .iter()
-        .map(|&character| lexicon.id_of(character))
-        .collect::<Option<Vec<_>>>()
-    else {
-        return Ok((Vec::new(), true));
-    };
-    let keys = record.clean.as_deref().unwrap_or(&record.pinyin);
-    let lattice =
-        SegmentLattice::build(keys, table, options).map_err(|source| EvalError::Unreadable {
-            record: index,
-            source,
-        })?;
-    let Some(reading) = lattice.cheapest_reading(
-        ids.len(),
-        |segment, position| admits(segment, ids[position], lexicon),
-        options,
-    ) else {
-        return Ok((Vec::new(), true));
-    };
-    let positions = candidates
-        .into_iter()
-        .filter(|position| {
-            let segment = &reading.segments()[position.index];
-            members[position.ambiguity]
-                .iter()
-                .any(|&other| other != ids[position.index] && admits(segment, other, lexicon))
-        })
-        .collect();
-    Ok((positions, false))
+        .collect()
 }
 
-/// Whether *segment* can have been typed for *character*: one of the
-/// character's readings lies in the segment's syllable range. The slice's
-/// lattices are built without the noise model, so every segment has a range.
-fn admits(segment: &Segment, character: CharId, lexicon: &Lexicon) -> bool {
-    segment.syllables().is_some_and(|range| {
-        lexicon
-            .readings(character)
-            .iter()
-            .any(|&reading| range.contains(reading))
-    })
+/// Whether the span typed for *position* also admits another member of its
+/// set.
+fn undecided(spelling: &Spelling<'_>, position: &Position, members: &[Vec<CharId>]) -> bool {
+    let wanted = spelling.ids[position.index];
+    members[position.ambiguity]
+        .iter()
+        .any(|&other| other != wanted && spelling.admits(position.index, other))
 }
 
 /// What the top hypothesis put at one slice position.
@@ -282,13 +194,8 @@ pub enum Verdict {
 /// One slice record's beam, judged.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Outcome {
-    /// The record's index in the evaluation set.
-    pub record: usize,
-    /// The top hypothesis; `None` when the engine answered nothing.
-    pub top: Option<String>,
-    /// The expected sentence's zero-based rank in the dumped beam; `None`
-    /// when the beam does not hold it.
-    pub rank: Option<usize>,
+    /// What the system answered.
+    pub answer: Answer,
     /// Each slice position with what the top hypothesis put there.
     pub positions: Vec<(Position, Verdict)>,
 }
@@ -296,11 +203,8 @@ pub struct Outcome {
 impl Outcome {
     fn new(index: usize, record: &EvalRecord, positions: &[Position], row: &DumpRow) -> Self {
         let expected: Vec<char> = record.text.chars().collect();
-        let top = row
-            .hypotheses
-            .first()
-            .map(|hypothesis| hypothesis.text.clone());
-        let found: Vec<char> = top.as_deref().unwrap_or_default().chars().collect();
+        let answer = Answer::new(index, record, row);
+        let found = answer.characters();
         let positions = positions
             .iter()
             .map(|&position| {
@@ -318,16 +222,7 @@ impl Outcome {
                 (position, verdict)
             })
             .collect();
-        let rank = row
-            .hypotheses
-            .iter()
-            .position(|hypothesis| hypothesis.text == record.text);
-        Self {
-            record: index,
-            top,
-            rank,
-            positions,
-        }
+        Self { answer, positions }
     }
 }
 
@@ -374,7 +269,7 @@ pub struct AmbiguityReport {
 
 impl AmbiguityReport {
     fn fold(&mut self, outcome: Outcome) {
-        if outcome.rank == Some(0) {
+        if outcome.answer.right() {
             self.top1_hits += 1;
         }
         for &(position, verdict) in &outcome.positions {
@@ -449,20 +344,15 @@ impl AmbiguityReport {
     ///
     /// If the two reports did not judge the same records.
     pub fn compare(&self, baseline: &Self) -> Result<Comparison, EvalError> {
-        let same = self.outcomes.len() == baseline.outcomes.len()
-            && self
-                .outcomes
-                .iter()
-                .zip(&baseline.outcomes)
-                .all(|(ours, theirs)| ours.record == theirs.record);
-        if !same {
-            return Err(EvalError::DifferentRecords);
-        }
+        same_records(
+            self.outcomes.iter().map(|outcome| &outcome.answer),
+            baseline.outcomes.iter().map(|outcome| &outcome.answer),
+        )?;
         let mut comparison = Comparison::default();
         for (ours, theirs) in self.outcomes.iter().zip(&baseline.outcomes) {
             comparison
                 .records
-                .add(ours.rank == Some(0), theirs.rank == Some(0));
+                .add(ours.answer.right(), theirs.answer.right());
             for ((_, ours), (_, theirs)) in ours.positions.iter().zip(&theirs.positions) {
                 comparison
                     .positions
@@ -480,92 +370,11 @@ impl AmbiguityReport {
     /// If *set* is not the evaluation set the report was measured on.
     #[must_use]
     pub fn listing<'a>(&'a self, set: &'a EvalSet) -> Listing<'a> {
-        Listing {
-            rows: self
-                .outcomes
-                .iter()
-                .map(|outcome| {
-                    let record = &set.records()[outcome.record];
-                    ListingRow {
-                        record: outcome.record,
-                        keystrokes: field(&record.pinyin),
-                        context: record.context.as_deref().map_or(Cow::Borrowed("-"), field),
-                        wanted: field(&record.text),
-                        top: outcome.top.as_deref().map_or(Cow::Borrowed("-"), field),
-                        rank: outcome.rank,
-                    }
-                })
-                .collect(),
-        }
-    }
-}
-
-/// The slice's records one per line, tab-separated.
-#[derive(Template)]
-#[template(path = "ambiguity_listing.txt", ext = "txt")]
-pub struct Listing<'a> {
-    rows: Vec<ListingRow<'a>>,
-}
-
-/// One line of a [`Listing`], its text fields escaped by [`field`].
-struct ListingRow<'a> {
-    record: usize,
-    keystrokes: Cow<'a, str>,
-    context: Cow<'a, str>,
-    wanted: Cow<'a, str>,
-    top: Cow<'a, str>,
-    rank: Option<usize>,
-}
-
-/// *text* as one tab-separated field: a backslash, tab, newline or carriage
-/// return is written as its backslash escape, so a multi-line context keeps
-/// its record on one line.
-fn field(text: &str) -> Cow<'_, str> {
-    if !text.contains(['\\', '\t', '\n', '\r']) {
-        return Cow::Borrowed(text);
-    }
-    let mut escaped = String::with_capacity(text.len() + 8);
-    for character in text.chars() {
-        match character {
-            '\\' => escaped.push_str("\\\\"),
-            '\t' => escaped.push_str("\\t"),
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            other => escaped.push(other),
-        }
-    }
-    Cow::Owned(escaped)
-}
-
-/// How often two systems disagree, and in whose favour.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
-pub struct Discordance {
-    /// Right in the compared report and wrong in the baseline.
-    pub gained: usize,
-    /// Wrong in the compared report and right in the baseline.
-    pub lost: usize,
-}
-
-impl Discordance {
-    fn add(&mut self, ours: bool, theirs: bool) {
-        match (ours, theirs) {
-            (true, false) => self.gained += 1,
-            (false, true) => self.lost += 1,
-            _ => {}
-        }
-    }
-
-    /// The paired test's statistic the notes report beside these counts,
-    /// `(gained - lost) / sqrt(gained + lost)`; zero when the two never
-    /// disagree.
-    #[must_use]
-    #[expect(clippy::cast_precision_loss, reason = "counts stay far below 2^53")]
-    pub fn z(&self) -> f64 {
-        let discordant = self.gained + self.lost;
-        if discordant == 0 {
-            return 0.0;
-        }
-        (self.gained as f64 - self.lost as f64) / (discordant as f64).sqrt()
+        Listing::new(
+            set,
+            self.outcomes.iter().map(|outcome| (&outcome.answer, None)),
+            false,
+        )
     }
 }
 
@@ -579,26 +388,6 @@ pub struct Comparison {
     /// of one record are not independent, so this z overstates the evidence
     /// when a record holds several.
     pub positions: Discordance,
-}
-
-/// *label* padded to the report's first column, counting a CJK character as
-/// the two columns a terminal gives it.
-fn pad(label: &str) -> String {
-    const COLUMN: usize = 22;
-    let width: usize = label
-        .chars()
-        .map(|character| if character.is_ascii() { 1 } else { 2 })
-        .sum();
-    format!("{label}{}", " ".repeat(COLUMN.saturating_sub(width)))
-}
-
-/// A ratio, or zero where there was nothing to divide.
-#[expect(clippy::cast_precision_loss, reason = "counts stay far below 2^53")]
-fn rate(hits: usize, total: usize) -> f64 {
-    if total == 0 {
-        return 0.0;
-    }
-    hits as f64 / total as f64
 }
 
 #[cfg(test)]
@@ -724,13 +513,13 @@ mod tests {
         let ranks: Vec<_> = report
             .outcomes()
             .iter()
-            .map(|outcome| outcome.rank)
+            .map(|outcome| outcome.answer.rank)
             .collect();
         assert_eq!(
             ranks,
             [Some(0), Some(1), None, None, Some(0), None, Some(1)]
         );
-        assert_eq!(report.outcomes()[3].top, None);
+        assert_eq!(report.outcomes()[3].answer.top, None);
     }
 
     #[test]
@@ -773,7 +562,7 @@ mod tests {
         let judged: Vec<_> = report
             .outcomes()
             .iter()
-            .map(|outcome| outcome.record)
+            .map(|outcome| outcome.answer.record)
             .collect();
         assert_eq!(judged, [3, 4, 5, 6]);
         let test = slice.measure(&set, Slice::Test, 0.5, &rows);
@@ -859,15 +648,6 @@ mod tests {
         assert!(
             listing.contains("0\ttashiwojiejie\t-\t她是我姐姐\t她是我姐姐\t1\n"),
             "{listing}"
-        );
-    }
-
-    #[test]
-    fn a_listed_field_keeps_its_record_on_one_line() {
-        assert!(matches!(field("她是我姐姐"), Cow::Borrowed("她是我姐姐")));
-        assert_eq!(
-            field("不知道，\n自求多福\t啦\\"),
-            "不知道，\\n自求多福\\t啦\\\\"
         );
     }
 

@@ -163,6 +163,17 @@ class Endpoint:
         return content
 
 
+def read_answers[T](answers: Path, decode: Callable[[Any], T]) -> dict[int, T]:
+    """Every answer *answers* holds, by record; a later line replaces an earlier one."""
+    known: dict[int, T] = {}
+    with answers.open(encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                row = json.loads(line)
+                known[int(row["record"])] = decode(row["answer"])
+    return known
+
+
 async def answer_all[R, T](
     records: Sequence[R],
     answers: Path,
@@ -182,13 +193,8 @@ async def answer_all[R, T](
     in flight and raises `UnfinishedError`; every answer that arrived before it is
     already in *answers*. The answers come back in the order of *records*.
     """
-    known: dict[int, T] = {}
-    if answers.is_file():
-        with answers.open(encoding="utf-8") as handle:
-            for line in handle:
-                if line.strip():
-                    row = json.loads(line)
-                    known[int(row["record"])] = decode(row["answer"])
+    known = read_answers(answers, decode) if answers.is_file() else {}
+    if known:
         log.info("resuming", answers=str(answers), answered=len(known))
     asked = [record for record in records if key(record) not in known]
     done = 0

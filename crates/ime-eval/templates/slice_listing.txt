@@ -1,0 +1,3 @@
+record	keystrokes	context	wanted	top	rank{% if spans %}	spans{% endif %}
+{% for row in rows %}{{ row.record }}	{{ row.keystrokes }}	{{ row.context }}	{{ row.wanted }}	{{ row.top }}	{% match row.rank %}{% when Some(rank) %}{{ rank + 1 }}{% when None %}absent{% endmatch %}{% if spans %}	{{ row.spans }}{% endif %}
+{% endfor %}
