@@ -1259,13 +1259,18 @@ def eval_e2e(
     row_positions: int = typer.Option(
         16384, help="Beam rows times positions one decode batch may hold"
     ),
+    ambiguity: Path = typer.Option(
+        None,
+        help="The ime-ambiguity binary (cargo build -p ime-eval --features cli); "
+        "given, each slice's report adds the ambiguity slice of the dump (#150)",
+    ),
     out: Path = typer.Option(None, help="Where the report text goes"),
     verbose: bool = VERBOSE,
 ) -> None:
     """Beam-search a lattice with an e2e checkpoint and report as `ime-eval` does."""
     configure(verbose)
     from mlime.data.corpus import default_char_table
-    from mlime.train.e2e_eval import evaluate
+    from mlime.train.e2e_eval import ambiguity_report, evaluate
     from mlime.train.run import build_lexicon_for, load_tokenizer
     from mlime.train.spans import SpanVocab
 
@@ -1293,7 +1298,14 @@ def eval_e2e(
         records_per_chunk=records_per_chunk,
         row_positions=row_positions,
     )
-    rendered = "\n\n".join(f"slice: {name}\n{report.render()}" for name, report in reports)
+    sections = []
+    for name, report in reports:
+        section = f"slice: {name}\n{report.render()}"
+        if ambiguity is not None:
+            slice_report = ambiguity_report(ambiguity, eval_set, dump, name, dev_share)
+            section += "\n\n" + slice_report.rstrip("\n")
+        sections.append(section)
+    rendered = "\n\n".join(sections)
     typer.echo(rendered)
     if out is not None:
         out.write_text(rendered + "\n", encoding="utf-8")

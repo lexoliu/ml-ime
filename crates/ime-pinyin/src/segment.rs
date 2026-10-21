@@ -471,6 +471,61 @@ impl<'input> SegmentLattice<'input> {
             .collect()
     }
 
+    /// The cheapest reading exactly *positions* characters long whose every
+    /// segment passes *admits*, given the segment and its position; `None`
+    /// when no reading does.
+    ///
+    /// [`SegmentLattice::k_best`] ranks the readings of the keystrokes alone.
+    /// This instead asks which reading a known sentence was typed along: a
+    /// caller that tests each segment against the sentence's character at
+    /// that position learns which span typed which character. The search
+    /// covers every edge of the lattice, not only the `max_paths` cheapest
+    /// readings, so a sentence typed along an unconventional reading is still
+    /// found. Ties go to the reading found first, which is deterministic.
+    #[must_use]
+    pub fn cheapest_reading(
+        &self,
+        positions: usize,
+        admits: impl Fn(&Segment, usize) -> bool,
+        options: &SegmentOptions,
+    ) -> Option<Segmentation> {
+        let len = self.input.len();
+        let width = positions + 1;
+        // `best[offset * width + count]`: the cheapest way to cover the first
+        // `offset` bytes with `count` admitted segments, and the edge that
+        // ended it, as `(cost, previous offset, edge index)`.
+        let mut best: Vec<Option<(f32, usize, usize)>> = vec![None; (len + 1) * width];
+        best[0] = Some((0.0, 0, 0));
+        for offset in 0..len {
+            for count in 0..positions {
+                let Some((cost, _, _)) = best[offset * width + count] else {
+                    continue;
+                };
+                for (edge, segment) in self.edges[offset].iter().enumerate() {
+                    if !admits(segment, count) {
+                        continue;
+                    }
+                    let total = cost + segment.cost(options);
+                    let slot = &mut best[segment.end() * width + count + 1];
+                    if slot.is_none_or(|(known, _, _)| total < known) {
+                        *slot = Some((total, offset, edge));
+                    }
+                }
+            }
+        }
+        let (cost, _, _) = best[len * width + positions]?;
+        let mut segments = Vec::with_capacity(positions);
+        let (mut offset, mut count) = (len, positions);
+        while count > 0 {
+            let (_, previous, edge) = best[offset * width + count]?;
+            segments.push(self.edges[previous][edge].clone());
+            offset = previous;
+            count -= 1;
+        }
+        segments.reverse();
+        Some(Segmentation { segments, cost })
+    }
+
     /// Walk a finished trace back to the start, producing the reading it encodes.
     fn reconstruct(&self, best: &[Vec<Trace>], trace: Trace) -> Segmentation {
         let cost = trace.cost;
@@ -772,5 +827,62 @@ mod tests {
             f64::from(corrected.cost()) > span_cost,
             "the path cost includes the correction prior"
         );
+    }
+
+    /// The span each character of *text* was typed with, along the cheapest
+    /// reading of *input* that spells it; `None` when none does.
+    fn typed_along(input: &str, text: &str) -> Option<Vec<String>> {
+        let table = SyllableTable::load();
+        let lexicon = crate::Lexicon::load(&table).expect("the generated tables agree");
+        let options = offline();
+        let lattice = SegmentLattice::build(input, &table, &options).expect("the input reads");
+        let ids: Vec<_> = text
+            .chars()
+            .map(|ch| lexicon.id_of(ch).expect("the test text is in the lexicon"))
+            .collect();
+        let reading = lattice.cheapest_reading(
+            ids.len(),
+            |segment, position| {
+                segment.syllables().is_some_and(|range| {
+                    lexicon
+                        .readings(ids[position])
+                        .iter()
+                        .any(|&reading| range.contains(reading))
+                })
+            },
+            &options,
+        )?;
+        Some(
+            reading
+                .segments()
+                .iter()
+                .map(|segment| input[segment.start()..segment.end()].to_owned())
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn the_sentence_picks_the_reading_it_was_typed_along() {
+        // `xian` reads best as one syllable, but 西安 can only have been typed
+        // as two, and the reading follows the sentence rather than the cost.
+        assert_eq!(typed_along("xian", "先").expect("先 spells"), ["xian"]);
+        assert_eq!(
+            typed_along("xian", "西安").expect("西安 spells"),
+            ["xi", "an"]
+        );
+        assert_eq!(
+            typed_along("tashiwojiejie", "她是我姐姐").expect("the full pinyin spells"),
+            ["ta", "shi", "wo", "jie", "jie"]
+        );
+        assert_eq!(
+            typed_along("zhg", "中国").expect("the initials spell"),
+            ["zh", "g"]
+        );
+    }
+
+    #[test]
+    fn a_sentence_the_keystrokes_cannot_spell_has_no_reading() {
+        assert_eq!(typed_along("nihao", "你们"), None);
+        assert_eq!(typed_along("nihao", "你"), None);
     }
 }

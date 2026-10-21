@@ -1,0 +1,8 @@
+ambiguity slice       value   detail
+--------------------  ------  --------------------
+records               {{ self.records() }}
+sentence, top-1       {{ self.top1_accuracy()|fmt("{:.4}") }}  {{ self.top1_hits() }} / {{ self.records() }}
+character             {{ self.total().accuracy()|fmt("{:.4}") }}  {{ self.total().right }} / {{ self.total().positions }}, {{ self.total().swapped }} to another of the set
+{% for (label, counts) in self.set_rows() %}{{ label }}{{ counts.accuracy()|fmt("{:.4}") }}  {{ counts.right }} / {{ counts.positions }}, {{ counts.swapped }} to another of the set
+{% endfor %}unspelled             {{ self.unspelled() }}
+

@@ -1,0 +1,5 @@
+against baseline      gained  lost    z
+--------------------  ------  ------  ------
+sentence, top-1       {{ self.records.gained|fmt("{:<6}") }}  {{ self.records.lost|fmt("{:<6}") }}  {{ self.records.z()|fmt("{:.2}") }}
+character             {{ self.positions.gained|fmt("{:<6}") }}  {{ self.positions.lost|fmt("{:<6}") }}  {{ self.positions.z()|fmt("{:.2}") }}
+
