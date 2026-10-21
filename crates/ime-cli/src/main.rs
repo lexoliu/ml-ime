@@ -657,12 +657,18 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
         },
     };
     let corrections = run.search.corrections(&table)?;
-    let progress = run.progress.map(|dir| neural::Progress {
-        dir,
-        model: run.model,
-        lm: run.lm,
-        stop_after: None,
-    });
+    let progress = run
+        .progress
+        .map(|dir| -> Result<_> {
+            Ok(neural::Progress {
+                dir,
+                build: neural::Build::current()?,
+                model: run.model,
+                lm: run.lm,
+                stop_after: None,
+            })
+        })
+        .transpose()?;
     let rendered = neural::fused_eval(
         run.eval_set,
         run.scores,
