@@ -1138,9 +1138,16 @@ def eval_rescore(
 
     from openai.types.shared import ReasoningEffort
 
+    from mlime.endpoint import UnfinishedError
     from mlime.rescore import rescore
 
-    report = rescore(dump, eval_set, picks, concurrency, cast(ReasoningEffort, effort))
+    try:
+        report = rescore(dump, eval_set, picks, concurrency, cast(ReasoningEffort, effort))
+    except UnfinishedError as error:
+        # No summary for a slice with unanswered records: it would count
+        # the endpoint's failures as the model's wrong answers.
+        typer.echo(f"unfinished: {error}", err=True)
+        raise typer.Exit(1) from error
     typer.echo(report.render())
     if out is not None:
         out.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")
@@ -1165,11 +1172,18 @@ def eval_generate(
 
     from openai.types.shared import ReasoningEffort
 
+    from mlime.endpoint import UnfinishedError
     from mlime.generate import generate
 
-    report = generate(
-        dump, eval_set, answers, concurrency, cast(ReasoningEffort, effort), with_hypotheses
-    )
+    try:
+        report = generate(
+            dump, eval_set, answers, concurrency, cast(ReasoningEffort, effort), with_hypotheses
+        )
+    except UnfinishedError as error:
+        # No summary for a slice with unanswered records: it would count
+        # the endpoint's failures as the model's wrong answers.
+        typer.echo(f"unfinished: {error}", err=True)
+        raise typer.Exit(1) from error
     typer.echo(report.render())
     if out is not None:
         out.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")
