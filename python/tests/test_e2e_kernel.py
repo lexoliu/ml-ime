@@ -239,6 +239,7 @@ def test_every_switch_the_kernel_passes_is_an_option_of_train_e2e(
     monkeypatch.setattr(kernel, "TYPOS", True)
     monkeypatch.setattr(kernel, "ACTIVATION_CHECKPOINTING", True)
     monkeypatch.setattr(kernel, "SEGMENT_STEPS", 70)
+    monkeypatch.setattr(kernel, "SEARCH_GRAPHS", True)
     argv = kernel.train_argv(
         tmp_path / "char_pinyin.tsv",
         tmp_path / "run",
@@ -371,3 +372,97 @@ def test_the_kernels_count_builds_on_every_core(
     assert isinstance(result.exception, CountedError), result.output
     assert asked["workers"] == os.cpu_count()
     assert asked["world_size"] == 2
+
+
+def test_a_ranking_stage_replays_its_search_from_graphs_when_stamped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only the trainer has a search; the count shares the ranking switches and refuses it."""
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    monkeypatch.setattr(kernel, "RANKING", {"weight": 0.05})
+    monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-v2-g4")
+    monkeypatch.setattr(kernel, "SEARCH_GRAPHS", True)
+    segmenter = tmp_path / "ime-segment"
+    count = kernel.count_argv(tmp_path / "char_pinyin.tsv", tmp_path / "counts.json", segmenter)
+    assert "--ranking" in count
+    assert "--search-graphs" not in count
+    train = kernel.train_argv(
+        tmp_path / "char_pinyin.tsv",
+        tmp_path / "run",
+        max_steps=100,
+        wall_budget=3600,
+        start=kernel.start_argv(None, tmp_path / "checkpoint-final.pt"),
+        resume=None,
+        token_budget=12288,
+        segmenter=segmenter,
+    )
+    assert "--search-graphs" in train
+
+
+def test_the_segmenter_is_found_in_the_directory_named_after_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The Colab driver mounts `ime-segment` at `<inputs>/ime-segment/ime-segment`."""
+    kernel = load_kernel(monkeypatch, tmp_path / "input", segment=0)
+    mount = tmp_path / "input" / "ime-segment"
+    mount.mkdir(parents=True)
+    (mount / "ime-segment").write_bytes(b"#!/bin/sh\n")
+    monkeypatch.setattr(kernel, "WORKING", tmp_path / "working")
+    staged = kernel.stage_segmenter()
+    assert staged == tmp_path / "working" / "bin" / "ime-segment"
+    assert staged.read_bytes() == b"#!/bin/sh\n"
+
+
+def test_the_window_start_reaches_the_trainer_from_the_stamp(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`mlime e2e stamp --profile-start` lands in the kernel, its argv, and the trainer's config."""
+    from typer.testing import CliRunner
+
+    import mlime.train.e2e
+    from mlime.__main__ import app
+    from mlime.train.loop import TrainingConfig
+
+    out = tmp_path / "kernel"
+    argv = ["e2e", "stamp", "mlime-e2e-v2-g4-trace", "--out", str(out)]
+    argv += ["--profile-steps", "30", "--profile-start", "400", "--trace-steps", "3"]
+    result = CliRunner().invoke(app, argv)
+    assert result.exit_code == 0, result.output
+    assert "  PROFILE_START = 400" in result.output
+
+    spec = importlib.util.spec_from_file_location("stamped_kernel", out / "kernel.py")
+    assert spec is not None and spec.loader is not None
+    kernel = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(kernel)
+    assert (kernel.PROFILE_STEPS, kernel.PROFILE_START, kernel.TRACE_STEPS) == (30, 400, 3)
+    monkeypatch.setattr(kernel, "TRAIN_SHARDS", ("news-00000.parquet",))
+    command = kernel.train_argv(
+        tmp_path / "char_pinyin.tsv",
+        tmp_path / "run",
+        max_steps=100,
+        wall_budget=None,
+        start=None,
+        resume=None,
+        token_budget=12288,
+        profile_steps=kernel.PROFILE_STEPS,
+        profile_start=kernel.PROFILE_START,
+        trace_steps=kernel.TRACE_STEPS,
+    )
+
+    seen: list[TrainingConfig] = []
+
+    class ReachedError(Exception):
+        """The trainer was called; the test has what it came for."""
+
+    def trainer(*args: object, **_: object) -> None:
+        training = args[2]
+        assert isinstance(training, TrainingConfig)
+        seen.append(training)
+        raise ReachedError
+
+    monkeypatch.setattr(mlime.train.e2e, "e2e", trainer)
+    mlime_at = command.index("mlime")
+    result = CliRunner().invoke(app, [str(arg) for arg in command[mlime_at + 1 :]])
+    assert isinstance(result.exception, ReachedError), result.output
+    (training,) = seen
+    assert (training.profile_steps, training.profile_start, training.trace_steps) == (30, 400, 3)

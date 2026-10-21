@@ -25,12 +25,16 @@
 use crate::engine::read;
 use anyhow::{Context as _, Result, anyhow, bail};
 use askama::Template;
-use blake2::{Blake2b, Digest as _, digest::consts::U8};
+use blake2::{
+    Blake2b, Digest as _,
+    digest::consts::{U8, U16},
+};
 use clap::{Args, ValueEnum};
 use flate2::read::MultiGzDecoder;
 use ime_decode::{
-    BeamOptions, Both, Candidates, Emission, Emittable, Hypothesis, LatticeRecord, NoTransition,
-    Record, ScoreRecord, Scored, Transition, Uniform, Weighted, decode_many, lattice_paths,
+    Asked, BeamOptions, Both, Candidates, Emission, Emittable, Hypothesis, LatticeRecord,
+    NoTransition, Record, ScoreRecord, Scored, Transition, Uniform, Weighted, decode_many,
+    lattice_paths,
 };
 use ime_eval::{
     AmbiguityReport, AmbiguitySlice, DumpRow, DumpedHypothesis, EvalRecord, EvalSet, Observation,
@@ -39,14 +43,14 @@ use ime_eval::{
 use ime_lm::CharLm;
 use ime_neural::RouteA;
 use ime_ngram::NgramModel;
-use ime_pinyin::{CorrectionTable, Lexicon, SegmentOptions, Segmentation, SyllableTable};
+use ime_pinyin::{CharId, CorrectionTable, Lexicon, SegmentOptions, Segmentation, SyllableTable};
 use rayon::iter::{
     IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead as _, BufReader, BufWriter, Write};
+use std::io::{BufRead as _, BufReader, BufWriter, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Sender};
@@ -515,6 +519,46 @@ pub enum Models<'a> {
     },
 }
 
+/// A transition that is never given the record's context: every reading
+/// starts as if nothing stood on screen ahead of the sentence.
+///
+/// This is how a context-off run takes the context away from its
+/// transitions -- the trigram, the character model, or both at once -- on
+/// every decode path, since `start` is the only place `decode_many` hands a
+/// transition the context. Everything else is the inner model's, forwarded
+/// as is, so the scores of a record that has no context are unchanged.
+struct WithoutContext<T>(T);
+
+impl<T: Transition> Transition for WithoutContext<T> {
+    const HISTORY: usize = T::HISTORY;
+
+    type State = T::State;
+
+    fn start(&self, _context: Option<&str>, asked: &Asked<'_>) -> Self::State {
+        self.0.start(None, asked)
+    }
+
+    fn score(&self, state: &Self::State, candidate: CharId) -> f32 {
+        self.0.score(state, candidate)
+    }
+
+    fn score_many(&self, state: &Self::State, weight: f32, allowed: &[CharId], out: &mut [f32]) {
+        self.0.score_many(state, weight, allowed, out);
+    }
+
+    fn finish(&self, state: &Self::State) -> f32 {
+        self.0.finish(state)
+    }
+
+    fn advance(&self, steps: &[(&Self::State, CharId, Asked<'_>)]) -> Vec<Self::State> {
+        self.0.advance(steps)
+    }
+
+    fn compact(&self, state: &Self::State) -> Self::State {
+        self.0.compact(state)
+    }
+}
+
 /// Resumable per-record progress for `fused-eval` (`--progress`).
 ///
 /// Set, every `measure` call of the run keeps a JSON Lines file in *dir* named
@@ -523,10 +567,14 @@ pub enum Models<'a> {
 /// line is the whole configuration key and every later line is one record's
 /// outcome, so a stopped run is continued by re-running the same command with
 /// the same directory, and resuming under arguments the file was not written
-/// with is refused rather than restarted.
+/// with is refused rather than restarted. The header also records the
+/// [`Build`] that wrote the file, and a file another build wrote is refused
+/// too: its records were decoded by other code.
 pub struct Progress<'a> {
     /// The directory the per-configuration files are kept in.
     pub dir: &'a Path,
+    /// The build this run is.
+    pub build: Build,
     /// The path the n-gram model was loaded from, when it was.
     pub model: Option<&'a Path>,
     /// The directory the character model was loaded from, when it was.
@@ -535,6 +583,45 @@ pub struct Progress<'a> {
     /// stand-in for a kill, since the command line never sets it.
     #[doc(hidden)]
     pub stop_after: Option<usize>,
+}
+
+/// The build of `ime-cli` a progress file was written by: the BLAKE2 hash of
+/// the running executable's bytes.
+///
+/// The executable is what decodes, so its bytes are the narrowest identity
+/// that still catches every change to the decode: the crate's code, a
+/// dependency or the lockfile, the toolchain, and an uncommitted edit, which a
+/// commit hash would miss. A change that leaves the executable as it was -- a
+/// note, a workflow, Python -- keeps the progress, where a commit hash would
+/// throw away hours of decoded records for nothing. The decode's inputs are
+/// not part of it; the configuration key names those.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Build(String);
+
+impl Build {
+    /// The build of the running executable.
+    ///
+    /// # Errors
+    ///
+    /// If the executable's path cannot be found or its bytes cannot be read.
+    pub fn current() -> Result<Self> {
+        let path = std::env::current_exe().context("could not locate the running executable")?;
+        let mut file = fs::File::open(&path)
+            .with_context(|| format!("could not open the executable {}", path.display()))?;
+        let mut hasher = Blake2b::<U16>::new();
+        let mut buffer = vec![0; 1 << 20];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .with_context(|| format!("could not read the executable {}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(Self(const_hex::encode(hasher.finalize())))
+    }
 }
 
 /// An emission source before a weight is applied to it: the data a
@@ -559,8 +646,9 @@ struct Run<'a> {
     route_a: Option<&'a RouteA>,
     /// Where the export directory lives; part of the progress key.
     route_a_path: Option<&'a Path>,
-    /// Whether live emissions read the record's context. Score files come as
-    /// written; the flag does not reach them.
+    /// Whether the decoder reads the record's context. Off, live emissions
+    /// run with the gate zeroed, a score file is taken on the caller's word
+    /// to have been emitted without it, and no transition is given it.
     with_context: bool,
     emittable: &'a Emittable,
     /// Where the emittable set was read from; part of the progress key.
@@ -590,11 +678,12 @@ impl<'a> Run<'a> {
     ) -> Option<ProgressRequest<'_>> {
         self.progress.map(|progress| ProgressRequest {
             dir: progress.dir,
+            build: &progress.build,
             stop_after: progress.stop_after,
             eval_set: self.eval_set,
             scores: self.scores_path,
             route_a: self.route_a_path,
-            with_context: self.route_a.map(|_| self.with_context),
+            with_context: self.with_context,
             emittable: self.emittable_path,
             model: progress.model,
             lm: progress.lm,
@@ -606,20 +695,49 @@ impl<'a> Run<'a> {
         })
     }
 
+    /// The sections one transition model produces, with the context taken
+    /// away from it when the run is context-off. A context-on run decodes
+    /// through the transition exactly as given.
+    fn decode<T: Transition + Sync>(
+        &self,
+        transition: &T,
+        label: &'static str,
+        lm_weight: f32,
+        lockstep: bool,
+    ) -> Result<Vec<Section>> {
+        if self.with_context {
+            self.sections(transition, label, lm_weight, lockstep)
+        } else {
+            self.sections(&WithoutContext(transition), label, lm_weight, lockstep)
+        }
+    }
+
     /// What emits for this run's sections, and the label the report gives it:
-    /// the score file, the towers live, or nothing at all.
+    /// the score file, the towers live, or nothing at all. A context-off run
+    /// says so in the label.
     ///
     /// # Errors
     ///
     /// If both the score file and the towers were given: the argument parser
     /// refuses the pair, but a caller that is not the command line could still
-    /// hand both in.
+    /// hand both in. If the run is context-off with neither: its report would
+    /// carry no label saying so.
     fn source(&self) -> Result<Option<(SourceInput<'a>, &'static str)>> {
         match (self.scores, self.route_a) {
             (Some(_), Some(_)) => {
                 bail!("--scores and --route-a are two answers to the same question")
             }
-            (Some(scores), None) => Ok(Some((SourceInput::File(scores), "neural"))),
+            (Some(scores), None) => Ok(Some((
+                SourceInput::File(scores),
+                if self.with_context {
+                    "neural"
+                } else {
+                    "neural-no-context"
+                },
+            ))),
+            (None, None) if !self.with_context => {
+                bail!("--no-context runs on emissions that --scores or --route-a must supply")
+            }
             (None, Some(towers)) => Ok(Some((
                 SourceInput::Live(towers),
                 if self.with_context {
@@ -796,12 +914,18 @@ impl<'a> Run<'a> {
 /// keeps the per-record rayon path, more feeds `records x paths x beams` rows
 /// to each model step, which is the shape a GPU backend is sized for.
 ///
+/// *`with_context`* off makes the whole decoder context-off: the towers run
+/// with the gate zeroed, the score file is taken to have been emitted without
+/// context (it cannot say), and no transition is given any record's context.
+/// The report's emission label and the progress key both say so.
+///
 /// # Errors
 ///
 /// If any input cannot be read, a
 /// record cannot be decoded, a score file does not describe the lattice the
-/// records segment into, the dump cannot be written, or a progress file was
-/// written under a different configuration.
+/// records segment into, the dump cannot be written, a progress file was
+/// written under a different configuration, or the run is context-off with
+/// no emissions to take the context away from.
 #[expect(
     clippy::too_many_arguments,
     reason = "every argument is a distinct axis of the ablation the command exists to run"
@@ -809,7 +933,8 @@ impl<'a> Run<'a> {
 pub fn fused_eval(
     eval_set: &Path,
     scores_path: Option<&Path>,
-    route_a: Option<(&Path, &RouteA, bool)>,
+    route_a: Option<(&Path, &RouteA)>,
+    with_context: bool,
     emittable_path: &Path,
     floor: f32,
     weights: &[f32],
@@ -838,15 +963,21 @@ pub fn fused_eval(
             .with_context(|| format!("could not create the dump directory {}", dir.display()))?;
     }
     let scores = scores_path.map(load_scores).transpose()?;
+    if let Some(path) = scores_path.filter(|_| !with_context) {
+        info!(
+            path = %path.display(),
+            "context off: the score file is taken to have been emitted without context"
+        );
+    }
     let run = Run {
         set: &set,
         eval_set,
         reader: &reader,
         scores: scores.as_ref(),
         scores_path,
-        route_a: route_a.map(|(_, towers, _)| towers),
-        route_a_path: route_a.map(|(path, _, _)| path),
-        with_context: route_a.is_none_or(|(_, _, with_context)| with_context),
+        route_a: route_a.map(|(_, towers)| towers),
+        route_a_path: route_a.map(|(path, _)| path),
+        with_context,
         emittable: &emittable,
         emittable_path,
         floor,
@@ -859,16 +990,16 @@ pub fn fused_eval(
         progress,
     };
     let mut sections = match transition {
-        Models::None => run.sections(&NoTransition, "none", 1.0, false)?,
-        Models::Ngram(ngram) => run.sections(ngram, "kn-trigram", 1.0, false)?,
+        Models::None => run.decode(&NoTransition, "none", 1.0, false)?,
+        Models::Ngram(ngram) => run.decode(ngram, "kn-trigram", 1.0, false)?,
         Models::CharLm(lm) => {
-            run.sections(lm, "char-lm", 1.0, lm.backend() != ime_lm::Backend::Cpu)?
+            run.decode(lm, "char-lm", 1.0, lm.backend() != ime_lm::Backend::Cpu)?
         }
         Models::Both {
             ngram,
             lm,
             lm_weight,
-        } => run.sections(
+        } => run.decode(
             &Both {
                 first: ngram,
                 first_weight: 1.0,
@@ -1146,14 +1277,16 @@ where
 struct ProgressRequest<'a> {
     /// The directory the per-configuration files are kept in.
     dir: &'a Path,
+    /// The build this run is.
+    build: &'a Build,
     /// The test stand-in for a kill: stop after this many new records.
     stop_after: Option<usize>,
     eval_set: &'a Path,
     scores: Option<&'a Path>,
     /// The export directory live emissions run from, when they do.
     route_a: Option<&'a Path>,
-    /// Whether live emissions read the context; `None` with a score file.
-    with_context: Option<bool>,
+    /// Whether the decoder read the context, score-file runs included.
+    with_context: bool,
     emittable: &'a Path,
     model: Option<&'a Path>,
     lm: Option<&'a Path>,
@@ -1182,10 +1315,10 @@ struct Name {
     /// The export directory a live-emission run decodes through.
     #[serde(default)]
     route_a: Option<PathBuf>,
-    /// Whether live emissions read the context; absent from a score-file
-    /// run's key.
-    #[serde(default)]
-    with_context: Option<bool>,
+    /// Whether the decoder read the context: the towers' gate and every
+    /// transition's start. A score-file run's is the caller's word for how
+    /// the file was emitted.
+    with_context: bool,
     emittable: PathBuf,
     model: Option<PathBuf>,
     lm: Option<PathBuf>,
@@ -1202,6 +1335,9 @@ struct Name {
 /// names the fields that differ.
 #[derive(Debug, Serialize, Deserialize)]
 struct Key {
+    /// The build that wrote the file; resuming under another is refused on
+    /// its own, before the rest of the key is compared.
+    build: Build,
     /// Which decode this is: the part the file is named for.
     #[serde(flatten)]
     name: Name,
@@ -1426,7 +1562,25 @@ fn check_header(text: &str, key: &Key, path: &Path) -> Result<()> {
         .lines()
         .next()
         .context("the progress file holds no configuration header")?;
-    let stored: Key = serde_json::from_str(header).with_context(|| {
+    let stored: serde_json::Value = serde_json::from_str(header).with_context(|| {
+        format!(
+            "the first line of {} is not a configuration key",
+            path.display()
+        )
+    })?;
+    // Checked before the key is parsed, so a file from before builds were
+    // recorded is refused as one rather than as a malformed header.
+    let stored_build = stored.get("build").and_then(serde_json::Value::as_str);
+    if stored_build != Some(key.build.0.as_str()) {
+        bail!(
+            "the progress file {} was written by build {}, not by this build {}: its records \
+             were decoded by other code; remove it to decode the section afresh",
+            path.display(),
+            stored_build.unwrap_or("(unrecorded)"),
+            key.build.0
+        );
+    }
+    let stored: Key = serde_json::from_value(stored).with_context(|| {
         format!(
             "the first line of {} is not a configuration key",
             path.display()
@@ -1518,6 +1672,7 @@ where
     T: Transition + Sync,
 {
     let key = Key {
+        build: progress.build.clone(),
         name: Name {
             eval_set: progress.eval_set.to_owned(),
             scores: progress.scores.map(Path::to_owned),
@@ -1774,6 +1929,7 @@ pub fn parse_weight(raw: &str) -> Result<f32, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::num::NonZeroUsize;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1823,14 +1979,27 @@ mod tests {
         /// *emittable* the characters the pretend model can score and
         /// *lexicon* the character table, or empty for the generated one.
         fn new(records: &[(&str, &str)], emittable: &str, lexicon: &str) -> Self {
+            let records: Vec<_> = records
+                .iter()
+                .map(|&(pinyin, text)| (pinyin, text, None))
+                .collect();
+            Self::with_contexts(&records, emittable, lexicon)
+        }
+
+        /// `new` over `(pinyin, expected, context)` triples.
+        fn with_contexts(
+            records: &[(&str, &str, Option<&str>)],
+            emittable: &str,
+            lexicon: &str,
+        ) -> Self {
             let scratch = Scratch::new("fixture");
             let eval_set = scratch.path("eval.jsonl");
             let mut source = String::new();
-            for &(pinyin, text) in records {
+            for &(pinyin, text, context) in records {
                 let record = EvalRecord {
                     pinyin: pinyin.to_owned(),
                     text: text.to_owned(),
-                    context: None,
+                    context: context.map(str::to_owned),
                     clean: None,
                 };
                 source.push_str(&serde_json::to_string(&record).expect("a record serialises"));
@@ -1900,7 +2069,7 @@ mod tests {
             sink.finish().expect("the score file flushes");
         }
 
-        /// One `fused-eval` run over the fixture.
+        /// One context-on `fused-eval` run over the fixture.
         ///
         /// # Errors
         ///
@@ -1913,35 +2082,42 @@ mod tests {
             transition: Models<'_>,
             progress: Option<&Progress<'_>>,
         ) -> Result<String> {
-            self.run_dumped(
+            self.run_as(
                 weights,
                 dev_share,
                 select_on_dev,
                 transition,
                 progress,
+                true,
                 None,
             )
         }
 
-        /// One `fused-eval` run over the fixture, its beams dumped into *dump*
-        /// when given.
+        /// `run`, context-on or context-off as *`with_context`* says, its
+        /// beams dumped into *dump* when given.
         ///
         /// # Errors
         ///
         /// Whatever the run reports.
-        fn run_dumped(
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "it forwards the axes of `fused_eval` the tests vary"
+        )]
+        fn run_as(
             &self,
             weights: &[f32],
             dev_share: f64,
             select_on_dev: bool,
             transition: Models<'_>,
             progress: Option<&Progress<'_>>,
+            with_context: bool,
             dump: Option<&Path>,
         ) -> Result<String> {
             fused_eval(
                 &self.eval_set,
                 Some(&self.scores),
                 None,
+                with_context,
                 &self.emittable,
                 -30.0,
                 weights,
@@ -1968,8 +2144,23 @@ mod tests {
 
         /// A `Progress` into this fixture's directory.
         fn progress<'a>(&'a self, stop_after: Option<usize>, lm: Option<&'a Path>) -> Progress<'a> {
+            self.progress_by(
+                Build::current().expect("the test binary hashes"),
+                stop_after,
+                lm,
+            )
+        }
+
+        /// `progress`, as though *build* were running.
+        fn progress_by<'a>(
+            &'a self,
+            build: Build,
+            stop_after: Option<usize>,
+            lm: Option<&'a Path>,
+        ) -> Progress<'a> {
             Progress {
                 dir: &self.progress_dir,
+                build,
                 model: None,
                 lm,
                 stop_after,
@@ -2031,6 +2222,124 @@ mod tests {
                 })
                 .collect()
         }
+
+        /// Hand *body* a `Run` over the fixture's whole set and score file,
+        /// built the way `fused_eval` builds one, decoding *batch* records at
+        /// a time -- one is the per-record path, more the lockstep one -- and
+        /// keeping every record's beam in its sections' rows.
+        fn with_run<R>(
+            &self,
+            with_context: bool,
+            batch: usize,
+            body: impl FnOnce(&Run<'_>) -> R,
+        ) -> R {
+            let set = load_set(&self.eval_set).expect("the eval set loads");
+            let lexicon = self.lexicon();
+            let emittable =
+                load_emittable(&self.emittable, &lexicon).expect("the emittable set loads");
+            let scores = load_scores(&self.scores).expect("the score file loads");
+            let reader = Reader {
+                table: SyllableTable::load(),
+                lexicon,
+                segment: segment(),
+                corrections: None,
+            };
+            let slice = SliceArgs {
+                slice: SliceArg::All,
+                dev_share: 0.5,
+                select_on_dev: false,
+            };
+            let beam = BeamOptions {
+                beam_width: NonZeroUsize::new(16).expect("16 is not zero"),
+                ..BeamOptions::default()
+            };
+            body(&Run {
+                set: &set,
+                eval_set: &self.eval_set,
+                reader: &reader,
+                scores: Some(&scores),
+                scores_path: Some(&self.scores),
+                route_a: None,
+                route_a_path: None,
+                with_context,
+                emittable: &emittable,
+                emittable_path: &self.emittable,
+                floor: -30.0,
+                weights: &[1.0],
+                typo_weights: &[1.0],
+                slice: &slice,
+                beam: &beam,
+                batch,
+                dump: true,
+                progress: None,
+            })
+        }
+    }
+
+    /// Every dumped row of *sections*, serialised, in record order.
+    fn rows(sections: &[Section]) -> Vec<String> {
+        sections
+            .iter()
+            .flat_map(|section| &section.rows)
+            .map(|row| serde_json::to_string(row).expect("a row serialises"))
+            .collect()
+    }
+
+    /// A transition that scores nothing and remembers the context of every
+    /// `start` it was asked for.
+    #[derive(Default)]
+    struct Recorder {
+        contexts: Mutex<Vec<Option<String>>>,
+    }
+
+    impl Recorder {
+        /// The distinct contexts `start` was given.
+        fn seen(&self) -> BTreeSet<Option<String>> {
+            self.contexts
+                .lock()
+                .expect("the recorder is not poisoned")
+                .iter()
+                .cloned()
+                .collect()
+        }
+    }
+
+    impl Transition for Recorder {
+        const HISTORY: usize = 1;
+
+        type State = ();
+
+        fn start(&self, context: Option<&str>, _asked: &Asked<'_>) -> Self::State {
+            self.contexts
+                .lock()
+                .expect("the recorder is not poisoned")
+                .push(context.map(str::to_owned));
+        }
+
+        fn score(&self, _state: &Self::State, _candidate: CharId) -> f32 {
+            0.0
+        }
+
+        fn finish(&self, _state: &Self::State) -> f32 {
+            0.0
+        }
+
+        fn advance(&self, steps: &[(&Self::State, CharId, Asked<'_>)]) -> Vec<Self::State> {
+            vec![(); steps.len()]
+        }
+    }
+
+    /// Three records over the generated lexicon, two of them with a context.
+    fn context_fixture() -> Fixture {
+        Fixture::with_contexts(
+            &[
+                ("nihao", "你好", Some("今天")),
+                ("zhongguo", "中国", None),
+                ("renmin", "人民", Some("我们")),
+            ],
+            "你\n好\n中\n国\n人\n民",
+            "",
+        )
     }
 
     /// The record lines a progress file's bytes carry (header excluded).
@@ -2158,6 +2467,100 @@ mod tests {
     }
 
     #[test]
+    fn a_resumed_run_from_another_build_is_refused() {
+        let fixture = Fixture::new(
+            &[("nihao", "你好"), ("zhongguo", "中国"), ("renmin", "人民")],
+            "你\n好\n中\n国\n人\n民",
+            "",
+        );
+        let other = Build("0123456789abcdef0123456789abcdef".to_owned());
+        assert_ne!(other, Build::current().expect("the test binary hashes"));
+        fixture
+            .run(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress_by(other.clone(), Some(1), None)),
+            )
+            .expect("the other build's stopped run decodes");
+        let before = fixture.progress_files();
+        assert_eq!(before[0].0["build"].as_str(), Some(other.0.as_str()));
+        let refused = fixture
+            .run(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress(None, None)),
+            )
+            .expect_err("another build's progress must be refused");
+        let message = format!("{refused:#}");
+        assert!(
+            message.contains(&other.0) && message.contains("not by this build"),
+            "the refusal names both builds: {message}"
+        );
+        assert_eq!(
+            fixture.progress_files(),
+            before,
+            "a refused resume leaves the file as it was"
+        );
+        // The build that wrote the file resumes it.
+        fixture
+            .run(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress_by(other, None, None)),
+            )
+            .expect("the same build resumes");
+        assert_eq!(fixture.progress_files()[0].1.len(), 3);
+    }
+
+    #[test]
+    fn a_progress_file_without_a_build_is_refused() {
+        let fixture = Fixture::new(&[("nihao", "你好")], "你\n好", "");
+        fixture
+            .run(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress(None, None)),
+            )
+            .expect("the first run decodes");
+        let path = fs::read_dir(&fixture.progress_dir)
+            .expect("the progress directory reads")
+            .next()
+            .expect("one progress file")
+            .expect("an entry reads")
+            .path();
+        let text = fs::read_to_string(&path).expect("the progress file reads");
+        let (header, rest) = text.split_once('\n').expect("a header line");
+        let mut header: serde_json::Value =
+            serde_json::from_str(header).expect("the header parses");
+        header
+            .as_object_mut()
+            .expect("the header is an object")
+            .remove("build");
+        fs::write(&path, format!("{header}\n{rest}")).expect("the progress file writes");
+        let refused = fixture
+            .run(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress(None, None)),
+            )
+            .expect_err("a file with no build must be refused");
+        assert!(
+            format!("{refused:#}").contains("(unrecorded)"),
+            "the refusal says no build was recorded: {refused:#}"
+        );
+    }
+
+    #[test]
     fn select_on_dev_resumes_each_pass_on_its_own_file() {
         let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ime-lm/tests/fixtures");
         let lexicon =
@@ -2267,6 +2670,160 @@ mod tests {
     }
 
     #[test]
+    fn a_context_off_run_hands_no_transition_the_context() {
+        let fixture = context_fixture();
+        let contexts = BTreeSet::from([None, Some("今天".to_owned()), Some("我们".to_owned())]);
+        let blind = BTreeSet::from([None]);
+        // One record at a time is the rayon path, two the lockstep one.
+        for batch in [1, 2] {
+            let on = Recorder::default();
+            let sections =
+                fixture.with_run(true, batch, |run| run.decode(&on, "recorder", 1.0, false));
+            let sections = sections.expect("the context-on run decodes");
+            assert_eq!(sections[0].emission, "neural");
+            assert_eq!(on.seen(), contexts, "batch {batch}: on reads every context");
+            let off = Recorder::default();
+            let sections =
+                fixture.with_run(false, batch, |run| run.decode(&off, "recorder", 1.0, false));
+            let sections = sections.expect("the context-off run decodes");
+            assert_eq!(sections[0].emission, "neural-no-context");
+            assert_eq!(off.seen(), blind, "batch {batch}: off reads none");
+            // A fused pair is blind as a whole: neither half sees a context.
+            let (first, second) = (Recorder::default(), Recorder::default());
+            let both = Both {
+                first: &first,
+                first_weight: 1.0,
+                second: &second,
+                second_weight: 1.0,
+            };
+            fixture
+                .with_run(false, batch, |run| run.decode(&both, "both", 1.0, false))
+                .expect("the context-off pair decodes");
+            assert_eq!(first.seen(), blind, "batch {batch}: the first half");
+            assert_eq!(second.seen(), blind, "batch {batch}: the second half");
+        }
+    }
+
+    #[test]
+    fn a_context_off_run_keeps_progress_apart_from_a_context_on_one() {
+        let fixture = context_fixture();
+        let on = fixture
+            .run_as(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress(None, None)),
+                true,
+                None,
+            )
+            .expect("the context-on run decodes");
+        let off = fixture
+            .run_as(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress(None, None)),
+                false,
+                None,
+            )
+            .expect("the context-off run decodes");
+        assert!(on.starts_with("emission neural,"), "{on}");
+        assert!(off.starts_with("emission neural-no-context,"), "{off}");
+        let files = fixture.progress_files();
+        assert_eq!(files.len(), 2, "on and off are two configurations");
+        let mut flags = files
+            .iter()
+            .map(|(header, lines)| {
+                assert_eq!(
+                    lines.len(),
+                    3,
+                    "every record decoded, none taken from the other"
+                );
+                header["with_context"].as_bool()
+            })
+            .collect::<Vec<_>>();
+        flags.sort_unstable();
+        assert_eq!(flags, [Some(false), Some(true)]);
+        // Each resumes its own file: a finished run decodes nothing new.
+        for (with_context, report) in [(true, &on), (false, &off)] {
+            let again = fixture
+                .run_as(
+                    &[1.0],
+                    0.5,
+                    false,
+                    Models::None,
+                    Some(&fixture.progress(None, None)),
+                    with_context,
+                    None,
+                )
+                .expect("the finished run resumes");
+            assert_eq!(&again, report);
+        }
+        let files = fixture.progress_files();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|(_, lines)| lines.len() == 3));
+    }
+
+    #[test]
+    fn the_character_model_reads_the_context_only_in_a_context_on_run() {
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ime-lm/tests/fixtures");
+        let lexicon =
+            fs::read_to_string(fixtures.join("char_pinyin.tsv")).expect("the table reads");
+        // The fixture lexicon's `ni`, `zai` and `wo` segment one way each.
+        // A record whose beam scores at -1e9 here (`wozai` did) cannot show
+        // the model's few nats: an f32 that large rounds them away.
+        let fixture = Fixture::with_contexts(
+            &[("niwo", "你我", Some("再")), ("zaini", "再你", None)],
+            "你\n再\n我",
+            &lexicon,
+        );
+        let table = SyllableTable::load();
+        let lm_lexicon = Lexicon::parse(&lexicon, &table).expect("the fixture lexicon parses");
+        let environment = ort::init()
+            .build()
+            .expect("the test builds its environment");
+        // A fresh model per decode, so no run is served from the cache an
+        // earlier one filled; one record at a time, so no record shares a
+        // step with batchmates that differ between the runs -- the lockstep
+        // path's context is the recorder test's.
+        let open = || {
+            CharLm::open(
+                &environment,
+                &fixtures.join("transformer"),
+                &lm_lexicon,
+                ime_lm::SessionShape::default(),
+            )
+            .expect("the transformer fixture opens")
+        };
+        // The context-on run decodes through the model exactly as given,
+        // which is what `fused_eval` did before the switch existed.
+        let lm = open();
+        let on = fixture.with_run(true, 1, |run| {
+            run.decode(&lm, "char-lm", 1.0, false)
+                .expect("the context-on run decodes")
+        });
+        let lm = open();
+        let given = fixture.with_run(true, 1, |run| {
+            run.sections(&lm, "char-lm", 1.0, false)
+                .expect("the unwrapped model decodes")
+        });
+        assert_eq!(rows(&on), rows(&given), "a context-on run is unchanged");
+        let lm = open();
+        let off = fixture.with_run(false, 1, |run| {
+            run.decode(&lm, "char-lm", 1.0, false)
+                .expect("the context-off run decodes")
+        });
+        let (on, off) = (rows(&on), rows(&off));
+        assert_eq!(on.len(), 2);
+        // Record 1 has no context: blind or not, its beam is bit for bit the
+        // same. Record 0 has one, and reading it moves the model's scores.
+        assert_eq!(on[1], off[1], "no context, no difference");
+        assert_ne!(on[0], off[0], "record 0 read its context");
+    }
+
+    #[test]
     fn a_negative_fusion_weight_is_refused() {
         assert!(parse_weight("-0.5").is_err());
         assert!(parse_weight("nan").is_err());
@@ -2302,7 +2859,7 @@ mod tests {
         );
         let dir = fixture.scratch.path("dump");
         let rendered = fixture
-            .run_dumped(&[1.0], 0.5, false, Models::None, None, Some(&dir))
+            .run_as(&[1.0], 0.5, false, Models::None, None, true, Some(&dir))
             .expect("the run decodes");
         let mut files: Vec<_> = fs::read_dir(&dir)
             .expect("the dump directory reads")

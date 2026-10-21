@@ -22,7 +22,7 @@ ime-cli fused-eval: beam search over the emissions with a transition —
 notes/<stage>.md
 ```
 
-The character LM is trained with `mlime train char-lm` (Kaggle, resumable across sessions) and
+The character LM is trained with `mlime train char-lm` (resumable across sessions) and
 exported with `mlime export char-lm`: `charlm.onnx` (one step over a batch of beams),
 `prefill.onnx` (the context once per record), the external weights files, and `charlm.json`, the
 manifest that names every tensor. `ime-lm` loads that directory; a graph without its manifest
@@ -41,8 +41,8 @@ table does not load, so an export and the decoder always move together.
 | `crates/ime-cli` | the command line: `fused-eval`, `train-ngram`, and the rest |
 | `crates/ime-corpus`, `ime-g2p`, `ime-synth` | corpus fetching, dual pinyin annotation, grounded synthesis of slang usage |
 | `python/` | the `mlime` CLI (uv project): corpus, labels, training, export, `eval generate` / `eval rime` |
-| `kaggle/`, `colab/` | the training kernels and the chain that keeps them running; `kaggle/README.md` |
-| `notes/` | the record; `notes/HANDOFF.md` is the operator's manual and the list of gotchas |
+| `kaggle/`, `colab/` | the training kernels and the Colab launcher; `kaggle/README.md` |
+| `notes/` | the record |
 | `macos/ContextProbe` | the accessibility probe for reading the host application's text |
 | `data/` | everything generated or downloaded: eval sets, score files, models, exports, run outputs; never committed |
 
@@ -86,9 +86,41 @@ table does not load, so an export and the decoder always move together.
   work is shaped wrong — too few rows a step, too few records in flight, a serial stage — and
   the shape is fixed before the run continues. Check utilisation once the run has warmed up and
   again at every wake, and record it with the run.
+- A GPU test on a training VM runs after the kernel's `install()`, in the environment the leg
+  trains in.
+- A GPU assignment refused for capacity (503) is retried after a pause, never in a loop; nothing
+  is billed until a runtime is assigned.
+- A performance measurement on a training card is training: every configuration starts from
+  the run's checkpoint and keeps its own, and the winner continues from its checkpoint. A leg
+  that is thrown away buys the same steps and discards them.
 - A grid never repeats a configuration already shown to be redundant. Once a cheaper
   configuration has matched the expensive one on the dev slice, the grid runs the cheaper one and
   the expensive one is a single check.
 - The decoder's shape is the product's: one sentence, eight beams a step. Its per-step cost is
   the input method's latency, so the levers there are bytes per weight and a faster backend, not
   more threads.
+
+## GPUs
+
+- No Devin, local or cloud, works on this repository: its code runs straight on expensive GPUs,
+  so it is written by a coordinating session or an Opus subagent and reviewed before any GPU
+  runs it.
+- Training runs only on an A100 or a G4, never an H100. A T4 or L4 checks GPU training code for
+  correctness and trains nothing: its legs publish nothing and their weights are discarded. Code
+  that is not GPU training code is covered by unit tests, not GPU checks.
+- No A100 or G4 training starts without the owner's explicit permission, asked with the
+  correctness and performance checks complete and the expected training time.
+- Every Colab runtime carries the watchdog; nothing outlives its controller. Cost is stated in
+  compute units, together with time.
+- `data/` is not regenerable and is never deleted without asking.
+- The e2e step is bound by kernel launches, so the host's cores decide the card, and memory is
+  never the limit (about 10 GB of VRAM). The G4 (RTX PRO 6000 Blackwell, 96 GB, 48-core host)
+  costs about 9 CU/h and is the training card: 0.355 s/step on the v2 epoch at 91.5%
+  utilisation, 0.542 s/step on the ranking stage at 85%. The A100 40 GB (12-core host, 5.3 CU/h)
+  starves on launches: 0.719 s/step at 75%. The L4 is power-capped at 72 W, so a launch
+  optimisation shows nothing on it. #155 holds the comparison.
+- Colab sessions are run from the Mac mini, the only machine whose `colab` resolves their
+  names. The owner watches one with
+  `ssh -t lexoliu@lexos-mac-mini 'TERM=xterm-256color /Users/lexoliu/.local/bin/colab ssh -s <session>'`.
+  `colab exec` exits 0 when the remote code raises; `colab/provision.sh`'s `remote` reports the
+  real outcome.

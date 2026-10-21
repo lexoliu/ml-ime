@@ -1034,6 +1034,23 @@ struct Node {
     children: Mutex<HashMap<CharId, Weak<Node>>>,
 }
 
+impl Node {
+    /// Whether stealing this node's page would take it from a reader, seen
+    /// from the sweep, which holds one strong reference of its own: a
+    /// holder besides that one and the desc memo (a state's row, or an
+    /// entry), or a live child, whose chain walks through this page. A
+    /// child that already dropped leaves a dead entry in `children`,
+    /// pruned here so it neither pins its parent nor lingers in the map.
+    fn in_use(self: &Arc<Self>) -> bool {
+        if Arc::strong_count(self) > 2 {
+            return true;
+        }
+        let mut children = self.children.lock().expect("the page trie is not poisoned");
+        children.retain(|_, child| child.strong_count() > 0);
+        !children.is_empty()
+    }
+}
+
 /// A page index claimed from the pool: returning the index to the free
 /// list when the last [`Node`] holding it drops.
 #[derive(Debug)]
@@ -1280,9 +1297,9 @@ impl CachePool {
 /// bytes the page path would have read.
 ///
 /// `SessionShape::cache_rows` is the page count. The free list serves
-/// claims; when it runs dry the pool reclaims nodes in insertion order —
-/// leaves still held by the trie but by no live state, detected by a
-/// strong count that says the desc memo is all that keeps them.
+/// claims; when it runs dry the pool sweeps its nodes oldest first, round
+/// and round, for a leaf still held by the trie but by no live state,
+/// detected by a strong count that says the desc memo is all that keeps it.
 #[derive(Debug)]
 struct PagePool {
     /// The Metal backend's pool buffers: when set, `keys`/`values` live as
@@ -1313,12 +1330,18 @@ struct PagePool {
     /// Page indices open for a claim — index zero is the masked scratch
     /// page and is never handed out.
     free: Arc<Mutex<Vec<u32>>>,
-    /// Every node in creation order, for the reclaim sweep.
+    /// The reclaim sweep's clock: every character node that still holds
+    /// its page, once each, oldest at the front — plus dead entries not yet
+    /// pruned. The sweep rotates it, so a node it skips as in use is seen
+    /// again on a later pass; `adopt` prunes the dead once they outnumber
+    /// the pages.
     order: Mutex<VecDeque<Weak<Node>>>,
     /// Serialises a node acquisition — the memo-hit `Arc::clone` and the
     /// dedup `Weak::upgrade` in `resolve_at` — against the sweep's
     /// strong-count check and tombstone, so no `Path`/`Pending` can come
-    /// to hold a node whose page was already stolen. Lock order: `order`
+    /// to hold a node whose page was already stolen. A fresh node needs no
+    /// such guard: `adopt` stores it in its memo before it enters `order`,
+    /// so the sweep never sees it with fewer holders. Lock order: `order`
     /// → `acquire` → `children` → `claim`; `free` is leaf-level inside
     /// `PageSlot::drop` and a `desc.node` memo lock is outermost of all.
     acquire: Mutex<()>,
@@ -1328,6 +1351,13 @@ struct PagePool {
     /// One node's byte footprint across the state tensors, for the notes.
     node_bytes: usize,
 }
+
+/// How many in-use nodes one reclaim sweep moves past before it gives up:
+/// the bound on [`PagePool::steal`]'s critical section, which every
+/// thread's `resolve_at` waits on. Small against any pool — a 4096-page
+/// pool's full rotation spans 64 refused claims — and large enough that a
+/// sweep is not dominated by its lock round-trips.
+const SWEEP_BUDGET: usize = 64;
 
 /// A scratch generation the pool reuses: its sequence depth and how many
 /// pending rows it covers.
@@ -1451,7 +1481,7 @@ impl PagePool {
             .or_else(|| self.reclaim())
     }
 
-    /// Steal the oldest dead leaf's page. A node is dead-safe to steal when
+    /// Steal an unused leaf's page, oldest first. A node is safe to steal when
     /// the only strong references are its desc's memo and the sweep's own
     /// upgrade — `strong_count <= 2` — meaning no state or entry holds it;
     /// stealing detaches it from its parent so a later resolve dedups a
@@ -1459,50 +1489,69 @@ impl PagePool {
     /// itself moves to the claimant: dropping it here would both return
     /// the index to `free` and hand it out — the next claim would then
     /// share one page between two live nodes. The `acquire` lock covers the
-    /// whole scan so a `resolve_at` clone or upgrade cannot slip between
+    /// whole sweep so a `resolve_at` clone or upgrade cannot slip between
     /// the count check and the tombstone.
     fn reclaim(&self) -> Option<PageSlot> {
-        let mut order = self.order.lock().expect("the page pool is not poisoned");
+        self.steal(&mut self.order.lock().expect("the page pool is not poisoned"))
+    }
+
+    /// The sweep itself, over *order* — the pool's queue, whose lock the
+    /// caller holds, so the lock order stays `order` → `acquire`.
+    ///
+    /// The queue is a clock and its front is the hand. A node in use — a
+    /// state or another entry holds it, or a live child chains through
+    /// its page — goes back to the tail, because it becomes stealable the
+    /// moment its last user lets go and only a later pass can see that.
+    /// An entry leaves the queue only when it can never be stolen: its
+    /// node is dead (its page went back with it), was stolen here, or was
+    /// unlinked from its parent by a racing `adopt` of the same character.
+    ///
+    /// One sweep requeues at most [`SWEEP_BUDGET`] nodes and looks at no
+    /// entry twice. Both locks are held throughout and every `resolve_at`
+    /// on every thread takes `acquire`, so a pool full of live nodes must
+    /// not turn each refused claim into a scan of the whole pool; the
+    /// rotation carries the hand's place over to the next sweep instead,
+    /// so a node is revisited within `len / SWEEP_BUDGET` refused claims.
+    /// Dead entries cost no budget: each is popped once, for good.
+    fn steal(&self, order: &mut VecDeque<Weak<Node>>) -> Option<PageSlot> {
         let _acquire = self.acquire.lock().expect("the page pool is not poisoned");
-        while let Some(weak) = order.pop_front() {
+        let mut unseen = order.len();
+        let mut budget = SWEEP_BUDGET;
+        while unseen > 0 && budget > 0 {
+            unseen -= 1;
+            let weak = order.pop_front().expect("`unseen` counts queued entries");
             let Some(node) = weak.upgrade() else {
                 continue;
             };
-            if Arc::strong_count(&node) > 2
-                || !node
-                    .children
-                    .lock()
-                    .expect("the page trie is not poisoned")
-                    .is_empty()
-            {
+            if node.in_use() {
+                order.push_back(weak);
+                budget -= 1;
                 continue;
             }
             let (Some(parent), Some(ch)) = (&node.parent, node.ch) else {
-                continue;
+                unreachable!("only character nodes enter the sweep's queue");
             };
             {
                 let mut children = parent
                     .children
                     .lock()
                     .expect("the page trie is not poisoned");
-                if children.get(&ch).is_some_and(|other| other.ptr_eq(&weak)) {
-                    children.remove(&ch);
-                } else {
+                if !children.get(&ch).is_some_and(|other| other.ptr_eq(&weak)) {
                     continue;
                 }
+                children.remove(&ch);
             }
-            let taken = node
+            let slot = node
                 .claim
                 .lock()
                 .expect("the page pool is not poisoned")
-                .take();
-            if let Some(slot) = taken {
-                // Tombstone before the slot's drop frees the index: a
-                // lock-free reader that still sees it then walks past a
-                // page already re-issued.
-                node.page.store(u32::MAX, Ordering::Relaxed);
-                return Some(slot);
-            }
+                .take()
+                .expect("a queued node keeps its page until the sweep takes it");
+            // Tombstone before the slot's drop frees the index: a
+            // lock-free reader that still sees it then walks past a
+            // page already re-issued.
+            node.page.store(u32::MAX, Ordering::Relaxed);
+            return Some(slot);
         }
         None
     }
@@ -1556,27 +1605,114 @@ impl PagePool {
                 panic!("the page write failed: {error}");
             }
         }
+        Some(self.adopt(parent, desc.ch, slot, &mut memo))
+    }
+
+    /// Give *slot*'s freshly written page to a new node under *parent* and
+    /// publish it: into *memo* first, then — a character node — into the
+    /// parent's children and the sweep's queue.
+    ///
+    /// The order is the invariant the sweep rests on. `order` is where the
+    /// sweep finds its victims, and it steals any queued leaf it sees at
+    /// `strong_count <= 2`, its own upgrade included. A node queued before
+    /// its memo holds it has only its creator's handle, so a sweep on
+    /// another thread passes that check and tombstones a node that is about
+    /// to become a live state's leaf; the next step then walks it into
+    /// `fill_page_row` or `slice_at`. With the memo stored first, a queued
+    /// node always has the memo and its creator's handle, which the caller
+    /// moves into the state's row.
+    fn adopt(
+        &self,
+        parent: &Arc<Node>,
+        ch: Option<CharId>,
+        slot: PageSlot,
+        memo: &mut Option<Arc<Node>>,
+    ) -> Arc<Node> {
         let node = Arc::new(Node {
-            ch: desc.ch,
+            ch,
             page: AtomicU32::new(slot.index),
             claim: Mutex::new(Some(slot)),
             depth: parent.depth + 1,
             parent: Some(Arc::clone(parent)),
             children: Mutex::new(HashMap::new()),
         });
-        if let Some(ch) = desc.ch {
-            parent
-                .children
-                .lock()
-                .expect("the page trie is not poisoned")
-                .insert(ch, Arc::downgrade(&node));
-        }
-        self.order
-            .lock()
-            .expect("the page pool is not poisoned")
-            .push_back(Arc::downgrade(&node));
         *memo = Some(Arc::clone(&node));
-        Some(node)
+        // A context node names no character, so no parent links it and the
+        // sweep could never unlink it: it stays out of the queue and its
+        // page returns only when it drops.
+        let Some(ch) = ch else {
+            return node;
+        };
+        parent
+            .children
+            .lock()
+            .expect("the page trie is not poisoned")
+            .insert(ch, Arc::downgrade(&node));
+        let mut order = self.order.lock().expect("the page pool is not poisoned");
+        order.push_back(Arc::downgrade(&node));
+        // Every live queued node holds a page, so at most `capacity` entries
+        // are live; past twice that the rest are dead, and pruning them
+        // here — rather than only when a sweep happens to pass — keeps a
+        // pool that never fills from queueing one entry per node it ever
+        // made. Each prune leaves at most `capacity` entries, so it runs
+        // once per `capacity` adoptions at the earliest.
+        if order.len() > 2 * self.capacity {
+            order.retain(|entry| entry.strong_count() > 0);
+        }
+        node
+    }
+
+    /// Chain a prelude's *positions* rows of *rows* under the trie root:
+    /// each position *write*s into a page from *claim* and becomes a context
+    /// node under the one before it, and the desc chain grows from *root*
+    /// one context desc per position. Returns the state's row and its path.
+    ///
+    /// Positions a claim cannot cover ride as pending tips, the same
+    /// fallthrough `advance` uses — `start` under a saturated pool degrades
+    /// rather than fails.
+    fn chain(
+        &self,
+        root: &Arc<PathDesc>,
+        rows: &Arc<Generation>,
+        positions: u32,
+        mut claim: impl FnMut() -> Option<PageSlot>,
+        mut write: impl FnMut(&PageSlot, u32) -> Result<(), LmError>,
+    ) -> Result<(StateRow, Arc<PathDesc>), LmError> {
+        let mut leaf = Arc::clone(&self.root);
+        let mut desc = Arc::clone(root);
+        let mut tips = Vec::new();
+        for position in 0..positions {
+            let child_desc = Arc::new(PathDesc {
+                parent: Some(desc),
+                ch: None,
+                node: Mutex::new(None),
+            });
+            desc = child_desc;
+            // Once a position has no page, none after it claims one: a page
+            // granted later would chain under the leaf before the gap and
+            // skip the positions in it, which `Pending` only allows at the
+            // end — `tips[j]` is position `leaf.depth + j`.
+            let Some(slot) = tips.is_empty().then(&mut claim).flatten() else {
+                tips.push(RowRef {
+                    generation: Arc::clone(rows),
+                    index: position,
+                });
+                continue;
+            };
+            write(&slot, position)?;
+            leaf = self.adopt(
+                &leaf,
+                None,
+                slot,
+                &mut desc.node.lock().expect("the desc memo is not poisoned"),
+            );
+        }
+        let row = if tips.is_empty() {
+            StateRow::Path(leaf)
+        } else {
+            StateRow::Pending { leaf, tips }
+        };
+        Ok((row, desc))
     }
 
     /// Write *row*'s slice of tensor `index` — one position's `[layers,
@@ -2670,10 +2806,6 @@ impl CharLm {
     /// `prefix_*` output — one position per row — to the device, then every
     /// position's slice written into its own claimed page. The pages form
     /// the context's chain: the record's root every beam shares.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one prefill is a straight-line sequence: bind and run the graph, then chain the prelude's pages or tips position by position"
-    )]
     fn prefill_pages(&self, context: Option<&str>, asked: &Asked<'_>) -> Result<LmState, LmError> {
         let Some(Cache::Pages(pool)) = &self.cache else {
             unreachable!("a paged export always owns its page pool");
@@ -2720,65 +2852,25 @@ impl CharLm {
         };
         // Write the prelude's pages: one claimed page per position, the
         // prefix output's row `position` landing at the chain's next page.
-        // Positions a claim cannot cover ride as pending tips, the same
-        // fallthrough `advance` uses — `start` under a saturated pool
-        // degrades rather than fails.
         let tick = std::time::Instant::now();
         let prefix_outs = Arc::new(Generation {
             tensors: prefix_outs,
         });
+        let positions =
+            u32::try_from(prefix_outs.tensors[0].shape()[0]).expect("a prelude length fits u32");
         let mut env = env_cell.borrow_mut();
-        let mut leaf = Arc::clone(&pool.root);
-        let mut desc = Arc::clone(&self.root_path);
-        let mut tips = Vec::new();
-        let positions = usize::try_from(prefix_outs.tensors[0].shape()[0])
-            .expect("a prelude length fits usize");
-        for position in 0..positions {
-            let Some(slot) = pool.claim() else {
-                tips.push(RowRef {
-                    generation: Arc::clone(&prefix_outs),
-                    index: u32::try_from(position).expect("a position fits u32"),
-                });
-                desc = Arc::new(PathDesc {
-                    parent: Some(desc),
-                    ch: None,
-                    node: Mutex::new(None),
-                });
-                continue;
-            };
-            for (index, tensor) in prefix_outs.tensors.iter().enumerate() {
-                pool.write_page(
-                    &mut env,
-                    tensor,
-                    u32::try_from(position).expect("a position fits u32"),
-                    slot.index,
-                    index,
-                )?;
-            }
-            let child = Arc::new(Node {
-                ch: None,
-                page: AtomicU32::new(slot.index),
-                claim: Mutex::new(Some(slot)),
-                depth: leaf.depth + 1,
-                parent: Some(Arc::clone(&leaf)),
-                children: Mutex::new(HashMap::new()),
-            });
-            pool.order
-                .lock()
-                .expect("the page pool is not poisoned")
-                .push_back(Arc::downgrade(&child));
-            let child_desc = Arc::new(PathDesc {
-                parent: Some(desc),
-                ch: None,
-                node: Mutex::new(None),
-            });
-            *child_desc
-                .node
-                .lock()
-                .expect("the desc memo is not poisoned") = Some(Arc::clone(&child));
-            leaf = child;
-            desc = child_desc;
-        }
+        let (row, desc) = pool.chain(
+            &self.root_path,
+            &prefix_outs,
+            positions,
+            || pool.claim(),
+            |slot, position| {
+                for (index, tensor) in prefix_outs.tensors.iter().enumerate() {
+                    pool.write_page(&mut env, tensor, position, slot.index, index)?;
+                }
+                Ok(())
+            },
+        )?;
         drop(env);
         self.bookkeeping.fetch_add(
             u64::try_from(tick.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -2786,11 +2878,7 @@ impl CharLm {
         );
         Ok(LmState {
             worker: None,
-            row: if tips.is_empty() {
-                StateRow::Path(leaf)
-            } else {
-                StateRow::Pending { leaf, tips }
-            },
+            row,
             path: desc,
             scores: Arc::new(Scores { ids, probs }),
             cache: None,
@@ -3820,6 +3908,12 @@ mod tests {
     /// The fixture lexicon's first character id — the reclaim test needs a
     /// real `CharId` to queue a node under, not a fabricated one.
     fn a_char() -> CharId {
+        char_at(0)
+    }
+
+    /// The fixture lexicon's character id at *index*, for a test that needs
+    /// two siblings under one parent.
+    fn char_at(index: usize) -> CharId {
         let source = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/char_pinyin.tsv"
@@ -3827,10 +3921,117 @@ mod tests {
         .expect("the fixture character table is committed");
         let lexicon = Lexicon::parse(&source, &SyllableTable::load())
             .expect("the fixture character table parses");
-        let character = lexicon.characters()[0];
+        let character = lexicon.characters()[index];
         lexicon
             .id_of(character)
             .expect("the lexicon indexes its own table")
+    }
+
+    /// A character node under *parent* on a fresh claim, published the way
+    /// `resolve_at` publishes one: the returned memo stands for its desc's,
+    /// the returned node for the state row that names it.
+    fn adopted(pool: &PagePool, parent: &Arc<Node>, ch: CharId) -> (Arc<Node>, Option<Arc<Node>>) {
+        let slot = pool.claim().expect("the test sizes the pool for its nodes");
+        let mut memo = None;
+        let node = pool.adopt(parent, Some(ch), slot, &mut memo);
+        (node, memo)
+    }
+
+    /// The test pool: *pages* pages, page zero never issued.
+    fn pool_of(pages: usize) -> PagePool {
+        PagePool::new(ModelDtype::Float32, pages, &[vec![0, 2, 3, 4]])
+            .expect("a page-major shape loads")
+    }
+
+    /// A node the sweep skips because a state still names it must be
+    /// stolen once the state lets go. The sweep used to drop every node it
+    /// skipped from its queue for good, so after one refused claim on a
+    /// full pool nothing it had passed was ever reclaimed, and every later
+    /// state stayed pending. That is #194.
+    #[test]
+    fn a_node_that_falls_out_of_use_after_a_sweep_is_reclaimed() {
+        let pool = pool_of(2);
+        let (leaf, memo) = adopted(&pool, &pool.root, a_char());
+        let index = leaf.page.load(Ordering::Relaxed);
+        assert!(
+            pool.claim().is_none(),
+            "a page a live state names is not stolen"
+        );
+        drop(leaf);
+        let slot = pool
+            .claim()
+            .expect("the sweep comes back to the node once no state names it");
+        assert_eq!(slot.index, index);
+        let tombstone = memo.expect("the memo holds the stolen node");
+        assert_eq!(tombstone.page.load(Ordering::Relaxed), u32::MAX);
+    }
+
+    /// A node whose children all dropped is a leaf again. The sweep used to
+    /// test `children.is_empty()`, which a dropped child's dead entry keeps
+    /// false, so the parent could never be stolen.
+    #[test]
+    fn a_parent_whose_children_dropped_is_reclaimed() {
+        let pool = pool_of(3);
+        let (parent, parent_memo) = adopted(&pool, &pool.root, a_char());
+        let index = parent.page.load(Ordering::Relaxed);
+        let child = adopted(&pool, &parent, a_char());
+        drop(parent);
+        assert!(
+            pool.claim().is_none(),
+            "a page a live child chains through is not stolen"
+        );
+        drop(child);
+        let freed = pool.claim().expect("the child's drop frees its page");
+        let slot = pool
+            .claim()
+            .expect("the sweep steals the parent its dead child left a leaf");
+        assert_eq!(slot.index, index);
+        drop((freed, parent_memo));
+    }
+
+    /// One sweep moves past at most `SWEEP_BUDGET` nodes in use, and the
+    /// next sweep picks up where it stopped rather than at the front again:
+    /// a pool full of live nodes costs each refused claim a bounded scan,
+    /// and a stealable node behind them is still reached.
+    #[test]
+    fn a_sweep_stops_at_its_budget_and_the_next_one_carries_on() {
+        let pool = pool_of(SWEEP_BUDGET + 3);
+        // `SWEEP_BUDGET + 1` nodes in use: a chain, each holding the next
+        // as a live child, its last named by a state.
+        let mut chain = vec![adopted(&pool, &pool.root, a_char())];
+        for _ in 0..SWEEP_BUDGET {
+            let parent = Arc::clone(&chain.last().expect("the chain has a head").0);
+            chain.push(adopted(&pool, &parent, a_char()));
+        }
+        let (unused, memo) = adopted(&pool, &pool.root, char_at(1));
+        let index = unused.page.load(Ordering::Relaxed);
+        drop(unused);
+        assert!(
+            pool.claim().is_none(),
+            "the first sweep spends its budget on the chain"
+        );
+        let slot = pool
+            .claim()
+            .expect("the second sweep reaches the unused node");
+        assert_eq!(slot.index, index);
+        drop((chain, memo));
+    }
+
+    /// The queue keeps one entry per node the pool ever made only until
+    /// the dead outnumber the pages: a pool that never fills — no sweep to
+    /// pop them — used to keep them all.
+    #[test]
+    fn the_sweeps_queue_stays_within_twice_the_pool() {
+        let pool = pool_of(4);
+        for _ in 0..100 {
+            drop(adopted(&pool, &pool.root, a_char()));
+        }
+        let queued = pool
+            .order
+            .lock()
+            .expect("the page pool is not poisoned")
+            .len();
+        assert!(queued <= 2 * pool.capacity, "{queued} entries queued");
     }
 
     /// A page the sweep steals must reach exactly one claimant: `reclaim`
@@ -3982,5 +4183,133 @@ mod tests {
             "a page a live chain names is never reclaimed"
         );
         let _ = (row_handle, desc);
+    }
+
+    /// A sweep on another thread must not steal a node its creator is still
+    /// handing out. `resolve_at` used to queue a fresh node in `order` and
+    /// only then store it in the desc memo. A sweep that reached the node
+    /// in between saw just the creator's handle plus its own upgrade,
+    /// `strong_count == 2`, and tombstoned it. The creator then returned the
+    /// tombstone as a live state's leaf, and the state's next step panicked
+    /// in `fill_page_row` (its own leaf) or `slice_at` (the leaf of a pending
+    /// child). That is #190.
+    ///
+    /// The test holds `order`'s lock so the creator stops right before it
+    /// queues the node, waits until the node shows up in the root's
+    /// children, and runs the sweep over the node at that point.
+    #[test]
+    fn a_fresh_node_is_held_by_its_memo_before_a_sweep_can_reach_it() {
+        let pool = PagePool::new(ModelDtype::Float32, 2, &[vec![0, 2, 3, 4]])
+            .expect("a page-major shape loads");
+        let ch = a_char();
+        let slot = pool.claim().expect("the pool's one page");
+        let index = slot.index;
+        let desc = PathDesc {
+            parent: None,
+            ch: Some(ch),
+            node: Mutex::new(None),
+        };
+        let order = pool.order.lock().expect("the page pool is not poisoned");
+        std::thread::scope(|scope| {
+            let creator = scope.spawn(|| {
+                pool.adopt(
+                    &pool.root,
+                    Some(ch),
+                    slot,
+                    &mut desc.node.lock().expect("the desc memo is not poisoned"),
+                )
+            });
+            let queued = loop {
+                let found = pool
+                    .root
+                    .children
+                    .lock()
+                    .expect("the page trie is not poisoned")
+                    .get(&ch)
+                    .cloned();
+                if let Some(weak) = found {
+                    break weak;
+                }
+                assert!(!creator.is_finished(), "the creator stops at `order`");
+                std::thread::yield_now();
+            };
+            let stolen = pool.steal(&mut VecDeque::from([queued]));
+            drop(order);
+            let node = creator.join().expect("the creator does not panic");
+            assert!(
+                stolen.is_none(),
+                "the sweep stole page {index} from a node its creator was still handing out"
+            );
+            assert_eq!(
+                node.page.load(Ordering::Relaxed),
+                index,
+                "a fresh node keeps its page"
+            );
+        });
+    }
+
+    /// A prelude whose claims fail partway must keep every position in
+    /// order. The chain used to keep claiming after a refusal, so a page
+    /// granted later — freed by another thread in between — was chained
+    /// under the last page before the gap: the leaf chain skipped the
+    /// refused position and the tips named it after the later one, and the
+    /// next `resolve_state` paired that tip with the later position's memo,
+    /// dropping it. That is #193.
+    ///
+    /// The refusal and the later grant come from a scripted claim, the only
+    /// deterministic way to get both inside one prelude: on one thread a
+    /// refused claim has drained the sweep's queue and nothing runs between
+    /// two claims.
+    #[test]
+    fn a_refused_prelude_claim_keeps_every_position_in_order() {
+        let pool = PagePool::new(ModelDtype::Float32, 3, &[vec![0, 2, 3, 4]])
+            .expect("a page-major shape loads");
+        let root = Arc::new(PathDesc {
+            parent: None,
+            ch: None,
+            node: Mutex::new(None),
+        });
+        let rows = Arc::new(Generation {
+            tensors: Vec::new(),
+        });
+        let mut claims = vec![pool.claim(), None, pool.claim()].into_iter();
+        let mut written = HashMap::new();
+        let (row, desc) = pool
+            .chain(
+                &root,
+                &rows,
+                3,
+                || claims.next().flatten(),
+                |slot, position| {
+                    written.insert(slot.index, position);
+                    Ok(())
+                },
+            )
+            .expect("a scripted chain writes nothing that can fail");
+        let (leaf, tips) = match row {
+            StateRow::Path(leaf) => (leaf, Vec::new()),
+            StateRow::Pending { leaf, tips } => (leaf, tips),
+            StateRow::Buf(_) => unreachable!("a chain is paged"),
+        };
+        let mut read = Vec::new();
+        let mut node = Some(&leaf);
+        while let Some(at) = node.filter(|at| at.parent.is_some()) {
+            read.push(written[&at.page.load(Ordering::Relaxed)]);
+            node = at.parent.as_ref();
+        }
+        read.reverse();
+        read.extend(tips.iter().map(|tip| tip.index));
+        assert_eq!(
+            read,
+            [0, 1, 2],
+            "the state reads every prelude position in order"
+        );
+        let mut depth = 0;
+        let mut at = &desc;
+        while let Some(parent) = &at.parent {
+            depth += 1;
+            at = parent;
+        }
+        assert_eq!(depth, 3, "the path names every prelude position");
     }
 }

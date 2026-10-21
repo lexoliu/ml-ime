@@ -1,4 +1,4 @@
-# Sourced by the Colab launchers (colab/e2e.sh, colab/char-lm.sh).
+# Sourced by the Colab launcher, colab/e2e.sh.
 #
 # A launcher's `start` is a dozen CLI calls against a runtime that bills from
 # the moment it exists, and any of them can fail -- the CLI drops its
@@ -26,25 +26,28 @@ deadline=$(type -P gtimeout || type -P timeout) || {
 # runtime -- a start once hung for hours on a billed L4 that way. Each call
 # ends within its subcommand's bound, or COLAB_SECONDS for a call known to
 # run longer, and a call cut off fails like any other.
-colab() {
-  local seconds
+bound() {
   case $1 in
-    sessions | stop) seconds=120 ;;
-    new | upload | download) seconds=900 ;;
-    *) seconds=600 ;;
+    sessions | stop) echo "${COLAB_SECONDS:-120}" ;;
+    new | upload | download) echo "${COLAB_SECONDS:-900}" ;;
+    *) echo "${COLAB_SECONDS:-600}" ;;
   esac
-  "$deadline" --kill-after=15 "${COLAB_SECONDS:-$seconds}" "$colab_cli" "$@"
+}
+
+colab() {
+  "$deadline" --kill-after=15 "$(bound "$1")" "$colab_cli" "$@"
 }
 
 # Run the Python on stdin in SESSION's kernel and fail when it does not finish.
 # `colab exec` hands the code to the runtime's IPython kernel and exits 0 even
 # when the code raises, so its status says only that the code was delivered.
 # Success is a token printed after the code's last statement, which a raise
-# never reaches; the code's own output is passed through.
+# never reaches; the code's own output is passed through. The CLI ends a cell
+# after its own --timeout, 30 s unless told, so the cell is given the call's bound.
 remote() {
   local session=$1 token output
   token="remote-ok-$RANDOM$RANDOM$RANDOM"
-  output=$({ cat; printf '\nprint("%s")\n' "$token"; } | colab exec -s "$session") || return
+  output=$({ cat; printf '\nprint("%s")\n' "$token"; } | colab exec -s "$session" --timeout "$(bound exec)") || return
   if ! printf '%s\n' "$output" | grep -qxF "$token"; then
     printf '%s\n' "$output" >&2
     echo "the code sent to $session did not run to its end" >&2
