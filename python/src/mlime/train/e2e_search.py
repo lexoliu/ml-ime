@@ -19,6 +19,7 @@ from torch import nn
 from mlime.logging import log
 from mlime.train.charlm_vocab import BOS
 from mlime.train.e2e_model import Decoder, E2EModel
+from mlime.train.shapes import bucket
 
 
 @dataclass(frozen=True)
@@ -38,19 +39,6 @@ class Lane:
     def length(self) -> int:
         """The number of typed positions."""
         return int(self.vectors.shape[0])
-
-
-def bucket(size: int) -> int:
-    """*size* rounded up to the next of four steps an octave: 8, 10, 12, 14, 16, 20, ...
-
-    A captured search graph serves one shape; padding every search to these
-    sizes bounds the graphs a run records by a few an octave, at a quarter
-    of padding at most.
-    """
-    if size <= 8:
-        return 8
-    quantum = 1 << (size.bit_length() - 3)
-    return -(-size // quantum) * quantum
 
 
 @dataclass(frozen=True)

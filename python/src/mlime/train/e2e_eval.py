@@ -63,6 +63,7 @@ from mlime.train.samples import (
     DEFAULT_CONTEXT_TOKENS,
     BaseTokenizer,
     Collator,
+    ContextTokenizer,
     token_budget_batches,
 )
 from mlime.train.spans import SpanVocab
@@ -255,6 +256,7 @@ def evaluate(
     lattice: Path,
     eval_set: Path,
     tokenizer: BaseTokenizer,
+    context_tokenizer: ContextTokenizer,
     lexicon: Lexicon,
     spans: SpanVocab,
     slice_: str,
@@ -284,6 +286,7 @@ def evaluate(
     model, step = load_model(checkpoint, lexicon, device)
     collator = Collator(
         tokenizer,
+        context_tokenizer,
         CandidateSpace(spans, lexicon.candidate_mask),
         context_dropout=0.0 if with_context else 1.0,
         max_context_tokens=max_context_tokens,

@@ -318,7 +318,9 @@ def emit(
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, route, step = load_model(checkpoint, lexicon, device)
+    # Route A reads its context with MacBERT, the base model's own tokens.
     collator = Collator(
+        tokenizer,
         tokenizer,
         CandidateSpace(spans, lexicon.candidate_mask),
         context_dropout=0.0 if with_context else 1.0,
