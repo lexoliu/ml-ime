@@ -1,4 +1,4 @@
-# Sourced by the Colab launchers (colab/e2e.sh, colab/char-lm.sh).
+# Sourced by the Colab launcher, colab/e2e.sh.
 #
 # A launcher's `start` is a dozen CLI calls against a runtime that bills from
 # the moment it exists, and any of them can fail -- the CLI drops its
