@@ -35,7 +35,7 @@ import torch.utils.checkpoint
 
 from mlime.train.charlm_vocab import BOS
 from mlime.train.e2e_model import E2EModel, RankingConfig
-from mlime.train.e2e_search import Lane, decode_lanes
+from mlime.train.e2e_search import Lane, SearchGraphs, decode_lanes
 from mlime.train.model import (
     RouteAOutput,
     mark_dynamic,
@@ -256,7 +256,12 @@ class RankingE2EModel(E2EModel):
     tree, the same checkpoint record (with its ``ranking`` field set), the
     same evaluation. The forward takes a :class:`RankBatch` instead of a
     plain one.
+
+    ``search_graphs``, set by the trainer on a CUDA run that asks for it,
+    replays the forward's search from captured CUDA graphs (#137).
     """
+
+    search_graphs: SearchGraphs | None = None
 
     def ranking(self) -> RankingConfig:
         """The ranking settings, which this model cannot be built without."""
@@ -290,6 +295,7 @@ class RankingE2EModel(E2EModel):
                     for row, length in enumerate(batch.lengths)
                 ],
                 ranking.beam,
+                graphs=self.search_graphs,
             )
         decoder.train(training)
         # Autocast caches each weight's low-precision cast for the rest of its

@@ -29,7 +29,16 @@ from mlime.train.arbitration import ReadingArbitration
 from mlime.train.charlm_vocab import SPECIALS, CharVocab
 from mlime.train.e2e import from_checkpoint
 from mlime.train.e2e_model import E2EConfig, E2EModel, RankingConfig, emittable_ids
-from mlime.train.e2e_search import Lane, decode_lanes
+from mlime.train.e2e_search import (
+    Lane,
+    SearchGraphs,
+    SearchInputs,
+    bucket,
+    decode_lanes,
+    run_search,
+    search_inputs,
+    walk_back,
+)
 from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.loop import TrainingConfig, train
 from mlime.train.ranking import RankBatch, RankCollator, RankingE2EModel, select_items
@@ -152,6 +161,99 @@ def test_ragged_lanes_search_as_each_lane_alone(lexicon: Lexicon, spans: SpanVoc
         assert [score for _, score in joint] == pytest.approx(
             [score for _, score in single], abs=1e-4
         )
+
+
+def test_buckets_pad_at_most_a_quarter() -> None:
+    assert [bucket(n) for n in (1, 8, 9, 11, 16, 17, 33, 100, 384)] == [
+        8,
+        8,
+        10,
+        12,
+        16,
+        20,
+        40,
+        112,
+        384,
+    ]
+    assert all(n <= bucket(n) <= max(8, n * 1.25) for n in range(1, 2000))
+
+
+def search_lanes(lexicon: Lexicon, spans: SpanVocab) -> list[Lane]:
+    """Three ragged lanes, none of a bucket's size."""
+    torch.manual_seed(1)
+    return [
+        admitted_lane(lexicon, spans, 0, ("wo", "ai", "bei", "jing"), TINY.hidden_size),
+        admitted_lane(lexicon, spans, 1, ("zhong", "ai"), TINY.hidden_size),
+        admitted_lane(lexicon, spans, 2, ("bei", "jing", "wo", "ai", "zhong"), TINY.hidden_size),
+    ]
+
+
+def test_a_bucketed_search_finds_what_the_exact_one_finds(
+    lexicon: Lexicon, spans: SpanVocab
+) -> None:
+    """Padding lanes and positions to a bucket changes no lane's hypotheses."""
+    model = ranking_model(lexicon).eval()
+    lanes = search_lanes(lexicon, spans)
+    device = model.decoder.emit_ids.device
+    with torch.no_grad():
+        exact = walk_back(
+            *run_search(model.decoder, search_inputs(lanes, 4, device, bucketed=False)), lanes
+        )
+        padded = search_inputs(lanes, 4, device, bucketed=True)
+        assert padded.masks.shape[:2] == (8, 8)
+        bucketed = walk_back(*run_search(model.decoder, padded), lanes)
+    for joint, single in zip(exact, bucketed, strict=True):
+        assert [sequence for sequence, _ in joint] == [sequence for sequence, _ in single]
+        assert [score for _, score in joint] == pytest.approx(
+            [score for _, score in single], abs=1e-5
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a CUDA device")
+def test_a_replayed_search_is_the_search_it_captured(lexicon: Lexicon, spans: SpanVocab) -> None:
+    """The graph replays the bucketed search bit for bit, for new inputs of its shape too."""
+    model = ranking_model(lexicon).cuda().eval()
+    graphs = SearchGraphs()
+    first = search_lanes(lexicon, spans)
+    second = [replace(lane, vectors=lane.vectors.flip(0)) for lane in reversed(first)]
+    with torch.no_grad():
+        for lanes in (first, second, first):
+            eager = run_search(
+                model.decoder, search_inputs(lanes, 4, torch.device("cuda"), bucketed=True)
+            )
+            replayed = graphs.run(
+                model.decoder, search_inputs(lanes, 4, torch.device("cuda"), bucketed=True)
+            )
+            for expected, found in zip(eager, replayed, strict=True):
+                assert torch.equal(expected, found)
+    assert len(graphs.captured) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a CUDA device")
+def test_a_search_past_the_buffers_is_captured_anew(lexicon: Lexicon, spans: SpanVocab) -> None:
+    """A larger search grows the buffers, drops the graphs, and captures its own.
+
+    The dropped graph's outputs are still held, so its pool outlives every
+    graph that used it.
+    """
+    model = ranking_model(lexicon).cuda().eval()
+    graphs = SearchGraphs()
+    small = search_lanes(lexicon, spans)
+    torch.manual_seed(2)
+    reading = ("wo", "ai", "bei", "jing", "zhong", "ai", "wo", "ai", "bei", "jing")
+    large = [*small, admitted_lane(lexicon, spans, 3, reading, TINY.hidden_size)]
+
+    def inputs(lanes: list[Lane]) -> SearchInputs:
+        return search_inputs(lanes, 4, torch.device("cuda"), bucketed=True)
+
+    with torch.no_grad():
+        held = graphs.run(model.decoder, inputs(small))
+        eager = run_search(model.decoder, inputs(large))
+        replayed = graphs.run(model.decoder, inputs(large))
+    assert replayed[0].shape[0] > held[0].shape[0]
+    for expected, found in zip(eager, replayed, strict=True):
+        assert torch.equal(expected, found)
+    assert len(graphs.captured) == 1
 
 
 def test_a_compiled_step_stops_compiling_once_warm(lexicon: Lexicon, spans: SpanVocab) -> None:

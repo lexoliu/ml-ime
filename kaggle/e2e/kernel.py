@@ -201,6 +201,11 @@ INIT_FROM = None
 #: rather than the span's candidates (#121). Stamped per push.
 WHOLE_ALPHABET = False
 
+#: Replay the ranking loss's beam search from captured CUDA graphs (#137);
+#: the search answers as the eager one does, so it is how the stage runs, not
+#: what it trains. Only a ranking stage has the search. Stamped per push.
+SEARCH_GRAPHS = False
+
 #: The training shards a run makes its epoch over; None trains on every
 #: mounted shard but the held-out ones. Stamped per push.
 TRAIN_SHARDS = None
@@ -299,13 +304,17 @@ def describe():
 
 
 def locate_all(*markers):
-    """Every mounted directory holding every one of *markers*."""
+    """Every mounted directory holding every one of *markers*, each a file.
+
+    A marker names a file: the mount the Colab driver makes for `ime-segment`
+    is a directory of that name, which must not make its parent the match.
+    """
     if not INPUTS.is_dir():
         raise FileNotFoundError(f"{INPUTS} does not exist; the kernel has no inputs at all")
     return [
         directory
         for directory in directories(INPUTS)
-        if all((directory / marker).exists() for marker in markers)
+        if all((directory / marker).is_file() for marker in markers)
     ]
 
 
@@ -640,6 +649,9 @@ def train_argv(
     if LEARNING_RATES is not None:
         argv += ["--base-lr", str(LEARNING_RATES[0]), "--new-lr", str(LEARNING_RATES[1])]
     argv += ranking_argv(segmenter)
+    # The trainer's alone: the count shares `ranking_argv` and has no search.
+    if SEARCH_GRAPHS:
+        argv.append("--search-graphs")
     if WHOLE_ALPHABET:
         argv.append("--whole-alphabet")
     if resume is not None:
@@ -952,6 +964,8 @@ def main():
     started = time.monotonic()
     if RANKING is not None and INIT_FROM is None:
         raise RuntimeError("a ranking stage starts from a finished run; stamp INIT_FROM")
+    if SEARCH_GRAPHS and RANKING is None:
+        raise RuntimeError("only a ranking stage has a search to replay; stamp RANKING")
     install()
     packages = package_root()
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)

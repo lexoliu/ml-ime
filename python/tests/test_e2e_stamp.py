@@ -209,3 +209,36 @@ def test_a_stage_starts_from_another_finished_v2_run_with_whole_rates(tmp_path: 
         E2EV2Stage(init_from="mlime-e2e-final")
     with pytest.raises(ValueError, match="cannot start from itself"):
         E2EV2Run(run="mlime-e2e-v2-g4", stage=E2EV2Stage(init_from="mlime-e2e-v2-g4"))
+
+
+def test_a_ranking_stage_stamps_its_search_graphs_beside_its_recipe(tmp_path: Path) -> None:
+    """The graphs change how the search runs, not the recipe it trains."""
+    out = tmp_path / "graphs"
+    argv = [
+        "e2e",
+        "stamp",
+        "mlime-e2e-v2-g4-graphs",
+        "--out",
+        str(out),
+        *STAGE_ARGV,
+        "--search-graphs",
+    ]
+    result = CliRunner().invoke(app, argv)
+    assert result.exit_code == 0, result.output
+    plain = tmp_path / "eager"
+    eager = ["e2e", "stamp", "mlime-e2e-v2-g4-graphs", "--out", str(plain), *STAGE_ARGV]
+    assert CliRunner().invoke(app, eager).exit_code == 0
+    assert changed_lines((plain / "kernel.py").read_text(), (out / "kernel.py").read_text()) == [
+        "SEARCH_GRAPHS = True"
+    ]
+
+
+def test_search_graphs_without_a_ranking_stage_are_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="only a ranking stage"):
+        E2EV2Run(
+            run="mlime-e2e-v2-g4-control",
+            stage=E2EV2Stage(init_from="mlime-e2e-v2-g4"),
+            search_graphs=True,
+        )
+    with pytest.raises(ValueError, match="only a ranking stage"):
+        E2EV2Run(run="mlime-e2e-v2-a100", search_graphs=True)
