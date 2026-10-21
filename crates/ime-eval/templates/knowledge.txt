@@ -1,0 +1,5 @@
+knowledge slice       records  top-1   entities  exact   characters  right
+--------------------  -------  ------  --------  ------  ----------  ------
+{% for (label, c) in self.rows() %}{{ label }}{{ c.records|fmt("{:<7}") }}  {{ c.top1()|fmt("{:.4}") }}  {{ c.entities|fmt("{:<8}") }}  {{ c.exact()|fmt("{:.4}") }}  {{ c.positions|fmt("{:<10}") }}  {{ c.characters()|fmt("{:.4}") }}
+{% endfor %}unspelled             {{ unspelled }}
+

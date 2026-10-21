@@ -289,6 +289,33 @@ def lexicon_fetch(
         typer.echo(f"{slug}: {count} entries")
 
 
+@lexicon_app.command("knowledge")
+def lexicon_knowledge(
+    data_dir: Path = DATA_DIR,
+    out: Path = typer.Option(
+        Path("data/lexicon/knowledge.tsv"), help="The `word<TAB>category` lexicon to write"
+    ),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Write the knowledge slice's lexicon from the fetched Sogou dictionaries and 梗百科."""
+    configure(verbose)
+    from mlime.data import knowledge
+
+    layout = DataLayout(data_dir)
+    ordinary = knowledge.read_ordinary_vocabulary(
+        knowledge.fetch_ordinary_vocabulary(layout.root / ".knowledge-cache")
+    )
+    sources = [
+        *knowledge.sogou_sources(layout.lexicon),
+        knowledge.gengbaike_source(layout.root / "gengbaike" / "gengbaike.jsonl"),
+    ]
+    lexicon = knowledge.build(sources, ordinary)
+    knowledge.write(lexicon, out)
+    for category in sorted(set(lexicon.values())):
+        typer.echo(f"{category}: {sum(c == category for c in lexicon.values())} entries")
+    typer.echo(f"{out}: {len(lexicon)} entries")
+
+
 @lexicon_app.command("list")
 def lexicon_list() -> None:
     """Show the available Sogou dictionaries and their quality metadata."""
@@ -1187,6 +1214,44 @@ def eval_generate(
     typer.echo(report.render())
     if out is not None:
         out.write_text(json.dumps(report.as_dict(), indent=2) + "\n", encoding="utf-8")
+
+
+@eval_app.command("dump-answers")
+def eval_dump_answers(
+    dump: Path = typer.Option(..., help="The dump `eval generate` was run on"),
+    eval_set: Path = typer.Option(..., help="The eval set the dump was decoded from"),
+    answers: Path = typer.Option(..., help="The answers file `eval generate` wrote"),
+    out: Path = typer.Option(..., help="The dump file to write"),
+) -> None:
+    """Write the generator's answers as a dump the slices read."""
+    from mlime.dumps import answer_rows, write_dump
+
+    typer.echo(f"{out}: {write_dump(answer_rows(dump, eval_set, answers), out)} records")
+
+
+@eval_app.command("dump-gui")
+def eval_dump_gui(
+    results: Path = typer.Option(..., help="The journal ime-drive wrote"),
+    eval_set: Path = typer.Option(..., help="The eval set the journal was typed from"),
+    slice_: str = typer.Option("test", "--slice", help="Which records to keep: all, dev or test"),
+    out: Path = typer.Option(..., help="The dump file to write"),
+) -> None:
+    """Write a GUI engine's committed sentences as a dump the slices read."""
+    from mlime.dumps import journal_rows, write_dump
+
+    typer.echo(f"{out}: {write_dump(journal_rows(results, eval_set, slice_), out)} records")
+
+
+@eval_app.command("dump-rime")
+def eval_dump_rime(
+    report: Path = typer.Option(..., help="The report `eval rime --out` wrote"),
+    eval_set: Path = typer.Option(..., help="The eval set RIME was typed from"),
+    out: Path = typer.Option(..., help="The dump file to write"),
+) -> None:
+    """Write RIME's committed sentences as a dump the slices read."""
+    from mlime.dumps import report_rows, write_dump
+
+    typer.echo(f"{out}: {write_dump(report_rows(report, eval_set), out)} records")
 
 
 @eval_app.command("rime")
