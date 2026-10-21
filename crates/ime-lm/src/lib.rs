@@ -55,9 +55,10 @@ use ime_pinyin::{CharId, Lexicon};
 use memmap2::Mmap;
 use ort::AsPointer;
 use ort::environment::Environment;
-use ort::ep::ExecutionProviderDispatch;
 use ort::memory::{AllocationDevice, Allocator, AllocatorType, MemoryInfo, MemoryType};
-use ort::session::builder::{GraphOptimizationLevel, PrepackedWeights};
+use ort::session::builder::{
+    AutoDevicePolicy, GraphOptimizationLevel, PrepackedWeights, SessionBuilder,
+};
 use ort::session::{IoBinding, Session};
 use ort::value::{
     DynTensor, DynTensorValueType, DynValue, Outlet, PrimitiveTensorElementType, Shape,
@@ -109,29 +110,49 @@ pub enum Backend {
 }
 
 impl Backend {
-    /// The providers a session of this backend registers.
+    /// Put *builder*'s sessions on this backend's provider.
+    ///
+    /// The CPU backend names the CPU through ONNX Runtime's device-selection
+    /// policy rather than an empty provider list: `ort` sets that policy to
+    /// `MaxEfficiency` on every new builder, and under it a session with no
+    /// provider appended is placed by ONNX Runtime's own device discovery,
+    /// which on Apple silicon finds the Neural Engine and splits the graphs
+    /// into Core ML partitions, each compiled to a model in the user temp
+    /// directory. `ort::ep::CPU` cannot stand in: it only sets the arena and
+    /// appends no provider, so the policy still decides.
     ///
     /// # Errors
     ///
-    /// If the backend's provider was not compiled into this build.
-    fn providers(self) -> Result<Vec<ExecutionProviderDispatch>, LmError> {
+    /// If the backend's provider was not compiled into this build or could
+    /// not be registered.
+    fn register(self, builder: SessionBuilder) -> Result<SessionBuilder, LmError> {
         // Every dispatch carries `error_on_failure`: a provider that cannot
         // initialise is an error at session creation, never a silent CPU
         // session.
         match self {
-            Self::Cpu => Ok(Vec::new()),
+            Self::Cpu => builder.with_auto_device(AutoDevicePolicy::PreferCPU),
             #[cfg(feature = "gpu-coreml")]
-            Self::CoreMl => Ok(vec![ort::ep::CoreML::default().build().error_on_failure()]),
+            Self::CoreMl => builder.with_execution_providers([ort::ep::CoreML::default()
+                .build()
+                .error_on_failure()]),
             #[cfg(feature = "gpu-webgpu")]
-            Self::WebGpu => Ok(vec![ort::ep::WebGPU::default().build().error_on_failure()]),
+            Self::WebGpu => builder.with_execution_providers([ort::ep::WebGPU::default()
+                .build()
+                .error_on_failure()]),
             #[cfg(feature = "gpu-cuda")]
-            Self::Cuda => Ok(vec![ort::ep::CUDA::default().build().error_on_failure()]),
+            Self::Cuda => builder.with_execution_providers([ort::ep::CUDA::default()
+                .build()
+                .error_on_failure()]),
             #[allow(
                 unreachable_patterns,
                 reason = "the arm is reachable only when a gpu-* feature is off; with both on, every Backend variant already has an arm"
             )]
-            _ => Err(LmError::NotCompiled { backend: self }),
+            _ => return Err(LmError::NotCompiled { backend: self }),
         }
+        .map_err(|source| LmError::Provider {
+            backend: self,
+            source: ort::Error::from(source),
+        })
     }
 }
 
@@ -801,16 +822,9 @@ impl Copier {
         let mut model =
             ort::editor::Model::new([ort::editor::Opset::new(ort::editor::ONNX_DOMAIN, 17)?])?;
         model.add_graph(graph)?;
-        let providers = shape.backend.providers()?;
-        let mut builder = session_builder(environment, shape)?;
-        if !providers.is_empty() {
-            builder = builder
-                .with_execution_providers(providers)
-                .map_err(|source| LmError::Provider {
-                    backend: shape.backend,
-                    source: ort::Error::from(source),
-                })?;
-        }
+        let builder = shape
+            .backend
+            .register(session_builder(environment, shape)?)?;
         let session = model.into_session(&builder)?;
         let binding = session.create_binding()?;
         Ok(Self {
@@ -3736,20 +3750,13 @@ fn open_session(
     initializers: &[(String, Arc<DynValue>)],
     shape: SessionShape,
 ) -> Result<Session, LmError> {
-    let providers = shape.backend.providers()?;
-    let mut builder = session_builder(environment, shape)?;
+    let mut builder = shape
+        .backend
+        .register(session_builder(environment, shape)?)?;
     if let Some(weights) = weights {
         builder = builder
             .with_prepacked_weights(weights)
             .map_err(ort::Error::from)?;
-    }
-    if !providers.is_empty() {
-        builder = builder
-            .with_execution_providers(providers)
-            .map_err(|source| LmError::Provider {
-                backend: shape.backend,
-                source: ort::Error::from(source),
-            })?;
     }
     for (name, value) in initializers {
         builder = builder
