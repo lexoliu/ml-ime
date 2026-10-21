@@ -13,7 +13,7 @@ mod common;
 use common::environment;
 use ime_decode::{
     BeamOptions, Candidates, Emittable, LatticeRecord, NoTransition, Record, Scored, Weighted,
-    decode_many, lattice_paths,
+    WordLexicon, decode_many, lattice_paths,
 };
 use ime_neural::{RouteA, SessionShape};
 use ime_pinyin::{Lexicon, SegmentLattice, SegmentOptions, SyllableTable};
@@ -46,6 +46,27 @@ fn session<'a>(
     emittable: &'a Emittable,
     incremental: bool,
 ) -> Session<'a, Fused<'a, NoTransition>> {
+    session_with(
+        towers,
+        table,
+        lexicon,
+        emittable,
+        incremental,
+        None,
+        BeamOptions::default(),
+    )
+}
+
+/// [`session`] proposing *words*' arcs under *beam*.
+fn session_with<'a>(
+    towers: &'a RouteA,
+    table: &'a SyllableTable,
+    lexicon: &'a Lexicon,
+    emittable: &'a Emittable,
+    incremental: bool,
+    words: Option<&'a WordLexicon>,
+    beam: BeamOptions,
+) -> Session<'a, Fused<'a, NoTransition>> {
     Session::new(
         Fused::new(
             towers,
@@ -66,7 +87,8 @@ fn session<'a>(
                 allow_incomplete_tail: false,
                 ..SegmentOptions::default()
             },
-            beam: BeamOptions::default(),
+            beam,
+            words,
             sentences: 3,
         },
     )
@@ -81,14 +103,42 @@ fn reference_top(
     lexicon: &Lexicon,
     emittable: &Emittable,
 ) -> String {
+    reference_top_with(
+        towers,
+        pinyin,
+        context,
+        lexicon,
+        emittable,
+        None,
+        &BeamOptions::default(),
+    )
+}
+
+/// [`reference_top`] proposing *words*' arcs under *beam*, as `fused-eval
+/// --arcs` decodes.
+fn reference_top_with(
+    towers: &RouteA,
+    pinyin: &str,
+    context: Option<&str>,
+    lexicon: &Lexicon,
+    emittable: &Emittable,
+    words: Option<&WordLexicon>,
+    beam: &BeamOptions,
+) -> String {
     let options = SegmentOptions {
         allow_incomplete_tail: false,
         ..SegmentOptions::default()
     };
-    let lattice =
-        SegmentLattice::build(pinyin, &SyllableTable::load(), &options).expect("the pinyin reads");
+    let table = SyllableTable::load();
+    let lattice = SegmentLattice::build(pinyin, &table, &options).expect("the pinyin reads");
     let segmentations = lattice.k_best(&options);
     let candidates = Candidates::build(&segmentations, lexicon).expect("the readings build");
+    let candidates = match words {
+        Some(words) => {
+            candidates.with_arcs(&segmentations, pinyin, words, lexicon, &table, &options)
+        }
+        None => candidates,
+    };
     let record = LatticeRecord {
         record: 0,
         pinyin: pinyin.to_owned(),
@@ -113,7 +163,7 @@ fn reference_top(
             context,
         }],
         &NoTransition,
-        &BeamOptions::default(),
+        beam,
     )
     .expect("the record decodes");
     answers
@@ -159,6 +209,52 @@ fn replay_equals_full_decode() {
             );
             assert_eq!(session.pending(), pinyin.len());
         }
+    }
+}
+
+#[test]
+fn a_session_with_word_arcs_answers_what_the_full_decode_does() {
+    let dir = fixture_dir();
+    let towers = RouteA::open(environment(), &dir.join("fp32"), SessionShape::default())
+        .expect("the fixture towers open");
+    let table = SyllableTable::load();
+    let lexicon = lexicon();
+    let emittable = emittable(&dir, &lexicon);
+    let (words, _) = WordLexicon::parse("北京\tidiom\n", &["idiom"], &lexicon, &table, &emittable)
+        .expect("the lexicon reads");
+    // A prior far above any emission gap: the arc must win, so the test
+    // shows the session proposes it, not only that it agrees.
+    let beam = BeamOptions {
+        arc_prior: 100.0,
+        ..BeamOptions::default()
+    };
+    let want = reference_top_with(
+        &towers,
+        "wabj",
+        None,
+        &lexicon,
+        &emittable,
+        Some(&words),
+        &beam,
+    );
+    assert!(
+        want.ends_with("北京"),
+        "the arc wins the full decode: {want}"
+    );
+    for incremental in [false, true] {
+        let mut session = session_with(
+            &towers,
+            &table,
+            &lexicon,
+            &emittable,
+            incremental,
+            Some(&words),
+            beam.clone(),
+        );
+        assert_eq!(
+            replay_top(&mut session, "wabj").as_deref(),
+            Some(want.as_str())
+        );
     }
 }
 

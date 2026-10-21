@@ -17,7 +17,7 @@ mod fused;
 
 use ime_decode::{
     BeamOptions, Breakdown, Candidates, DecodeError, Emission, Hypothesis, Record, Transition,
-    decode_many_stats,
+    WordLexicon, decode_many_stats,
 };
 use ime_pinyin::{
     Lexicon, SegmentError, SegmentLattice, SegmentOptions, Segmentation, SyllableTable,
@@ -88,8 +88,12 @@ pub struct SessionOptions<'a> {
     /// half-typed syllable; an offline replay can turn it off to mirror an
     /// evaluation exactly.
     pub segment: SegmentOptions,
-    /// The beam's width and arity — the product's shape is width 16, top 8.
+    /// The beam's width and arity — the product's shape is width 16, top 8
+    /// — and the word arcs' prior and slots.
     pub beam: BeamOptions,
+    /// The curated lexicon whose entries the beam proposes whole where the
+    /// keystrokes spell them; `None` decodes character by character only.
+    pub words: Option<&'a WordLexicon>,
     /// How many whole-input sentences lead the candidate list; the rest of
     /// the list is prefix candidates.
     pub sentences: usize,
@@ -479,6 +483,17 @@ impl<'a, E: Engine> Session<'a, E> {
         };
         self.observe(&pieces.paths);
         let candidates = Candidates::build(&pieces.paths, self.options.lexicon)?;
+        let candidates = match self.options.words {
+            Some(words) => candidates.with_arcs(
+                &pieces.paths,
+                &pieces.pinyin,
+                words,
+                self.options.lexicon,
+                self.options.table,
+                &self.options.segment,
+            ),
+            None => candidates,
+        };
         self.stages.segment_ns += nanos(tick);
 
         // The context is an owned copy: `emission`'s lifetime parameter

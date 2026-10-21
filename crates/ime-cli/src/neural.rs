@@ -33,8 +33,8 @@ use clap::{Args, ValueEnum};
 use flate2::read::MultiGzDecoder;
 use ime_decode::{
     Asked, BeamOptions, Both, Candidates, Emission, Emittable, Hypothesis, LatticeRecord,
-    NoTransition, Record, ScoreRecord, Scored, Transition, Uniform, Weighted, decode_many,
-    lattice_paths,
+    NoTransition, Record, ScoreRecord, Scored, Transition, Uniform, Weighted, WordLexicon,
+    decode_many, lattice_paths,
 };
 use ime_eval::{
     AmbiguityReport, AmbiguitySlice, DumpRow, DumpedHypothesis, EvalRecord, EvalSet, Observation,
@@ -174,6 +174,71 @@ impl MetalWeightsArg {
             Self::F16 => ime_lm::MetalWeights::F16,
         }
     }
+}
+
+/// Word arcs: the curated lexicon whose entries the beam proposes whole
+/// when the keystrokes spell them (`ime_decode::WordLexicon`).
+#[derive(Debug, Clone, Args)]
+pub struct ArcArgs {
+    /// A `word<TAB>category` lexicon, as `mlime lexicon knowledge` writes
+    /// `data/lexicon/knowledge.tsv`. Its entries of `--arc-category` become
+    /// word arcs: whole words the beam proposes where the keystrokes spell
+    /// them, protected until they land and scored by the same models.
+    #[arg(long)]
+    pub arcs: Option<PathBuf>,
+    /// Which categories of `--arcs` propose arcs; repeatable.
+    #[arg(long = "arc-category", default_values_t = ["idiom".to_owned()], requires = "arcs")]
+    pub arc_categories: Vec<String>,
+    /// How many arcs in flight keep a slot each, per reading, on top of
+    /// `--beam-width`: a step advances at most `beam-width + arc-width`
+    /// states per reading.
+    #[arg(long, default_value = "8")]
+    pub arc_width: usize,
+}
+
+impl ArcArgs {
+    /// The word lexicon `--arcs` names, kept to the categories asked for and
+    /// to entries route A can emit; `None` without `--arcs`.
+    ///
+    /// # Errors
+    ///
+    /// If the file cannot be read or is malformed, or no entry survives.
+    pub fn load(
+        &self,
+        lexicon: &Lexicon,
+        table: &SyllableTable,
+        emittable: &Emittable,
+    ) -> Result<Option<WordLexicon>> {
+        let Some(path) = &self.arcs else {
+            return Ok(None);
+        };
+        let source = fs::read_to_string(path)
+            .with_context(|| format!("could not read the word lexicon at {}", path.display()))?;
+        let categories: Vec<&str> = self.arc_categories.iter().map(String::as_str).collect();
+        let (words, stats) = WordLexicon::parse(&source, &categories, lexicon, table, emittable)
+            .with_context(|| format!("{} is not a usable word lexicon", path.display()))?;
+        info!(
+            path = %path.display(),
+            categories = ?categories,
+            kept = stats.kept,
+            other_category = stats.other_category,
+            unknown = stats.unknown,
+            unemittable = stats.unemittable,
+            duplicate = stats.duplicate,
+            "loaded the word lexicon"
+        );
+        Ok(Some(words))
+    }
+}
+
+/// The word arcs one `fused-eval` run decodes with: the lexicon's
+/// arguments and the lexicon priors the run sweeps.
+#[derive(Clone, Copy)]
+pub struct ArcRun<'a> {
+    /// The lexicon, its categories and the arc slots.
+    pub args: &'a ArcArgs,
+    /// The lexicon priors to decode at; each is one entry of the sweep.
+    pub priors: &'a [f32],
 }
 
 /// Supplies the emission model for one record's lattice.
@@ -373,6 +438,9 @@ struct Section {
     /// Whether the run corrected keystrokes; the report shows the prior's
     /// weight only where it can act.
     corrections: bool,
+    /// The lexicon prior this section's word arcs landed with; `None` when
+    /// the run proposed no arcs.
+    arc_prior: Option<f32>,
     transition: &'static str,
     slice: SliceArg,
     /// Whether the weight won a dev sweep rather than being given on the
@@ -402,6 +470,9 @@ struct Reader {
     /// The typo noise model, when the run corrects keystrokes: absent, the
     /// lattice and the candidate masks are exactly the clean path's.
     corrections: Option<CorrectionTable>,
+    /// The word lexicon whose arcs every reading carries, when the run
+    /// proposes them: absent, the lattice is exactly the arc-free one.
+    words: Option<WordLexicon>,
 }
 
 impl Reader {
@@ -418,6 +489,7 @@ impl Reader {
             &self.segment,
             self.corrections.as_ref(),
             &self.lexicon,
+            self.words.as_ref(),
         ) {
             Ok(resolved) => Ok(Some(resolved)),
             Err(crate::engine::BaselineError::Segment {
@@ -430,11 +502,17 @@ impl Reader {
 }
 
 /// Write the lattice an evaluation set decodes into, for the model to score.
+/// With word arcs, a position also asks about every arc character placed
+/// there outside its mask, so the score file answers what the arcs read.
 ///
 /// # Errors
 ///
 /// If the evaluation set cannot be read, a record cannot be segmented, or the
 /// output cannot be written.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is one input of the lattice the score file must answer"
+)]
 pub fn emit_lattice(
     eval_set: &Path,
     out: &Path,
@@ -443,14 +521,17 @@ pub fn emit_lattice(
     lexicon: Lexicon,
     segment: SegmentOptions,
     corrections: Option<CorrectionTable>,
+    arcs: &ArcArgs,
 ) -> Result<()> {
     let set = load_set(eval_set)?;
     let emittable = load_emittable(emittable, &lexicon)?;
+    let words = arcs.load(&lexicon, &table, &emittable)?;
     let reader = Reader {
         table,
         lexicon,
         segment,
         corrections,
+        words,
     };
     let file =
         fs::File::create(out).with_context(|| format!("could not create {}", out.display()))?;
@@ -656,8 +737,14 @@ struct Run<'a> {
     floor: f32,
     weights: &'a [f32],
     /// The correction-prior weights the sweep tries; each is one entry in the
-    /// `weight x typo-weight` product a select-on-dev run decodes.
+    /// `weight x typo-weight x arc-prior` product a select-on-dev run decodes.
     typo_weights: &'a [f32],
+    /// Where the word lexicon was read from and which categories it kept,
+    /// when the run proposes arcs; part of the progress key.
+    arcs: Option<(&'a Path, &'a [String])>,
+    /// The lexicon priors the sweep tries; one zero-weight entry without
+    /// arcs.
+    arc_priors: &'a [f32],
     slice: &'a SliceArgs,
     beam: &'a BeamOptions,
     /// How many records one `decode_many` call decodes in lockstep. One keeps
@@ -675,6 +762,7 @@ impl<'a> Run<'a> {
         lm_weight: f32,
         weight: f32,
         typo_weight: f32,
+        arc_prior: Option<f32>,
     ) -> Option<ProgressRequest<'_>> {
         self.progress.map(|progress| ProgressRequest {
             dir: progress.dir,
@@ -691,6 +779,8 @@ impl<'a> Run<'a> {
             floor: self.floor,
             weight,
             typo_weight,
+            arcs: self.arcs,
+            arc_prior,
             transition: label,
         })
     }
@@ -768,69 +858,65 @@ impl<'a> Run<'a> {
             return self.transition_only(transition, label, lm_weight, lockstep);
         };
         let emission_cache = Mutex::new(HashMap::new());
-        let measure_at = |which: SliceArg, weight: f32, typo_weight: f32| -> Result<Section> {
-            let beam = BeamOptions {
-                typo_weight,
-                ..(*self.beam).clone()
-            };
-            let emissions = match input {
-                SourceInput::File(scores) => Sources::File(NeuralEmissions {
-                    scores,
-                    emittable: self.emittable,
+        let measure_at =
+            |which: SliceArg, weight: f32, typo_weight: f32, arc_prior: f32| -> Result<Section> {
+                let beam = BeamOptions {
+                    typo_weight,
+                    arc_prior,
+                    ..(*self.beam).clone()
+                };
+                let arc_prior = self.arcs.map(|_| arc_prior);
+                let emissions = match input {
+                    SourceInput::File(scores) => Sources::File(NeuralEmissions {
+                        scores,
+                        emittable: self.emittable,
+                        weight,
+                        floor: self.floor,
+                    }),
+                    SourceInput::Live(towers) => Sources::Live(LiveEmissions {
+                        towers,
+                        corrections: self.reader.corrections.as_ref(),
+                        emittable: self.emittable,
+                        lexicon: &self.reader.lexicon,
+                        cache: &emission_cache,
+                        weight,
+                        floor: self.floor,
+                        with_context: self.with_context,
+                    }),
+                };
+                let request = self.request(label, lm_weight, weight, typo_weight, arc_prior);
+                let (report, rows) = measure(
+                    self.set,
+                    which,
+                    self.slice.dev_share,
+                    self.reader,
+                    &emissions,
+                    transition,
+                    &beam,
+                    self.batch,
+                    lockstep,
+                    self.dump,
+                    request.as_ref(),
+                )?;
+                Ok(Section {
+                    emission: emission_label,
                     weight,
-                    floor: self.floor,
-                }),
-                SourceInput::Live(towers) => Sources::Live(LiveEmissions {
-                    towers,
-                    corrections: self.reader.corrections.as_ref(),
-                    emittable: self.emittable,
-                    lexicon: &self.reader.lexicon,
-                    cache: &emission_cache,
-                    weight,
-                    floor: self.floor,
-                    with_context: self.with_context,
-                }),
+                    typo_weight,
+                    corrections: self.reader.corrections.is_some(),
+                    arc_prior,
+                    transition: label,
+                    slice: which,
+                    selected: false,
+                    report,
+                    rows,
+                    ambiguity: None,
+                })
             };
-            let request = self.request(label, lm_weight, weight, typo_weight);
-            let (report, rows) = measure(
-                self.set,
-                which,
-                self.slice.dev_share,
-                self.reader,
-                &emissions,
-                transition,
-                &beam,
-                self.batch,
-                lockstep,
-                self.dump,
-                request.as_ref(),
-            )?;
-            Ok(Section {
-                emission: emission_label,
-                weight,
-                typo_weight,
-                corrections: self.reader.corrections.is_some(),
-                transition: label,
-                slice: which,
-                selected: false,
-                report,
-                rows,
-                ambiguity: None,
-            })
-        };
-        // Without the noise model every prior is zero and the sweep is one
-        // entry wide, however many `--typo-weight`s the command line lists.
-        let typo_weights = if self.reader.corrections.is_some() {
-            self.typo_weights
-        } else {
-            &self.typo_weights[..self.typo_weights.len().min(1)]
-        };
+        let grid = self.grid();
         let mut sections = Vec::new();
         if self.slice.select_on_dev {
-            for &weight in self.weights {
-                for &typo_weight in typo_weights {
-                    sections.push(measure_at(SliceArg::Dev, weight, typo_weight)?);
-                }
+            for &(weight, typo_weight, arc_prior) in &grid {
+                sections.push(measure_at(SliceArg::Dev, weight, typo_weight, arc_prior)?);
             }
             let mut winner = 0;
             for (index, section) in sections.iter().enumerate().skip(1) {
@@ -842,17 +928,44 @@ impl<'a> Run<'a> {
                 SliceArg::Test,
                 sections[winner].weight,
                 sections[winner].typo_weight,
+                sections[winner].arc_prior.unwrap_or(0.0),
             )?;
             test.selected = true;
             sections.push(test);
         } else {
-            for &weight in self.weights {
-                for &typo_weight in typo_weights {
-                    sections.push(measure_at(self.slice.slice, weight, typo_weight)?);
-                }
+            for &(weight, typo_weight, arc_prior) in &grid {
+                sections.push(measure_at(
+                    self.slice.slice,
+                    weight,
+                    typo_weight,
+                    arc_prior,
+                )?);
             }
         }
         Ok(sections)
+    }
+
+    /// Every `weight x typo-weight x arc-prior` the run decodes at, in the
+    /// order the command line gave them, so a dev tie goes to the first.
+    /// Without the noise model every correction prior is zero and that axis
+    /// is one entry wide, however many `--typo-weight`s the command line
+    /// lists.
+    fn grid(&self) -> Vec<(f32, f32, f32)> {
+        let typo_weights = if self.reader.corrections.is_some() {
+            self.typo_weights
+        } else {
+            &self.typo_weights[..self.typo_weights.len().min(1)]
+        };
+        self.weights
+            .iter()
+            .flat_map(|&weight| {
+                typo_weights.iter().flat_map(move |&typo_weight| {
+                    self.arc_priors
+                        .iter()
+                        .map(move |&arc_prior| (weight, typo_weight, arc_prior))
+                })
+            })
+            .collect()
     }
 
     /// The one section a run without emissions produces: the transition alone
@@ -866,11 +979,14 @@ impl<'a> Run<'a> {
         lockstep: bool,
     ) -> Result<Vec<Section>> {
         let typo_weight = self.typo_weights.first().copied().unwrap_or(1.0);
+        let arc_prior = self.arc_priors.first().copied().unwrap_or(0.0);
         let beam = BeamOptions {
             typo_weight,
+            arc_prior,
             ..(*self.beam).clone()
         };
-        let request = self.request(label, lm_weight, 0.0, typo_weight);
+        let arc_prior = self.arcs.map(|_| arc_prior);
+        let request = self.request(label, lm_weight, 0.0, typo_weight, arc_prior);
         let (report, rows) = measure(
             self.set,
             self.slice.slice,
@@ -889,6 +1005,7 @@ impl<'a> Run<'a> {
             weight: 0.0,
             typo_weight,
             corrections: self.reader.corrections.is_some(),
+            arc_prior,
             transition: label,
             slice: self.slice.slice,
             selected: false,
@@ -909,6 +1026,9 @@ impl<'a> Run<'a> {
 /// slice instead and the report closes with the test slice at whichever weight
 /// scored the highest sentence top-1 there. With *dump* every evaluated
 /// section's beam is written there too, one JSON Lines file per section.
+///
+/// *arcs*, when given, attaches its lexicon's word arcs to every reading and
+/// adds its lexicon priors to the sweep: every weight pairs with every prior.
 ///
 /// *batch* is how many records one `decode_many` call runs in lockstep: one
 /// keeps the per-record rayon path, more feeds `records x paths x beams` rows
@@ -946,17 +1066,38 @@ pub fn fused_eval(
     lexicon: Lexicon,
     segment: SegmentOptions,
     corrections: Option<CorrectionTable>,
+    arcs: Option<ArcRun<'_>>,
     beam: &BeamOptions,
     batch: usize,
     transition: Models<'_>,
 ) -> Result<String> {
     let set = load_set(eval_set)?;
     let emittable = load_emittable(emittable_path, &lexicon)?;
+    let (words, arc_identity, arc_priors, beam) = match arcs {
+        Some(ArcRun { args, priors }) => {
+            let path = args
+                .arcs
+                .as_deref()
+                .context("a word-arc run names its lexicon with --arcs")?;
+            (
+                args.load(&lexicon, &table, &emittable)?,
+                Some((path, args.arc_categories.as_slice())),
+                priors,
+                BeamOptions {
+                    arc_width: args.arc_width,
+                    ..beam.clone()
+                },
+            )
+        }
+        None => (None, None, &[0.0f32][..], beam.clone()),
+    };
+    let beam = &beam;
     let reader = Reader {
         table,
         lexicon,
         segment,
         corrections,
+        words,
     };
     if let Some(dir) = dump {
         fs::create_dir_all(dir)
@@ -983,6 +1124,8 @@ pub fn fused_eval(
         floor,
         weights,
         typo_weights,
+        arcs: arc_identity,
+        arc_priors,
         slice,
         beam,
         batch,
@@ -1296,6 +1439,10 @@ struct ProgressRequest<'a> {
     weight: f32,
     /// The correction-prior weight this call decodes at.
     typo_weight: f32,
+    /// The word lexicon and its categories, when the run proposes arcs.
+    arcs: Option<(&'a Path, &'a [String])>,
+    /// The lexicon prior this call decodes at, when the run proposes arcs.
+    arc_prior: Option<f32>,
     /// The transition's label in the report.
     transition: &'static str,
 }
@@ -1327,6 +1474,13 @@ struct Name {
     /// The correction-prior weight the decode ran at; part of the name so a
     /// sweep's files stay distinct.
     typo_weight: f32,
+    /// The word lexicon whose arcs the decode proposed.
+    arcs: Option<PathBuf>,
+    /// The lexicon categories the arcs were drawn from.
+    arc_categories: Option<Vec<String>>,
+    /// The lexicon prior the decode ran at; part of the name so a sweep's
+    /// files stay distinct.
+    arc_prior: Option<f32>,
     transition: String,
 }
 
@@ -1361,6 +1515,8 @@ struct Key {
     segmentation_weight: f32,
     /// How many beam states survive each position.
     beam_width: usize,
+    /// How many arcs in flight keep a slot beside the beam width.
+    arc_width: usize,
     /// How many hypotheses each record is ranked on.
     top_k: usize,
     /// The share of the set the dev slice holds.
@@ -1684,6 +1840,9 @@ where
             slice: slice.label().to_owned(),
             weight: progress.weight,
             typo_weight: progress.typo_weight,
+            arcs: progress.arcs.map(|(path, _)| path.to_owned()),
+            arc_categories: progress.arcs.map(|(_, categories)| categories.to_vec()),
+            arc_prior: progress.arc_prior,
             transition: progress.transition.to_owned(),
         },
         lm_weight: progress.lm_weight,
@@ -1696,6 +1855,7 @@ where
         ambiguity_weight: reader.segment.ambiguity_weight,
         segmentation_weight: beam.segmentation_weight,
         beam_width: beam.beam_width.get(),
+        arc_width: beam.arc_width,
         top_k: beam.top_k.get(),
         dev_share,
     };
@@ -1809,11 +1969,15 @@ fn write_dump(dir: &Path, section: &Section) -> Result<()> {
     } else {
         String::new()
     };
+    let arc_prior = section
+        .arc_prior
+        .map_or_else(String::new, |prior| format!("-a{prior:.3}"));
     let path = dir.join(format!(
-        "{}-w{:.3}{}-{}-{}.jsonl",
+        "{}-w{:.3}{}{}-{}-{}.jsonl",
         section.emission,
         section.weight,
         typo_weight,
+        arc_prior,
         section.transition,
         section.slice.label()
     ));
@@ -2041,6 +2205,11 @@ mod tests {
                 self.lexicon(),
                 segment(),
                 None,
+                &ArcArgs {
+                    arcs: None,
+                    arc_categories: Vec::new(),
+                    arc_width: 8,
+                },
             )
             .expect("the lattice emits");
             let source = fs::read_to_string(&lattice).expect("the lattice reads");
@@ -2132,6 +2301,7 @@ mod tests {
                 SyllableTable::load(),
                 self.lexicon(),
                 segment(),
+                None,
                 None,
                 &BeamOptions {
                     beam_width: NonZeroUsize::new(16).expect("16 is not zero"),
@@ -2243,6 +2413,7 @@ mod tests {
                 lexicon,
                 segment: segment(),
                 corrections: None,
+                words: None,
             };
             let slice = SliceArgs {
                 slice: SliceArg::All,
@@ -2267,6 +2438,8 @@ mod tests {
                 floor: -30.0,
                 weights: &[1.0],
                 typo_weights: &[1.0],
+                arcs: None,
+                arc_priors: &[0.0],
                 slice: &slice,
                 beam: &beam,
                 batch,

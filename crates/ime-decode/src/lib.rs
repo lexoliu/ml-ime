@@ -10,11 +10,13 @@
 //! n-gram baseline is the same search with the emission term switched off
 //! ([`Uniform`]), which is what makes the two routes comparable.
 
+mod arcs;
 mod beam;
 mod candidates;
 mod emissions;
 mod score;
 
+pub use arcs::{WordArc, WordLexicon, WordLexiconError, WordLexiconStats};
 pub use beam::{BeamOptions, Breakdown, Hypothesis, Record, decode_many, decode_many_stats};
 pub use candidates::{CandidatePath, Candidates};
 pub use emissions::{
@@ -410,6 +412,234 @@ mod tests {
             "the guarded runner-up survives the beam and reaches the list: {:?}",
             best.iter().map(|h| h.text(&lexicon)).collect::<Vec<_>>()
         );
+    }
+
+    /// Every character of the lexicon, as an emittable set.
+    fn every_character(lexicon: &Lexicon) -> Emittable {
+        let source: String = lexicon
+            .characters()
+            .iter()
+            .flat_map(|&ch| [ch, '\n'])
+            .collect();
+        Emittable::parse(&source, lexicon).expect("the lexicon's own characters")
+    }
+
+    /// *input*'s readings with the arcs of a one-line idiom lexicon.
+    fn with_idiom(
+        input: &str,
+        idiom: &str,
+        table: &SyllableTable,
+        lexicon: &Lexicon,
+    ) -> Candidates {
+        let options = offline();
+        let lattice = SegmentLattice::build(input, table, &options).expect("input reads");
+        let readings = lattice.k_best(&options);
+        let (words, _) = WordLexicon::parse(
+            &format!("{idiom}\tidiom\n"),
+            &["idiom"],
+            lexicon,
+            table,
+            &every_character(lexicon),
+        )
+        .expect("the lexicon reads");
+        Candidates::build(&readings, lexicon)
+            .expect("masks are non-empty")
+            .with_arcs(&readings, input, &words, lexicon, table, &options)
+    }
+
+    /// Scores looked up by (position, character); everything else -20.
+    struct PerPosition(HashMap<(usize, CharId), f32>);
+
+    impl Emission for &PerPosition {
+        fn score(&self, _path: usize, position: usize, candidate: CharId) -> f32 {
+            *self.0.get(&(position, candidate)).unwrap_or(&-20.0)
+        }
+    }
+
+    /// The `yffs` fixture: 一帆风顺 wins as a whole, but its first character
+    /// loses position 0 to 夜 by five nats, so a one-wide beam drops it.
+    fn yffs(lexicon: &Lexicon, first: f32) -> (PerPosition, Preference) {
+        let id = |ch| lexicon.id_of(ch).expect("in the lexicon");
+        let mut scores = HashMap::new();
+        scores.insert((0, id('一')), first);
+        scores.insert((0, id('夜')), 0.0);
+        for (position, ch) in [(1, '帆'), (2, '风'), (3, '顺')] {
+            scores.insert((position, id(ch)), 0.0);
+        }
+        (PerPosition(scores), Preference::new(lexicon, "一帆风顺"))
+    }
+
+    fn narrow_beam() -> BeamOptions {
+        BeamOptions {
+            beam_width: std::num::NonZeroUsize::new(1).expect("1 is not zero"),
+            diversity_gap: 0.0,
+            ..BeamOptions::default()
+        }
+    }
+
+    #[test]
+    fn an_arc_carries_its_idiom_through_a_beam_that_drops_its_first_character() {
+        let (table, lexicon) = fixture();
+        // 一 locally: -15 (emission). 夜 locally: 0 - 10 (the bigram).
+        // Whole: 一帆风顺 -15, 夜帆风顺 -20.
+        let (emission, transition) = yffs(&lexicon, -15.0);
+        let plain = candidates("yffs", &table, &lexicon);
+        let without =
+            decode(&plain, &emission, &transition, None, &narrow_beam()).expect("yffs decodes");
+        assert_ne!(
+            without[0].text(&lexicon),
+            "一帆风顺",
+            "the narrow beam prunes it"
+        );
+        let arcs = with_idiom("yffs", "一帆风顺", &table, &lexicon);
+        let with =
+            decode(&arcs, &emission, &transition, None, &narrow_beam()).expect("yffs decodes");
+        assert_eq!(with[0].text(&lexicon), "一帆风顺");
+        assert!((with[0].score() - without[0].score()).abs() > 1.0);
+    }
+
+    #[test]
+    fn the_lexicon_prior_lifts_a_landed_abbreviated_arc() {
+        let (table, lexicon) = fixture();
+        // Whole: 一帆风顺 -25, 夜帆风顺 -20 -- the arc lands but loses
+        // until the prior pays for it.
+        let (emission, transition) = yffs(&lexicon, -25.0);
+        let arcs = with_idiom("yffs", "一帆风顺", &table, &lexicon);
+        let unprimed =
+            decode(&arcs, &emission, &transition, None, &narrow_beam()).expect("yffs decodes");
+        assert_ne!(unprimed[0].text(&lexicon), "一帆风顺");
+        let primed = BeamOptions {
+            arc_prior: 10.0,
+            ..narrow_beam()
+        };
+        let best = decode(&arcs, &emission, &transition, None, &primed).expect("yffs decodes");
+        assert_eq!(best[0].text(&lexicon), "一帆风顺");
+    }
+
+    #[test]
+    fn the_arc_slots_sit_beside_the_beam_width() {
+        let (table, lexicon) = fixture();
+        let (emission, transition) = yffs(&lexicon, -15.0);
+        let arcs = with_idiom("yffs", "一帆风顺", &table, &lexicon);
+        let unprotected = BeamOptions {
+            arc_width: 0,
+            ..narrow_beam()
+        };
+        let best = decode(&arcs, &emission, &transition, None, &unprotected).expect("yffs decodes");
+        assert_ne!(
+            best[0].text(&lexicon),
+            "一帆风顺",
+            "with no arc slot the arc competes for the one slot and loses it"
+        );
+    }
+
+    #[test]
+    fn a_batch_without_arcs_decodes_as_before() {
+        let (table, lexicon) = fixture();
+        let (emission, transition) = yffs(&lexicon, -15.0);
+        let plain = candidates("yffs", &table, &lexicon);
+        let options = offline();
+        let lattice = SegmentLattice::build("yffs", &table, &options).expect("input reads");
+        let readings = lattice.k_best(&options);
+        let (words, _) = WordLexicon::parse(
+            "马马虎虎\tidiom\n",
+            &["idiom"],
+            &lexicon,
+            &table,
+            &every_character(&lexicon),
+        )
+        .expect("the lexicon reads");
+        let unmatched = Candidates::build(&readings, &lexicon)
+            .expect("masks are non-empty")
+            .with_arcs(&readings, "yffs", &words, &lexicon, &table, &options);
+        assert!(unmatched.paths().iter().all(|path| path.arcs().is_empty()));
+        let a = decode(
+            &plain,
+            &emission,
+            &transition,
+            None,
+            &BeamOptions::default(),
+        )
+        .expect("decodes");
+        let b = decode(
+            &unmatched,
+            &emission,
+            &transition,
+            None,
+            &BeamOptions::default(),
+        )
+        .expect("decodes");
+        assert_eq!(a.len(), b.len());
+        for (a, b) in a.iter().zip(&b) {
+            assert_eq!(a.chars(), b.chars());
+            assert_eq!(a.score().to_bits(), b.score().to_bits());
+        }
+    }
+
+    #[test]
+    fn an_arc_outside_a_mask_is_asked_for_where_it_is_scored() {
+        /// A bigram preference that, like the character LM, answers only
+        /// what the step producing the state was asked for.
+        struct Strict(Preference);
+        #[derive(Clone)]
+        struct Asking {
+            last: Option<CharId>,
+            asked: Vec<CharId>,
+        }
+        impl Transition for Strict {
+            const HISTORY: usize = 1;
+            type State = Asking;
+            fn start(&self, _context: Option<&str>, asked: &Asked<'_>) -> Asking {
+                Asking {
+                    last: None,
+                    asked: asked.candidates.to_vec(),
+                }
+            }
+            fn score(&self, state: &Asking, candidate: CharId) -> f32 {
+                assert!(
+                    state.asked.contains(&candidate),
+                    "scored {candidate:?}, which the step never asked for"
+                );
+                self.0.score(&state.last, candidate)
+            }
+            fn finish(&self, _state: &Asking) -> f32 {
+                0.0
+            }
+            fn advance(&self, steps: &[(&Asking, CharId, Asked<'_>)]) -> Vec<Asking> {
+                steps
+                    .iter()
+                    .map(|(_, ch, asked)| Asking {
+                        last: Some(*ch),
+                        asked: asked.candidates.to_vec(),
+                    })
+                    .collect()
+            }
+        }
+        let (table, lexicon) = fixture();
+        let ma = lexicon.id_of('马').expect("马");
+        let batch = with_idiom("mmhh", "马马虎虎", &table, &lexicon);
+        // Some reading takes `m` as the syllable m, whose mask lacks 马; the
+        // arc still runs there, and asks for 马.
+        let outside = batch
+            .paths()
+            .iter()
+            .find(|path| {
+                path.len() == 4
+                    && !path.arcs().is_empty()
+                    && path.positions()[0].binary_search(&ma).is_err()
+            })
+            .expect("a reading reads `m` as the syllable and still spells the idiom");
+        assert!(outside.asked(0).binary_search(&ma).is_ok());
+        assert!(outside.arcs()[0].reread() > 0.0);
+        let best = decode(
+            &batch,
+            Uniform,
+            &Strict(Preference::new(&lexicon, "马马虎虎")),
+            None,
+            &BeamOptions::default(),
+        )
+        .expect("mmhh decodes");
+        assert_eq!(best[0].text(&lexicon), "马马虎虎");
     }
 
     #[test]

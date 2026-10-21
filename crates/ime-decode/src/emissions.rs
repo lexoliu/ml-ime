@@ -177,7 +177,10 @@ pub struct LatticePath {
     pub spans: Vec<String>,
     /// The characters the model is asked about at each position: one string per
     /// position, one `char` per candidate, in the order the score file answers
-    /// them.
+    /// them. A position's set is its mask plus the word-arc characters placed
+    /// there outside it ([`CandidatePath::asked`]).
+    ///
+    /// [`CandidatePath::asked`]: crate::CandidatePath::asked
     ///
     /// Concatenated rather than listed because every candidate is a single
     /// character and a JSON array of one-character strings spends four bytes of
@@ -224,12 +227,10 @@ pub fn lattice_paths(
                 .iter()
                 .map(|segment| pinyin[segment.start()..segment.end()].to_owned())
                 .collect(),
-            candidates: reading
-                .positions()
-                .iter()
-                .map(|allowed| {
+            candidates: (0..reading.len())
+                .map(|position| {
                     emittable
-                        .restrict(allowed)
+                        .restrict(reading.asked(position))
                         .iter()
                         .map(|id| lexicon.character(*id))
                         .collect()
@@ -298,9 +299,8 @@ impl<'a> Scored<'a> {
                 });
             }
             let mut positions = Vec::with_capacity(reading.len());
-            for (position, (values, allowed)) in scored.iter().zip(reading.positions()).enumerate()
-            {
-                let restricted = emittable.restrict(allowed);
+            for (position, values) in scored.iter().enumerate() {
+                let restricted = emittable.restrict(reading.asked(position));
                 if values.len() != restricted.len() {
                     return Err(EmissionError::CandidateCount {
                         record,
