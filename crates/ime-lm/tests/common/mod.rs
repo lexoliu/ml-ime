@@ -103,6 +103,7 @@ pub fn shape() -> SessionShape {
 }
 
 /// The `expected.json` committed with the `arch` fixture.
+#[allow(dead_code)]
 pub fn expected(dir: &Path, arch: &str) -> Expected {
     serde_json::from_str(
         &fs::read_to_string(dir.join(arch).join("expected.json"))

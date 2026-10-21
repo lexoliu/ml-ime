@@ -21,7 +21,7 @@ use crate::text::is_han;
 use features::{Features, features};
 use ort::environment::Environment;
 use ort::session::Session;
-use ort::session::builder::GraphOptimizationLevel;
+use ort::session::builder::{AutoDevicePolicy, GraphOptimizationLevel};
 use ort::value::Tensor;
 use std::path::{Path, PathBuf};
 use tables::Tables;
@@ -275,9 +275,14 @@ impl Converter {
 }
 
 /// Open the ONNX session with the same options the Python `G2PWConverter` uses:
-/// every graph optimization, sequential execution, two intra-op threads.
+/// every graph optimization, sequential execution, two intra-op threads, the
+/// CPU alone. The CPU is named through the device-selection policy because
+/// `ort` presets it to `MaxEfficiency`, under which ONNX Runtime places a
+/// session that appends no provider on the Neural Engine via Core ML on Apple
+/// silicon.
 fn open_session(environment: &Environment, model: &Path) -> ort::Result<Session> {
     let mut builder = Session::builder(environment)?
+        .with_auto_device(AutoDevicePolicy::PreferCPU)?
         .with_optimization_level(GraphOptimizationLevel::Level3)?
         .with_parallel_execution(false)?
         .with_intra_threads(2)?;
