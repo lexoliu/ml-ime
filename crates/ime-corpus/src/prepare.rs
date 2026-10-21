@@ -26,6 +26,7 @@
 use crate::clean::{CleaningCounts, clean};
 use crate::error::Result;
 use crate::filter::{FilterCounts, SampleFilter};
+use crate::privacy::{PersonalCounts, PersonalData};
 use crate::segment::typing_segments;
 use crate::source::{
     MAX_CONTEXT_CHARACTERS, RawDocument, SAMPLES_PER_SHARD, SegmentUnit, SourceSpec,
@@ -48,6 +49,8 @@ pub struct PrepareReport {
     pub documents: usize,
     /// What the line-level cleaning removed.
     pub cleaning: CleaningCounts,
+    /// Sentences dropped for holding personal data.
+    pub personal: PersonalCounts,
     /// Why candidate targets were kept or dropped.
     pub counts: FilterCounts,
     /// How many samples reached the shards.
@@ -73,13 +76,17 @@ impl PrepareReport {
 
 /// One document reduced to the ordered units its samples are cut out of.
 #[derive(Clone, PartialEq, Eq, Debug)]
-struct Segmented {
-    units: Vec<String>,
-    cleaning: CleaningCounts,
+pub(crate) struct Segmented {
+    pub(crate) units: Vec<String>,
+    pub(crate) cleaning: CleaningCounts,
 }
 
-/// Clean, normalise and split one document into its units.
-fn segment(document: &RawDocument, spec: SourceSpec, normalizer: &Normalizer) -> Result<Segmented> {
+/// Clean, normalise and split one document into its units, personal data included.
+pub(crate) fn split_units(
+    document: &RawDocument,
+    spec: SourceSpec,
+    normalizer: &Normalizer,
+) -> Result<Segmented> {
     let mut units = Vec::new();
     let mut counts = CleaningCounts::default();
     for part in &document.parts {
@@ -101,12 +108,45 @@ fn segment(document: &RawDocument, spec: SourceSpec, normalizer: &Normalizer) ->
     })
 }
 
+/// Drop every unit that holds personal data, before any target or context is cut.
+///
+/// A dropped unit is gone from the document altogether, so it reaches neither
+/// a target nor the context of the units after it.
+pub(crate) fn drop_personal(units: &mut Vec<String>, personal: &PersonalData) -> PersonalCounts {
+    let mut counts = PersonalCounts::default();
+    units.retain(|unit| match personal.find(unit) {
+        Some(kind) => {
+            counts.record(kind);
+            false
+        }
+        None => true,
+    });
+    counts
+}
+
+/// Clean, normalise and split one document, then drop its personal data.
+fn segment(
+    document: &RawDocument,
+    spec: SourceSpec,
+    normalizer: &Normalizer,
+    personal: &PersonalData,
+) -> Result<(Segmented, PersonalCounts)> {
+    let mut segmented = split_units(document, spec, normalizer)?;
+    let dropped = drop_personal(&mut segmented.units, personal);
+    Ok((segmented, dropped))
+}
+
 /// What was on the writer's screen when they started typing one segment.
 ///
 /// Two things, in the order they were typed: the run of units before the segment's
 /// own, and the part of that unit the segment follows. Only the last
 /// [`MAX_CONTEXT_CHARACTERS`] survive, because that is as much as the model reads.
-fn context_of(units: &[String], index: usize, prefix: &str, spec: SourceSpec) -> Option<String> {
+pub(crate) fn context_of(
+    units: &[String],
+    index: usize,
+    prefix: &str,
+    spec: SourceSpec,
+) -> Option<String> {
     let start = index.saturating_sub(spec.context_units);
     let mut pieces: Vec<&str> = units[start..index].iter().map(String::as_str).collect();
     if !prefix.is_empty() {
@@ -145,9 +185,11 @@ pub fn prepare(
         .into());
     }
     let normalizer = Normalizer::new()?;
+    let personal = PersonalData::new();
     let mut filter = SampleFilter::new(lexicon);
     let mut writer = ShardWriter::new(&layout.samples(), spec.name, SAMPLES_PER_SHARD)?;
     let mut cleaning = CleaningCounts::default();
+    let mut personal_counts = PersonalCounts::default();
     let mut documents = 0_usize;
     let mut written = 0_usize;
 
@@ -155,12 +197,13 @@ pub fn prepare(
         let frame = read_frame(path)?;
         let batch = RawDocument::from_frame(&frame)?;
         documents += batch.len();
-        let segmented: Vec<Segmented> = batch
+        let segmented: Vec<(Segmented, PersonalCounts)> = batch
             .par_iter()
-            .map(|document| segment(document, spec, &normalizer))
+            .map(|document| segment(document, spec, &normalizer, &personal))
             .collect::<Result<Vec<_>>>()?;
-        for document in &segmented {
+        for (document, dropped) in &segmented {
             cleaning.merge(document.cleaning);
+            personal_counts.merge(*dropped);
             for (index, unit) in document.units.iter().enumerate() {
                 for candidate in typing_segments(unit) {
                     let text = candidate.text();
@@ -195,6 +238,7 @@ pub fn prepare(
         source: spec.name,
         documents,
         cleaning,
+        personal: personal_counts,
         counts: filter.counts(),
         written,
         milliseconds: started.elapsed().as_millis(),
@@ -204,6 +248,7 @@ pub fn prepare(
         documents = report.documents,
         lines = report.cleaning.lines,
         infobox_lines = report.cleaning.infobox_lines,
+        personal = report.personal.total(),
         kept = report.counts.kept,
         too_short_run = report.counts.too_short_run,
         too_long_run = report.counts.too_long_run,
@@ -247,8 +292,13 @@ mod tests {
     fn an_infobox_block_is_gone_before_the_prose_is_split() {
         let raw = "初音未来\n本名=初音ミク\n发色=青\n萌点=双马尾、吐槽\n\
                    她是世界上最有名的虚拟歌手。很多人都喜欢她的歌曲。";
-        let segmented = segment(&document(&MOEGIRL, raw), MOEGIRL, &normalizer())
-            .expect("the fixture normalises");
+        let (segmented, _) = segment(
+            &document(&MOEGIRL, raw),
+            MOEGIRL,
+            &normalizer(),
+            &PersonalData::new(),
+        )
+        .expect("the fixture normalises");
         assert_eq!(segmented.cleaning.infobox_lines, 3);
         assert!(segmented.units.iter().all(|line| !line.contains('=')));
         assert_eq!(
@@ -259,13 +309,14 @@ mod tests {
 
     #[test]
     fn a_douyin_caption_loses_its_hashtags_and_keeps_its_sentence() {
-        let segmented = segment(
+        let (segmented, _) = segment(
             &document(
                 &DOUYIN,
                 "这个女人可不好惹！  #GQ说电影  #智取威虎山电影解说 ",
             ),
             DOUYIN,
             &normalizer(),
+            &PersonalData::new(),
         )
         .expect("the fixture normalises");
         assert_eq!(segmented.units, vec!["这个女人可不好惹！".to_owned()]);
@@ -281,13 +332,38 @@ mod tests {
                 "哈哈哈哈 ！ 那 我 的 嘴巴 要 烂掉".to_owned(),
             ],
         };
-        let segmented = segment(&raw, DIALOGUE, &normalizer()).expect("the fixture normalises");
+        let (segmented, _) = segment(&raw, DIALOGUE, &normalizer(), &PersonalData::new())
+            .expect("the fixture normalises");
         assert_eq!(
             segmented.units,
             vec![
                 "火锅我在重庆吃了七八顿。真的".to_owned(),
                 "哈哈哈哈！那我的嘴巴要烂掉".to_owned(),
             ]
+        );
+    }
+
+    #[test]
+    fn a_sentence_with_personal_data_is_gone_as_target_and_as_context() {
+        let raw = "我们周六去爬山。有事打我电话13812345678。记得带上水和干粮。";
+        let (segmented, dropped) = segment(
+            &document(&MOEGIRL, raw),
+            MOEGIRL,
+            &normalizer(),
+            &PersonalData::new(),
+        )
+        .expect("the fixture normalises");
+        assert_eq!(dropped.phone, 1);
+        assert_eq!(
+            segmented.units,
+            vec![
+                "我们周六去爬山。".to_owned(),
+                "记得带上水和干粮。".to_owned()
+            ]
+        );
+        assert_eq!(
+            context_of(&segmented.units, 1, "", MOEGIRL),
+            Some("我们周六去爬山。".to_owned())
         );
     }
 
