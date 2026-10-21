@@ -89,8 +89,8 @@ The three twins are the SAME sentences typed three ways. A committed
 sentence lands in the engine's learned dictionary, so on the abbreviated
 twin the first letters recall sentences the engine already saw — only the
 first twin typed on a fresh engine state is a measurement. Observed: after
-eval3 ran, abbreviated record 0 (`zxmlnd`) offered 最下面雷鸟的 — the eval3
-record 0 sentence — as its first candidate.
+eval3 ran, abbreviated record 0 offered that record's own sentence as its first
+candidate.
 
 So: one twin per fresh state. Fresh means a fresh VM, or the engine's
 learned-word stores deleted and learning off before the twin. Where each
