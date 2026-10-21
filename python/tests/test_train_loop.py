@@ -46,6 +46,7 @@ from mlime.train.producer import (
     LocalProducer,
     ProcessProducer,
     StreamPosition,
+    epoch_groups,
 )
 from mlime.train.ranking import RankCollator
 from mlime.train.samples import (
@@ -56,6 +57,7 @@ from mlime.train.samples import (
     CorpusStream,
     SampleBuilder,
     TrainingExample,
+    example_shape,
 )
 from mlime.train.spans import SpanVocab
 
@@ -893,6 +895,154 @@ def test_an_accumulating_run_pauses_and_resumes_in_micro_batches(
     # Two micro-batches made the one step; the resume continues at the third.
     assert records(resumed.metrics, "resume")[0]["index"] == 2
     assert step_losses(resumed.metrics) == step_losses(whole.metrics)[1:]
+    weights = uninterrupted.state_dict()
+    for name, tensor in resumed_model.state_dict().items():
+        assert torch.equal(tensor, weights[name]), name
+
+
+class Recording:
+    """The real collator, keeping what each batch it made holds, in the order it made them.
+
+    A lane opened in the test's process collates only when the step asks
+    for a batch, so the record is the run's consumption, micro-batch by
+    micro-batch.
+    """
+
+    def __init__(self, inner: Collator, spans: SpanVocab):
+        self.inner = inner
+        self.rng = inner.rng
+        self.spans = spans
+        self.made: list[list[tuple[str, str]]] = []
+
+    @property
+    def max_context_tokens(self) -> int:
+        return self.inner.max_context_tokens
+
+    def rows(self, example: TrainingExample) -> int:
+        return self.inner.rows(example)
+
+    def __call__(self, group: list[TrainingExample]) -> Batch:
+        self.made.append([(example.id, " ".join(example.spans)) for example in group])
+        return self.inner(group)
+
+
+def padded_cost(group: list[TrainingExample], max_context_tokens: int) -> int:
+    """The positions *group* pads to, as the budget packer weighs them."""
+    shapes = [example_shape(example, max_context_tokens) for example in group]
+    return max(fill for fill, _ in shapes) * len(group) + max(deep for _, deep in shapes) * len(
+        group
+    )
+
+
+#: 12288 x 2 against 24576 x 1, in miniature: on the short corpus a budget of
+#: 30 cuts each epoch into groups of 3, 3 and 2, and one of 60 into 6 and 2,
+#: so the first configuration's second update reaches across the epoch
+#: boundary while the second's never does. Both cover two epochs.
+SAME_TOKENS = {(30, 2): 3, (60, 1): 4}
+
+
+def test_a_doubled_budget_trains_the_same_stream_in_updates_of_the_same_tokens(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """Halving the budget and doubling the accumulation keeps what an update may
+    pad to and the order the examples come in; only where the stream is cut
+    changes. Each update trains on exactly the `accumulate` groups the
+    budget's own grouping (the census's) puts next in the stream."""
+    read: dict[tuple[int, int], list[tuple[str, str]]] = {}
+    for (budget, accumulate), steps in SAME_TOKENS.items():
+        stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+        groups = [
+            group for epoch in (0, 1) for group in epoch_groups(stream, collator, budget, epoch)
+        ]
+        assert len(groups) == steps * accumulate
+
+        stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+        recording = Recording(collator, spans)
+        config = replace(RESUMABLE, token_budget=budget, accumulate=accumulate, max_steps=steps)
+        segment = train(
+            tiny_model(lexicon),
+            [BuiltLane(stream, recording)],
+            config,
+            tmp_path / f"{budget}x{accumulate}",
+        )
+        assert segment.finished
+        assert recording.made == [
+            [(example.id, " ".join(example.spans)) for example in group] for group in groups
+        ]
+        windows = [
+            groups[start : start + accumulate] for start in range(0, len(groups), accumulate)
+        ]
+        assert [record["examples"] for record in records(segment.metrics, "step")] == [
+            sum(len(group) for group in window) for window in windows
+        ]
+        for window in windows:
+            assert sum(padded_cost(group, collator.max_context_tokens) for group in window) <= 60
+        read[budget, accumulate] = [example for made in recording.made for example in made]
+
+    # The two configurations read one stream -- the same sixteen examples,
+    # typed the same way, in the same order -- cut into different updates.
+    assert read[30, 2] == read[60, 1]
+    assert len(read[30, 2]) == 16
+
+
+@pytest.mark.parametrize(
+    ("budget", "accumulate", "position"),
+    [(30, 2, {"epoch": 1, "index": 1}), (60, 1, {"epoch": 0, "index": 2})],
+)
+def test_a_resume_lands_on_the_example_after_the_last_update(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+    budget: int,
+    accumulate: int,
+    position: dict[str, int],
+) -> None:
+    """A segment that pauses after two updates resumes on the very example the
+    uninterrupted run trained on next -- at 30 x 2 from inside epoch 1, where
+    the second update reached across the boundary, and at 60 x 1 from the end
+    of epoch 0."""
+    config = replace(
+        RESUMABLE,
+        token_budget=budget,
+        accumulate=accumulate,
+        max_steps=SAME_TOKENS[budget, accumulate],
+    )
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    whole_recording = Recording(collator, spans)
+    uninterrupted = tiny_model(lexicon)
+    whole = train(uninterrupted, [BuiltLane(stream, whole_recording)], config, tmp_path / "whole")
+
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    paused = train(
+        tiny_model(lexicon),
+        [BuiltLane(stream, collator)],
+        replace(config, segment_steps=2),
+        tmp_path / "paused",
+    )
+    assert (paused.step, paused.finished) == (2, False)
+
+    resumed_model = tiny_model(lexicon)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    resumed_recording = Recording(collator, spans)
+    resumed = train(
+        resumed_model,
+        [BuiltLane(stream, resumed_recording)],
+        config,
+        tmp_path / "resumed",
+        resume=tmp_path / "paused" / "checkpoint-paused.pt",
+    )
+    resume = records(resumed.metrics, "resume")[0]
+    assert {"epoch": resume["epoch"], "index": resume["index"]} == position
+    assert resumed_recording.made == whole_recording.made[2 * accumulate :]
+    assert step_losses(resumed.metrics) == step_losses(whole.metrics)[2:]
     weights = uninterrupted.state_dict()
     for name, tensor in resumed_model.state_dict().items():
         assert torch.equal(tensor, weights[name]), name
