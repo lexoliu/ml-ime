@@ -35,7 +35,7 @@ def _record(index: int, text: str, hypotheses: tuple[str, ...]) -> DumpedRecord:
     )
 
 
-def test_evaluate_counts_generated_beam_oracle_characters_and_gaps() -> None:
+def test_evaluate_counts_generated_beam_oracle_characters_and_length_mismatches() -> None:
     generations = [
         # beam right, model right
         Generation(record=_record(0, "你好", ("你好", "拟好")), text="你好"),
@@ -45,8 +45,8 @@ def test_evaluate_counts_generated_beam_oracle_characters_and_gaps() -> None:
         Generation(record=_record(2, "谢谢你", ("写写你", "谢写你")), text="谢谢您"),
         # model wrote the wrong length
         Generation(record=_record(3, "晚安", ("完安", "万安")), text="晚安了"),
-        # unanswered
-        Generation(record=_record(4, "早", ("找", "早")), text=None, reason="timeout"),
+        # model wrong, answer in the beam
+        Generation(record=_record(4, "早", ("找", "早")), text="找"),
     ]
     result = evaluate(generations)
     assert result.records == 5
@@ -56,4 +56,3 @@ def test_evaluate_counts_generated_beam_oracle_characters_and_gaps() -> None:
     assert result.characters == 10
     assert result.characters_right == pytest.approx((2 + 2 + 2 + 1 + 0) / 10)
     assert result.length_mismatches == 1
-    assert result.unanswered == 1

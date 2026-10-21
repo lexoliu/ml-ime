@@ -27,7 +27,7 @@ from jinja2 import Template
 from openai.types.shared import ReasoningEffort
 from rapidfuzz.distance import Levenshtein
 
-from mlime.endpoint import Answer, Endpoint, answer_all
+from mlime.endpoint import Endpoint, answer_all
 from mlime.rescore import DumpedRecord, read_dump
 from mlime.settings import LlmSettings
 
@@ -40,11 +40,10 @@ TRAILING = "。！？!?.,，；;"
 
 @dataclass(frozen=True)
 class Generation:
-    """What the model wrote for a record, or why it wrote nothing."""
+    """What the model wrote for a record."""
 
     record: DumpedRecord
-    text: str | None
-    reason: str = ""
+    text: str
 
 
 @dataclass(frozen=True)
@@ -58,7 +57,6 @@ class GenerateResult:
     characters: int
     characters_right: float
     length_mismatches: int
-    unanswered: int
 
     def as_dict(self) -> dict[str, object]:
         """A JSON-friendly view."""
@@ -70,7 +68,6 @@ class GenerateResult:
             "characters": self.characters,
             "characters_right": self.characters_right,
             "length_mismatches": self.length_mismatches,
-            "unanswered": self.unanswered,
         }
 
 
@@ -151,15 +148,18 @@ class Generator:
     async def generate_all(
         self, records: Sequence[DumpedRecord], answers: Path
     ) -> list[Generation]:
-        """Generate for every record concurrently, keeping every answer in *answers*."""
+        """Generate for every record concurrently, keeping every answer in *answers*.
 
-        async def one(record: DumpedRecord) -> Answer[str]:
+        Raises `mlime.endpoint.UnfinishedError` when a record goes unanswered.
+        """
+
+        async def one(record: DumpedRecord) -> str:
             return await self._endpoint.ask(self.prompt(record), parse_sentence, record.index)
 
-        results = await answer_all(records, answers, lambda r: r.index, one, str)
+        texts = await answer_all(records, answers, lambda r: r.index, one, str)
         return [
-            Generation(record=record, text=answer.value, reason=answer.reason)
-            for record, answer in zip(records, results, strict=True)
+            Generation(record=record, text=text)
+            for record, text in zip(records, texts, strict=True)
         ]
 
 
@@ -174,14 +174,9 @@ def evaluate(generations: Sequence[Generation]) -> GenerateResult:
         oracle=sum(any(h.text == g.record.text for h in g.record.hypotheses) for g in generations)
         / total,
         characters=characters,
-        characters_right=sum(
-            characters_right(g.record.text, g.text) for g in generations if g.text is not None
-        )
+        characters_right=sum(characters_right(g.record.text, g.text) for g in generations)
         / characters,
-        length_mismatches=sum(
-            g.text is not None and len(g.text) != len(g.record.text) for g in generations
-        ),
-        unanswered=sum(g.text is None for g in generations),
+        length_mismatches=sum(len(g.text) != len(g.record.text) for g in generations),
     )
 
 
@@ -207,7 +202,6 @@ class GenerateReport:
                     "record": g.record.index,
                     "expected": g.record.text,
                     "generated": g.text,
-                    "reason": g.reason,
                 }
                 for g in self.generations
             ],
@@ -225,7 +219,7 @@ class GenerateReport:
                 f"{r.records} records: generated top-1 {r.generated_top1:.4f}, "
                 f"beam top-1 {r.beam_top1:.4f}, oracle {r.oracle:.4f}",
                 f"characters right {r.characters_right:.4f} of {r.characters}, "
-                f"length mismatches {r.length_mismatches}, unanswered {r.unanswered}",
+                f"length mismatches {r.length_mismatches}",
             ]
         )
 

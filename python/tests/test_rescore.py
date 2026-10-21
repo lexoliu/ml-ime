@@ -27,7 +27,7 @@ def _record(index: int, text: str, hypotheses: tuple[str, ...]) -> DumpedRecord:
     )
 
 
-def test_evaluate_counts_beam_reranked_oracle_and_unanswered() -> None:
+def test_evaluate_counts_beam_reranked_and_oracle() -> None:
     choices = [
         # beam right, model right
         Choice(record=_record(0, "你好", ("你好", "拟好")), picked=0),
@@ -35,12 +35,11 @@ def test_evaluate_counts_beam_reranked_oracle_and_unanswered() -> None:
         Choice(record=_record(1, "再见", ("在见", "再见")), picked=1),
         # beam wrong, model wrong, answer present
         Choice(record=_record(2, "谢谢", ("写写", "谢谢")), picked=0),
-        # answer absent, unanswered falls back to the beam
-        Choice(record=_record(3, "晚安", ("完安", "万安")), picked=None, reason="timeout"),
+        # answer absent
+        Choice(record=_record(3, "晚安", ("完安", "万安")), picked=1),
     ]
     result = evaluate(choices)
     assert result.records == 4
     assert result.beam_top1 == 0.25
     assert result.reranked_top1 == 0.5
     assert result.oracle == 0.75
-    assert result.unanswered == 1
