@@ -239,6 +239,7 @@ def test_every_switch_the_kernel_passes_is_an_option_of_train_e2e(
     monkeypatch.setattr(kernel, "TYPOS", True)
     monkeypatch.setattr(kernel, "ACTIVATION_CHECKPOINTING", True)
     monkeypatch.setattr(kernel, "SEGMENT_STEPS", 70)
+    monkeypatch.setattr(kernel, "SEARCH_GRAPHS", True)
     argv = kernel.train_argv(
         tmp_path / "char_pinyin.tsv",
         tmp_path / "run",
@@ -371,3 +372,42 @@ def test_the_kernels_count_builds_on_every_core(
     assert isinstance(result.exception, CountedError), result.output
     assert asked["workers"] == os.cpu_count()
     assert asked["world_size"] == 2
+
+
+def test_a_ranking_stage_replays_its_search_from_graphs_when_stamped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Only the trainer has a search; the count shares the ranking switches and refuses it."""
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    monkeypatch.setattr(kernel, "RANKING", {"weight": 0.05})
+    monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-v2-g4")
+    monkeypatch.setattr(kernel, "SEARCH_GRAPHS", True)
+    segmenter = tmp_path / "ime-segment"
+    count = kernel.count_argv(tmp_path / "char_pinyin.tsv", tmp_path / "counts.json", segmenter)
+    assert "--ranking" in count
+    assert "--search-graphs" not in count
+    train = kernel.train_argv(
+        tmp_path / "char_pinyin.tsv",
+        tmp_path / "run",
+        max_steps=100,
+        wall_budget=3600,
+        start=kernel.start_argv(None, tmp_path / "checkpoint-final.pt"),
+        resume=None,
+        token_budget=12288,
+        segmenter=segmenter,
+    )
+    assert "--search-graphs" in train
+
+
+def test_the_segmenter_is_found_in_the_directory_named_after_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The Colab driver mounts `ime-segment` at `<inputs>/ime-segment/ime-segment`."""
+    kernel = load_kernel(monkeypatch, tmp_path / "input", segment=0)
+    mount = tmp_path / "input" / "ime-segment"
+    mount.mkdir(parents=True)
+    (mount / "ime-segment").write_bytes(b"#!/bin/sh\n")
+    monkeypatch.setattr(kernel, "WORKING", tmp_path / "working")
+    staged = kernel.stage_segmenter()
+    assert staged == tmp_path / "working" / "bin" / "ime-segment"
+    assert staged.read_bytes() == b"#!/bin/sh\n"
