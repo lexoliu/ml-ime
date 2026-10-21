@@ -42,7 +42,7 @@ table does not load, so an export and the decoder always move together.
 | `crates/ime-corpus`, `ime-g2p`, `ime-synth` | corpus fetching, dual pinyin annotation, grounded synthesis of slang usage |
 | `python/` | the `mlime` CLI (uv project): corpus, labels, training, export, `eval generate` / `eval rime` |
 | `kaggle/`, `colab/` | the training kernels and the Colab launcher; `kaggle/README.md` |
-| `notes/` | the record; `notes/HANDOFF.md` is the operator's manual and the list of gotchas |
+| `notes/` | the record |
 | `macos/ContextProbe` | the accessibility probe for reading the host application's text |
 | `data/` | everything generated or downloaded: eval sets, score files, models, exports, run outputs; never committed |
 
