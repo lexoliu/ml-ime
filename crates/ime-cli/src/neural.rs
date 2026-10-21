@@ -25,7 +25,10 @@
 use crate::engine::read;
 use anyhow::{Context as _, Result, anyhow, bail};
 use askama::Template;
-use blake2::{Blake2b, Digest as _, digest::consts::U8};
+use blake2::{
+    Blake2b, Digest as _,
+    digest::consts::{U8, U16},
+};
 use clap::{Args, ValueEnum};
 use flate2::read::MultiGzDecoder;
 use ime_decode::{
@@ -44,7 +47,7 @@ use rayon::iter::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{BufRead as _, BufReader, BufWriter, Write};
+use std::io::{BufRead as _, BufReader, BufWriter, Read as _, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::mpsc::{self, Sender};
@@ -576,10 +579,14 @@ impl<T: Transition> Transition for WithoutContext<T> {
 /// line is the whole configuration key and every later line is one record's
 /// outcome, so a stopped run is continued by re-running the same command with
 /// the same directory, and resuming under arguments the file was not written
-/// with is refused rather than restarted.
+/// with is refused rather than restarted. The header also records the
+/// [`Build`] that wrote the file, and a file another build wrote is refused
+/// too: its records were decoded by other code.
 pub struct Progress<'a> {
     /// The directory the per-configuration files are kept in.
     pub dir: &'a Path,
+    /// The build this run is.
+    pub build: Build,
     /// The path the n-gram model was loaded from, when it was.
     pub model: Option<&'a Path>,
     /// The directory the character model was loaded from, when it was.
@@ -588,6 +595,45 @@ pub struct Progress<'a> {
     /// stand-in for a kill, since the command line never sets it.
     #[doc(hidden)]
     pub stop_after: Option<usize>,
+}
+
+/// The build of `ime-cli` a progress file was written by: the BLAKE2 hash of
+/// the running executable's bytes.
+///
+/// The executable is what decodes, so its bytes are the narrowest identity
+/// that still catches every change to the decode: the crate's code, a
+/// dependency or the lockfile, the toolchain, and an uncommitted edit, which a
+/// commit hash would miss. A change that leaves the executable as it was -- a
+/// note, a workflow, Python -- keeps the progress, where a commit hash would
+/// throw away hours of decoded records for nothing. The decode's inputs are
+/// not part of it; the configuration key names those.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Build(String);
+
+impl Build {
+    /// The build of the running executable.
+    ///
+    /// # Errors
+    ///
+    /// If the executable's path cannot be found or its bytes cannot be read.
+    pub fn current() -> Result<Self> {
+        let path = std::env::current_exe().context("could not locate the running executable")?;
+        let mut file = fs::File::open(&path)
+            .with_context(|| format!("could not open the executable {}", path.display()))?;
+        let mut hasher = Blake2b::<U16>::new();
+        let mut buffer = vec![0; 1 << 20];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .with_context(|| format!("could not read the executable {}", path.display()))?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(Self(const_hex::encode(hasher.finalize())))
+    }
 }
 
 /// An emission source before a weight is applied to it: the data a
@@ -644,6 +690,7 @@ impl<'a> Run<'a> {
     ) -> Option<ProgressRequest<'_>> {
         self.progress.map(|progress| ProgressRequest {
             dir: progress.dir,
+            build: &progress.build,
             stop_after: progress.stop_after,
             eval_set: self.eval_set,
             scores: self.scores_path,
@@ -1233,6 +1280,8 @@ where
 struct ProgressRequest<'a> {
     /// The directory the per-configuration files are kept in.
     dir: &'a Path,
+    /// The build this run is.
+    build: &'a Build,
     /// The test stand-in for a kill: stop after this many new records.
     stop_after: Option<usize>,
     eval_set: &'a Path,
@@ -1289,6 +1338,9 @@ struct Name {
 /// names the fields that differ.
 #[derive(Debug, Serialize, Deserialize)]
 struct Key {
+    /// The build that wrote the file; resuming under another is refused on
+    /// its own, before the rest of the key is compared.
+    build: Build,
     /// Which decode this is: the part the file is named for.
     #[serde(flatten)]
     name: Name,
@@ -1513,7 +1565,25 @@ fn check_header(text: &str, key: &Key, path: &Path) -> Result<()> {
         .lines()
         .next()
         .context("the progress file holds no configuration header")?;
-    let stored: Key = serde_json::from_str(header).with_context(|| {
+    let stored: serde_json::Value = serde_json::from_str(header).with_context(|| {
+        format!(
+            "the first line of {} is not a configuration key",
+            path.display()
+        )
+    })?;
+    // Checked before the key is parsed, so a file from before builds were
+    // recorded is refused as one rather than as a malformed header.
+    let stored_build = stored.get("build").and_then(serde_json::Value::as_str);
+    if stored_build != Some(key.build.0.as_str()) {
+        bail!(
+            "the progress file {} was written by build {}, not by this build {}: its records \
+             were decoded by other code; remove it to decode the section afresh",
+            path.display(),
+            stored_build.unwrap_or("(unrecorded)"),
+            key.build.0
+        );
+    }
+    let stored: Key = serde_json::from_value(stored).with_context(|| {
         format!(
             "the first line of {} is not a configuration key",
             path.display()
@@ -1605,6 +1675,7 @@ where
     T: Transition + Sync,
 {
     let key = Key {
+        build: progress.build.clone(),
         name: Name {
             eval_set: progress.eval_set.to_owned(),
             scores: progress.scores.map(Path::to_owned),
@@ -2065,8 +2136,23 @@ mod tests {
 
         /// A `Progress` into this fixture's directory.
         fn progress<'a>(&'a self, stop_after: Option<usize>, lm: Option<&'a Path>) -> Progress<'a> {
+            self.progress_by(
+                Build::current().expect("the test binary hashes"),
+                stop_after,
+                lm,
+            )
+        }
+
+        /// `progress`, as though *build* were running.
+        fn progress_by<'a>(
+            &'a self,
+            build: Build,
+            stop_after: Option<usize>,
+            lm: Option<&'a Path>,
+        ) -> Progress<'a> {
             Progress {
                 dir: &self.progress_dir,
+                build,
                 model: None,
                 lm,
                 stop_after,
@@ -2370,6 +2456,100 @@ mod tests {
             )
             .expect("another weight is another file, not a refusal");
         assert_eq!(fixture.progress_files().len(), 2);
+    }
+
+    #[test]
+    fn a_resumed_run_from_another_build_is_refused() {
+        let fixture = Fixture::new(
+            &[("nihao", "你好"), ("zhongguo", "中国"), ("renmin", "人民")],
+            "你\n好\n中\n国\n人\n民",
+            "",
+        );
+        let other = Build("0123456789abcdef0123456789abcdef".to_owned());
+        assert_ne!(other, Build::current().expect("the test binary hashes"));
+        fixture
+            .run(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress_by(other.clone(), Some(1), None)),
+            )
+            .expect("the other build's stopped run decodes");
+        let before = fixture.progress_files();
+        assert_eq!(before[0].0["build"].as_str(), Some(other.0.as_str()));
+        let refused = fixture
+            .run(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress(None, None)),
+            )
+            .expect_err("another build's progress must be refused");
+        let message = format!("{refused:#}");
+        assert!(
+            message.contains(&other.0) && message.contains("not by this build"),
+            "the refusal names both builds: {message}"
+        );
+        assert_eq!(
+            fixture.progress_files(),
+            before,
+            "a refused resume leaves the file as it was"
+        );
+        // The build that wrote the file resumes it.
+        fixture
+            .run(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress_by(other, None, None)),
+            )
+            .expect("the same build resumes");
+        assert_eq!(fixture.progress_files()[0].1.len(), 3);
+    }
+
+    #[test]
+    fn a_progress_file_without_a_build_is_refused() {
+        let fixture = Fixture::new(&[("nihao", "你好")], "你\n好", "");
+        fixture
+            .run(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress(None, None)),
+            )
+            .expect("the first run decodes");
+        let path = fs::read_dir(&fixture.progress_dir)
+            .expect("the progress directory reads")
+            .next()
+            .expect("one progress file")
+            .expect("an entry reads")
+            .path();
+        let text = fs::read_to_string(&path).expect("the progress file reads");
+        let (header, rest) = text.split_once('\n').expect("a header line");
+        let mut header: serde_json::Value =
+            serde_json::from_str(header).expect("the header parses");
+        header
+            .as_object_mut()
+            .expect("the header is an object")
+            .remove("build");
+        fs::write(&path, format!("{header}\n{rest}")).expect("the progress file writes");
+        let refused = fixture
+            .run(
+                &[1.0],
+                0.5,
+                false,
+                Models::None,
+                Some(&fixture.progress(None, None)),
+            )
+            .expect_err("a file with no build must be refused");
+        assert!(
+            format!("{refused:#}").contains("(unrecorded)"),
+            "the refusal says no build was recorded: {refused:#}"
+        );
     }
 
     #[test]
