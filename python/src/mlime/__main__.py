@@ -1196,6 +1196,30 @@ def eval_rime(
         write_report(report, out)
 
 
+@eval_app.command("drift")
+def eval_drift(
+    dump: Path = typer.Option(..., help="A --dump file: fused-eval's or `eval e2e`'s"),
+    eval_set: Path = typer.Option(..., help="The eval set the dump was decoded from"),
+    samples: Path = typer.Option(
+        Path("data/run3_pool/samples"), help="Directory of the sample shards rarity is read off"
+    ),
+    slice_: str = typer.Option("test", "--slice", help="test (default), dev or all"),
+    dev_share: float = typer.Option(0.0905, help="Share of the set that is development data"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Count the top-1 answers by kind and how rare the substituted characters are."""
+    configure(verbose)
+    from mlime.drift import FrequencyRanks, measure
+    from mlime.rescore import read_dump
+
+    if slice_ not in ("dev", "test", "all"):
+        raise typer.BadParameter("--slice must be dev, test or all")
+    ranks = FrequencyRanks.from_shards(list(samples.glob("*.parquet")))
+    typer.echo(f"sample: {samples}, {ranks.characters:,} characters, {len(ranks.ranks):,} distinct")
+    drift = measure(read_dump(dump, eval_set), eval_set, ranks, slice_, dev_share)
+    typer.echo(f"slice: {slice_}\n{drift.render()}")
+
+
 @eval_app.command("e2e")
 def eval_e2e(
     checkpoint: Path = typer.Option(..., help="An e2e checkpoint written by `train e2e`"),
