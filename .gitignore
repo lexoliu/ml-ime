@@ -11,3 +11,9 @@ __pycache__/
 macos/ContextProbe/.build/
 macos/ContextProbe/build/
 /.resume-brief.md
+# Fixture graphs and weights: published by python/scripts/publish_fixtures.py,
+# pinned in crates/ime-fixtures/fixtures.json.
+/crates/ime-lm/tests/fixtures/**/*.onnx
+/crates/ime-lm/tests/fixtures/**/*.weights
+/crates/ime-neural/tests/fixtures/**/*.onnx
+/crates/ime-neural/tests/fixtures/**/*.weights

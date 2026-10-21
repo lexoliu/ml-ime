@@ -43,5 +43,8 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 
+[dev-dependencies]
+ime-fixtures.workspace = true
+
 [lints]
 workspace = true

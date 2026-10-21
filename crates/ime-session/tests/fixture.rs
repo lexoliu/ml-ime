@@ -1,12 +1,11 @@
-//! The session end to end on the committed fixture towers: replay a record
-//! keystroke by keystroke and its last top candidate must equal the answer
+//! The session end to end on the fixture towers: replay a record keystroke
+//! by keystroke and its last top candidate must equal the answer
 //! `decode_many` computes for the whole input — the equality `ime-cli replay`
 //! asserts per record, proven on the fixture where both directions are cheap.
 //!
-//! The towers are the `fp32` fixture export under
-//! `crates/ime-neural/tests/fixtures/`, the candidate sets are the real
-//! generated tables, and the emittable restriction is the fixture's nine
-//! characters.
+//! The towers are the `fp32` export of `ime_fixtures::route_a`, the candidate
+//! sets are the real generated tables, and the emittable restriction is the
+//! fixture's nine characters.
 
 mod common;
 
@@ -18,11 +17,11 @@ use ime_decode::{
 use ime_neural::{RouteA, SessionShape};
 use ime_pinyin::{Lexicon, SegmentLattice, SegmentOptions, SyllableTable};
 use ime_session::{Fused, FusedConfig, Session, SessionOptions as Options};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// `crates/ime-neural/tests/fixtures` — the fp32 export lives under `fp32/`.
-fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../ime-neural/tests/fixtures")
+/// The route A fixture set — the fp32 export lives under `fp32/`.
+fn fixture_dir() -> &'static Path {
+    ime_fixtures::route_a()
 }
 
 /// The generated lexicon every table is indexed through.
@@ -143,7 +142,7 @@ fn replay_equals_full_decode() {
         .expect("the fixture towers open");
     let table = SyllableTable::load();
     let lexicon = lexicon();
-    let emittable = emittable(&dir, &lexicon);
+    let emittable = emittable(dir, &lexicon);
     for (pinyin, context) in [("zhongwo", Some("北京大学")), ("woaibeijing", None)] {
         let want = reference_top(&towers, pinyin, context, &lexicon, &emittable);
         for incremental in [false, true] {
@@ -169,7 +168,7 @@ fn apostrophe_is_a_boundary() {
         .expect("the fixture towers open");
     let table = SyllableTable::load();
     let lexicon = lexicon();
-    let emittable = emittable(&dir, &lexicon);
+    let emittable = emittable(dir, &lexicon);
     let mut session = session(&towers, &table, &lexicon, &emittable, false);
     for ch in "zhong'wo".chars() {
         session.key(ch).expect("a keystroke decodes");
@@ -202,7 +201,7 @@ fn select_consumes_and_commits_to_context() {
         .expect("the fixture towers open");
     let table = SyllableTable::load();
     let lexicon = lexicon();
-    let emittable = emittable(&dir, &lexicon);
+    let emittable = emittable(dir, &lexicon);
     let mut session = session(&towers, &table, &lexicon, &emittable, false);
     session.set_context("北京大学").expect("context sets");
     for ch in "zhongwo".chars() {
@@ -229,7 +228,7 @@ fn prefix_commit_leaves_rest_pending() {
         .expect("the fixture towers open");
     let table = SyllableTable::load();
     let lexicon = lexicon();
-    let emittable = emittable(&dir, &lexicon);
+    let emittable = emittable(dir, &lexicon);
     let mut session = session(&towers, &table, &lexicon, &emittable, false);
     for ch in "woaibeijing".chars() {
         session.key(ch).expect("a keystroke decodes");
@@ -260,7 +259,7 @@ fn prefix_candidates_at_syllable_boundaries() {
         .expect("the fixture towers open");
     let table = SyllableTable::load();
     let lexicon = lexicon();
-    let emittable = emittable(&dir, &lexicon);
+    let emittable = emittable(dir, &lexicon);
     let mut session = session(&towers, &table, &lexicon, &emittable, false);
     // "wo", "ai" full syllables followed by the abbreviated "b", "j".
     for ch in "woaibj".chars() {

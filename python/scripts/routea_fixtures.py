@@ -17,6 +17,10 @@ export against the fp32 table at the bound `test_int8_export_tracks_fp32`
 uses. `<out>/char_pinyin.tsv` is the character
 table the Rust `Lexicon` parses, and `<out>/emittable.txt` the set
 `Emittable::parse` reads.
+
+Written into `crates/ime-neural/tests/fixtures`, the text files are committed
+and the graphs and weights are published with `scripts/publish_fixtures.py`,
+which pins them in `crates/ime-fixtures/fixtures.json`.
 """
 
 import json
