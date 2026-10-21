@@ -86,6 +86,10 @@ table does not load, so an export and the decoder always move together.
   work is shaped wrong — too few rows a step, too few records in flight, a serial stage — and
   the shape is fixed before the run continues. Check utilisation once the run has warmed up and
   again at every wake, and record it with the run.
+- A GPU test on a training VM runs after the kernel's `install()`, in the environment the leg
+  trains in.
+- A GPU assignment refused for capacity (503) is retried after a pause, never in a loop; nothing
+  is billed until a runtime is assigned.
 - A performance measurement on a training card is training: every configuration starts from
   the run's checkpoint and keeps its own, and the winner continues from its checkpoint. A leg
   that is thrown away buys the same steps and discards them.
