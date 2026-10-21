@@ -925,17 +925,29 @@ def forward_model(lexicon: Lexicon, seed: int) -> RankingE2EModel:
 SEEDS = (0, 1, 2)
 
 
+DEVICES = [
+    "cpu",
+    pytest.param(
+        "cuda",
+        marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device"),
+    ),
+]
+
+
+@pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize("seed", SEEDS)
 def test_the_ranking_forward_is_116s_forward(
-    lexicon: Lexicon, spans: SpanVocab, tokenizer: StubTokenizer, seed: int
+    lexicon: Lexicon, spans: SpanVocab, tokenizer: StubTokenizer, seed: int, device: str
 ) -> None:
     """The device step trains what the host step trained: the same losses, the same gradients.
 
     Dropout is off -- the two lay their paths out differently, so they would
     draw different masks -- and everything else is the same model and batch.
+    On CUDA the path sums are atomic adds in whatever order they land, so
+    the two agree to rounding rather than bit for bit.
     """
-    model = forward_model(lexicon, seed)
-    batch = colliding_batch(lexicon, spans, tokenizer)
+    model = forward_model(lexicon, seed).to(device)
+    batch = colliding_batch(lexicon, spans, tokenizer).to(torch.device(device))
 
     output = model(batch)
     assert output.loss is not None
