@@ -25,6 +25,7 @@ use ime_pinyin::{CharId, Lexicon, Segment, SegmentLattice, SegmentOptions, Sylla
 use rayon::iter::{
     IndexedParallelIterator as _, IntoParallelRefIterator as _, ParallelIterator as _,
 };
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 /// Characters typed alike that only the surrounding text tells apart.
@@ -483,7 +484,17 @@ impl AmbiguityReport {
             rows: self
                 .outcomes
                 .iter()
-                .map(|outcome| (outcome, &set.records()[outcome.record]))
+                .map(|outcome| {
+                    let record = &set.records()[outcome.record];
+                    ListingRow {
+                        record: outcome.record,
+                        keystrokes: field(&record.pinyin),
+                        context: record.context.as_deref().map_or(Cow::Borrowed("-"), field),
+                        wanted: field(&record.text),
+                        top: outcome.top.as_deref().map_or(Cow::Borrowed("-"), field),
+                        rank: outcome.rank,
+                    }
+                })
                 .collect(),
         }
     }
@@ -493,7 +504,37 @@ impl AmbiguityReport {
 #[derive(Template)]
 #[template(path = "ambiguity_listing.txt", ext = "txt")]
 pub struct Listing<'a> {
-    rows: Vec<(&'a Outcome, &'a EvalRecord)>,
+    rows: Vec<ListingRow<'a>>,
+}
+
+/// One line of a [`Listing`], its text fields escaped by [`field`].
+struct ListingRow<'a> {
+    record: usize,
+    keystrokes: Cow<'a, str>,
+    context: Cow<'a, str>,
+    wanted: Cow<'a, str>,
+    top: Cow<'a, str>,
+    rank: Option<usize>,
+}
+
+/// *text* as one tab-separated field: a backslash, tab, newline or carriage
+/// return is written as its backslash escape, so a multi-line context keeps
+/// its record on one line.
+fn field(text: &str) -> Cow<'_, str> {
+    if !text.contains(['\\', '\t', '\n', '\r']) {
+        return Cow::Borrowed(text);
+    }
+    let mut escaped = String::with_capacity(text.len() + 8);
+    for character in text.chars() {
+        match character {
+            '\\' => escaped.push_str("\\\\"),
+            '\t' => escaped.push_str("\\t"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            other => escaped.push(other),
+        }
+    }
+    Cow::Owned(escaped)
 }
 
 /// How often two systems disagree, and in whose favour.
@@ -818,6 +859,15 @@ mod tests {
         assert!(
             listing.contains("0\ttashiwojiejie\t-\t她是我姐姐\t她是我姐姐\t1\n"),
             "{listing}"
+        );
+    }
+
+    #[test]
+    fn a_listed_field_keeps_its_record_on_one_line() {
+        assert!(matches!(field("她是我姐姐"), Cow::Borrowed("她是我姐姐")));
+        assert_eq!(
+            field("不知道，\n自求多福\t啦\\"),
+            "不知道，\\n自求多福\\t啦\\\\"
         );
     }
 
