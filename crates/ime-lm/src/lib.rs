@@ -1609,6 +1609,59 @@ impl PagePool {
         node
     }
 
+    /// Chain a prelude's *positions* rows of *rows* under the trie root:
+    /// each position *write*s into a page from *claim* and becomes a context
+    /// node under the one before it, and the desc chain grows from *root*
+    /// one context desc per position. Returns the state's row and its path.
+    ///
+    /// Positions a claim cannot cover ride as pending tips, the same
+    /// fallthrough `advance` uses — `start` under a saturated pool degrades
+    /// rather than fails.
+    fn chain(
+        &self,
+        root: &Arc<PathDesc>,
+        rows: &Arc<Generation>,
+        positions: u32,
+        mut claim: impl FnMut() -> Option<PageSlot>,
+        mut write: impl FnMut(&PageSlot, u32) -> Result<(), LmError>,
+    ) -> Result<(StateRow, Arc<PathDesc>), LmError> {
+        let mut leaf = Arc::clone(&self.root);
+        let mut desc = Arc::clone(root);
+        let mut tips = Vec::new();
+        for position in 0..positions {
+            let child_desc = Arc::new(PathDesc {
+                parent: Some(desc),
+                ch: None,
+                node: Mutex::new(None),
+            });
+            desc = child_desc;
+            // Once a position has no page, none after it claims one: a page
+            // granted later would chain under the leaf before the gap and
+            // skip the positions in it, which `Pending` only allows at the
+            // end — `tips[j]` is position `leaf.depth + j`.
+            let Some(slot) = tips.is_empty().then(&mut claim).flatten() else {
+                tips.push(RowRef {
+                    generation: Arc::clone(rows),
+                    index: position,
+                });
+                continue;
+            };
+            write(&slot, position)?;
+            leaf = self.adopt(
+                &leaf,
+                None,
+                slot,
+                &mut desc.node.lock().expect("the desc memo is not poisoned"),
+            );
+        }
+        let row = if tips.is_empty() {
+            StateRow::Path(leaf)
+        } else {
+            StateRow::Pending { leaf, tips }
+        };
+        Ok((row, desc))
+    }
+
     /// Write *row*'s slice of tensor `index` — one position's `[layers,
     /// heads, head_dim]` — into page *page* of the pool buffer, contiguous
     /// under the page-major layout.
@@ -2700,10 +2753,6 @@ impl CharLm {
     /// `prefix_*` output — one position per row — to the device, then every
     /// position's slice written into its own claimed page. The pages form
     /// the context's chain: the record's root every beam shares.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one prefill is a straight-line sequence: bind and run the graph, then chain the prelude's pages or tips position by position"
-    )]
     fn prefill_pages(&self, context: Option<&str>, asked: &Asked<'_>) -> Result<LmState, LmError> {
         let Some(Cache::Pages(pool)) = &self.cache else {
             unreachable!("a paged export always owns its page pool");
@@ -2750,58 +2799,25 @@ impl CharLm {
         };
         // Write the prelude's pages: one claimed page per position, the
         // prefix output's row `position` landing at the chain's next page.
-        // Positions a claim cannot cover ride as pending tips, the same
-        // fallthrough `advance` uses — `start` under a saturated pool
-        // degrades rather than fails.
         let tick = std::time::Instant::now();
         let prefix_outs = Arc::new(Generation {
             tensors: prefix_outs,
         });
+        let positions =
+            u32::try_from(prefix_outs.tensors[0].shape()[0]).expect("a prelude length fits u32");
         let mut env = env_cell.borrow_mut();
-        let mut leaf = Arc::clone(&pool.root);
-        let mut desc = Arc::clone(&self.root_path);
-        let mut tips = Vec::new();
-        let positions = usize::try_from(prefix_outs.tensors[0].shape()[0])
-            .expect("a prelude length fits usize");
-        for position in 0..positions {
-            let Some(slot) = pool.claim() else {
-                tips.push(RowRef {
-                    generation: Arc::clone(&prefix_outs),
-                    index: u32::try_from(position).expect("a position fits u32"),
-                });
-                desc = Arc::new(PathDesc {
-                    parent: Some(desc),
-                    ch: None,
-                    node: Mutex::new(None),
-                });
-                continue;
-            };
-            for (index, tensor) in prefix_outs.tensors.iter().enumerate() {
-                pool.write_page(
-                    &mut env,
-                    tensor,
-                    u32::try_from(position).expect("a position fits u32"),
-                    slot.index,
-                    index,
-                )?;
-            }
-            let child_desc = Arc::new(PathDesc {
-                parent: Some(desc),
-                ch: None,
-                node: Mutex::new(None),
-            });
-            let child = pool.adopt(
-                &leaf,
-                None,
-                slot,
-                &mut child_desc
-                    .node
-                    .lock()
-                    .expect("the desc memo is not poisoned"),
-            );
-            leaf = child;
-            desc = child_desc;
-        }
+        let (row, desc) = pool.chain(
+            &self.root_path,
+            &prefix_outs,
+            positions,
+            || pool.claim(),
+            |slot, position| {
+                for (index, tensor) in prefix_outs.tensors.iter().enumerate() {
+                    pool.write_page(&mut env, tensor, position, slot.index, index)?;
+                }
+                Ok(())
+            },
+        )?;
         drop(env);
         self.bookkeeping.fetch_add(
             u64::try_from(tick.elapsed().as_nanos()).unwrap_or(u64::MAX),
@@ -2809,11 +2825,7 @@ impl CharLm {
         );
         Ok(LmState {
             worker: None,
-            row: if tips.is_empty() {
-                StateRow::Path(leaf)
-            } else {
-                StateRow::Pending { leaf, tips }
-            },
+            row,
             path: desc,
             scores: Arc::new(Scores { ids, probs }),
             cache: None,
@@ -4068,5 +4080,70 @@ mod tests {
                 "a fresh node keeps its page"
             );
         });
+    }
+
+    /// A prelude whose claims fail partway must keep every position in
+    /// order. The chain used to keep claiming after a refusal, so a page
+    /// granted later — freed by another thread in between — was chained
+    /// under the last page before the gap: the leaf chain skipped the
+    /// refused position and the tips named it after the later one, and the
+    /// next `resolve_state` paired that tip with the later position's memo,
+    /// dropping it. That is #193.
+    ///
+    /// The refusal and the later grant come from a scripted claim, the only
+    /// deterministic way to get both inside one prelude: on one thread a
+    /// refused claim has drained the sweep's queue and nothing runs between
+    /// two claims.
+    #[test]
+    fn a_refused_prelude_claim_keeps_every_position_in_order() {
+        let pool = PagePool::new(ModelDtype::Float32, 3, &[vec![0, 2, 3, 4]])
+            .expect("a page-major shape loads");
+        let root = Arc::new(PathDesc {
+            parent: None,
+            ch: None,
+            node: Mutex::new(None),
+        });
+        let rows = Arc::new(Generation {
+            tensors: Vec::new(),
+        });
+        let mut claims = vec![pool.claim(), None, pool.claim()].into_iter();
+        let mut written = HashMap::new();
+        let (row, desc) = pool
+            .chain(
+                &root,
+                &rows,
+                3,
+                || claims.next().flatten(),
+                |slot, position| {
+                    written.insert(slot.index, position);
+                    Ok(())
+                },
+            )
+            .expect("a scripted chain writes nothing that can fail");
+        let (leaf, tips) = match row {
+            StateRow::Path(leaf) => (leaf, Vec::new()),
+            StateRow::Pending { leaf, tips } => (leaf, tips),
+            StateRow::Buf(_) => unreachable!("a chain is paged"),
+        };
+        let mut read = Vec::new();
+        let mut node = Some(&leaf);
+        while let Some(at) = node.filter(|at| at.parent.is_some()) {
+            read.push(written[&at.page.load(Ordering::Relaxed)]);
+            node = at.parent.as_ref();
+        }
+        read.reverse();
+        read.extend(tips.iter().map(|tip| tip.index));
+        assert_eq!(
+            read,
+            [0, 1, 2],
+            "the state reads every prelude position in order"
+        );
+        let mut depth = 0;
+        let mut at = &desc;
+        while let Some(parent) = &at.parent {
+            depth += 1;
+            at = parent;
+        }
+        assert_eq!(depth, 3, "the path names every prelude position");
     }
 }
