@@ -32,7 +32,7 @@ import regex
 from jinja2 import Template
 from openai.types.shared import ReasoningEffort
 
-from mlime.endpoint import Answer, Endpoint, answer_all
+from mlime.endpoint import Endpoint, answer_all
 from mlime.logging import log
 from mlime.settings import LlmSettings
 
@@ -60,17 +60,15 @@ class DumpedRecord:
 
 @dataclass(frozen=True)
 class Choice:
-    """What the model picked for a record, or why it picked nothing."""
+    """Which hypothesis the model picked for a record."""
 
     record: DumpedRecord
-    picked: int | None
-    reason: str = ""
+    picked: int
 
     @property
     def top1(self) -> str:
-        """The reranked answer: the pick, or the beam's own first when there is none."""
-        index = 0 if self.picked is None else self.picked
-        return self.record.hypotheses[index].text
+        """The reranked answer: the picked hypothesis."""
+        return self.record.hypotheses[self.picked].text
 
 
 @dataclass(frozen=True)
@@ -81,7 +79,6 @@ class SliceResult:
     beam_top1: float
     reranked_top1: float
     oracle: float
-    unanswered: int
 
     def as_dict(self) -> dict[str, object]:
         """A JSON-friendly view."""
@@ -90,7 +87,6 @@ class SliceResult:
             "beam_top1": self.beam_top1,
             "reranked_top1": self.reranked_top1,
             "oracle": self.oracle,
-            "unanswered": self.unanswered,
         }
 
 
@@ -174,19 +170,21 @@ class Reranker:
         )
 
     async def choose_all(self, records: Sequence[DumpedRecord], picks: Path) -> list[Choice]:
-        """Choose for every record concurrently, keeping every answer in *picks*."""
+        """Choose for every record concurrently, keeping every answer in *picks*.
 
-        async def one(record: DumpedRecord) -> Answer[int]:
+        Raises `mlime.endpoint.UnfinishedError` when a record goes unanswered.
+        """
+
+        async def one(record: DumpedRecord) -> int:
             return await self._endpoint.ask(
                 self.prompt(record),
                 lambda content: parse_choice(content, len(record.hypotheses)),
                 record.index,
             )
 
-        answers = await answer_all(records, picks, lambda r: r.index, one, int)
+        picked = await answer_all(records, picks, lambda r: r.index, one, int)
         return [
-            Choice(record=record, picked=answer.value, reason=answer.reason)
-            for record, answer in zip(records, answers, strict=True)
+            Choice(record=record, picked=pick) for record, pick in zip(records, picked, strict=True)
         ]
 
 
@@ -199,7 +197,6 @@ def evaluate(choices: Sequence[Choice]) -> SliceResult:
         reranked_top1=sum(c.top1 == c.record.text for c in choices) / total,
         oracle=sum(any(h.text == c.record.text for h in c.record.hypotheses) for c in choices)
         / total,
-        unanswered=sum(c.picked is None for c in choices),
     )
 
 
@@ -218,10 +215,7 @@ class RescoreReport:
             "model": self.model,
             "reasoning_effort": self.reasoning_effort,
             "result": self.result.as_dict(),
-            "choices": [
-                {"record": c.record.index, "picked": c.picked, "reason": c.reason}
-                for c in self.choices
-            ],
+            "choices": [{"record": c.record.index, "picked": c.picked} for c in self.choices],
         }
 
     def render(self) -> str:
@@ -231,8 +225,7 @@ class RescoreReport:
             [
                 f"model {self.model}, reasoning effort {self.reasoning_effort}",
                 f"{r.records} records: beam top-1 {r.beam_top1:.4f}, "
-                f"reranked top-1 {r.reranked_top1:.4f}, oracle {r.oracle:.4f}, "
-                f"unanswered {r.unanswered}",
+                f"reranked top-1 {r.reranked_top1:.4f}, oracle {r.oracle:.4f}",
             ]
         )
 
