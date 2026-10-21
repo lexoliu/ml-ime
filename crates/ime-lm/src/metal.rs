@@ -71,10 +71,48 @@ using namespace metal;
 #define EPS 1e-5f
 #define INV_SQRT_HD 0.125f   // 1/sqrt(64)
 
-// STATS2 is the per-row slot stride (in floats) of the stats accumulator
-// buffer: slot 0 = embed's x, slots 1..LAYERS = ffn2's x for the next
-// layer's qkv, slots LAYERS+1..2*LAYERS = out's x for ffn0.
-constant uint STATS2 = (2u * LAYERS + 1u) * 2u;
+// The per-row LN sums (Σx, Σx²) arrive as partials, one per 32-column tile
+// of the x producer, each in a slot of its own: the consumer adds them in
+// one fixed order, so the sums — and every LN after them — are the same bits on
+// every call. An atomicAdd would round in whatever order the GPU retires
+// the tiles. Slot 0 = embed's x, slots 1..LAYERS = ffn2's x for the next
+// layer's qkv, slots LAYERS+1..2*LAYERS = out's x for ffn0; within a slot,
+// STA_TILES Σx partials then STA_TILES Σx² partials.
+#define STA_TILES (HID / 32u)
+constant uint STATS_ROW = (2u * LAYERS + 1u) * 2u * STA_TILES;
+
+// A consumer reduces a row's partials in quarters: quarter q holds tiles
+// [q*STA_QUARTER, (q+1)*STA_QUARTER), summed in tile order, and the row's
+// sums are (q0 + q1) + (q2 + q3) — the order a four-lane xor butterfly
+// produces, so `lm_sm`'s parallel reduce and `lm_smv`'s serial one give
+// the same bits.
+#define STA_QUARTER (STA_TILES / 4u)
+static_assert(STA_QUARTER == 4u, "a quarter is one float4 of partials");
+
+// Quarter q of row m's (Σx, Σx²) partials in slot `slot` — four tiles,
+// one 16-byte load each for the Σx and the Σx² run (every row, slot and
+// quarter offset is a multiple of four floats).
+inline float2 ln_quarter(device const float* stats, uint m, uint slot, uint q) {
+    device const float* p = stats + (ulong)m * STATS_ROW + slot * 2u * STA_TILES
+        + q * STA_QUARTER;
+    const float4 sx = *(device const float4*)p;
+    const float4 ss = *(device const float4*)(p + STA_TILES);
+    return float2(((sx.x + sx.y) + sx.z) + sx.w, ((ss.x + ss.y) + ss.z) + ss.w);
+}
+
+// (mean, rstd) over K from a row's (Σx, Σx²).
+inline float2 ln_of(float2 s, uint K) {
+    const float mean = s.x / (float)K;
+    return float2(mean, rsqrt(max(s.y / (float)K - mean * mean, 0.0f) + EPS));
+}
+
+// Row m's (mean, rstd) — one thread's serial reduce.
+inline float2 ln_moments(device const float* stats, uint m, uint slot, uint K) {
+    return ln_of(
+        (ln_quarter(stats, m, slot, 0u) + ln_quarter(stats, m, slot, 1u))
+            + (ln_quarter(stats, m, slot, 2u) + ln_quarter(stats, m, slot, 3u)),
+        K);
+}
 
 // Weight element at [i*out + o] — [in, out] row-major so a warp's consecutive
 // outputs read consecutive bytes. Q: 0 = f16, 1 = i8 + per-out scale, 2 = f32.
@@ -116,14 +154,13 @@ kernel void lm_embed(
     device const float* b_in    [[buffer(8)]],   // [HID]
     constant uint&      vocab   [[buffer(9)]],
     device half*        x16     [[buffer(10)]],  // [rows, HID] fp16 x
-    device atomic_float* stats  [[buffer(11)]],  // [rows, STATS2] sums
+    device float*       stats   [[buffer(11)]],  // [rows, STATS_ROW] partials
     uint tgid [[threadgroup_position_in_grid]],
     uint tid  [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg   [[simdgroup_index_in_threadgroup]])
 {
     threadgroup float tg_x[HID];
-    threadgroup float tg_red[2 * (HID / 32)];
     const uint row = tgid;
     tg_x[tid] = ldw<QE>(w_emb, s_emb, tid, token[row], vocab);
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -133,31 +170,13 @@ kernel void lm_embed(
     }
     x[row * HID + tid] = acc;
     x16[(ulong)row * HID + tid] = half(acc);
-    // Slot 0's Σx/Σx² come from this row — the threadgroup owns it whole,
-    // so the reduce is in-register; the later slots are cleared here so
-    // the layer producers' atomicAdds start from zero each call.
-    for (uint s = 2u + tid; s < STATS2; s += HID) {
-        atomic_store_explicit(
-            stats + (ulong)row * STATS2 + s, 0.0f, memory_order_relaxed);
-    }
+    // Slot 0's partials: simdgroup sg holds the row's columns
+    // [32*sg, 32*sg + 32) — the same tiles the layer producers write.
     const float s0 = simd_sum(acc);
     const float s1 = simd_sum(acc * acc);
     if (lane == 0) {
-        tg_red[2 * sg] = s0;
-        tg_red[2 * sg + 1] = s1;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float t0 = 0.0f;
-        float t1 = 0.0f;
-        for (uint i = 0; i < HID / 32; ++i) {
-            t0 += tg_red[2 * i];
-            t1 += tg_red[2 * i + 1];
-        }
-        atomic_store_explicit(
-            stats + (ulong)row * STATS2, t0, memory_order_relaxed);
-        atomic_store_explicit(
-            stats + (ulong)row * STATS2 + 1u, t1, memory_order_relaxed);
+        stats[(ulong)row * STATS_ROW + sg] = s0;
+        stats[(ulong)row * STATS_ROW + STA_TILES + sg] = s1;
     }
 }
 
@@ -189,9 +208,9 @@ constant uint MM_BIAS = 16u;
 constant uint MM_SCALE = 32u;
 // MM_H16 — the epilogue also writes the output as fp16 into `out_h`, the
 // [rows, N] half-word staging buffer the consuming `lm_sm` reads as A.
-// MM_STA — the epilogue atomicAdds per-row (Σv, Σv²) into stats[m][slot],
-// `layer` carrying the slot index (it is free on non-QKV ops); the
-// consumer's algebraic LN reads the sums.
+// MM_STA — the epilogue stores the tile's per-row (Σv, Σv²) partial into
+// stats[m][slot][tile], `layer` carrying the slot index (it is free on
+// non-QKV ops); the consumer's algebraic LN sums the partials.
 constant uint MM_H16 = 64u;
 constant uint MM_STA = 128u;
 
@@ -572,22 +591,22 @@ template [[host_name("lm_embed_i8")]] kernel void lm_embed<1, 1>(
     device float*, device const void*, device const float*, device const float*,
     device const uint*, device const uint*, device const void*,
     device const float*, device const float*, constant uint&,
-    device half*, device atomic_float*, uint, uint, uint, uint);
+    device half*, device float*, uint, uint, uint, uint);
 template [[host_name("lm_embed_f16")]] kernel void lm_embed<0, 0>(
     device float*, device const void*, device const float*, device const float*,
     device const uint*, device const uint*, device const void*,
     device const float*, device const float*, constant uint&,
-    device half*, device atomic_float*, uint, uint, uint, uint);
+    device half*, device float*, uint, uint, uint, uint);
 template [[host_name("lm_embed_f32")]] kernel void lm_embed<2, 2>(
     device float*, device const void*, device const float*, device const float*,
     device const uint*, device const uint*, device const void*,
     device const float*, device const float*, constant uint&,
-    device half*, device atomic_float*, uint, uint, uint, uint);
+    device half*, device float*, uint, uint, uint, uint);
 template [[host_name("lm_embed_f32_i8")]] kernel void lm_embed<2, 1>(
     device float*, device const void*, device const float*, device const float*,
     device const uint*, device const uint*, device const void*,
     device const float*, device const float*, constant uint&,
-    device half*, device atomic_float*, uint, uint, uint, uint);
+    device half*, device float*, uint, uint, uint, uint);
 template [[host_name("lm_mm_i8")]] kernel void lm_mm<1>(
     device const float*, device const float*, device const void*,
     device const float*, device const float*, device float*,
@@ -624,7 +643,7 @@ template [[host_name("lm_mm_f32")]] kernel void lm_mm<2>(
 // the LN weight folded into the repacked table (W'[n,k] = lnw[k]*W[n,k])
 // and c1[n] = sum_k lnw[k]*W[n,k], c2[n] = sum_k lnb[k]*W[n,k] precomputed
 // at load, the consumer's epilogue computes rstd*(raw - mean*c1[n]) + c2[n]
-// off the row sums the x producers atomicAdd into `stats`. Same epilogue
+// off the row-sum partials the x producers store into `stats`. Same epilogue
 // family as lm_mm.
 constant uint SM_NT = 4u;
 constant uint SM_KS = 4u;
@@ -648,7 +667,7 @@ kernel void lm_sm(
     constant uint&      M     [[buffer(11)]],
     constant uint&      layer [[buffer(12)]],  // stats slot on LN/STA ops
     device half*        out_h [[buffer(13)]],  // [M, N] fp16, when MM_H16
-    device atomic_float* stats [[buffer(14)]], // [rows, STATS2]
+    device float*       stats [[buffer(14)]], // [rows, STATS_ROW]
     device const float* cc    [[buffer(15)]],  // [2N] c1|c2, when MM_LN
     threadgroup float*  part  [[threadgroup(0)]],
     uint2 tgid [[threadgroup_position_in_grid]],
@@ -663,6 +682,22 @@ kernel void lm_sm(
     // function constant cannot size an array, so the declaration keeps
     // the maximum width while every loop bounds at SM_R8.
     simdgroup_float8x8 acc[4][SM_NT];
+    // The LN consumers' per-row moments, once per tile row — every column
+    // of the row shares them. Four lanes per row each reduce a quarter of
+    // its partials and the xor butterfly combines them in `ln_moments`'
+    // order; issued ahead of the K loop so the loads overlap it, and the
+    // K-partials barrier below publishes them.
+    threadgroup float2 tg_ln[32];
+    if (flags & MM_LN) {
+        const uint t = sgi * 32u + lane;
+        const uint r = t / 4u;
+        const uint q = t % 4u;
+        const bool live = r < SM_R8 * 8u && row0 + r < M;
+        float2 s = live ? ln_quarter(stats, row0 + r, layer, q) : float2(0.0f);
+        s += simd_shuffle_xor(s, 1);
+        s += simd_shuffle_xor(s, 2);
+        if (live && q == 0u) { tg_ln[r] = ln_of(s, K); }
+    }
     for (uint r = 0; r < SM_R8; ++r) {
         for (uint c = 0; c < SM_NT; ++c) {
             acc[r][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
@@ -709,18 +744,10 @@ kernel void lm_sm(
         const uint n = col0 + i % (8u * SM_NT);
         if (m >= M || n >= N) { continue; }
         if (flags & MM_LN) {
-            // LN(x)*W without touching x: stats[m] holds (Σx, Σx²) the
-            // producer atomicAdd'd; c1/c2 fold the LN weights at pack.
-            const float sx = atomic_load_explicit(
-                stats + (ulong)m * STATS2 + layer * 2u,
-                memory_order_relaxed);
-            const float ss = atomic_load_explicit(
-                stats + (ulong)m * STATS2 + layer * 2u + 1u,
-                memory_order_relaxed);
-            const float mean = sx / (float)K;
-            const float rstd =
-                rsqrt(max(ss / (float)K - mean * mean, 0.0f) + EPS);
-            v = rstd * (v - mean * cc[n]) + cc[N + n];
+            // LN(x)*W without touching x: the row's moments come from
+            // the producers' partials; c1/c2 fold the LN weights at pack.
+            const float2 ln = tg_ln[m - row0];
+            v = ln.y * (v - ln.x * cc[n]) + cc[N + n];
         }
         if (flags & MM_SCALE) { v *= S[n]; }
         if (flags & MM_BIAS) { v += bias[n]; }
@@ -747,18 +774,17 @@ kernel void lm_sm(
     }
     if (flags & MM_STA) {
         // The row sums land on lane 0 — every lane of the simdgroup held
-        // one column of the same row — then one atomicAdd per row.
+        // one column of the same row — then the tile's partial lands in
+        // its own slot.
         for (uint r = 0; r < SM_R8 * 2u; ++r) {
             const float sx = simd_sum(psum[r]);
             const float ss = simd_sum(psq[r]);
             const uint m = row0 + sgi + r * 4u;
             if (lane == 0u && m < M) {
-                atomic_fetch_add_explicit(
-                    stats + (ulong)m * STATS2 + layer * 2u, sx,
-                    memory_order_relaxed);
-                atomic_fetch_add_explicit(
-                    stats + (ulong)m * STATS2 + layer * 2u + 1u, ss,
-                    memory_order_relaxed);
+                device float* p = stats + (ulong)m * STATS_ROW
+                    + layer * 2u * STA_TILES + tgid.x;
+                p[0] = sx;
+                p[STA_TILES] = ss;
             }
         }
     }
@@ -786,7 +812,7 @@ kernel void lm_smv(
     constant uint&      M     [[buffer(11)]],
     constant uint&      layer [[buffer(12)]],
     device half*        out_h [[buffer(13)]],
-    device atomic_float* stats [[buffer(14)]],
+    device float*       stats [[buffer(14)]],
     device const float* cc    [[buffer(15)]],
     threadgroup float*  part  [[threadgroup(0)]], // [M, SM_KS * 32] partials
     uint tgid [[threadgroup_position_in_grid]],
@@ -835,16 +861,8 @@ kernel void lm_smv(
         if (live) {
             v = sums[m];
             if (flags & MM_LN) {
-                const float sx = atomic_load_explicit(
-                    stats + (ulong)m * STATS2 + layer * 2u,
-                    memory_order_relaxed);
-                const float ss = atomic_load_explicit(
-                    stats + (ulong)m * STATS2 + layer * 2u + 1u,
-                    memory_order_relaxed);
-                const float mean = sx / (float)K;
-                const float rstd =
-                    rsqrt(max(ss / (float)K - mean * mean, 0.0f) + EPS);
-                v = rstd * (v - mean * cc[n]) + cc[N + n];
+                const float2 ln = ln_moments(stats, m, layer, K);
+                v = ln.y * (v - ln.x * cc[n]) + cc[N + n];
             }
             if (flags & MM_SCALE) { v *= S[n]; }
             if (flags & MM_BIAS) { v += bias[n]; }
@@ -857,12 +875,10 @@ kernel void lm_smv(
             const float sx = simd_sum(v);
             const float ss = simd_sum(v * v);
             if (lane == 0u) {
-                atomic_fetch_add_explicit(
-                    stats + (ulong)m * STATS2 + layer * 2u, sx,
-                    memory_order_relaxed);
-                atomic_fetch_add_explicit(
-                    stats + (ulong)m * STATS2 + layer * 2u + 1u, ss,
-                    memory_order_relaxed);
+                device float* p = stats + (ulong)m * STATS_ROW
+                    + layer * 2u * STA_TILES + tgid;
+                p[0] = sx;
+                p[STA_TILES] = ss;
             }
         }
         if (!live) { continue; }
@@ -946,12 +962,14 @@ const MM_SCALE: u32 = 32;
 /// Write the epilogue's fp16 output into `out_h` — the staged A a
 /// consuming `lm_sm` reads.
 const MM_H16: u32 = 64;
-/// Accumulate per-row (Σv, Σv²) into `stats` at the slot `layer` names —
-/// the x-producers (out, ffn2) feed the consumers' algebraic LN.
+/// Store the tile's per-row (Σv, Σv²) partial into `stats` at the slot
+/// `layer` names — the x-producers (out, ffn2) feed the consumers'
+/// algebraic LN.
 const MM_STA: u32 = 128;
-/// The stats buffer's per-row float stride: slots 0..2*layers+1, two
-/// floats each — must match the kernel's `STATS2`.
-const STATS2: usize = (2 * 12 + 1) * 2;
+/// The stats buffer's per-row float stride: slots 0..2*layers+1, each a
+/// Σx and a Σx² partial per 32-column producer tile — must match the
+/// kernel's `STATS_ROW`.
+const STATS_ROW: usize = (2 * 12 + 1) * 2 * (HIDDEN / 32);
 
 /// Everything an `lm_mm` dispatch binds: the pipeline, the nine buffer
 /// arguments (with byte offsets for the slabbed weights), the flags, and the
@@ -1544,9 +1562,11 @@ pub struct MetalStep {
     /// `u16` — ffn0's gelu output as fp16 `[rows32, NFF]`, read by ffn2's
     /// A.
     u16: Buffer,
-    /// `st` — the row-sum accumulators `[rows, 2L+1]` float2 slots: embed
-    /// zeroes and fills slot 0, out atomicAdds LAYERS+1+l, ffn2 l+1, and
-    /// the LN consumers read them — `metal_atomic` types in the kernels.
+    /// `st` — the row-sum partials `[rows, 2L+1, 2, H/32]`: per slot, a Σx
+    /// and a Σx² per 32-column producer tile. Embed fills slot 0, out
+    /// slot LAYERS+1+l, ffn2 slot l+1; the LN consumers sum a slot's
+    /// partials in one fixed order, so the moments never depend on the order
+    /// the GPU retires the tiles.
     st: Buffer,
     /// `set_profiling` — when on, `step` records per-dispatch GPU ms.
     profiling: bool,
@@ -2180,7 +2200,7 @@ impl MetalStep {
                 MTLResourceOptions::StorageModeShared,
             ),
             st: device.new_buffer(
-                32 * STATS2 as u64 * 4,
+                32 * STATS_ROW as u64 * 4,
                 MTLResourceOptions::StorageModeShared,
             ),
             profiling: false,
@@ -2983,7 +3003,7 @@ impl MetalStep {
         self.x16 = zero(&self.device, r32 * self.hidden * 2);
         self.a16 = zero(&self.device, r32 * self.hidden * 2);
         self.u16 = zero(&self.device, r32 * self.feedforward * 2);
-        self.st = zero(&self.device, r * STATS2 * 4);
+        self.st = zero(&self.device, r * STATS_ROW * 4);
         let slot_bytes = s * self.layers * HEADS * w * HEAD_DIM * 4;
         self.skeys = zero(&self.device, slot_bytes);
         self.svals = zero(&self.device, slot_bytes);
