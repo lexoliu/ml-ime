@@ -36,7 +36,10 @@ use ime_decode::{
     NoTransition, Record, ScoreRecord, Scored, Transition, Uniform, Weighted, decode_many,
     lattice_paths,
 };
-use ime_eval::{EvalRecord, EvalSet, Observation, Report, Slice};
+use ime_eval::{
+    AmbiguityReport, AmbiguitySlice, DumpRow, DumpedHypothesis, EvalRecord, EvalSet, Observation,
+    Report, Slice,
+};
 use ime_lm::CharLm;
 use ime_neural::RouteA;
 use ime_ngram::NgramModel;
@@ -371,7 +374,7 @@ struct Section {
     /// weight only where it can act.
     corrections: bool,
     transition: &'static str,
-    slice: &'static str,
+    slice: SliceArg,
     /// Whether the weight won a dev sweep rather than being given on the
     /// command line.
     selected: bool,
@@ -379,24 +382,9 @@ struct Section {
     /// The beam of every record in the slice, sorted by record. Filled only
     /// when a dump directory was given; the report ignores it.
     rows: Vec<DumpRow>,
-}
-
-/// One line of a dump file: the record's expected text and the beam it
-/// decoded into, best first.
-#[derive(Serialize)]
-struct DumpRow {
-    record: usize,
-    text: String,
-    hypotheses: Vec<DumpedHypothesis>,
-}
-
-/// One hypothesis as the dump records it. Deserializable because the
-/// progress file stores the same shape and a resumed run builds its dump out
-/// of it again.
-#[derive(Debug, Serialize, Deserialize)]
-struct DumpedHypothesis {
-    text: String,
-    score: f32,
+    /// The ambiguity slice of the dumped beam, measured as `ime-ambiguity`
+    /// measures the dump file; present exactly when the rows are.
+    ambiguity: Option<AmbiguityReport>,
 }
 
 /// Every configuration that was run, as it goes to stdout.
@@ -823,10 +811,11 @@ impl<'a> Run<'a> {
                 typo_weight,
                 corrections: self.reader.corrections.is_some(),
                 transition: label,
-                slice: which.label(),
+                slice: which,
                 selected: false,
                 report,
                 rows,
+                ambiguity: None,
             })
         };
         // Without the noise model every prior is zero and the sweep is one
@@ -901,10 +890,11 @@ impl<'a> Run<'a> {
             typo_weight,
             corrections: self.reader.corrections.is_some(),
             transition: label,
-            slice: self.slice.slice.label(),
+            slice: self.slice.slice,
             selected: false,
             report,
             rows,
+            ambiguity: None,
         }])
     }
 }
@@ -999,7 +989,7 @@ pub fn fused_eval(
         dump: dump.is_some(),
         progress,
     };
-    let sections = match transition {
+    let mut sections = match transition {
         Models::None => run.decode(&NoTransition, "none", 1.0, false)?,
         Models::Ngram(ngram) => run.decode(ngram, "kn-trigram", 1.0, false)?,
         Models::CharLm(lm) => {
@@ -1022,7 +1012,14 @@ pub fn fused_eval(
         )?,
     };
     if let Some(dir) = dump {
-        for section in &sections {
+        let ambiguity = AmbiguitySlice::select(&set, &reader.table, &reader.lexicon)
+            .context("could not select the ambiguity slice")?;
+        for section in &mut sections {
+            section.ambiguity = Some(
+                ambiguity
+                    .measure(&set, section.slice.slice(), slice.dev_share, &section.rows)
+                    .context("could not measure the ambiguity slice of the beam")?,
+            );
             write_dump(dir, section)?;
         }
     }
@@ -1814,7 +1811,11 @@ fn write_dump(dir: &Path, section: &Section) -> Result<()> {
     };
     let path = dir.join(format!(
         "{}-w{:.3}{}-{}-{}.jsonl",
-        section.emission, section.weight, typo_weight, section.transition, section.slice
+        section.emission,
+        section.weight,
+        typo_weight,
+        section.transition,
+        section.slice.label()
     ));
     let file =
         fs::File::create(&path).with_context(|| format!("could not create {}", path.display()))?;
@@ -2088,14 +2089,20 @@ mod tests {
                 transition,
                 progress,
                 true,
+                None,
             )
         }
 
-        /// `run`, context-on or context-off as *`with_context`* says.
+        /// `run`, context-on or context-off as *`with_context`* says, its
+        /// beams dumped into *dump* when given.
         ///
         /// # Errors
         ///
         /// Whatever the run reports.
+        #[expect(
+            clippy::too_many_arguments,
+            reason = "it forwards the axes of `fused_eval` the tests vary"
+        )]
         fn run_as(
             &self,
             weights: &[f32],
@@ -2104,6 +2111,7 @@ mod tests {
             transition: Models<'_>,
             progress: Option<&Progress<'_>>,
             with_context: bool,
+            dump: Option<&Path>,
         ) -> Result<String> {
             fused_eval(
                 &self.eval_set,
@@ -2119,7 +2127,7 @@ mod tests {
                     dev_share,
                     select_on_dev,
                 },
-                None,
+                dump,
                 progress,
                 SyllableTable::load(),
                 self.lexicon(),
@@ -2707,6 +2715,7 @@ mod tests {
                 Models::None,
                 Some(&fixture.progress(None, None)),
                 true,
+                None,
             )
             .expect("the context-on run decodes");
         let off = fixture
@@ -2717,6 +2726,7 @@ mod tests {
                 Models::None,
                 Some(&fixture.progress(None, None)),
                 false,
+                None,
             )
             .expect("the context-off run decodes");
         assert!(on.starts_with("emission neural,"), "{on}");
@@ -2746,6 +2756,7 @@ mod tests {
                     Models::None,
                     Some(&fixture.progress(None, None)),
                     with_context,
+                    None,
                 )
                 .expect("the finished run resumes");
             assert_eq!(&again, report);
@@ -2832,5 +2843,40 @@ mod tests {
             SliceArg::Dev.slice().holds(&record, 0.5),
             SliceArg::Test.slice().holds(&record, 0.5)
         );
+    }
+
+    #[test]
+    fn the_slice_of_the_beam_is_what_its_dump_file_rescores_to() {
+        let fixture = Fixture::new(
+            &[
+                ("tashiwojiejie", "她是我姐姐"),
+                ("wodeshu", "我的书"),
+                ("nihao", "你好"),
+                ("tahao", "他好"),
+            ],
+            "他\n她\n它\n是\n我\n姐\n的\n地\n得\n书\n你\n好",
+            "",
+        );
+        let dir = fixture.scratch.path("dump");
+        let rendered = fixture
+            .run_as(&[1.0], 0.5, false, Models::None, None, true, Some(&dir))
+            .expect("the run decodes");
+        let mut files: Vec<_> = fs::read_dir(&dir)
+            .expect("the dump directory reads")
+            .map(|entry| entry.expect("a dump entry reads").path())
+            .collect();
+        assert_eq!(files.len(), 1, "one section, one dump file");
+        let rows = ime_eval::parse_dump(
+            &fs::read_to_string(files.remove(0)).expect("the dump file reads"),
+        )
+        .expect("the dump file parses");
+        let set = load_set(&fixture.eval_set).expect("the set loads");
+        let rescored = AmbiguitySlice::select(&set, &SyllableTable::load(), &fixture.lexicon())
+            .expect("the slice selects")
+            .measure(&set, Slice::All, 0.5, &rows)
+            .expect("the dump covers the slice");
+        assert_eq!(rescored.records(), 3, "every record but 你好");
+        let table = rescored.render().expect("the slice renders");
+        assert!(rendered.contains(&table), "{table}\nin\n{rendered}");
     }
 }
