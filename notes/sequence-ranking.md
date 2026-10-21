@@ -532,8 +532,8 @@ Where the segmentation gain goes differs by style. On full pinyin, 84 of the 104
 
 ### Reproduce
 
-1. Stamp the kernel: `uv run --project python mlime e2e stamp mlime-e2e-v2-rank-g4 --out <dir> --init-from mlime-e2e-v2-g4 --ranking --rank-weight 0.05 --base-lr 2e-5 --new-lr 2e-5 --token-budget 12288 --accumulate 2 --search-graphs`, with one `--train-shard` for each of the 20-pick's 22 shards (the `train_shards` of `run-config.json` below).
-2. Run it: `colab/e2e.sh <dir> start --session-hours 5 --gpu G4`, then `colab/e2e.sh <dir> wait --deadline 18000` until it finishes. The final checkpoint, `run-config.json` and the six evaluations with their dumps are in the `lexoliu/mlime-resume` bucket under `final/mlime-e2e-v2-rank-g4/` (`final/mlime-e2e-v2-rank01-g4/` for 0.1).
+1. Stamp the kernel: `uv run --project python mlime e2e stamp mlime-e2e-v2-rank-g4 --out <dir> --init-from mlime-e2e-v2-g4 --ranking --rank-segmentations 8 --rank-beam 4 --rank-negatives 8 --rank-weight 0.05 --base-lr 2e-5 --new-lr 2e-5 --token-budget 12288 --accumulate 2 --search-graphs`, with one `--train-shard` for each of the 20-pick's 22 shards (the `train_shards` of `run-config.json` below).
+2. Run it: `colab/e2e.sh <dir> start --commit <rev> --census <batch-counts.json> --session-hours 5 --gpu G4` (0.05 ran from 6ae0132, 0.1 from 066850c; the census is the `batch-counts.json` of a run of the same shape), then `colab/e2e.sh <dir> wait --deadline 18000` until it finishes. The final checkpoint, `run-config.json` and the six evaluations with their dumps are in the `lexoliu/mlime-resume` bucket under `final/mlime-e2e-v2-rank-g4/` (`final/mlime-e2e-v2-rank01-g4/` for 0.1).
 3. The drift table, per twin and run: `uv run --project python mlime eval drift --dump <final>/e2e-lattice-context-on.jsonl --eval-set data/run3_pool/eval3.jsonl --slice test`, with `-abbreviated` and `-mixed` in both names for the other twins. It reproduces #130's table exactly with `--slice all`.
 
 ## Next
