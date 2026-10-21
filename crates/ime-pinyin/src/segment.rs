@@ -8,13 +8,9 @@
 
 use std::sync::Arc;
 
-use crate::corrections::{CORRECTIONS_MAX_EDITS, Correction, CorrectionTable};
+use crate::corrections::{Correction, CorrectionTable, MAX_CORRECTED_LEN};
 use crate::syllable::{MAX_SYLLABLE_LEN, SyllableRange, SyllableTable};
 use thiserror::Error;
-
-/// The longest typed span a corrected segment can cover: a full syllable can
-/// only drift two edits' worth of letters from what was meant.
-const MAX_CORRECTED_LEN: usize = MAX_SYLLABLE_LEN + CORRECTIONS_MAX_EDITS;
 
 /// What a typed span can be read as. The inventory case keeps the syllable
 /// range; a span the inventory does not reach -- a typo -- instead carries the
