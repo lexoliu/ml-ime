@@ -10,11 +10,18 @@
 //! [`ime-decode`]: https://github.com/lexoliu/ml-ime
 
 mod corrections;
+mod legality;
 mod lexicon;
 mod segment;
 mod syllable;
 
-pub use corrections::{Correction, CorrectionTable, NoiseError};
+pub use corrections::{
+    CORRECTIONS_K, CORRECTIONS_MAX_EDITS, Correction, CorrectionTable, MAX_CORRECTED_LEN,
+    NoiseError,
+};
+pub use legality::{
+    Edge, EmitId, KeyLattice, Keys, KeysError, Legality, LegalityError, LegalityOptions, Step,
+};
 pub use lexicon::{CharId, Lexicon, LexiconError};
 pub use segment::{Readings, Segment, SegmentError, SegmentLattice, SegmentOptions, Segmentation};
 pub use syllable::{MAX_SYLLABLE_LEN, SyllableId, SyllableRange, SyllableTable};
