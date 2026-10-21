@@ -346,7 +346,8 @@ def test_the_waiter_probes_the_vm_through_colab_exec(tmp_path: Path) -> None:
     )
     assert done.returncode == 10, done.stdout + done.stderr
     calls = [json.loads(line) for line in (fake / "calls.jsonl").read_text().splitlines()]
-    assert [call["argv"] for call in calls] == [["exec", "-s", "mlime-e2e-v2-t4"]] * 3
+    probe = ["exec", "-s", "mlime-e2e-v2-t4", "--timeout", str(control.PROBE_SECONDS)]
+    assert [call["argv"] for call in calls] == [probe] * 3
     # The probe runs the checkout's leg.py, which beats before it reports.
     assert calls[0]["stdin"] == control.PROBE
     assert f"{control.CHECKOUT}/colab/leg.py" in control.PROBE
