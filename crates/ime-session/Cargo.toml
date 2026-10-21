@@ -17,6 +17,7 @@ ime-pinyin.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+ime-fixtures.workspace = true
 ort.workspace = true
 
 [lints]

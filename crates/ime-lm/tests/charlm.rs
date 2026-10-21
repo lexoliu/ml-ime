@@ -4,10 +4,11 @@
 //! tokens and requests — and against the row the same step returns with the
 //! whole alphabet asked.
 //!
-//! The fixtures under `tests/fixtures/` are written by
-//! `python/scripts/charlm_fixtures.py`; regenerate them with
-//! `cd python && uv run python scripts/charlm_fixtures.py
-//! ../crates/ime-lm/tests/fixtures`.
+//! The fixtures are written by `python/scripts/charlm_fixtures.py` into
+//! `tests/fixtures/`; regenerate them with `cd python && uv run python
+//! scripts/charlm_fixtures.py ../crates/ime-lm/tests/fixtures`, then publish
+//! the graphs and weights with `python/scripts/publish_fixtures.py`. The
+//! tests read the set `ime_fixtures::charlm` assembles.
 
 mod common;
 
@@ -291,7 +292,7 @@ fn a_manifest_of_another_layout_is_refused() {
     let lexicon = lexicon(&dir);
     let fixture: serde_json::Map<String, serde_json::Value> = serde_json::from_str(
         &fs::read_to_string(dir.join("transformer").join("charlm.json"))
-            .expect("the fixture manifest is committed"),
+            .expect("the fixture manifest is assembled"),
     )
     .expect("the fixture manifest parses");
 

@@ -74,14 +74,12 @@ pub struct Expected {
     pub full: Vec<Vec<Vec<f32>>>,
 }
 
-/// `tests/fixtures/` beside this crate — or wherever `CHARLM_FIXTURES`
-/// points, so a shipped test binary can run on a machine whose checkout
-/// path differs from the build machine's.
+/// The assembled fixture set `ime_fixtures::charlm` names — or wherever
+/// `CHARLM_FIXTURES` points, so a shipped test binary can run on a machine
+/// that holds a copy of that directory at another path.
 pub fn fixture_dir() -> PathBuf {
-    std::env::var_os("CHARLM_FIXTURES").map_or_else(
-        || Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures"),
-        PathBuf::from,
-    )
+    std::env::var_os("CHARLM_FIXTURES")
+        .map_or_else(|| ime_fixtures::charlm().to_path_buf(), PathBuf::from)
 }
 
 /// The fixture lexicon, from the `char_pinyin.tsv` committed beside the
@@ -89,7 +87,7 @@ pub fn fixture_dir() -> PathBuf {
 pub fn lexicon(dir: &Path) -> Lexicon {
     let table = SyllableTable::load();
     let source = fs::read_to_string(dir.join("char_pinyin.tsv"))
-        .expect("char_pinyin.tsv is committed with the fixtures");
+        .expect("char_pinyin.tsv is assembled with the fixtures");
     Lexicon::parse(&source, &table).expect("the fixture table parses")
 }
 
@@ -107,7 +105,7 @@ pub fn shape() -> SessionShape {
 pub fn expected(dir: &Path, arch: &str) -> Expected {
     serde_json::from_str(
         &fs::read_to_string(dir.join(arch).join("expected.json"))
-            .expect("expected.json is committed with the fixture"),
+            .expect("expected.json is assembled with the fixture"),
     )
     .expect("expected.json parses")
 }
@@ -122,7 +120,7 @@ pub fn alphabet(dir: &Path, arch: &str) -> Vec<String> {
     }
     serde_json::from_str::<Chars>(
         &fs::read_to_string(dir.join(arch).join("charlm.json"))
-            .expect("the fixture manifest is committed"),
+            .expect("the fixture manifest is assembled"),
     )
     .expect("the fixture manifest parses")
     .chars
