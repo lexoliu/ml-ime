@@ -1318,7 +1318,9 @@ struct PagePool {
     /// Serialises a node acquisition — the memo-hit `Arc::clone` and the
     /// dedup `Weak::upgrade` in `resolve_at` — against the sweep's
     /// strong-count check and tombstone, so no `Path`/`Pending` can come
-    /// to hold a node whose page was already stolen. Lock order: `order`
+    /// to hold a node whose page was already stolen. A fresh node needs no
+    /// such guard: `adopt` stores it in its memo before it enters `order`,
+    /// so the sweep never sees it with fewer holders. Lock order: `order`
     /// → `acquire` → `children` → `claim`; `free` is leaf-level inside
     /// `PageSlot::drop` and a `desc.node` memo lock is outermost of all.
     acquire: Mutex<()>,
@@ -1462,7 +1464,12 @@ impl PagePool {
     /// whole scan so a `resolve_at` clone or upgrade cannot slip between
     /// the count check and the tombstone.
     fn reclaim(&self) -> Option<PageSlot> {
-        let mut order = self.order.lock().expect("the page pool is not poisoned");
+        self.steal(&mut self.order.lock().expect("the page pool is not poisoned"))
+    }
+
+    /// The sweep itself, over *order* — the pool's queue, whose lock the
+    /// caller holds, so the lock order stays `order` → `acquire`.
+    fn steal(&self, order: &mut VecDeque<Weak<Node>>) -> Option<PageSlot> {
         let _acquire = self.acquire.lock().expect("the page pool is not poisoned");
         while let Some(weak) = order.pop_front() {
             let Some(node) = weak.upgrade() else {
@@ -1556,15 +1563,39 @@ impl PagePool {
                 panic!("the page write failed: {error}");
             }
         }
+        Some(self.adopt(parent, desc.ch, slot, &mut memo))
+    }
+
+    /// Give *slot*'s freshly written page to a new node under *parent* and
+    /// publish it: into *memo* first, then into the parent's children and
+    /// the sweep's queue.
+    ///
+    /// The order is the invariant the sweep rests on. `order` is where the
+    /// sweep finds its victims, and it steals any queued leaf it sees at
+    /// `strong_count <= 2`, its own upgrade included. A node queued before
+    /// its memo holds it has only its creator's handle, so a sweep on
+    /// another thread passes that check and tombstones a node that is about
+    /// to become a live state's leaf; the next step then walks it into
+    /// `fill_page_row` or `slice_at`. With the memo stored first, a queued
+    /// node always has the memo and its creator's handle, which the caller
+    /// moves into the state's row.
+    fn adopt(
+        &self,
+        parent: &Arc<Node>,
+        ch: Option<CharId>,
+        slot: PageSlot,
+        memo: &mut Option<Arc<Node>>,
+    ) -> Arc<Node> {
         let node = Arc::new(Node {
-            ch: desc.ch,
+            ch,
             page: AtomicU32::new(slot.index),
             claim: Mutex::new(Some(slot)),
             depth: parent.depth + 1,
             parent: Some(Arc::clone(parent)),
             children: Mutex::new(HashMap::new()),
         });
-        if let Some(ch) = desc.ch {
+        *memo = Some(Arc::clone(&node));
+        if let Some(ch) = ch {
             parent
                 .children
                 .lock()
@@ -1575,8 +1606,7 @@ impl PagePool {
             .lock()
             .expect("the page pool is not poisoned")
             .push_back(Arc::downgrade(&node));
-        *memo = Some(Arc::clone(&node));
-        Some(node)
+        node
     }
 
     /// Write *row*'s slice of tensor `index` — one position's `[layers,
@@ -2755,27 +2785,20 @@ impl CharLm {
                     index,
                 )?;
             }
-            let child = Arc::new(Node {
-                ch: None,
-                page: AtomicU32::new(slot.index),
-                claim: Mutex::new(Some(slot)),
-                depth: leaf.depth + 1,
-                parent: Some(Arc::clone(&leaf)),
-                children: Mutex::new(HashMap::new()),
-            });
-            pool.order
-                .lock()
-                .expect("the page pool is not poisoned")
-                .push_back(Arc::downgrade(&child));
             let child_desc = Arc::new(PathDesc {
                 parent: Some(desc),
                 ch: None,
                 node: Mutex::new(None),
             });
-            *child_desc
-                .node
-                .lock()
-                .expect("the desc memo is not poisoned") = Some(Arc::clone(&child));
+            let child = pool.adopt(
+                &leaf,
+                None,
+                slot,
+                &mut child_desc
+                    .node
+                    .lock()
+                    .expect("the desc memo is not poisoned"),
+            );
             leaf = child;
             desc = child_desc;
         }
@@ -3982,5 +4005,68 @@ mod tests {
             "a page a live chain names is never reclaimed"
         );
         let _ = (row_handle, desc);
+    }
+
+    /// A sweep on another thread must not steal a node its creator is still
+    /// handing out. `resolve_at` used to queue a fresh node in `order` and
+    /// only then store it in the desc memo. A sweep that reached the node
+    /// in between saw just the creator's handle plus its own upgrade,
+    /// `strong_count == 2`, and tombstoned it. The creator then returned the
+    /// tombstone as a live state's leaf, and the state's next step panicked
+    /// in `fill_page_row` (its own leaf) or `slice_at` (the leaf of a pending
+    /// child). That is #190.
+    ///
+    /// The test holds `order`'s lock so the creator stops right before it
+    /// queues the node, waits until the node shows up in the root's
+    /// children, and runs the sweep over the node at that point.
+    #[test]
+    fn a_fresh_node_is_held_by_its_memo_before_a_sweep_can_reach_it() {
+        let pool = PagePool::new(ModelDtype::Float32, 2, &[vec![0, 2, 3, 4]])
+            .expect("a page-major shape loads");
+        let ch = a_char();
+        let slot = pool.claim().expect("the pool's one page");
+        let index = slot.index;
+        let desc = PathDesc {
+            parent: None,
+            ch: Some(ch),
+            node: Mutex::new(None),
+        };
+        let order = pool.order.lock().expect("the page pool is not poisoned");
+        std::thread::scope(|scope| {
+            let creator = scope.spawn(|| {
+                pool.adopt(
+                    &pool.root,
+                    Some(ch),
+                    slot,
+                    &mut desc.node.lock().expect("the desc memo is not poisoned"),
+                )
+            });
+            let queued = loop {
+                let found = pool
+                    .root
+                    .children
+                    .lock()
+                    .expect("the page trie is not poisoned")
+                    .get(&ch)
+                    .cloned();
+                if let Some(weak) = found {
+                    break weak;
+                }
+                assert!(!creator.is_finished(), "the creator stops at `order`");
+                std::thread::yield_now();
+            };
+            let stolen = pool.steal(&mut VecDeque::from([queued]));
+            drop(order);
+            let node = creator.join().expect("the creator does not panic");
+            assert!(
+                stolen.is_none(),
+                "the sweep stole page {index} from a node its creator was still handing out"
+            );
+            assert_eq!(
+                node.page.load(Ordering::Relaxed),
+                index,
+                "a fresh node keeps its page"
+            );
+        });
     }
 }
