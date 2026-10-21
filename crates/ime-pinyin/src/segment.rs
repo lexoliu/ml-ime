@@ -354,9 +354,13 @@ impl<'input> SegmentLattice<'input> {
                 )]
                 let (s, e) = (start as u32, end as u32);
                 if !table.prefix_range(span).is_empty() {
-                    if let Some(exact) = table.exact_range(span) {
-                        push(&mut edges[start], s, e, Readings::Syllables(exact));
-                    }
+                    // A span that is an initial is read through its whole
+                    // prefix range, which holds the syllable it may also
+                    // spell (`m` is 呣 as well as every m- syllable). The
+                    // exact edge would be a second edge over the same keys
+                    // whose only difference is a smaller ambiguity cost, so
+                    // it would win the path on price alone and spend k-best
+                    // slots on duplicate span tuples.
                     if options.allow_abbreviation && SyllableTable::is_abbreviation(span) {
                         push(
                             &mut edges[start],
@@ -364,6 +368,8 @@ impl<'input> SegmentLattice<'input> {
                             e,
                             Readings::Syllables(table.prefix_range(span)),
                         );
+                    } else if let Some(exact) = table.exact_range(span) {
+                        push(&mut edges[start], s, e, Readings::Syllables(exact));
                     }
                     if options.allow_incomplete_tail && end == len {
                         push(
@@ -574,24 +580,87 @@ mod tests {
     }
 
     #[test]
-    fn a_pure_abbreviation_still_reads() {
-        // 中国人民 typed as initials. Every path is four characters long, but the
-        // cheapest one reads the trailing `m` as the syllable 呒 rather than as an
-        // initial, because a single letter can be both. Both readings belong in
-        // the batch; only the language model can tell them apart.
+    fn a_pure_abbreviation_reads_once() {
+        // 中国人民 typed as initials. The trailing `m` is an initial and also the
+        // syllable 呒, and one segment carries both: its readings are the whole
+        // m- range, so 呒 and 民 compete inside one position instead of as two
+        // readings that differ only in price.
         let table = SyllableTable::load();
         let options = offline();
         let lattice = SegmentLattice::build("zgrm", &table, &options).expect("zgrm reads");
         let paths = lattice.k_best(&options);
-        assert!(
-            paths.iter().all(|p| p.len() == 4),
-            "one character per typed initial"
-        );
-        assert!(
-            paths
+        assert_eq!(paths.len(), 1, "got {paths:?}");
+        let m = &paths[0].segments()[3];
+        let range = m.syllables().expect("`m` is on the inventory");
+        assert_eq!(range, table.prefix_range("m"));
+        assert!(range.contains(table.exact("m").expect("`m` is a syllable")));
+        assert!(m.ambiguity() > 1, "the m- initials stay readable");
+    }
+
+    #[test]
+    fn an_initial_that_spells_a_syllable_has_one_edge() {
+        // `a e o m n` are each a syllable and an initial. Two edges over the same
+        // key would read the same characters at two prices, and the cheaper
+        // exact one would win every path it is on.
+        let table = SyllableTable::load();
+        let options = offline();
+        for letter in ["a", "e", "o", "m", "n"] {
+            assert!(table.exact(letter).is_some(), "{letter} is a syllable");
+            let lattice = SegmentLattice::build(letter, &table, &options).expect("a letter reads");
+            assert_eq!(
+                lattice.edges[0],
+                [Segment {
+                    start: 0,
+                    end: 1,
+                    readings: Readings::Syllables(table.prefix_range(letter)),
+                }],
+                "{letter}"
+            );
+        }
+    }
+
+    #[test]
+    fn readings_never_repeat_a_span_tuple() {
+        // Every reading of the batch cuts the keys differently: a repeat would
+        // spend one of the `max_paths` slots on spans already in the batch.
+        let table = SyllableTable::load();
+        let options = offline();
+        for input in ["nmhm", "wmdzgrmao", "zhenme", "aeonm"] {
+            let paths = SegmentLattice::build(input, &table, &options)
+                .expect("the input reads")
+                .k_best(&options);
+            let mut tuples: Vec<Vec<(usize, usize)>> = paths
                 .iter()
-                .any(|p| p.segments().iter().all(|s| s.ambiguity() > 1)),
-            "the all-initials reading must survive into the batch"
+                .map(|path| {
+                    path.segments()
+                        .iter()
+                        .map(|s| (s.start(), s.end()))
+                        .collect()
+                })
+                .collect();
+            let readings = tuples.len();
+            tuples.sort();
+            tuples.dedup();
+            assert_eq!(tuples.len(), readings, "{input}: {paths:?}");
+        }
+    }
+
+    #[test]
+    fn without_abbreviations_a_lone_letter_is_its_syllable() {
+        let table = SyllableTable::load();
+        let strict = SegmentOptions {
+            allow_abbreviation: false,
+            allow_incomplete_tail: false,
+            ..SegmentOptions::default()
+        };
+        let lattice = SegmentLattice::build("e", &table, &strict).expect("`e` is a syllable");
+        assert_eq!(
+            lattice.edges[0],
+            [Segment {
+                start: 0,
+                end: 1,
+                readings: Readings::Syllables(table.exact_range("e").expect("`e` is a syllable")),
+            }]
         );
     }
 
