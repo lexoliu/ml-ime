@@ -408,6 +408,8 @@ class CorrectionTable:
         self._k = k
         self._cache: dict[str, tuple[tuple[str, float], ...]] = {}
         self._costs_cache: dict[str, dict[str, float]] = {}
+        self._outcomes_cache: dict[str, dict[str, float]] = {}
+        self._reach_index: dict[str, tuple[str, ...]] | None = None
 
     @classmethod
     def load(
@@ -416,9 +418,24 @@ class CorrectionTable:
         """Build the table the generated ``typo.json`` and syllable inventory describe."""
         return cls(NoiseModel.load(typo_table), load_syllables(syllables_path), k=k)
 
+    @property
+    def syllables(self) -> frozenset[str]:
+        """The inventory the corrections range over."""
+        return self._syllables
+
     def __contains__(self, syllable: str) -> bool:
         """Whether *syllable* is an inventory syllable the table prices."""
         return syllable in self._syllables
+
+    def reaches(self, span: str) -> bool:
+        """Whether ``corrections(span)`` is non-empty, answered without resolving it.
+
+        A span has entries exactly when some syllable's one- or two-edit
+        outcomes produce it, or when it earns the cost-0 self entry as a
+        syllable or a prefix of one. Most substrings of a keystroke string are
+        neither, and this is how a caller walking every substring skips them.
+        """
+        return span in self._reach() or span in self._syllables or span in self._prefixes
 
     def corrections(self, span: str) -> tuple[tuple[str, float], ...]:
         """The ``(syllable, cost)`` entries for *span*, sorted then capped at ``K``."""
@@ -446,21 +463,55 @@ class CorrectionTable:
         return tuple(ranked[: self._k])
 
     def _resolve_costs(self, span: str) -> dict[str, float]:
+        """``-log P(span | y)`` for every syllable *y* the reach index says produces *span*.
+
+        ``P(span | y)`` is the one-edit draw plus every two-edit path through an
+        intermediate ``m``, summed in ``_outcomes(y)`` order. An intermediate
+        whose outcomes do not hold *span* contributes an exact ``0.0``, which
+        leaves a float sum -- compensated or not -- bit for bit where it was, so
+        those terms are skipped rather than evaluated.
+        """
         costs: dict[str, float] = {}
-        predecessors = self._predecessors(span)
-        origins = predecessors | set().union(
-            *(self._predecessors(intermediate) for intermediate in predecessors)
-        )
-        for syllable in sorted(origins & self._syllables):
+        for syllable in self._reach().get(span, ()):
             probability = self._one_edit_probability(syllable, span) + sum(
                 draw * self._one_edit_probability(intermediate, span)
-                for intermediate, draw in self._outcomes(syllable).items()
+                for intermediate, draw in self._outcomes_of(syllable).items()
+                if span in self._outcomes_of(intermediate)
             )
             if probability > 0.0:
                 costs[syllable] = -math.log(probability)
         if span in self._syllables or span in self._prefixes:
             costs[span] = 0.0
         return costs
+
+    def _outcomes_of(self, letters: str) -> dict[str, float]:
+        """``_outcomes(letters)``, memoised: the reach index asks every intermediate once."""
+        cached = self._outcomes_cache.get(letters)
+        if cached is None:
+            cached = self._outcomes(letters)
+            self._outcomes_cache[letters] = cached
+        return cached
+
+    def _reach(self) -> dict[str, tuple[str, ...]]:
+        """Every string one or two edits of a syllable produce, with those syllables, sorted.
+
+        Built once on first use by walking each syllable's outcomes and its
+        outcomes' outcomes forward: about 64k strings from the 425 syllables,
+        under a second. It is the forward image of ``_predecessors`` taken
+        twice, so it names exactly the syllables whose ``P(span | y)`` is
+        positive.
+        """
+        if self._reach_index is None:
+            origins: dict[str, set[str]] = {}
+            for syllable in sorted(self._syllables):
+                for intermediate in self._outcomes_of(syllable):
+                    origins.setdefault(intermediate, set()).add(syllable)
+                    for produced in self._outcomes_of(intermediate):
+                        origins.setdefault(produced, set()).add(syllable)
+            self._reach_index = {
+                produced: tuple(sorted(syllables)) for produced, syllables in origins.items()
+            }
+        return self._reach_index
 
     def _applicable(self, letters: str) -> dict[str, float]:
         """Each edit kind's probability at *letters*, normalised the way `corrupt` draws it."""
