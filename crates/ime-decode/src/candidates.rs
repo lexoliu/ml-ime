@@ -1,7 +1,8 @@
 //! The decoder's input: what each output position is allowed to be.
 
 use crate::DecodeError;
-use ime_pinyin::{CharId, CorrectionTable, Lexicon, Segmentation, SyllableTable};
+use crate::arcs::{WordArc, WordLexicon};
+use ime_pinyin::{CharId, CorrectionTable, Lexicon, SegmentOptions, Segmentation, SyllableTable};
 
 /// One reading of the typed string, resolved down to characters.
 ///
@@ -17,6 +18,14 @@ pub struct CandidatePath {
     /// resolved without the noise model -- every candidate costs 0 there.
     priors: Option<Vec<Vec<f64>>>,
     cost: f32,
+    /// The lexicon entries this reading spells, in start order; empty when
+    /// the batch was built without a word lexicon.
+    arcs: Vec<WordArc>,
+    /// What each position's emission and transitions are asked for, where an
+    /// arc puts a character outside the position's mask: the mask and those
+    /// characters, sorted. `None` when no arc reaches outside a mask, and
+    /// then the masks themselves are what is asked.
+    asked: Option<Vec<Vec<CharId>>>,
 }
 
 impl CandidatePath {
@@ -36,6 +45,24 @@ impl CandidatePath {
         self.priors
             .as_ref()
             .map_or(0.0, |priors| priors[position][slot])
+    }
+
+    /// What the models are asked about at *position*: its mask, plus every
+    /// arc character placed there that the mask does not hold. Sorted and
+    /// deduplicated, and equal to `positions()[position]` when no arc
+    /// reaches outside it -- so a batch built without arcs asks exactly what
+    /// it always did.
+    #[must_use]
+    pub fn asked(&self, position: usize) -> &[CharId] {
+        self.asked
+            .as_ref()
+            .map_or(&self.positions[position], |asked| &asked[position])
+    }
+
+    /// The lexicon entries this reading spells, in start order.
+    #[must_use]
+    pub fn arcs(&self) -> &[WordArc] {
+        &self.arcs
     }
 
     /// How many characters this reading produces.
@@ -111,6 +138,8 @@ impl Candidates {
                 positions,
                 priors: None,
                 cost: segmentation.cost(),
+                arcs: Vec::new(),
+                asked: None,
             });
         }
         Ok(Self { paths })
@@ -181,9 +210,70 @@ impl Candidates {
                 positions,
                 priors: Some(priors),
                 cost: segmentation.cost(),
+                arcs: Vec::new(),
+                asked: None,
             });
         }
         Ok(Self { paths })
+    }
+
+    /// This batch with every arc of *words* its readings spell attached:
+    /// *segmentations* are the readings the batch was built from, in the
+    /// same order, and *pinyin* the keystrokes they span.
+    ///
+    /// A position an arc puts a character on outside its mask asks the
+    /// models about that character too ([`CandidatePath::asked`]); the beam
+    /// still expands only the mask there, so the character is reachable
+    /// through the arc alone.
+    ///
+    /// # Panics
+    ///
+    /// If *segmentations* is not the list the batch was built from.
+    #[must_use]
+    pub fn with_arcs(
+        mut self,
+        segmentations: &[Segmentation],
+        pinyin: &str,
+        words: &WordLexicon,
+        lexicon: &Lexicon,
+        table: &SyllableTable,
+        options: &SegmentOptions,
+    ) -> Self {
+        assert_eq!(
+            segmentations.len(),
+            self.paths.len(),
+            "arcs are proposed over the readings the batch was built from"
+        );
+        for (path, segmentation) in self.paths.iter_mut().zip(segmentations) {
+            assert_eq!(
+                segmentation.len(),
+                path.len(),
+                "arcs are proposed over the readings the batch was built from"
+            );
+            path.arcs = words.arcs(
+                segmentation,
+                &path.positions,
+                pinyin,
+                lexicon,
+                table,
+                options,
+            );
+            let mut asked: Option<Vec<Vec<CharId>>> = None;
+            for arc in &path.arcs {
+                for (offset, &ch) in arc.chars().iter().enumerate() {
+                    let position = arc.start() + offset;
+                    if path.positions[position].binary_search(&ch).is_ok() {
+                        continue;
+                    }
+                    let sets = asked.get_or_insert_with(|| path.positions.clone());
+                    if let Err(slot) = sets[position].binary_search(&ch) {
+                        sets[position].insert(slot, ch);
+                    }
+                }
+            }
+            path.asked = asked;
+        }
+        self
     }
 
     /// The readings, in the order [`SegmentLattice::k_best`] ranked them.

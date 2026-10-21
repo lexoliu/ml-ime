@@ -146,6 +146,13 @@ pub(crate) struct ReplayArgs {
     /// with its batchmates shows directly as a bit-diff. Requires `--lm`.
     #[arg(long, value_name = "INDEX")]
     probe: Option<usize>,
+    /// The lexicon prior, in nats, a word arc gains when it lands with at
+    /// least one character typed as an initial: the weight `fused-eval
+    /// --select-on-dev` chose for the typing style being replayed.
+    #[arg(long, value_parser = crate::neural::parse_weight, default_value = "0.0", requires = "arcs")]
+    arc_prior: f32,
+    #[command(flatten)]
+    arcs: crate::neural::ArcArgs,
     #[command(flatten)]
     slice: SliceArgs,
     #[command(flatten)]
@@ -193,6 +200,10 @@ struct Keystroke {
     beam_finish_ns: u64,
     /// (beam, character) pairs the expansion scored.
     beam_expanded: u64,
+    /// Lineages started on a word arc.
+    beam_arc_starts: u64,
+    /// Slots kept for word arcs in flight, summed over steps.
+    beam_arc_slots: u64,
 }
 
 /// A record whose session answer disagreed with the baseline's.
@@ -321,6 +332,12 @@ struct StageReport {
     beam_finish_ns: u64,
     /// (beam, character) pairs the expansion scored, cumulative.
     beam_expanded: u64,
+    /// Lineages started on a word arc, cumulative.
+    beam_arc_starts: u64,
+    /// Slots kept for word arcs in flight, summed over steps.
+    beam_arc_slots: u64,
+    /// Arcs in flight that found every arc slot taken, summed over steps.
+    beam_arcs_unprotected: u64,
 }
 
 /// The lattice-invalidation counters, echoed.
@@ -614,6 +631,9 @@ struct Harness<'a> {
     emittable: &'a ime_decode::Emittable,
     lexicon: &'a ime_pinyin::Lexicon,
     table: &'a ime_pinyin::SyllableTable,
+    /// The word lexicon the sessions propose arcs from, when `--arcs` names
+    /// one.
+    words: Option<&'a ime_decode::WordLexicon>,
     args: &'a ReplayArgs,
 }
 
@@ -622,6 +642,16 @@ struct Harness<'a> {
 type FusedSession<'a, T> = Session<'a, Fused<'a, Cached<Timed<T>>>>;
 
 impl<'a> Harness<'a> {
+    /// The session's beam: the search arguments, with the word arcs'
+    /// prior and slots.
+    fn beam(&self) -> ime_decode::BeamOptions {
+        ime_decode::BeamOptions {
+            arc_prior: self.args.arc_prior,
+            arc_width: self.args.arcs.arc_width,
+            ..self.args.search.beam()
+        }
+    }
+
     /// A session over *transition*, decoding under the run's options;
     /// *incremental* selects the engine's reuse — the context tower's and
     /// the state cache's alike, the cache's rows bound dropping to zero
@@ -650,7 +680,8 @@ impl<'a> Harness<'a> {
                 lexicon: self.lexicon,
                 table: self.table,
                 segment: self.args.search.segment(),
-                beam: self.args.search.beam(),
+                beam: self.beam(),
+                words: self.words,
                 sentences: 3,
             },
         )
@@ -683,7 +714,8 @@ impl<'a> Harness<'a> {
                 lexicon: self.lexicon,
                 table: self.table,
                 segment: self.args.search.segment(),
-                beam: self.args.search.beam(),
+                beam: self.beam(),
+                words: self.words,
                 sentences: 3,
             },
         )
@@ -809,6 +841,8 @@ fn replay_kind<T: Transition>(
                 beam_select_ns: now.breakdown.select_ns - before.breakdown.select_ns,
                 beam_finish_ns: now.breakdown.finish_ns - before.breakdown.finish_ns,
                 beam_expanded: now.breakdown.expanded - before.breakdown.expanded,
+                beam_arc_starts: now.breakdown.arc_starts - before.breakdown.arc_starts,
+                beam_arc_slots: now.breakdown.arc_slots - before.breakdown.arc_slots,
             });
             if !paused && harness.args.pause_at == Some(typed) {
                 paused = true;
@@ -996,6 +1030,9 @@ fn report(
             beam_select_ns: replays.stages.breakdown.select_ns,
             beam_finish_ns: replays.stages.breakdown.finish_ns,
             beam_expanded: replays.stages.breakdown.expanded,
+            beam_arc_starts: replays.stages.breakdown.arc_starts,
+            beam_arc_slots: replays.stages.breakdown.arc_slots,
+            beam_arcs_unprotected: replays.stages.breakdown.arcs_unprotected,
         },
         invalidation: InvalidationReport {
             compared: replays.invalidation.compared,
@@ -1156,6 +1193,7 @@ pub fn run(args: &ReplayArgs) -> Result<()> {
         })
         .transpose()?;
     let emittable = load_emittable(&args.emittable, &lexicon)?;
+    let words = args.arcs.load(&lexicon, &table, &emittable)?;
     let set = load_set(&args.eval_set)?;
     memory_breakdown("opened");
     if let Some(index) = args.probe {
@@ -1173,6 +1211,7 @@ pub fn run(args: &ReplayArgs) -> Result<()> {
                 emittable: &emittable,
                 lexicon: &lexicon,
                 table: &table,
+                words: words.as_ref(),
                 args,
             },
             index,
@@ -1202,6 +1241,7 @@ pub fn run(args: &ReplayArgs) -> Result<()> {
         emittable: &emittable,
         lexicon: &lexicon,
         table: &table,
+        words: words.as_ref(),
         args,
     };
     let replays = match (ngram.as_ref(), lm.as_ref()) {
