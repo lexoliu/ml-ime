@@ -360,9 +360,11 @@ def compile_modules(model: E2EModel, mode: str) -> None:
     19 to 23.4 examples a second per rank and the cards from 70% to 93% busy.
     The C++ links against ``libcuda.so``, which the host must provide.
 
-    A context tower that runs apart from the fill pass (``separate``: Qwen's,
-    frozen or replayed from its own graphs) stays outside the compiled region,
-    and only the fill pass that reads its memory is compiled.
+    A context tower that runs apart from the fill pass (``separate``: Qwen's
+    frozen, or replayed from its own graphs) stays outside the compiled
+    region, and only the fill pass that reads its memory is compiled. Qwen
+    with adapters trains, and is compiled inside ``encode`` with the fill
+    pass.
     """
     options = {**torch._inductor.list_mode_options(mode), "cpp_wrapper": True}
     if model.context.separate:

@@ -606,6 +606,58 @@ def test_s0_trains_the_gated_blocks_and_the_towers_additions_and_nothing_inherit
     rebuilt.load_state_dict(after, strict=True)
 
 
+def test_an_adapted_tower_trains_inside_the_compiled_pass_and_computes_the_eager_step(
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    tokenizer: StubTokenizer,
+    reader_vocab: CharVocab,
+    e2e_config: E2EConfig,
+    qwen: QwenContextConfig,
+) -> None:
+    """#237: the adapted tower runs inside the compiled ``encode``, not eager before it.
+
+    Eager, its forward and backward are a launch for every RMSNorm, rotary and
+    adapter op of every block, and the L4 sat idle half the step issuing them.
+    Compiled, it is one graph with no break, whose loss and gradients are the
+    eager step's. The adapters' B is moved off zero first, so A has a gradient
+    to compare too.
+    """
+    from mlime.train.e2e import compile_modules
+
+    tower = replace(qwen, lora=LoraConfig(rank=2, alpha=4.0))
+    eager = s0_model(lexicon, reader_vocab, e2e_config, tower).eval()
+    torch.manual_seed(5)
+    with torch.no_grad():
+        for name, parameter in eager.named_parameters():
+            if name.endswith("lora_b"):
+                parameter.normal_(std=0.1)
+    compiled = s0_model(lexicon, reader_vocab, e2e_config, tower).eval()
+    compiled.load_state_dict(eager.state_dict())
+    assert isinstance(compiled.context, QwenContextTower)
+    assert not compiled.context.separate
+    compile_modules(compiled, "default")
+    batch = s0_batch(spans, lexicon, tokenizer, tower)
+
+    torch._dynamo.utils.counters.clear()
+    losses = []
+    for model in (eager, compiled):
+        loss = model(batch).loss
+        assert loss is not None
+        loss.backward()
+        losses.append(loss.detach())
+    assert not torch._dynamo.utils.counters["graph_break"]
+    torch.testing.assert_close(losses[1], losses[0])
+    trained = [
+        (name, p, dict(compiled.named_parameters())[name])
+        for name, p in eager.named_parameters()
+        if p.requires_grad
+    ]
+    assert any(name.endswith("lora_a") for name, _, _ in trained)
+    for name, before, after in trained:
+        assert before.grad is not None and after.grad is not None, name
+        torch.testing.assert_close(after.grad, before.grad, msg=name)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="device syncs need a CUDA device")
 @pytest.mark.parametrize("variant", sorted(VARIANTS))
 def test_an_s0_step_of_each_variant_never_waits_on_the_device(

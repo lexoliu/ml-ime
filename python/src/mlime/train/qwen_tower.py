@@ -23,9 +23,11 @@ Three things make it a context tower rather than a language model:
   new.
 - **Frozen, or LoRA.** The tower's own weights never train. With
   :class:`LoraConfig` its attention projections carry low-rank adapters that
-  do; without, it runs under ``no_grad`` -- no autograd graph through its
-  layers -- and on CUDA it can be replayed from captured graphs
-  (:class:`TowerGraphs`), one launch for the whole forward.
+  do, and the tower trains inside the compiled encoder pass like any tower
+  with a backward; without, it runs apart from that pass under ``no_grad``
+  -- no autograd graph through its layers -- and on CUDA it can be replayed
+  from captured graphs (:class:`TowerGraphs`), one launch for the whole
+  forward.
 - **Whole, or cut at a layer.** ``layers`` keeps only the first N decoder
   blocks (#237): the blocks above are never built, loaded or run, so the
   cross-attention reads the residual stream after block N and the context
@@ -41,7 +43,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, ClassVar
+from typing import Any
 
 import torch
 from torch import nn
@@ -327,8 +329,6 @@ class QwenContextTower(ContextTower):
     forward from captured CUDA graphs.
     """
 
-    separate: ClassVar[bool] = True
-
     model: Any
     norm: nn.LayerNorm
     head_ids: torch.Tensor
@@ -381,6 +381,17 @@ class QwenContextTower(ContextTower):
     def frozen(self) -> bool:
         """Whether nothing of the tower's own trains (no LoRA)."""
         return self.tower_config.lora is None
+
+    @property
+    def separate(self) -> bool:
+        """A frozen tower runs apart from the compiled pass; an adapted one inside it.
+
+        An adapted tower has a backward through every block, and eager it is
+        some ten thousand launches a micro-batch, forward and backward, most
+        of them RMSNorm, rotary and adapter element-wise work in fp32 that
+        the compiled pass fuses.
+        """
+        return self.frozen
 
     def new_parameters(self) -> tuple[str, ...]:
         """The LayerNorm on the context rows and every LoRA adapter."""
@@ -473,15 +484,15 @@ class QwenContextTower(ContextTower):
                 head = self._head = self.compute_head()
         return head
 
-    def states(self, ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def states(self, ids: torch.Tensor, mask: torch.Tensor, head: HeadState) -> torch.Tensor:
         """``[C, T]`` context ids, right-padded under *mask*, to ``[C, T, width]`` rows.
 
-        Each row attends to the head and to its own tokens up to itself; its
-        tokens sit at positions ``H..H+T-1`` after the head's ``0..H-1``, so a
-        row reads exactly as the head and the row in one sequence would. The
-        tower runs outside the training's autocast, in its own precision.
+        Each row attends to *head* -- :meth:`head_state`, which the caller
+        computes once for the forward -- and to its own tokens up to itself;
+        its tokens sit at positions ``H..H+T-1`` after the head's ``0..H-1``,
+        so a row reads exactly as the head and the row in one sequence would.
+        The tower runs outside the training's autocast, in its own precision.
         """
-        head = self.head_state()
         length = ids.shape[1]
         own = torch.ones(length, length, dtype=torch.bool, device=ids.device).tril()
         visible = torch.cat(
@@ -500,7 +511,7 @@ class QwenContextTower(ContextTower):
     def frozen_states(self, ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """:meth:`states` without autograd: what a frozen tower runs and a graph captures."""
         with torch.no_grad():
-            return self.states(ids, mask)
+            return self.states(ids, mask, self.head_state())
 
     def memory(self, ids: torch.Tensor, mask: torch.Tensor) -> ContextMemory:
         """The rows the cross-attention reads: the head's, then the context's, normed.
@@ -522,7 +533,9 @@ class QwenContextTower(ContextTower):
                 else self.graphs.states(self, ids, mask)
             )
         else:
-            states = self.states(ids, mask)
+            # The head this forward already computed: an adapted tower's head
+            # is a forward of its own, and the rows and the prefix are one.
+            states = self.states(ids, mask, head)
         joined = torch.cat([head.rows.expand(rows, -1, -1), states], dim=1)
         real = torch.cat(
             [torch.ones(rows, head.length, dtype=torch.bool, device=ids.device), mask.bool()],
