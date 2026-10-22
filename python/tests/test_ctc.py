@@ -315,8 +315,8 @@ def test_the_cuda_loss_and_gradients_match_the_cpus() -> None:
     lengths = torch.tensor([length for _, length in shapes])
     results = []
     for device in ("cpu", "cuda"):
-        own_blank = blank.to(device).requires_grad_(True)
-        own_emit = emit.to(device).requires_grad_(True)
+        own_blank = blank.detach().to(device).requires_grad_(True)
+        own_emit = emit.detach().to(device).requires_grad_(True)
         nll = constrained_ctc(
             own_blank,
             own_emit,
