@@ -18,7 +18,10 @@
 //!
 //! Two passes share all of this: [`GeneralPass`] keeps every target that
 //! passes, and [`MinePass`] keeps only sentences that use an entry run3 never
-//! shows, through the gates in [`crate::mine`].
+//! shows, through the gates in [`crate::mine`]. A mining pass's shards are not
+//! training data yet: they wait under the source's run state for the judge
+//! (`mlime corpus judge`), which writes the records it keeps into the samples
+//! directory.
 
 use crate::download::{Hub, RepoFile};
 use crate::error::{Error, Result};
@@ -474,6 +477,12 @@ impl FileOutput {
 
 /// One way of turning a source's documents into samples.
 pub trait Pass {
+    /// Whether the pass's samples wait for a judgement before they may be trained on.
+    ///
+    /// Such a pass writes its shards under the source's run state, never into
+    /// the samples directory every training stage reads.
+    const AWAITS_JUDGE: bool;
+
     /// Restore what a finished file left: its accepted digests and kept entries.
     ///
     /// # Errors
@@ -534,6 +543,8 @@ impl<'a> GeneralPass<'a> {
 }
 
 impl Pass for GeneralPass<'_> {
+    const AWAITS_JUDGE: bool = false;
+
     fn restore(&mut self, record: &FileRecord, digests: Vec<Digest>) -> Result<()> {
         self.filter.preload(digests);
         self.written += record.census.written;
@@ -665,6 +676,8 @@ struct Mined {
 }
 
 impl Pass for MinePass<'_> {
+    const AWAITS_JUDGE: bool = true;
+
     fn restore(&mut self, record: &FileRecord, digests: Vec<Digest>) -> Result<()> {
         self.filter.preload(digests);
         for (entry, count) in &record.entries {
@@ -891,7 +904,7 @@ struct StateDirs {
 }
 
 impl StateDirs {
-    fn new(root: &Path, source: &str) -> Result<Self> {
+    fn new(root: &Path, source: &str, awaits_judge: bool) -> Result<Self> {
         let state = root.join("ingest").join(source);
         let dirs = Self {
             files: state.join("files"),
@@ -899,7 +912,11 @@ impl StateDirs {
             entries: state.join("entries"),
             hits: state.join("hits"),
             scratch: state.join("scratch"),
-            samples: root.join("samples"),
+            samples: if awaits_judge {
+                state.join("unjudged")
+            } else {
+                root.join("samples")
+            },
             downloads: root.join("downloads").join(source),
             root: state,
         };
@@ -946,7 +963,7 @@ pub fn available_bytes(path: &Path) -> Result<u64> {
 pub async fn run<U: Upstream, P: Pass>(hub: &Hub, plan: &Plan, pass: &mut P) -> Result<RunReport> {
     let started = Instant::now();
     let spec = U::SPEC;
-    let dirs = StateDirs::new(&plan.root, spec.name)?;
+    let dirs = StateDirs::new(&plan.root, spec.name, P::AWAITS_JUDGE)?;
     let files = listing::<U>(hub, plan).await?;
 
     let records = restore(&dirs, &files, spec, pass)?;
@@ -1448,12 +1465,12 @@ mod tests {
     }
 
     impl Fixture {
-        fn new(name: &str) -> Self {
+        fn new<P: Pass>(name: &str) -> Self {
             let root = std::env::temp_dir()
                 .join(format!("ime-corpus-ingest-{name}-{}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
-            let dirs =
-                StateDirs::new(&root, Lines::SPEC.name).expect("the fixture root is writable");
+            let dirs = StateDirs::new(&root, Lines::SPEC.name, P::AWAITS_JUDGE)
+                .expect("the fixture root is writable");
             Self {
                 root,
                 dirs,
@@ -1497,7 +1514,7 @@ mod tests {
 
     #[test]
     fn planted_evaluation_collisions_personal_data_and_run3_targets_never_reach_a_sample() {
-        let fixture = Fixture::new("planted");
+        let fixture = Fixture::new::<GeneralPass<'_>>("planted");
         let run3 = Run3::of(["这句话很正常哦"]);
         let shared = Shared::new(&fixture.lexicon, &fixture.guard, &run3).expect("builds");
         let mut pass = GeneralPass::new(&shared, None);
@@ -1550,7 +1567,7 @@ mod tests {
 
     #[test]
     fn a_resumed_run_deduplicates_against_the_files_already_finished() {
-        let fixture = Fixture::new("resume");
+        let fixture = Fixture::new::<GeneralPass<'_>>("resume");
         let run3 = Run3::of(["无关的句子在这里"]);
         let shared = Shared::new(&fixture.lexicon, &fixture.guard, &run3).expect("builds");
         let mut first = GeneralPass::new(&shared, None);
@@ -1597,7 +1614,7 @@ mod tests {
 
     #[test]
     fn what_an_unfinished_file_left_is_removed_on_restore() {
-        let fixture = Fixture::new("leftovers");
+        let fixture = Fixture::new::<GeneralPass<'_>>("leftovers");
         let run3 = Run3::of(["无关的句子在这里"]);
         let shared = Shared::new(&fixture.lexicon, &fixture.guard, &run3).expect("builds");
         let mut pass = GeneralPass::new(&shared, None);
@@ -1627,7 +1644,7 @@ mod tests {
 
     #[test]
     fn a_listing_that_moved_under_a_finished_file_is_refused() {
-        let fixture = Fixture::new("moved");
+        let fixture = Fixture::new::<GeneralPass<'_>>("moved");
         let run3 = Run3::of(["无关的句子在这里"]);
         let shared = Shared::new(&fixture.lexicon, &fixture.guard, &run3).expect("builds");
         let mut pass = GeneralPass::new(&shared, None);
@@ -1640,7 +1657,7 @@ mod tests {
 
     #[test]
     fn the_target_budget_truncates_the_file_it_is_reached_in() {
-        let fixture = Fixture::new("budget");
+        let fixture = Fixture::new::<GeneralPass<'_>>("budget");
         let run3 = Run3::of(["无关的句子在这里"]);
         let shared = Shared::new(&fixture.lexicon, &fixture.guard, &run3).expect("builds");
         let mut pass = GeneralPass::new(&shared, Some(2));
@@ -1675,7 +1692,7 @@ mod tests {
 
     #[test]
     fn mining_keeps_real_usage_once_per_entry_up_to_the_cap() {
-        let fixture = Fixture::new("mine");
+        let fixture = Fixture::new::<MinePass<'_>>("mine");
         let matcher = matcher();
         let tail = "后来他慢慢学会了读书写字也成了一个很有学问的人。";
         let names: Vec<char> = "一二三四五六七八九十百千万天地人日月山水火木金土上下左右前后东西南北春夏秋冬风雨雷电花草树叶红黄蓝白黑大小多少高低长短"
@@ -1713,6 +1730,18 @@ mod tests {
                 .iter()
                 .all(|sample| sample.text.contains("一丁不识"))
         );
+        // Nothing mined reaches the samples every stage trains on before the judge has read it.
+        assert!(
+            fixture
+                .dirs
+                .samples
+                .ends_with("ingest/fineweb2-hq/unjudged")
+        );
+        assert_eq!(
+            shard_paths(&fixture.root.join("samples"), Lines::SPEC.name)
+                .expect("the directory lists"),
+            Vec::<PathBuf>::new()
+        );
 
         // A resumed pass starts from the counts the finished file left.
         let mut resumed = MinePass::new(&shared, &matcher).expect("run3 has pairs");
@@ -1724,7 +1753,7 @@ mod tests {
 
     #[test]
     fn mining_drops_a_hit_in_a_document_that_quotes_an_evaluation_record() {
-        let fixture = Fixture::new("mine-leak");
+        let fixture = Fixture::new::<MinePass<'_>>("mine-leak");
         let matcher = matcher();
         let document =
             "只好躲在书店里等雨停了，窗外桂花真香。他小时候家里穷得一丁不识，后来学会了读书。";

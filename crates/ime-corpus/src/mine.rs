@@ -15,6 +15,9 @@
 //!   once or when its character pairs are ones no run3 sentence ever writes.
 //!
 //! Each entry keeps at most [`PER_ENTRY_CAP`] sentences over the whole pass.
+//! What passes is still only a candidate: `mlime corpus judge` drops word-boundary
+//! false matches and asks two models whether the sentence and its page read as
+//! natural human writing before any of it is trained on.
 
 use crate::error::{Error, Result};
 use crate::text::Normalizer;
