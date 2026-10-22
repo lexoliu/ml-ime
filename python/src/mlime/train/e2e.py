@@ -365,6 +365,14 @@ def build_fresh(
     return model, vocabularies
 
 
+def inductor_options(mode: str) -> dict[str, Any]:
+    """The Inductor options every compiled call of a run takes: *mode*'s, with a C++ wrapper.
+
+    :func:`compile_modules` says why the wrapper is C++.
+    """
+    return {**torch._inductor.list_mode_options(mode), "cpp_wrapper": True}
+
+
 def compile_modules(model: E2EModel, mode: str) -> None:
     """torch.compile the encoder pass and the decoder stack, in place.
 
@@ -395,18 +403,24 @@ def compile_modules(model: E2EModel, mode: str) -> None:
     19 to 23.4 examples a second per rank and the cards from 70% to 93% busy.
     The C++ links against ``libcuda.so``, which the host must provide.
 
-    A context tower that runs apart from the fill pass (``separate``: Qwen's,
-    frozen or replayed from its own graphs) stays outside the compiled region,
-    and only the fill pass that reads its memory is compiled.
+    A context tower that runs apart from the fill pass (``separate``: Qwen)
+    stays outside the compiled region, and only the fill pass that reads its
+    memory is compiled with ``encode_fill``; the tower compiles its own layers
+    with the same options (:meth:`ContextTower.compile_layers`). Qwen with
+    adapters compiles one decoder layer, called for each of its blocks
+    (#237): unrolled into ``encode``, its 28 blocks made a forward graph
+    whose C++ wrapper g++ had not built in over half an hour on an L4.
 
     A key-level model runs the fill pass twice a step -- over the spans for
     its teacher and over the keys -- and reads the context once for both, so
     its units are the context tower, the fill pass and the key front, each
     one graph whatever fills the fill pass's positions.
     """
-    options = {**torch._inductor.list_mode_options(mode), "cpp_wrapper": True}
+    options = inductor_options(mode)
     if isinstance(model, KeyE2EModel):
-        if not model.context.separate:
+        if model.context.separate:
+            model.context.compile_layers(options)
+        else:
             model.encode_context = torch.compile(  # type: ignore[method-assign]
                 model.encode_context, dynamic=True, options=options
             )
@@ -422,6 +436,7 @@ def compile_modules(model: E2EModel, mode: str) -> None:
         log.info("key front, towers and decoder compiled", mode=mode)
         return
     if model.context.separate:
+        model.context.compile_layers(options)
         model.encode_fill = torch.compile(  # type: ignore[method-assign]
             model.encode_fill, dynamic=True, options=options
         )

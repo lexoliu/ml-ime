@@ -75,7 +75,7 @@ E2E_V2_RUN = re.compile(r"mlime-e2e-(v2|keys)-[a-z0-9]+(-[a-z0-9]+)*")
 E2E_KEYS_RUN = "mlime-e2e-keys-"
 
 #: What a stamped ``CONTEXT_TOWER`` holds: the kernel's ``--context-*`` options.
-CONTEXT_TOWER_FIELDS = frozenset({"tower", "revision", "lora_rank", "lora_alpha"})
+CONTEXT_TOWER_FIELDS = frozenset({"tower", "revision", "lora_rank", "lora_alpha", "layers"})
 
 #: What a stamped ``KEYS`` holds: the kernel's key front options (#223).
 KEYS_FIELDS = frozenset({"layers", "distill_weight", "correct_syllables"})
@@ -144,8 +144,9 @@ class E2EV2Stage:
     pair, None for ``mlime train e2e``'s defaults; *token_budget* and
     *accumulate* default to v1's. *context_tower* (``CONTEXT_TOWER``) reads
     the context with a Qwen model, swapped in over *init_from*'s MacBERT tower
-    (#222): its ``tower`` and ``revision``, and a ``lora_rank`` and
-    ``lora_alpha`` where 0 keeps it frozen. *context_warm_up*
+    (#222): its ``tower`` and ``revision``, a ``lora_rank`` and
+    ``lora_alpha`` where 0 keeps it frozen, and ``layers``, the decoder blocks
+    the tower keeps from the bottom, None for all of them (#237). *context_warm_up*
     (``CONTEXT_WARM_UP``) trains only the context path, which is S0.
     *keys* (``KEYS``) reads keystrokes through a key front with a per-key CTC
     head (#223): its ``layers``, ``distill_weight`` and ``correct_syllables``.

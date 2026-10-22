@@ -243,7 +243,13 @@ def test_every_switch_the_kernel_passes_is_an_option_of_train_e2e(
     monkeypatch.setattr(
         kernel,
         "CONTEXT_TOWER",
-        {"tower": "Qwen/Qwen3-0.6B-Base", "revision": "abc", "lora_rank": 0, "lora_alpha": 16.0},
+        {
+            "tower": "Qwen/Qwen3-0.6B-Base",
+            "revision": "abc",
+            "lora_rank": 0,
+            "lora_alpha": 16.0,
+            "layers": 18,
+        },
     )
     monkeypatch.setattr(kernel, "CONTEXT_WARM_UP", True)
     monkeypatch.setattr(kernel, "TOWER_GRAPHS", True)
@@ -260,6 +266,7 @@ def test_every_switch_the_kernel_passes_is_an_option_of_train_e2e(
     )
     command = argv.index("mlime")
     assert argv[command + 1 : command + 3] == ["train", "e2e"]
+    assert argv[argv.index("--context-layers") + 1] == "18"
     group = typer.main.get_command(app)
     assert isinstance(group, TyperGroup)
     train = group.commands["train"]
