@@ -13,6 +13,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 import polars as pl
@@ -232,7 +233,57 @@ def test_a_review_reply_without_the_two_booleans_fails(reply: str) -> None:
 
 def test_verdicts_out_of_order_are_refused() -> None:
     with pytest.raises(JudgeError, match="out of order"):
-        judge.next_stage([{"id": "a", "entry": "e", "stage": "jev", "keep": True}])
+        judge.next_stage([{"id": "a", "entry": "e", "stage": "jev", "p": 0.9}])
+
+
+def logged(
+    p: float, review: bool | None = None, old_keep: bool | None = None
+) -> list[dict[str, Any]]:
+    """A unit's verdicts: through the boundary, Jev at *p*, and a review when one is given.
+
+    *old_keep* writes the Jev line as the log held it before the threshold
+    moved out of it, with the ``keep`` an earlier threshold gave.
+    """
+    jev: dict[str, Any] = {"id": "a", "entry": "e", "stage": "jev", "p": p}
+    if old_keep is not None:
+        jev["keep"] = old_keep
+    lines = [{"id": "a", "entry": "e", "stage": "boundary", "keep": True}, jev]
+    if review is not None:
+        lines.append({"id": "a", "entry": "e", "stage": "review", "keep": review})
+    return lines
+
+
+@pytest.mark.parametrize("old_keep", [None, True])
+def test_a_unit_below_the_threshold_is_decided_at_jev(old_keep: bool | None) -> None:
+    assert judge.next_stage(logged(0.75, old_keep=old_keep)) is None
+    assert judge.deciding(logged(0.75, old_keep=old_keep))[-1]["stage"] == "jev"
+
+
+@pytest.mark.parametrize("old_keep", [None, True])
+def test_a_review_after_a_unit_fell_below_the_threshold_decides_nothing(
+    old_keep: bool | None,
+) -> None:
+    lines = logged(0.75, review=True, old_keep=old_keep)
+    assert judge.next_stage(lines) is None
+    assert judge.deciding(lines) == lines[:2]
+
+
+@pytest.mark.parametrize("old_keep", [None, True, False])
+def test_a_unit_at_or_above_the_threshold_goes_to_review(old_keep: bool | None) -> None:
+    # A stored keep of either sign is ignored: only the probability is read.
+    assert judge.next_stage(logged(0.85, old_keep=old_keep)) == "review"
+    assert judge.next_stage(logged(judge.JEV_THRESHOLD, old_keep=old_keep)) == "review"
+    for verdict in (True, False):
+        lines = logged(0.85, review=verdict, old_keep=old_keep)
+        assert judge.next_stage(lines) is None
+        assert judge.deciding(lines) == lines
+        assert judge.passes(lines[-1]) is verdict
+
+
+def test_a_verdict_past_the_last_rule_is_refused() -> None:
+    lines = logged(0.85, review=True)
+    with pytest.raises(JudgeError, match="out of order"):
+        judge.next_stage([*lines, lines[-1]])
 
 
 # --- the run ------------------------------------------------------------------
@@ -243,8 +294,8 @@ RECORDS: list[tuple[str, str, float, tuple[bool, bool]]] = [
     ("他小时候一丁不识字", "一丁不识", 0.9, (False, True)),  # rule 1
     ("中秋那天果然花好月圆了", "花好月圆", 0.5, (False, True)),  # Jev
     ("这一家人从此花好月圆", "花好月圆", 0.95, (True, True)),  # spun page
-    ("那幅画画得一丁不识的样子", "一丁不识", 0.75, (False, False)),  # unnatural
-    ("村里的老人大多一丁不识", "一丁不识", 0.7, (False, True)),  # kept at the threshold
+    ("那幅画画得一丁不识的样子", "一丁不识", 0.85, (False, False)),  # unnatural
+    ("村里的老人大多一丁不识", "一丁不识", 0.8, (False, True)),  # kept at the threshold
 ]
 
 
@@ -402,3 +453,131 @@ def test_a_record_with_two_entries_keeps_the_one_that_passes(tmp_path: Path) -> 
     census = asyncio.run(judge.judge_source(layout, LEXICON, Natural(), Fine(), 1, 1))
     assert (census.units, census.boundary, census.kept_units, census.kept_records) == (2, 1, 1, 1)
     assert layout.kept_rows(0).read_text(encoding="utf-8") == "000000000000\t画蛇添足\n"
+
+
+# --- the threshold, applied when verdicts are read ------------------------------
+
+#: Sentence, Jev's probability, and the review's (context_spun, sentence_natural).
+BAND: dict[str, tuple[float, tuple[bool, bool]]] = {
+    "老街坊里一丁不识的人不多了": (0.75, (False, True)),  # below 0.8, reviewed keep under 0.7
+    "奶奶年轻时一丁不识": (0.75, (False, True)),  # below 0.8, its review never came
+    "他爷爷那辈人一丁不识": (0.85, (False, True)),  # above, not reviewed yet: kept by review
+    "那篇文章说村民一丁不识": (0.85, (True, True)),  # above, reviewed spun under 0.7
+    "当年他确实一丁不识": (0.5, (False, True)),  # below either threshold
+}
+
+
+@dataclass
+class BandJev:
+    asked: list[str] = field(default_factory=list)
+
+    async def ask(self, unit: Unit) -> JevAnswer:
+        self.asked.append(unit.text)
+        return JevAnswer(p=BAND[unit.text][0], model="jev-fake")
+
+
+@dataclass
+class BandReview:
+    asked: list[str] = field(default_factory=list)
+
+    async def ask(self, unit: Unit) -> ReviewAnswer:
+        self.asked.append(unit.text)
+        spun, natural = BAND[unit.text][1]
+        return ReviewAnswer(context_spun=spun, sentence_natural=natural)
+
+
+def band_run(layout: MinedLayout) -> tuple[judge.JudgeCensus, BandJev, BandReview]:
+    jev, review = BandJev(), BandReview()
+    census = asyncio.run(judge.judge_source(layout, LEXICON, jev, review, 2, 2))
+    return census, jev, review
+
+
+def kept_texts(layout: MinedLayout) -> list[str]:
+    path = layout.samples / f"{judge.SOURCE}-0000000.parquet"
+    return pl.read_parquet(path).get_column("text").to_list() if path.exists() else []
+
+
+BAND_CENSUS = judge.JudgeCensus(
+    records=5, units=5, jev=3, review_spun=1, kept_units=1, kept_records=1
+)
+
+
+def test_a_fresh_run_reviews_only_what_reaches_the_threshold(tmp_path: Path) -> None:
+    layout = mined_root(tmp_path, [(text, "一丁不识") for text in BAND])
+    census, jev, review = band_run(layout)
+    assert census == BAND_CENSUS
+    assert sorted(jev.asked) == sorted(BAND)
+    assert sorted(review.asked) == sorted(["他爷爷那辈人一丁不识", "那篇文章说村民一丁不识"])
+    assert kept_texts(layout) == ["他爷爷那辈人一丁不识"]
+    jev_lines = [
+        line
+        for line in map(json.loads, layout.verdicts(0).read_text("utf-8").splitlines())
+        if line["stage"] == "jev"
+    ]
+    assert all("keep" not in line for line in jev_lines)
+    judged = json.loads(layout.judged(0).read_text(encoding="utf-8"))
+    assert judged["jev_threshold"] == judge.JEV_THRESHOLD
+
+
+def test_a_log_written_under_the_old_threshold_resumes_under_the_new(tmp_path: Path) -> None:
+    layout = mined_root(tmp_path, [(text, "一丁不识") for text in BAND])
+    ids = {text: f"0000{index:08x}" for index, text in enumerate(BAND)}
+    layout.judge.mkdir(parents=True)
+    old: list[dict[str, Any]] = []
+    for text, (p, _) in BAND.items():
+        old.append({"id": ids[text], "entry": "一丁不识", "stage": "boundary", "keep": True})
+        old.append(
+            {
+                "id": ids[text],
+                "entry": "一丁不识",
+                "stage": "jev",
+                "keep": p >= 0.7,
+                "p": p,
+                "model": "jev-fake",
+                "seconds": 1.0,
+            }
+        )
+    for text, spun in (("老街坊里一丁不识的人不多了", False), ("那篇文章说村民一丁不识", True)):
+        old.append(
+            {
+                "id": ids[text],
+                "entry": "一丁不识",
+                "stage": "review",
+                "keep": not spun,
+                "context_spun": spun,
+                "sentence_natural": True,
+                "seconds": 2.0,
+            }
+        )
+    written = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in old)
+    layout.verdicts(0).write_text(written, encoding="utf-8")
+
+    census, jev, review = band_run(layout)
+    assert census == BAND_CENSUS
+    assert jev.asked == []
+    # Only the unit at 0.85 left unreviewed is asked; the reviewed unit at 0.75 is dropped.
+    assert review.asked == ["他爷爷那辈人一丁不识"]
+    assert kept_texts(layout) == ["他爷爷那辈人一丁不识"]
+    # The log is only appended to.
+    after = layout.verdicts(0).read_text(encoding="utf-8")
+    assert after.startswith(written)
+    assert [json.loads(line)["stage"] for line in after[len(written) :].splitlines()] == ["review"]
+
+
+def test_a_file_judged_under_another_threshold_is_judged_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    layout = mined_root(tmp_path, [(text, "一丁不识") for text in BAND])
+    monkeypatch.setattr(judge, "JEV_THRESHOLD", 0.7)
+    band_run(layout)
+    assert sorted(kept_texts(layout)) == sorted(
+        ["老街坊里一丁不识的人不多了", "奶奶年轻时一丁不识", "他爷爷那辈人一丁不识"]
+    )
+    monkeypatch.undo()
+
+    census, jev, review = band_run(layout)
+    assert census == BAND_CENSUS
+    assert jev.asked == [] and review.asked == []
+    assert kept_texts(layout) == ["他爷爷那辈人一丁不识"]
+    assert json.loads(layout.judged(0).read_text(encoding="utf-8"))["jev_threshold"] == 0.8
+    assert layout.kept_rows(0).read_text(encoding="utf-8") == f"{0:04d}{2:08x}\t一丁不识\n"
