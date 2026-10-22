@@ -237,7 +237,7 @@ class NoiseModel:
         for syllable in syllables:
             bounds.append([cursor, cursor + len(syllable)])
             cursor += len(syllable)
-        edits = [self._apply(rng, letters, bounds) for _ in range(self._draw_count(rng, min_edits))]
+        edits = [self._apply(rng, letters, bounds) for _ in range(self.draw_count(rng, min_edits))]
         return Corruption(
             "".join(letters),
             tuple(edits),
@@ -250,7 +250,23 @@ class NoiseModel:
             return Corruption("".join(syllables), (), tuple(syllables))
         return self.corrupt(syllables, rng, min_edits=1)
 
-    def _draw_count(self, rng: random.Random, at_least: int) -> int:
+    def edit_span(self, span: str, rng: random.Random) -> tuple[str, Edit]:
+        """*span* after one edit drawn as :meth:`corrupt` draws each of its edits.
+
+        The edit stays inside the span -- a transposition never reaches across
+        a seam, an omission or a doubling never moves a key into a neighbour --
+        which is what key-level training needs to keep each typed syllable's
+        keys its own (#216 §4).
+        """
+        if not span:
+            raise ValueError("there is nothing to edit in an empty span")
+        letters = list(span)
+        bounds = [[0, len(letters)]]
+        edit = self._apply(rng, letters, bounds)
+        return "".join(letters), edit
+
+    def draw_count(self, rng: random.Random, at_least: int) -> int:
+        """An edit count from the table's distribution, redrawn until it reaches *at_least*."""
         counts = list(self._edit_count)
         weights = [self._edit_count[count] for count in counts]
         count = rng.choices(counts, weights)[0]

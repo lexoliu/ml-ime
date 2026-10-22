@@ -473,3 +473,97 @@ def test_the_window_start_reaches_the_trainer_from_the_stamp(
     assert isinstance(result.exception, ReachedError), result.output
     (training,) = seen
     assert (training.profile_steps, training.profile_start, training.trace_steps) == (30, 400, 3)
+
+
+def test_a_key_stage_passes_its_front_to_the_count_and_the_trainer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The count and the trainer see the same key examples; the shape goes to training only.
+
+    Both commands parse the argv the kernel builds, and the count builds its
+    examples with the key front's settings and the typo switch, so the census
+    is the run's own.
+    """
+    import typer
+    from typer.core import TyperGroup
+    from typer.testing import CliRunner
+
+    import mlime.__main__ as cli
+    import mlime.train.count as count
+    from mlime.train.keys import KeyFrontConfig
+    from mlime.train.run import Slices, Vocabularies
+
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-v2-rank-g4")
+    monkeypatch.setattr(
+        kernel, "KEYS", {"layers": 3, "distill_weight": 0.5, "correct_syllables": False}
+    )
+    monkeypatch.setattr(kernel, "KEY_WARM_UP", True)
+    monkeypatch.setattr(kernel, "TYPOS", True)
+    assert kernel.stage()["keys"] == {
+        "layers": 3,
+        "distill_weight": 0.5,
+        "correct_syllables": False,
+    }
+
+    train_argv = kernel.train_argv(
+        tmp_path / "char_pinyin.tsv",
+        tmp_path / "run",
+        max_steps=100,
+        wall_budget=3600,
+        start=kernel.start_argv(None, tmp_path / "checkpoint-final.pt"),
+        resume=None,
+        token_budget=12288,
+        trace_steps=0,
+        segmenter=None,
+    )
+    command = train_argv.index("mlime")
+    tail = [str(arg) for arg in train_argv[command + 3 :]]
+    for switch in ("--keys", "--no-correct-syllables", "--key-warm-up", "--typos"):
+        assert switch in tail, switch
+    assert tail[tail.index("--key-front-layers") + 1] == "3"
+    assert tail[tail.index("--distill-weight") + 1] == "0.5"
+    group = typer.main.get_command(cli.app)
+    assert isinstance(group, TyperGroup)
+    train = group.commands["train"]
+    assert isinstance(train, TyperGroup)
+    train.commands["e2e"].make_context("e2e", tail)
+
+    count_argv = kernel.count_argv(tmp_path / "char_pinyin.tsv", tmp_path / "counts.json", None)
+    assert "--key-front-layers" not in count_argv and "--key-warm-up" not in count_argv
+    asked: dict[str, object] = {}
+
+    class CountedError(Exception):
+        pass
+
+    def counting(*args: object, **kwargs: object) -> None:
+        asked.update(kwargs)
+        raise CountedError
+
+    monkeypatch.setattr(count, "count_batches", counting)
+    monkeypatch.setattr(Vocabularies, "load", classmethod(lambda cls, *_: None))
+    monkeypatch.setattr(cli, "route_a_slices", lambda *_: Slices(train=("a",), held_out=()))
+    (tmp_path / "char_pinyin.tsv").touch()
+    command = count_argv.index("mlime")
+    result = CliRunner().invoke(cli.app, [str(arg) for arg in count_argv[command + 1 :]])
+    assert isinstance(result.exception, CountedError), result.output
+    keys = asked["keys"]
+    assert isinstance(keys, KeyFrontConfig)
+    assert keys.sampling() == KeyFrontConfig(correct_syllables=False).sampling()
+    augmentation = asked["augmentation"]
+    assert getattr(augmentation, "typos", None) is True
+
+
+def test_a_key_stage_needs_the_run_it_warms_up_over(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    monkeypatch.setattr(
+        kernel, "KEYS", {"layers": 2, "distill_weight": 1.0, "correct_syllables": True}
+    )
+    with pytest.raises(RuntimeError, match="stamp INIT_FROM"):
+        kernel.main()
+    monkeypatch.setattr(kernel, "KEYS", None)
+    monkeypatch.setattr(kernel, "KEY_WARM_UP", True)
+    with pytest.raises(RuntimeError, match="stamp KEYS"):
+        kernel.main()

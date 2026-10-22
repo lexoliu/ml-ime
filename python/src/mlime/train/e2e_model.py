@@ -38,6 +38,7 @@ from transformers import BertConfig, BertForMaskedLM
 
 from mlime.train.charlm_model import Block, CharLmConfig, TransformerCharLm
 from mlime.train.charlm_vocab import BOS, CharVocab
+from mlime.train.keys import KeyFrontConfig
 from mlime.train.lexicon import Lexicon
 from mlime.train.model import (
     BertContextTower,
@@ -124,6 +125,13 @@ class E2EConfig(RouteAConfig):
     #: whatever the tower adds -- with everything else frozen: the warm-up a
     #: new tower enters through (S0).
     context_warm_up: bool = False
+    #: The key-level front and CTC head of #216 (#223); None is the span model,
+    #: which every checkpoint before it is.
+    keys: KeyFrontConfig | None = None
+    #: Train only the key front and the CTC head, distilling the parent's
+    #: encoder states, with everything else frozen: the warm-up the key front
+    #: enters through (S1).
+    key_warm_up: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -133,6 +141,20 @@ class E2EConfig(RouteAConfig):
             )
         if self.aux_weight < 0.0:
             raise ValueError(f"aux_weight must not be negative, got {self.aux_weight}")
+        if self.keys is not None:
+            if self.ranking is not None:
+                raise ValueError(
+                    "the ranking loss searches lattice readings; a key-level model has none"
+                )
+            if self.context_warm_up:
+                raise ValueError("a run warms up one new part at a time: the context or the keys")
+            if not self.key_warm_up:
+                raise ValueError(
+                    "a key front enters through its warm-up (S1); the joint stage's "
+                    "transition term (S2) is not built yet"
+                )
+        elif self.key_warm_up:
+            raise ValueError("the key warm-up trains a key front; name one with keys")
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> E2EConfig:
@@ -143,6 +165,8 @@ class E2EConfig(RouteAConfig):
             fields["ranking"] = RankingConfig(**fields["ranking"])
         if fields.get("context") is not None:
             fields["context"] = QwenContextConfig.from_record(fields["context"])
+        if fields.get("keys") is not None:
+            fields["keys"] = KeyFrontConfig.from_record(fields["keys"])
         return cls(**fields)
 
 
@@ -626,8 +650,13 @@ class E2EModel(RouteAModel):
         """The encoder's context gates, then each decoder block's cross gate."""
         return super().gate_parameters() + [layer.gate for layer in self.decoder.gated_layers()]
 
-    def _scored(self, batch: Batch) -> _Scored | None:
+    def _scored(self, batch: Batch, hidden: torch.Tensor | None = None) -> _Scored | None:
         """The scored positions' logits for both heads, ``[P, E]`` apiece.
+
+        *hidden* stands in for the encoder's ``[B, W, H]`` states over the
+        batch's span columns when given -- the key front's states at the span
+        ends, which the S1 gate feeds the parent's decoder; by default the
+        span model's own encoder pass computes them.
 
         One matmul per head against the whole emittable alphabet at the scored
         positions only -- the same tensors route A's loss is computed on, so a
@@ -640,7 +669,8 @@ class E2EModel(RouteAModel):
         """
         decoder = self.decoder
         mark_dynamic(batch)
-        hidden = self.encode(batch)
+        if hidden is None:
+            hidden = self.encode(batch)
         width = batch.targets.shape[1]
         # The spans sit at fill positions 1..n and the sentinel pair frames
         # them, so the decoder's sequence is the batch's width less the two.
@@ -744,7 +774,11 @@ class E2EModel(RouteAModel):
         ``predictions`` maps an argmax back to its emission index. A position
         no span was typed at keeps the floor.
         """
-        scored = self._scored(batch)
+        return self.frame(batch, None)
+
+    def frame(self, batch: Batch, hidden: torch.Tensor | None) -> torch.Tensor:
+        """:meth:`scores`' frame, with the encoder states *hidden* when given (:meth:`_scored`)."""
+        scored = self._scored(batch, hidden)
         width = batch.targets.shape[1]
         ids = batch.candidate_ids[:, 1 : width - 1]
         counts = batch.candidate_counts[:, 1 : width - 1]
