@@ -19,9 +19,23 @@ passed the one before:
    preceding text not spun and the sentence natural. A record on a spun page is
    dropped whole, even when the sentence itself reads well.
 
-The question, the threshold and the prompt were set on 120 hand-labelled mined
-records, which showed the judges the last :data:`CONTEXT_CHARACTERS` characters
-of the context; the judge shows them the same.
+The question and the prompt were set on 120 hand-labelled mined records, which
+showed the judges the last :data:`CONTEXT_CHARACTERS` characters of the context;
+the judge shows them the same. On those records Jev at 0.7 followed by the review
+kept 27, all real, of the 57 real ones. The threshold was then raised to 0.8 on
+the run itself: among the first 1,188 reviews the review model rejected 33% of
+the units Jev put in [0.7, 0.8), 17% of [0.8, 0.9) and 4% of 0.9 and above, and
+the review serves one request at a time, so only units at 0.8 and above are
+kept, every one of them reviewed. On the labels 0.8 followed by the review keeps
+8, all real: the hand labels found 24 of the 25 records in [0.7, 0.8) real, and
+the review kept 19 of them, none of them wrongly.
+
+A unit's Jev verdict is its probability, and :data:`JEV_THRESHOLD` is applied
+whenever a verdict is read (:func:`passes`), never stored: a log written under
+another threshold is decided by the current one when a run resumes, and a unit
+it dropped is dropped whatever later verdicts its log holds. A judged file
+records the threshold it was finished under, and a run at another threshold
+finishes it again from its log.
 
 A record holding two entries is judged once per entry, and keeps the entries
 that pass; it is kept when one does. Every verdict is appended to its mined
@@ -62,7 +76,7 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 JEV_MODEL = "jev-latest"
 
 #: The least probability Jev must give :data:`QUESTION` for a record to go on.
-JEV_THRESHOLD = 0.7
+JEV_THRESHOLD = 0.8
 
 #: Requests in flight at once, to Jev and to the review model.
 JEV_CONCURRENCY = 32
@@ -273,19 +287,58 @@ class Asker[T](Protocol):
     async def ask(self, unit: Unit) -> T: ...
 
 
-def verdict_line(unit: Unit, stage: Stage, keep: bool, **detail: object) -> dict[str, object]:
-    """One line of the verdict log."""
+def verdict_line(
+    unit: Unit, stage: Literal["boundary", "review"], keep: bool, **detail: object
+) -> dict[str, object]:
+    """One line of the verdict log for a rule whose verdict is a yes or a no."""
     return {"id": unit.id, "entry": unit.entry, "stage": stage, "keep": keep, **detail}
+
+
+def jev_line(unit: Unit, answer: JevAnswer, seconds: float) -> dict[str, object]:
+    """One line of the verdict log for Jev, whose verdict is its probability."""
+    return {
+        "id": unit.id,
+        "entry": unit.entry,
+        "stage": "jev",
+        "p": answer.p,
+        "model": answer.model,
+        "seconds": seconds,
+    }
+
+
+def passes(line: Mapping[str, Any]) -> bool:
+    """Whether a verdict lets its unit go on, under the threshold in force now.
+
+    A Jev line is read by its probability alone. Lines written before the
+    threshold moved out of the log also hold the ``keep`` it gave then, which
+    is ignored: the threshold is the run's decision, not the log's.
+    """
+    if line["stage"] == "jev":
+        return bool(line["p"] >= JEV_THRESHOLD)
+    return bool(line["keep"])
+
+
+def deciding(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """A unit's verdicts up to the first that stops it, checked to be in rule order.
+
+    Verdicts after one that stops the unit were given under an earlier, looser
+    threshold and decide nothing now.
+    """
+    for position, line in enumerate(lines):
+        if position >= len(STAGES) or line["stage"] != STAGES[position]:
+            raise JudgeError(f"verdicts out of order for {line['id']} {line['entry']}: {lines}")
+    for position, line in enumerate(lines):
+        if not passes(line):
+            return lines[: position + 1]
+    return lines
 
 
 def next_stage(lines: list[dict[str, Any]]) -> Stage | None:
     """The rule a unit faces next, given its verdicts so far; ``None`` once it is decided."""
-    for position, line in enumerate(lines):
-        if line["stage"] != STAGES[position]:
-            raise JudgeError(f"verdicts out of order for {line['id']} {line['entry']}: {lines}")
+    lines = deciding(lines)
     if not lines:
         return "boundary"
-    if not lines[-1]["keep"] or len(lines) == len(STAGES):
+    if not passes(lines[-1]) or len(lines) == len(STAGES):
         return None
     return STAGES[len(lines)]
 
@@ -609,8 +662,8 @@ def census_of(
         lines = verdicts[unit.key]
         if next_stage(lines) is not None:
             raise JudgeError(f"{unit.key} of file {unit.ordinal:04d} is not decided yet")
-        last = lines[-1]
-        if last["keep"]:
+        last = deciding(lines)[-1]
+        if passes(last):
             census.kept_units += 1
             kept.setdefault(unit.id, []).append(unit.entry)
         elif last["stage"] == "boundary":
@@ -664,7 +717,12 @@ def finish_file(
         layout.judged(ordinal),
         lambda path: path.write_text(
             json.dumps(
-                {"ordinal": ordinal, "census": asdict(census), "entries": entries},
+                {
+                    "ordinal": ordinal,
+                    "jev_threshold": JEV_THRESHOLD,
+                    "census": asdict(census),
+                    "entries": entries,
+                },
                 ensure_ascii=False,
                 indent=2,
             ),
@@ -745,12 +803,30 @@ class FileState:
     verdicts: dict[tuple[str, str], list[dict[str, Any]]]
     log_path: Path
     open_units: int = 0
+    finished: bool = False
 
     def record(self, line: dict[str, object]) -> None:
         """Append one verdict to the log and to memory, before anything acts on it."""
         with self.log_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(line, ensure_ascii=False) + "\n")
         self.verdicts.setdefault((str(line["id"]), str(line["entry"])), []).append(dict(line))
+
+
+def finished_at_threshold(layout: MinedLayout, ordinal: int) -> bool:
+    """Whether a mined file was judged under the threshold in force now."""
+    path = layout.judged(ordinal)
+    if not path.exists():
+        return False
+    threshold = json.loads(path.read_text(encoding="utf-8")).get("jev_threshold")
+    if threshold == JEV_THRESHOLD:
+        return True
+    log.warning(
+        "judging a file again under another Jev threshold",
+        ordinal=ordinal,
+        judged_at=threshold,
+        threshold=JEV_THRESHOLD,
+    )
+    return False
 
 
 async def judge_source(
@@ -769,7 +845,7 @@ async def judge_source(
     jev_queue: asyncio.Queue[Unit] = asyncio.Queue()
     review_queue: asyncio.Queue[Unit | None] = asyncio.Queue()
     for ordinal in layout.mined_ordinals():
-        if layout.judged(ordinal).exists():
+        if finished_at_threshold(layout, ordinal):
             continue
         units, _ = load_units(layout, ordinal)
         if len({unit.key for unit in units}) != len(units):
@@ -811,6 +887,7 @@ async def judge_source(
         state.open_units -= 1
         if state.open_units == 0:
             await asyncio.to_thread(finish_file, layout, state.ordinal, state.units, state.verdicts)
+            state.finished = True
 
     async def jev_worker() -> None:
         while True:
@@ -820,18 +897,9 @@ async def judge_source(
                 return
             asked = time.monotonic()
             answer = await jev.ask(unit)
-            keep = answer.p >= JEV_THRESHOLD
-            states[unit.ordinal].record(
-                verdict_line(
-                    unit,
-                    "jev",
-                    keep,
-                    p=answer.p,
-                    model=answer.model,
-                    seconds=round(time.monotonic() - asked, 3),
-                )
-            )
-            if keep:
+            line = jev_line(unit, answer, round(time.monotonic() - asked, 3))
+            states[unit.ordinal].record(line)
+            if passes(line):
                 review_queue.put_nowait(unit)
             else:
                 await decided(unit)
@@ -867,7 +935,7 @@ async def judge_source(
 
     # A file every unit of which was decided before this run (or by rule 1) finishes here.
     for state in states.values():
-        if state.open_units == 0 and not layout.judged(state.ordinal).exists():
+        if state.open_units == 0 and not state.finished:
             finish_file(layout, state.ordinal, state.units, state.verdicts)
     return write_summary(layout)
 
