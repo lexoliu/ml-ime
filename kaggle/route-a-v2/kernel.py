@@ -19,14 +19,23 @@ count-batches`) and writes what it found to `run-config.json`; every later
 segment reads that file from the previous output. The number has to be fixed
 before the first step because the cosine schedule bends on it, and it has to be
 exact because overshooting quietly starts a third pass.
+
+With `RESCORE_FROM` stamped, the kernel trains nothing: it mounts that
+finished segment as a kernel source and scores the mounted lattices with its
+final checkpoint, the scoring the finishing segment does after its last step.
+That is how a lattice rebuilt by a newer segmenter gets its scores without a
+new run.
 """
 
 import json
 import os
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 INPUTS = Path("/kaggle/input")
@@ -38,6 +47,11 @@ MAX_DEPTH = 4
 
 #: Which segment of the chain this kernel is; stamped per copy at push time.
 SEGMENT = 0
+
+#: The finished segment whose final checkpoint rescores the mounted lattices
+#: instead of training, by its kernel name (`mlime-route-a-v2-s6`), mounted as
+#: a kernel source. Empty for a training segment; stamped at push time.
+RESCORE_FROM = ""
 
 #: Passes over the training shards the whole chain makes.
 EPOCHS = 2
@@ -89,6 +103,8 @@ REQUIREMENTS = (
     "regex",
     "typer",
     "transformers>=5.16",
+    # `mlime.train.run` reads the typo model's path from the table builder.
+    "pypinyin",
 )
 
 
@@ -291,6 +307,104 @@ def emit_argv(checkpoint, lattice, out, char_table, context):
     ]
 
 
+def gpus():
+    """The GPUs this session has, one `nvidia-smi -L` line each."""
+    listing = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, check=True)
+    found = [line for line in listing.stdout.splitlines() if line.startswith("GPU ")]
+    print("\n".join(found), flush=True)
+    if not found:
+        raise RuntimeError("the session has no GPU")
+    return len(found)
+
+
+def scoring_jobs(lattices):
+    """Every `(lattice, context)` pair to score, the longest first.
+
+    A GPU takes the next pair the moment it is free, so starting with the
+    largest lattice keeps the pair that finishes last a short one. Context on
+    costs more than off over the same lattice, so it goes first.
+    """
+    jobs = [(lattice, context) for lattice in lattices for context in (True, False)]
+    return sorted(jobs, key=lambda job: (job[0].stat().st_size, job[1]), reverse=True)
+
+
+def score_lattices(checkpoint, assets, char_table, env, devices):
+    """Score every lattice in *assets* with context on and off, a pair per GPU at a time.
+
+    Each scoring is one process on one GPU, so *devices* of them run at once;
+    a failure stops every GPU from taking another pair.
+    """
+    lattices = sorted(assets.glob("lattice*.jsonl"))
+    if not lattices:
+        raise FileNotFoundError(f"no lattice*.jsonl under {assets}")
+    pending = queue.SimpleQueue()
+    for job in scoring_jobs(lattices):
+        pending.put(job)
+    failed = threading.Event()
+
+    def worker(device):
+        device_env = dict(env, CUDA_VISIBLE_DEVICES=str(device))
+        scored = {}
+        while not failed.is_set():
+            try:
+                lattice, context = pending.get_nowait()
+            except queue.Empty:
+                break
+            name = f"{lattice.stem}-context-{'on' if context else 'off'}"
+            scores = WORKING / f"scores-{name}.jsonl.gz"
+            code, elapsed = run(
+                emit_argv(checkpoint, lattice, scores, char_table, context),
+                device_env,
+                str(WORKING / f"emit-{name}.log"),
+            )
+            if code != 0:
+                failed.set()
+                raise RuntimeError(f"scoring {name} failed; its log is in the kernel output")
+            scored[name] = {
+                "bytes": scores.stat().st_size,
+                "seconds": round(elapsed, 1),
+                "gpu": device,
+            }
+        return scored
+
+    with ThreadPoolExecutor(max_workers=devices) as pool:
+        per_device = list(pool.map(worker, range(devices)))
+    return {name: entry for scored in per_device for name, entry in scored.items()}
+
+
+def finished_run():
+    """`RESCORE_FROM`'s final checkpoint and run summary, from its mounted output."""
+    holder = locate("checkpoint-final.pt")
+    root = next((path for path in (holder, *holder.parents) if path.name == RESCORE_FROM), None)
+    if root is None:
+        raise FileNotFoundError(
+            f"the mounted checkpoint-final.pt is not {RESCORE_FROM}'s; mounts hold {describe()}"
+        )
+    summary = json.loads((root / "run-summary.json").read_text())
+    if summary.get("finished") is not True:
+        raise RuntimeError(f"{RESCORE_FROM} did not finish its run; its summary is {summary}")
+    return holder / "checkpoint-final.pt", summary
+
+
+def rescore(assets, env, devices):
+    """Score the mounted lattices with `RESCORE_FROM`'s final checkpoint."""
+    started = time.monotonic()
+    checkpoint, source = finished_run()
+    scored = score_lattices(checkpoint, assets, assets / "char_pinyin.tsv", env, devices)
+    summary = {
+        "rescored_from": RESCORE_FROM,
+        "checkpoint": str(checkpoint),
+        "step": source["max_steps"],
+        "gpus": devices,
+        "seconds": round(time.monotonic() - started, 1),
+        "scores": scored,
+    }
+    (WORKING / "run-summary.json").write_text(
+        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+    )
+    print(json.dumps(summary, indent=2), flush=True)
+
+
 def run(argv, env, log):
     """Run *argv*, tee its output to *log*, and return (exit code, seconds)."""
     started = time.monotonic()
@@ -354,14 +468,8 @@ def main():
     started = time.monotonic()
     install()
     package_root = importable_package()
-    v1_samples, v1_labels = parquet_mounts(V1_MARKER)
-    rest_samples, rest_labels = parquet_mounts(REST_MARKER)
     assets = locate("char_pinyin.tsv", "lattice.jsonl")
-    stage_data({"samples": (v1_samples, rest_samples), "labels": (v1_labels, rest_labels)})
-    print(
-        subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, check=True).stdout,
-        flush=True,
-    )
+    devices = gpus()
 
     env = dict(os.environ)
     env["PYTHONPATH"] = str(package_root)
@@ -369,6 +477,13 @@ def main():
     env["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
     sys.path.insert(0, str(package_root))
     warm_cache()
+    if RESCORE_FROM:
+        rescore(assets, env, devices)
+        return
+
+    v1_samples, v1_labels = parquet_mounts(V1_MARKER)
+    rest_samples, rest_labels = parquet_mounts(REST_MARKER)
+    stage_data({"samples": (v1_samples, rest_samples), "labels": (v1_labels, rest_labels)})
 
     char_table = assets / "char_pinyin.tsv"
     out = WORKING / "run"
@@ -429,27 +544,12 @@ def main():
         checkpoint = out / "checkpoint-final.pt"
         if not checkpoint.is_file():
             raise RuntimeError("the run finished without writing a final checkpoint")
-        lattices = sorted(assets.glob("lattice*.jsonl"))
-        if not lattices:
-            raise FileNotFoundError(f"no lattice*.jsonl under {assets}")
-        scored = {}
-        for lattice in lattices:
-            for context in (True, False):
-                name = f"{lattice.stem}-context-{'on' if context else 'off'}"
-                scores = WORKING / f"scores-{name}.jsonl.gz"
-                code, elapsed = run(
-                    emit_argv(checkpoint, lattice, scores, char_table, context),
-                    env,
-                    str(WORKING / f"emit-{name}.log"),
-                )
-                if code != 0:
-                    raise RuntimeError(f"scoring {lattice.name} with context {name} failed")
-                scored[name] = {"bytes": scores.stat().st_size, "seconds": round(elapsed, 1)}
-        summary["scores"] = scored
+        summary["scores"] = score_lattices(checkpoint, assets, char_table, env, devices)
         summary["held_out"] = records_of(out / "metrics.jsonl", "summary")[-1]
 
     (WORKING / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
 
 
-main()
+if __name__ == "__main__":
+    main()
