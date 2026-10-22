@@ -26,7 +26,7 @@ from mlime.train.charlm_vocab import CharVocab
 from mlime.train.e2e_model import E2EConfig, E2EModel, RankingConfig, emittable_ids
 from mlime.train.e2e_search import SearchGraphs
 from mlime.train.key_model import KeyE2EModel, key_evaluate, letter_token_ids
-from mlime.train.keys import KeyExample, KeyFrontConfig
+from mlime.train.keys import FillTowerTraining, KeyExample, KeyFrontConfig
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import Distributed, MetricLog, TrainingConfig, evaluate, train
 from mlime.train.model import RouteAConfig
@@ -278,7 +278,7 @@ def build_from(
     context_warm_up: bool,
     keys: KeyFrontConfig | None = None,
     key_warm_up: bool = False,
-    train_fill_tower: bool = False,
+    train_fill_tower: FillTowerTraining | None = None,
 ) -> tuple[E2EModel, Vocabularies]:
     """The model the e2e checkpoint at *source* describes, under this stage's losses.
 
@@ -467,7 +467,7 @@ def e2e(
     tower_graphs: bool = False,
     keys: KeyFrontConfig | None = None,
     key_warm_up: bool = False,
-    train_fill_tower: bool = False,
+    train_fill_tower: FillTowerTraining | None = None,
 ) -> RunResult:
     """Train the end-to-end model over *slices.train*; score held-out both ways.
 
@@ -495,8 +495,9 @@ def e2e(
     (#223), whose examples are typed as keys with their legal alignments;
     *key_warm_up* trains only the front and the head, distilling the parent's
     encoder states (S1). *train_fill_tower* trains the fill tower beside
-    them at the pretrained rate, distilling towards a frozen copy of the
-    parent's (#241). A finished key run is scored by the S1 gate's measure --
+    them at the pretrained rate -- and with ``cross_attention`` its gated
+    context blocks -- distilling towards frozen copies of the parent's
+    (#241). A finished key run is scored by the S1 gate's measure --
     the parent's decoder fed the front's states -- beside the parent's own on
     the same examples.
     """
@@ -532,7 +533,7 @@ def e2e(
         raise ValueError(
             "a key front warms up over a finished run; start the stage with --init-e2e"
         )
-    if train_fill_tower and not key_warm_up:
+    if train_fill_tower is not None and not key_warm_up:
         raise ValueError(
             "--train-fill-tower trains the tower in the key warm-up; add --key-warm-up"
         )
@@ -627,8 +628,8 @@ def e2e(
             )
         model.freeze_for_key_warm_up()
         log.info(
-            "key warm-up: the key front and the CTC head train"
-            + (", and the fill tower beside a frozen copy" if train_fill_tower else " alone"),
+            "key warm-up: the key front and the CTC head train",
+            beside=list(model.trained_parts()),
             trainable=sum(p.numel() for p in model.parameters() if p.requires_grad),
         )
 

@@ -40,11 +40,11 @@ stage reads keystrokes through a key front with a per-key CTC head (#223):
 the first segment builds the front over the finished run's weights, and
 `KEY_WARM_UP` trains only the front and the head, distilling that run's
 encoder states, which is S1; `TRAIN_FILL_TOWER` trains the fill tower in S1
-as well, against a frozen copy of that run's (#241). A key-level run is
-scored by the trainer's held-out gate -- the parent's decoder fed the front's
-states -- not by the lattice search, which does not decode it. A finished run
-is told apart from the run it started from by the stage its run-config
-records.
+as well, and with its `cross_attention` the tower's gated context blocks,
+against frozen copies of that run's (#241). A key-level run is scored by the
+trainer's held-out gate -- the parent's decoder fed the front's states -- not
+by the lattice search, which does not decode it. A finished run is told apart
+from the run it started from by the stage its run-config records.
 
 A leg measures itself while it trains: `GpuSampler` and `HostSampler` log the
 cards, and the trainers' threads and the host's memory, to `gpu.csv` and
@@ -250,7 +250,9 @@ KEY_WARM_UP = False
 
 #: Train the fill tower too in the key warm-up, at the pretrained rate, its
 #: distillation targets those of a frozen copy of `INIT_FROM`'s tower (#241).
-TRAIN_FILL_TOWER = False
+#: None leaves it frozen; `{"cross_attention": True}` trains its gated context
+#: blocks beside it, against a frozen copy of those too.
+TRAIN_FILL_TOWER = None
 
 #: The (pretrained, new) learning rates; None keeps `mlime train e2e`'s.
 LEARNING_RATES = None
@@ -622,7 +624,7 @@ def stage_of(config):
         "context_warm_up": config.get("context_warm_up", False),
         "keys": config.get("keys"),
         "key_warm_up": config.get("key_warm_up", False),
-        "train_fill_tower": config.get("train_fill_tower", False),
+        "train_fill_tower": config.get("train_fill_tower"),
     }
 
 
@@ -667,8 +669,10 @@ def key_training_argv():
     ]
     if KEY_WARM_UP:
         argv.append("--key-warm-up")
-    if TRAIN_FILL_TOWER:
+    if TRAIN_FILL_TOWER is not None:
         argv.append("--train-fill-tower")
+        if TRAIN_FILL_TOWER["cross_attention"]:
+            argv.append("--train-cross-attention")
     return argv
 
 
@@ -1096,7 +1100,7 @@ def main():
         raise RuntimeError("a key front is built over a finished run; stamp INIT_FROM")
     if KEY_WARM_UP and KEYS is None:
         raise RuntimeError("the key warm-up trains a key front; stamp KEYS")
-    if TRAIN_FILL_TOWER and not KEY_WARM_UP:
+    if TRAIN_FILL_TOWER is not None and not KEY_WARM_UP:
         raise RuntimeError("the fill tower trains in the key warm-up; stamp KEY_WARM_UP")
     install()
     packages = package_root()

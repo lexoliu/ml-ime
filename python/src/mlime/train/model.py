@@ -355,6 +355,16 @@ def mark_dynamic(batch: Batch) -> None:
     torch._dynamo.maybe_mark_dynamic(batch.span_letters, (0, 1, 2))
 
 
+def context_blocks(blocks: nn.ModuleList) -> list[ContextCrossAttention]:
+    """The gated context blocks of a fill tower, narrowed out of their untyped module list."""
+    layers = []
+    for layer in blocks:
+        if not isinstance(layer, ContextCrossAttention):
+            raise TypeError(f"the cross-attention list holds a {type(layer).__name__}")
+        layers.append(layer)
+    return layers
+
+
 class RouteAModel(nn.Module):
     """The fill tower, the context tower, and the gates between them.
 
@@ -508,12 +518,7 @@ class RouteAModel(nn.Module):
 
     def gated_layers(self) -> list[ContextCrossAttention]:
         """The cross-attention layers, narrowed out of the untyped module list."""
-        layers = []
-        for layer in self.cross_attention:
-            if not isinstance(layer, ContextCrossAttention):
-                raise TypeError(f"the cross-attention list holds a {type(layer).__name__}")
-            layers.append(layer)
-        return layers
+        return context_blocks(self.cross_attention)
 
     def gate_parameters(self) -> list[nn.Parameter]:
         """Each context gate the model learns, in the order :meth:`gates` reports them."""
@@ -589,6 +594,7 @@ class RouteAModel(nn.Module):
         """The fill tower over the typed spans, its top layers reading *memory*."""
         return self.fill_pass(
             self.fill,
+            self.cross_attention,
             self._fill_inputs(batch, self.fill),
             batch.attention_mask,
             memory,
@@ -599,6 +605,7 @@ class RouteAModel(nn.Module):
     def fill_pass(
         self,
         tower: BertModel,
+        blocks: nn.ModuleList,
         inputs: torch.Tensor,
         attention_mask: torch.Tensor,
         memory: ContextMemory | None,
@@ -611,8 +618,9 @@ class RouteAModel(nn.Module):
         reads context row ``context_rows[i]``, and *context_kept* ``[C]`` says
         which contexts survived the dropout. What fills the positions is the
         caller's: the typed spans (:meth:`encode_fill`), or a key-level front.
-        *tower* is the model's own ``fill``, or a frozen copy of it that a
-        key-level warm-up keeps as its teacher while ``fill`` trains.
+        *tower* and its gated context *blocks* are the model's own ``fill`` and
+        ``cross_attention``, or frozen copies of them that a key-level warm-up
+        keeps as its teacher while the originals train.
         """
         embeddings: torch.Tensor = tower.embeddings(inputs_embeds=inputs)
         # A 4D mask early-exits ``_create_attention_masks`` before its padding
@@ -628,7 +636,7 @@ class RouteAModel(nn.Module):
             encoder_hidden_states=None,
             past_key_values=None,
         )
-        gated = self.gated_layers()
+        gated = context_blocks(blocks)
         has_context = context_kept[context_rows]
         gated_from = len(tower.encoder.layer) - len(gated)
         hidden = embeddings
