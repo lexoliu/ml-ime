@@ -1667,12 +1667,63 @@ def eval_typo_twin(
     typer.echo(typo_twin(eval_set, out, seed, table, syllable_path, lattice))
 
 
+@eval_app.command("idiom-draw")
+def eval_idiom_draw(
+    samples: Path = typer.Option(..., "--samples", help="The ingested corpus's samples directory"),
+    sources: list[str] = typer.Option(
+        ..., "--source", help="A source whose samples shards make the pool; repeatable"
+    ),
+    entries: Path = typer.Option(..., "--entries", help="#215's entry table (entries-215.tsv)"),
+    knowledge_path: Path = typer.Option(
+        ..., "--knowledge", help="The knowledge lexicon (knowledge.tsv)"
+    ),
+    emittable: Path = typer.Option(..., "--emittable", help="The emittable characters"),
+    ordinary_cache: Path = typer.Option(
+        ..., "--ordinary-cache", help="Where jieba's pinned dictionary is kept"
+    ),
+    eval3: Path = typer.Option(..., "--eval3", help="eval3, whose idioms set the frequencies"),
+    against: list[Path] = typer.Option(
+        ...,
+        "--against",
+        help="An evaluation or held-out file the draw must not overlap; repeatable",
+    ),
+    strata: int = typer.Option(10, "--strata", help="Strata of eval3's idiom frequencies"),
+    size: int = typer.Option(..., "--size", help="Idioms to draw, one sentence each"),
+    seed: int = typer.Option(..., "--seed", help="Seed of the idiom and sentence orders"),
+    out: Path = typer.Option(..., "--out", help="A fresh root for the candidate set"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Draw #243's idioms at eval3's run3 frequencies, one sentence each, for the judge.
+
+    Then `mlime corpus judge --input candidates --data-dir <out>` judges them.
+    """
+    configure(verbose)
+    from mlime.data import idiom_set, judge, knowledge
+
+    ordinary = knowledge.read_ordinary_vocabulary(
+        knowledge.fetch_ordinary_vocabulary(ordinary_cache)
+    )
+    inputs = idiom_set.Inputs(
+        table=idiom_set.read_table(entries),
+        knowledge_idioms=idiom_set.read_knowledge_idioms(knowledge_path),
+        emittable=frozenset(emittable.read_text(encoding="utf-8").split()),
+        eval_texts=[record.text for record in idiom_set.read_records(eval3)],
+        collisions=idiom_set.collisions_of(against),
+        lexicon=judge.BoundaryLexicon.load(entries, ordinary),
+    )
+    pool = idiom_set.read_pool(samples, sources)
+    frame, census = idiom_set.draw(pool, inputs, strata, size, seed)
+    idiom_set.write_draw(out, frame, census)
+    typer.echo(json.dumps(census.as_dict(), ensure_ascii=False, indent=2))
+
+
 @eval_app.command("idiom-set")
 def eval_idiom_set(
-    mined: Path = typer.Option(
-        ...,
-        "--mined",
-        help="The ingestion's fineweb2-mined directory, with unjudged/ and judge/",
+    judged: Path = typer.Option(
+        ..., "--judged", help="The root the judge read, every file of it judged"
+    ),
+    layout: Literal["mined", "candidates"] = typer.Option(
+        "candidates", "--input", help="How the judge read it, as `mlime corpus judge --input`"
     ),
     entries: Path = typer.Option(..., "--entries", help="#215's entry table (entries-215.tsv)"),
     against: list[Path] = typer.Option(
@@ -1683,16 +1734,20 @@ def eval_idiom_set(
     out: Path = typer.Option(..., "--out", help="A fresh data root for the selection"),
     verbose: bool = VERBOSE,
 ) -> None:
-    """Draw #243's idiom selection from the judged mined records, as samples to annotate.
+    """Build #243's idiom selection from what the judge kept, as samples to annotate.
 
     Then `ime-cli g2p annotate --data-dir <out>` and `ime-cli export eval-set
     --data-dir <out> --typing abbreviated` make it an evaluation set, the way
     eval3's abbreviated twin was made.
     """
     configure(verbose)
+    from mlime.data import judge
     from mlime.data.idiom_set import build
 
-    census = build(mined, entries, against, out)
+    candidates: judge.Candidates = (
+        judge.MinedLayout(judged) if layout == "mined" else judge.CandidateSet(judged)
+    )
+    census = build(candidates, entries, against, out)
     typer.echo(json.dumps(census.as_dict(), ensure_ascii=False, indent=2))
 
 
