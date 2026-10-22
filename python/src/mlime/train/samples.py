@@ -183,11 +183,25 @@ class BuildCounts:
     unknown_span: int = 0
     unemittable_character: int = 0
     target_not_admitted: int = 0
+    #: Key-level examples whose gold sentence the legality automaton rejects
+    #: over the keys typed for it: a defect in the data or the augmentation,
+    #: never trained on (#216 §3), and zero on clean data.
+    illegal_gold: int = 0
+    #: Key-level examples with more keys than the fill tower has positions.
+    keys_too_long: int = 0
     #: Label positions the arbitration table rewrote. Positions, not sentences:
     #: one sentence can carry several, and an arbitrated sentence still lands
     #: under whichever outcome it reaches. So this one is not an outcome and is
     #: kept out of :attr:`seen`, which counts samples.
     reading_arbitrated: int = field(default=0, metadata={"outcome": False})
+    #: Key-level sentences the noise model's per-sentence coin corrupted, and
+    #: the edits it placed: the share the coin draws is ``per_sentence``.
+    typo_sentences: int = field(default=0, metadata={"outcome": False})
+    typo_edits: int = field(default=0, metadata={"outcome": False})
+    #: Edits redrawn because the corrections could not read the span back, and
+    #: edits given up after every redraw failed.
+    typo_edits_redrawn: int = field(default=0, metadata={"outcome": False})
+    typo_edits_dropped: int = field(default=0, metadata={"outcome": False})
 
     @property
     def seen(self) -> int:
@@ -222,6 +236,10 @@ class TrainingExample:
 
     def __len__(self) -> int:
         return len(self.spans)
+
+    def fill_width(self) -> int:
+        """The fill-tower positions this example pads a batch to: its spans and the sentinels."""
+        return len(self.spans) + 2
 
 
 class SampleBuilder:
@@ -271,6 +289,39 @@ class SampleBuilder:
         self, sample: Sample, syllables: Sequence[str] | None, epoch: int
     ) -> TrainingExample | None:
         """The example for *sample* at *epoch*, or ``None`` with a counter raised."""
+        settled = self.settle(sample, syllables)
+        if settled is None:
+            return None
+        readings, targets = settled
+        rng = example_rng(self.seed, epoch, sample.id)
+        spans = type_syllables(readings, rng, self.augmentation)
+        if self.noise is not None:
+            # The styles choose *which* keys the typist meant to press and the
+            # noise model then slips them -- corrupting before the abbreviation
+            # would let the initial of a typoed syllable erase the slip.
+            spans = self.noise.maybe_corrupt(spans, rng).spans
+        if not self.candidates.admits_all(spans, targets):
+            self.counts.target_not_admitted += 1
+            return None
+        self.counts.kept += 1
+        return TrainingExample(
+            id=sample.id,
+            spans=spans,
+            span_ids=tuple(self.spans.id_or_unknown(span) for span in spans),
+            targets=targets,
+            context=sample.context,
+        )
+
+    def settle(
+        self, sample: Sample, syllables: Sequence[str] | None
+    ) -> tuple[tuple[str, ...], tuple[int, ...]] | None:
+        """*sample*'s settled readings and emission targets, or ``None`` with a counter raised.
+
+        Everything about an example that does not depend on how it is typed:
+        the label is there, the text is all Han and as long as its label, every
+        reading settles to a span the inventory knows, and every character is
+        emittable. Typing the readings is the caller's.
+        """
         if syllables is None:
             self.counts.unlabelled += 1
             return None
@@ -300,25 +351,7 @@ class SampleBuilder:
         if targets is None:
             self.counts.unemittable_character += 1
             return None
-
-        rng = example_rng(self.seed, epoch, sample.id)
-        spans = type_syllables(tuple(readings), rng, self.augmentation)
-        if self.noise is not None:
-            # The styles choose *which* keys the typist meant to press and the
-            # noise model then slips them -- corrupting before the abbreviation
-            # would let the initial of a typoed syllable erase the slip.
-            spans = self.noise.maybe_corrupt(spans, rng).spans
-        if not self.candidates.admits_all(spans, targets):
-            self.counts.target_not_admitted += 1
-            return None
-        self.counts.kept += 1
-        return TrainingExample(
-            id=sample.id,
-            spans=spans,
-            span_ids=tuple(self.spans.id_or_unknown(span) for span in spans),
-            targets=targets,
-            context=sample.context,
-        )
+        return tuple(readings), targets
 
 
 def read_pair(
@@ -928,7 +961,7 @@ class BudgetPacker:
 
 def example_shape(example: TrainingExample, max_context_tokens: int) -> tuple[int, int]:
     """The fill and context widths *example* pads a batch to, sentinels included."""
-    return len(example) + 2, _context_width(example, max_context_tokens)
+    return example.fill_width(), _context_width(example, max_context_tokens)
 
 
 def _context_width(example: TrainingExample, max_context_tokens: int) -> int:
