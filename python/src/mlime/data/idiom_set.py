@@ -36,7 +36,10 @@ only them.
 **The set** (:func:`build`). Once the judge has finished every file of both
 rounds, each idiom
 contributes the record it kept, checked against evaluation once more, to a
-samples shard ``ime-cli g2p annotate`` reads; the annotation and ``ime-cli
+samples shard ``ime-cli g2p annotate`` reads. The top-up's yield is a guess, so
+the strata still come out over or under eval3's proportions; the set is
+trimmed, each stratum in a seeded order, to the largest size it reaches in
+them (:func:`trim`). The annotation and ``ime-cli
 export eval-set --typing abbreviated`` make it a set the way eval3's
 abbreviated twin was made.
 
@@ -65,7 +68,7 @@ held-out file the ingestion was guarded with, each after ``--against``::
     mlime corpus judge --input candidates --data-dir data/idiom-select-243/pool \\
         --entries data/corpus-225/inputs/entries-215.tsv \\
         --ordinary-cache data/corpus-225/.knowledge-cache
-    mlime eval idiom-set --judged data/idiom-select-243/pool \\
+    mlime eval idiom-set --judged data/idiom-select-243/pool --match-strata \\
         --entries data/corpus-225/inputs/entries-215.tsv <against> --out <root>
     ime-cli g2p annotate --data-dir <root>
     ime-cli export eval-set --data-dir <root> --out <root>/idioms-abbreviated.jsonl \\
@@ -223,6 +226,18 @@ class Strata:
         lowers = (1, *cuts)
         targets = Counter(bisect_right(lowers, value) - 1 for value in values)
         return cls(lowers=lowers, targets=tuple(targets[index] for index in range(len(lowers))))
+
+    @classmethod
+    def of_census(cls, strata: Sequence[Mapping[str, Any]]) -> Strata:
+        """The strata a draw census records, each with its ``lower``, ``upper`` and ``eval3``."""
+        ordered = sorted(strata, key=lambda stratum: int(stratum["stratum"]))
+        if [int(stratum["stratum"]) for stratum in ordered] != list(range(len(ordered))):
+            raise SelectionError("the draw census does not number its strata from zero")
+        uppers = [stratum["upper"] for stratum in ordered]
+        lowers = tuple(int(stratum["lower"]) for stratum in ordered)
+        if not ordered or uppers != [*lowers[1:], None]:
+            raise SelectionError("the draw census's strata do not tile the run3 counts")
+        return cls(lowers=lowers, targets=tuple(int(stratum["eval3"]) for stratum in ordered))
 
     def __len__(self) -> int:
         return len(self.lowers)
@@ -980,6 +995,10 @@ class Census:
     kept_idiom_units: int = 0
     idioms: int = 0
     dropped: Counter[str] = field(default_factory=Counter)
+    #: Records the trim to eval3's proportions took out; see :func:`trim`.
+    trimmed: int = 0
+    #: Per stratum, the records selected and the ones the trim kept, when trimmed.
+    strata: list[dict[str, Any]] = field(default_factory=list)
     records: int = 0
     sources: Counter[str] = field(default_factory=Counter)
     entry_lengths: Counter[int] = field(default_factory=Counter)
@@ -1006,7 +1025,6 @@ def select(
     """
     census = Census(kept_units=units.height)
     category = dict(zip(entries["entry"], entries["category"], strict=True))
-    occurrences = dict(zip(entries["entry"], entries["occurrences"], strict=True))
 
     candidates: dict[str, list[dict[str, Any]]] = {}
     for unit in units.sort("id", "entry").iter_rows(named=True):
@@ -1041,17 +1059,65 @@ def select(
             continue
         taken_ids.add(pick["id"])
         taken_texts.add(pick["text"])
-        census.entry_lengths[len(entry)] += 1
-        census.run3_occurrences[int(occurrences[entry])] += 1
         chosen.append({column: pick[column] for column in SAMPLE_COLUMNS} | {"entry": entry})
-    census.records = len(chosen)
     if not chosen:
         raise SelectionError("no kept idiom record survived the collision checks")
     frame = pl.DataFrame(
         chosen, schema={**{column: pl.String for column in SAMPLE_COLUMNS}, "entry": pl.String}
     )
-    census.sources = Counter(frame["source"].to_list())
     return frame, census
+
+
+@dataclass(frozen=True)
+class Proportions:
+    """The strata a set is held to, and the seed its trim draws with."""
+
+    strata: Strata
+    seed: int
+
+    @classmethod
+    def of_draw(cls, root: Path) -> Proportions:
+        """The strata and seed of the draw under *root*, from its census."""
+        path = root / DRAW_CENSUS
+        if not path.exists():
+            raise SelectionError(f"{root} holds no draw census; only a stratified draw has strata")
+        drawn = json.loads(path.read_text(encoding="utf-8"))
+        return cls(strata=Strata.of_census(drawn["strata"]), seed=int(drawn["seed"]))
+
+
+def trim(
+    frame: pl.DataFrame, occurrences: Mapping[str, int], proportions: Proportions, census: Census
+) -> pl.DataFrame:
+    """The largest part of *frame* in eval3's proportions, recorded in *census*.
+
+    The judge keeps rare idioms less often and a top-up's yield is a guess, so
+    the strata come out of the judge over or under eval3's proportions. The
+    size is the largest the strata's records reach in those proportions; each
+    stratum keeps its quota of records in a seeded order of its idioms.
+    """
+    strata = proportions.strata
+    groups: list[list[str]] = [[] for _ in range(len(strata))]
+    for entry in sorted(frame["entry"].to_list()):
+        groups[strata.index(int(occurrences[entry]))].append(entry)
+    quotas = strata.allocate(strata.largest_size([len(group) for group in groups]))
+    keep: set[str] = set()
+    census.strata = []
+    for index, group in enumerate(groups):
+        random.Random(f"{proportions.seed}:trim:{index}").shuffle(group)
+        keep.update(group[: quotas[index]])
+        census.strata.append(
+            {
+                "stratum": index,
+                "lower": strata.lowers[index],
+                "upper": strata.upper(index),
+                "eval3": strata.targets[index],
+                "selected": len(group),
+                "kept": quotas[index],
+            }
+        )
+    trimmed = frame.filter(pl.col("entry").is_in(keep))
+    census.trimmed = frame.height - trimmed.height
+    return trimmed
 
 
 def build(
@@ -1059,13 +1125,24 @@ def build(
     entry_table: Path,
     against: Iterable[Path],
     out: Path,
+    proportions: Proportions | None,
 ) -> Census:
-    """Write the set's samples shards, its idiom list and its census under *out*."""
+    """Write the set's samples shards, its idiom list and its census under *out*.
+
+    With *proportions*, the set is trimmed to them (:func:`trim`).
+    """
     units = kept_units(layout)
     entries = pl.read_csv(entry_table, separator="\t", quote_char=None).select(
         "entry", "category", "occurrences"
     )
     frame, census = select(units, entries, collisions_of(against))
+    occurrences = dict(zip(entries["entry"], entries["occurrences"], strict=True))
+    if proportions is not None:
+        frame = trim(frame, occurrences, proportions, census)
+    census.records = frame.height
+    census.sources = Counter(frame["source"].to_list())
+    census.entry_lengths = Counter(len(entry) for entry in frame["entry"])
+    census.run3_occurrences = Counter(int(occurrences[entry]) for entry in frame["entry"])
 
     samples = out / "samples"
     samples.mkdir(parents=True, exist_ok=True)
@@ -1082,6 +1159,7 @@ def build(
         records=census.records,
         idioms=census.idioms,
         dropped=dict(census.dropped),
+        trimmed=census.trimmed,
         out=str(out),
     )
     return census
