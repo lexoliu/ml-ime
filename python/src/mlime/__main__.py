@@ -1623,6 +1623,35 @@ def eval_typo_twin(
     typer.echo(typo_twin(eval_set, out, seed, table, syllable_path, lattice))
 
 
+@eval_app.command("idiom-set")
+def eval_idiom_set(
+    mined: Path = typer.Option(
+        ...,
+        "--mined",
+        help="The ingestion's fineweb2-mined directory, with unjudged/ and judge/",
+    ),
+    entries: Path = typer.Option(..., "--entries", help="#215's entry table (entries-215.tsv)"),
+    against: list[Path] = typer.Option(
+        ...,
+        "--against",
+        help="An evaluation set or pool the selection must not overlap; repeatable",
+    ),
+    out: Path = typer.Option(..., "--out", help="A fresh data root for the selection"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Draw #243's idiom selection from the judged mined records, as samples to annotate.
+
+    Then `ime-cli g2p annotate --data-dir <out>` and `ime-cli export eval-set
+    --data-dir <out> --typing abbreviated` make it an evaluation set, the way
+    eval3's abbreviated twin was made.
+    """
+    configure(verbose)
+    from mlime.data.idiom_set import build
+
+    census = build(mined, entries, against, out)
+    typer.echo(json.dumps(census.as_dict(), ensure_ascii=False, indent=2))
+
+
 @eval_app.command("gui")
 def eval_gui(
     engine: str = typer.Option(..., help="apple, sogou or baidu -- the engine ime-drive ran"),
