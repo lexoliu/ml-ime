@@ -165,8 +165,64 @@ pub const DIALOGUE: SourceSpec = SourceSpec {
     context_units: DOCUMENT_CONTEXT_UNITS,
 };
 
-/// Every source this crate knows, in the order the CLI lists them.
+/// Every source `fetch` and `prepare` know, in the order the CLI lists them.
 pub const SOURCES: [SourceSpec; 6] = [WIKI, NEWS, DIALOGUE, MOEGIRL, DOUYIN, BILIBILI];
+
+/// FineWeb2-HQ's Mandarin: the top decile of FineWeb-2 by quality classifier.
+///
+/// General web prose for S2, read by [`crate::ingest`] one parquet file at a
+/// time rather than fetched whole.
+pub const FINEWEB2_HQ: SourceSpec = SourceSpec {
+    name: "fineweb2-hq",
+    dataset: "epfml/FineWeb2-HQ",
+    cleaning: Cleaning::NONE,
+    unit: SegmentUnit::Sentence,
+    context_units: DOCUMENT_CONTEXT_UNITS,
+};
+
+/// FineWeb-2's Mandarin, from which only the sentences holding an entry run3
+/// never shows are kept, for #215's share of S3.
+pub const FINEWEB2_MINED: SourceSpec = SourceSpec {
+    name: "fineweb2-mined",
+    dataset: "HuggingFaceFW/fineweb-2",
+    cleaning: Cleaning::NONE,
+    unit: SegmentUnit::Sentence,
+    context_units: DOCUMENT_CONTEXT_UNITS,
+};
+
+/// MNBVC's forum boards: a thread is its opening post then its replies.
+///
+/// Sentences rather than turns, because a reply on these boards is often a
+/// long post; the replies above a sentence are what its writer was reading.
+/// Replies quote each other with `@handle`, which is stripped like a
+/// bilibili mention.
+pub const MNBVC_FORUM: SourceSpec = SourceSpec {
+    name: "mnbvc-forum",
+    dataset: "liwu/MNBVC",
+    cleaning: Cleaning {
+        drop_infobox_lines: false,
+        strip_hashtags: true,
+        strip_mentions: true,
+        strip_reply_prefix: true,
+    },
+    unit: SegmentUnit::Sentence,
+    context_units: DOCUMENT_CONTEXT_UNITS,
+};
+
+/// MNBVC's `YYeTs` fan subtitles: one document per subtitle file, a line per turn.
+///
+/// A subtitle line is what one speaker says before the next line, so it is
+/// a turn, and the lines before it are the scene it is said in.
+pub const YYETS: SourceSpec = SourceSpec {
+    name: "yyets",
+    dataset: "liwu/MNBVC",
+    cleaning: Cleaning::NONE,
+    unit: SegmentUnit::Turn,
+    context_units: DOCUMENT_CONTEXT_UNITS,
+};
+
+/// Every source [`crate::ingest`] streams.
+pub const STREAMED: [SourceSpec; 4] = [FINEWEB2_HQ, FINEWEB2_MINED, MNBVC_FORUM, YYETS];
 
 /// One upstream document, untouched apart from being split where upstream split it.
 ///
@@ -269,9 +325,13 @@ mod tests {
 
     #[test]
     fn every_source_has_a_distinct_name() {
-        let mut names: Vec<&str> = SOURCES.iter().map(|source| source.name).collect();
+        let mut names: Vec<&str> = SOURCES
+            .iter()
+            .chain(STREAMED.iter())
+            .map(|source| source.name)
+            .collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), SOURCES.len());
+        assert_eq!(names.len(), SOURCES.len() + STREAMED.len());
     }
 }
