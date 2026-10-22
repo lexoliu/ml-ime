@@ -23,9 +23,14 @@ Three things make it a context tower rather than a language model:
   new.
 - **Frozen, or LoRA.** The tower's own weights never train. With
   :class:`LoraConfig` its attention projections carry low-rank adapters that
-  do; without, it runs under ``no_grad`` -- no autograd graph through 28
+  do; without, it runs under ``no_grad`` -- no autograd graph through its
   layers -- and on CUDA it can be replayed from captured graphs
   (:class:`TowerGraphs`), one launch for the whole forward.
+- **Whole, or cut at a layer.** ``layers`` keeps only the first N decoder
+  blocks (#237): the blocks above are never built, loaded or run, so the
+  cross-attention reads the residual stream after block N and the context
+  costs N blocks. Qwen's final norm still closes the stack, so the rows the
+  blocks read differ from the whole tower's in depth alone.
 
 The context side is tokenised with Qwen's own BPE (:class:`QwenContextTokenizer`)
 and the fill side keeps MacBERT's one character a position.
@@ -88,7 +93,9 @@ class QwenContextConfig:
     and tokenizer for every build, the weights only when a run swaps the tower
     in (a checkpoint carries them after that). ``dtype`` is the tower's own
     precision, outside the training's fp16 autocast: Qwen's activations do not
-    fit fp16's range. ``lora`` None keeps the tower frozen.
+    fit fp16's range. ``lora`` None keeps the tower frozen. ``layers`` is how
+    many of the model's decoder blocks the tower keeps, from the bottom; None
+    keeps every one.
     """
 
     model: str = QWEN_MODEL
@@ -96,12 +103,15 @@ class QwenContextConfig:
     head: str = CONSTANT_HEAD
     dtype: str = "bfloat16"
     lora: LoraConfig | None = None
+    layers: int | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(getattr(torch, self.dtype, None), torch.dtype):
             raise ValueError(f"{self.dtype!r} is not a torch dtype")
         if not self.head:
             raise ValueError("the constant head holds at least one token")
+        if self.layers is not None and self.layers < 1:
+            raise ValueError(f"the tower keeps at least one layer, got {self.layers}")
 
     @property
     def torch_dtype(self) -> torch.dtype:
@@ -306,13 +316,15 @@ def carried_cross_attention(
 class QwenContextTower(ContextTower):
     """Qwen3 reading the context after its constant head, frozen or with LoRA.
 
-    ``model`` is the Qwen3 decoder stack without its LM head; its layers are
+    ``model`` is the Qwen3 decoder stack without its LM head, already cut to
+    the config's ``layers`` when it names a cut (:func:`qwen_config`); its layers are
     run one by one here, as the fill tower's are, so the head's keys and values
     can be handed to each layer as a prefix and the masks built without the
     host checks transformers' own mask builder makes. ``norm`` is the new
-    LayerNorm on the context rows, the only part of the tower that trains in
-    S0. ``graphs``, set by the trainer on a CUDA run that asks for it, replays
-    a frozen tower's forward from captured CUDA graphs.
+    LayerNorm on the context rows, the only part of a frozen tower that trains
+    in S0; an adapted tower trains its adapters beside it. ``graphs``, set by
+    the trainer on a CUDA run that asks for it, replays a frozen tower's
+    forward from captured CUDA graphs.
     """
 
     separate: ClassVar[bool] = True
@@ -394,7 +406,14 @@ class QwenContextTower(ContextTower):
         positions: torch.Tensor,
         cache: _Recorder | _HeadPrefix,
     ) -> torch.Tensor:
-        """Qwen's stack over *ids* with the 4D *mask*, writing to and reading *cache*."""
+        """Qwen's stack over *ids* with the 4D *mask*, writing to and reading *cache*.
+
+        The final norm closes the stack whether or not it was cut: the residual
+        stream carries Qwen's few massive-activation channels from its first
+        blocks on, and the final norm's gains are what tame them, so with it
+        the rows a cut tower hands the context LayerNorm are the kind the whole
+        tower's were and the cut changes their depth alone.
+        """
         model = self.model
         hidden: torch.Tensor = model.embed_tokens(ids)
         rotary = model.rotary_emb(hidden, positions)
@@ -654,18 +673,39 @@ def load_context_tokenizer(config: QwenContextConfig) -> QwenContextTokenizer:
     )
 
 
+def qwen_config(config: QwenContextConfig) -> Any:
+    """The Qwen3 config of the stack *config* names, cut to its ``layers``.
+
+    A cut keeps the bottom ``layers`` blocks, and the per-layer attention
+    kinds with them; asking for more blocks than the model has is an error.
+    """
+    from transformers import AutoConfig
+
+    qwen = AutoConfig.from_pretrained(config.model, revision=config.revision)
+    qwen._attn_implementation = "sdpa"
+    if config.layers is not None:
+        if config.layers > qwen.num_hidden_layers:
+            raise ValueError(
+                f"{config.model} has {qwen.num_hidden_layers} decoder blocks; "
+                f"the tower cannot keep {config.layers}"
+            )
+        qwen.num_hidden_layers = config.layers
+        qwen.layer_types = qwen.layer_types[: config.layers]
+    return qwen
+
+
 def build_tower(config: QwenContextConfig) -> QwenContextTower:
     """The tower *config* names, its shape from Qwen's config and its weights random.
 
     Every build takes the weights from somewhere else: a run that swaps the
     tower in from Qwen's release (:func:`load_pretrained`), and every later
-    build -- a resume, an evaluation -- from the run's own checkpoint.
+    build -- a resume, an evaluation -- from the run's own checkpoint. A cut
+    tower's stack is built cut: the blocks above the cut do not exist.
     """
-    from transformers import AutoConfig, Qwen3Model
+    from transformers import Qwen3Model
 
     tokenizer = load_context_tokenizer(config)
-    qwen = AutoConfig.from_pretrained(config.model, revision=config.revision)
-    qwen._attn_implementation = "sdpa"
+    qwen = qwen_config(config)
     tower = QwenContextTower(Qwen3Model(qwen), tokenizer.head_ids(config.head), config)
     log.info(
         "qwen context tower built",
@@ -673,6 +713,7 @@ def build_tower(config: QwenContextConfig) -> QwenContextTower:
         revision=config.revision,
         head=tower.head_ids.tolist(),
         lora=config.lora is not None,
+        layers=len(tower.model.layers),
     )
     return tower
 
@@ -682,6 +723,8 @@ def load_pretrained(tower: QwenContextTower) -> None:
 
     Only the adapters an adapted tower adds may be left at their
     initialisation; anything else missing or left over is a different model.
+    A cut tower loads the release through its own cut config, so the blocks
+    above the cut are read past and never built.
     """
     from transformers import Qwen3Model
 
@@ -689,6 +732,7 @@ def load_pretrained(tower: QwenContextTower) -> None:
     released = Qwen3Model.from_pretrained(
         config.model,
         revision=config.revision,
+        config=qwen_config(config),
         dtype=config.torch_dtype,
         attn_implementation="sdpa",
     )
