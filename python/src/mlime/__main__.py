@@ -24,7 +24,8 @@ from mlime.data import DataLayout
 from mlime.logging import configure
 
 if TYPE_CHECKING:  # the training modules pull in torch; --help must not
-    from mlime.train.e2e_model import RankingConfig
+    from mlime.train.e2e_model import E2EConfig, RankingConfig
+    from mlime.train.qwen_tower import QwenContextConfig
     from mlime.train.run import RunPaths, Slices
 
 app = typer.Typer(help="ml-ime data pipeline", no_args_is_help=True)
@@ -91,6 +92,28 @@ RANK_NEGATIVES = typer.Option(
     None, help="Negatives each example ranks the gold sentence against (default 8)"
 )
 RANK_WEIGHT = typer.Option(None, help="Weight of the ranking loss inside the total (default 1.0)")
+CONTEXT_TOWER = typer.Option(
+    None,
+    "--context-tower",
+    help="Read the context with this Qwen model (#222), such as Qwen/Qwen3-0.6B-Base; "
+    "omitted, with the base model's own MacBERT tower",
+)
+CONTEXT_REVISION = typer.Option(
+    None,
+    "--context-revision",
+    help="The Qwen model's commit; the pinned Qwen3-0.6B-Base one by default",
+)
+CONTEXT_LORA_RANK = typer.Option(
+    0, "--context-lora-rank", help="LoRA rank on the Qwen tower's attention; 0 keeps it frozen"
+)
+CONTEXT_LORA_ALPHA = typer.Option(
+    16.0, "--context-lora-alpha", help="LoRA alpha, with --context-lora-rank"
+)
+CONTEXT_WARM_UP = typer.Option(
+    False,
+    "--context-warm-up/--no-context-warm-up",
+    help="Train only the context path -- the gated blocks and the tower's additions (S0)",
+)
 
 
 @app.callback()
@@ -436,6 +459,26 @@ def ranking_settings(
     )
 
 
+def context_settings(
+    tower: str | None, revision: str | None, lora_rank: int, lora_alpha: float
+) -> QwenContextConfig | None:
+    """The Qwen context tower's settings from ``--context-*``; None keeps MacBERT's."""
+    from mlime.train.qwen_tower import QWEN_REVISION, LoraConfig, QwenContextConfig
+
+    if tower is None:
+        if revision is not None or lora_rank:
+            raise typer.BadParameter(
+                "--context-revision and --context-lora-rank set the Qwen tower; "
+                "pass --context-tower"
+            )
+        return None
+    return QwenContextConfig(
+        model=tower,
+        revision=QWEN_REVISION if revision is None else revision,
+        lora=LoraConfig(rank=lora_rank, alpha=lora_alpha) if lora_rank else None,
+    )
+
+
 def route_a_slices(
     data_dir: Path, train_shard: list[str], held_out_shard: list[str], max_held_out: int = 4096
 ) -> Slices:
@@ -559,6 +602,16 @@ def train_e2e(
         False,
         "--typos/--no-typos",
         help="Corrupt the typed keystrokes with the shared noise model, per its authored rate",
+    ),
+    context_tower: str | None = CONTEXT_TOWER,
+    context_revision: str | None = CONTEXT_REVISION,
+    context_lora_rank: int = CONTEXT_LORA_RANK,
+    context_lora_alpha: float = CONTEXT_LORA_ALPHA,
+    context_warm_up: bool = CONTEXT_WARM_UP,
+    tower_graphs: bool = typer.Option(
+        False,
+        "--tower-graphs/--no-tower-graphs",
+        help="Replay a frozen Qwen context tower's forward from captured CUDA graphs",
     ),
     max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
     token_budget: int = TOKEN_BUDGET,
@@ -693,6 +746,11 @@ def train_e2e(
             segmenter=segmenter,
             whole_alphabet=whole_alphabet,
             search_graphs=search_graphs,
+            context=context_settings(
+                context_tower, context_revision, context_lora_rank, context_lora_alpha
+            ),
+            context_warm_up=context_warm_up,
+            tower_graphs=tower_graphs,
         )
     except torch.cuda.OutOfMemoryError as error:
         # The peak is recorded even at the crash, and the cache freed before
@@ -796,8 +854,10 @@ def train_count_batches(
         if workers is None:
             raise typer.BadParameter("the cores are not countable here; pass --workers")
     paths = route_a_paths(data_dir, labels, char_table, out.parent)
+    # The batches are packed by characters, so the context tower's tokenizer
+    # does not enter the count: the base model's own stands for every tower.
     census = count_batches(
-        Vocabularies.load(paths.char_table, base_model),
+        Vocabularies.load(paths.char_table, base_model, None),
         paths,
         route_a_slices(data_dir, train_shard, held_out_shard),
         token_budget=token_budget,
@@ -1076,6 +1136,16 @@ def e2e_stamp(
         "--search-graphs/--no-search-graphs",
         help="Replay a ranking stage's search from captured CUDA graphs (SEARCH_GRAPHS)",
     ),
+    context_tower: str | None = CONTEXT_TOWER,
+    context_revision: str | None = CONTEXT_REVISION,
+    context_lora_rank: int = CONTEXT_LORA_RANK,
+    context_lora_alpha: float = CONTEXT_LORA_ALPHA,
+    context_warm_up: bool = CONTEXT_WARM_UP,
+    tower_graphs: bool = typer.Option(
+        False,
+        "--tower-graphs/--no-tower-graphs",
+        help="Replay a frozen Qwen context tower from captured CUDA graphs (TOWER_GRAPHS)",
+    ),
 ) -> None:
     """Write a v2 run's kernel directory: v1's recipe, the run's slug, the v2 sources.
 
@@ -1083,8 +1153,9 @@ def e2e_stamp(
     stager stamps each leg's segment, commit and session into its copy. With
     `--init-from` the run is a stage of that finished v2 run, and the stage's
     options -- the ranking loss, the learning rates, the token budget and the
-    accumulation -- are the only fields of v1's recipe it changes; without it
-    they are refused, since a plain v2 run is v1's recipe exactly.
+    accumulation, the Qwen context tower and its warm-up -- are the only
+    fields of v1's recipe it changes; without it they are refused, since a
+    plain v2 run is v1's recipe exactly.
     """
     from mlime.locate import find_upwards
     from mlime.stamp import E2E_V2_SOURCES, E2EV2Run, E2EV2Stage, stamp_e2e_v2
@@ -1101,7 +1172,10 @@ def e2e_stamp(
         "--new-lr": new_lr,
         "--token-budget": token_budget,
         "--accumulate": accumulate,
+        "--context-tower": context_tower,
+        "--context-warm-up": context_warm_up or None,
     }
+    tower = context_settings(context_tower, context_revision, context_lora_rank, context_lora_alpha)
     stage = None
     if init_from is None:
         given = [option for option, value in recipe_options.items() if value is not None]
@@ -1124,6 +1198,15 @@ def e2e_stamp(
             init_from=init_from,
             ranking=ranking_config,
             learning_rates=None if base_lr is None or new_lr is None else (base_lr, new_lr),
+            context_tower=None
+            if tower is None
+            else {
+                "tower": tower.model,
+                "revision": tower.revision,
+                "lora_rank": context_lora_rank,
+                "lora_alpha": context_lora_alpha,
+            },
+            context_warm_up=context_warm_up,
             **overrides,
         )
     spec = E2EV2Run(
@@ -1134,6 +1217,7 @@ def e2e_stamp(
         train_shards=tuple(train_shard) if train_shard else None,
         stage=stage,
         search_graphs=search_graphs,
+        tower_graphs=tower_graphs,
     )
     recipe = stamp_e2e_v2(source, out, spec)
     typer.echo(f"{out}: {spec.slug}, stamped from {source}")
@@ -1336,6 +1420,7 @@ def eval_e2e(
     configure(verbose)
     from mlime.data.corpus import default_char_table
     from mlime.train.e2e_eval import ambiguity_report, evaluate
+    from mlime.train.qwen_tower import load_context_tokenizer
     from mlime.train.run import build_lexicon_for, load_tokenizer
     from mlime.train.spans import SpanVocab
 
@@ -1345,12 +1430,16 @@ def eval_e2e(
     if slice_ not in ("dev", "test", "all"):
         raise typer.BadParameter("--slice must be dev, test or all")
     spans = SpanVocab.load()
-    tokenizer = load_tokenizer(_e2e_base_model(checkpoint))
+    recorded = _e2e_config(checkpoint)
+    tokenizer = load_tokenizer(recorded.base_model)
     reports = evaluate(
         checkpoint=checkpoint,
         lattice=lattice,
         eval_set=eval_set,
         tokenizer=tokenizer,
+        context_tokenizer=tokenizer
+        if recorded.context is None
+        else load_context_tokenizer(recorded.context),
         lexicon=build_lexicon_for(table, tokenizer, spans),
         spans=spans,
         slice_=slice_,
@@ -1376,15 +1465,17 @@ def eval_e2e(
         out.write_text(rendered + "\n", encoding="utf-8")
 
 
-def _e2e_base_model(checkpoint: Path) -> str:
-    """The base checkpoint an e2e model was built on, read out of its own file."""
+def _e2e_config(checkpoint: Path) -> E2EConfig:
+    """The config an e2e model was built under, read out of its own file."""
     import torch
 
-    state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    from mlime.train.e2e_model import E2EConfig
+
+    state = torch.load(checkpoint, map_location="cpu", weights_only=False, mmap=True)
     record = state.get("e2e")
     if not isinstance(record, dict):
         raise typer.BadParameter(f"{checkpoint} holds no e2e record; it is not an e2e checkpoint")
-    return str(record["base_model"])
+    return E2EConfig.from_record(record)
 
 
 @eval_app.command("typo-twin")

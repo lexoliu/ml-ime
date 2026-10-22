@@ -2,10 +2,12 @@
 //! lattice with the score table `routea_fixtures.py` recorded from
 //! onnxruntime over the exported graphs.
 //!
-//! The fixtures under `tests/fixtures/` are written by
-//! `python/scripts/routea_fixtures.py`; regenerate them with
-//! `uv run --project python python/scripts/routea_fixtures.py
-//! crates/ime-neural/tests/fixtures` from the repository root.
+//! The fixtures are written by `python/scripts/routea_fixtures.py` into
+//! `tests/fixtures/`; regenerate them with `uv run --project python
+//! python/scripts/routea_fixtures.py crates/ime-neural/tests/fixtures` from
+//! the repository root, then publish the graphs and weights with
+//! `python/scripts/publish_fixtures.py`. The tests read the set
+//! `ime_fixtures::route_a` assembles.
 
 use ime_decode::{Candidates, Emission, Emittable, LatticeRecord};
 use ime_neural::{RouteA, SessionShape};
@@ -13,7 +15,7 @@ use ime_pinyin::{Lexicon, SegmentLattice, SegmentOptions, SyllableTable};
 use ort::environment::Environment;
 use serde::Deserialize;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::OnceLock;
 
 /// The test binary's ONNX Runtime environment. ONNX Runtime allows one
@@ -28,9 +30,9 @@ fn environment() -> &'static Environment {
     })
 }
 
-/// `tests/fixtures/` beside this crate.
-fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+/// The assembled route A fixture set.
+fn fixture_dir() -> &'static Path {
+    ime_fixtures::route_a()
 }
 
 /// The full lexicon, the one `emit-lattice` and the decoder build candidate
@@ -42,7 +44,7 @@ fn lexicon() -> Lexicon {
 /// The emittable set the lattice was written with.
 fn emittable(dir: &Path, lexicon: &Lexicon) -> Emittable {
     let source = fs::read_to_string(dir.join("emittable.txt"))
-        .expect("emittable.txt is committed with the fixtures");
+        .expect("emittable.txt is assembled with the fixtures");
     Emittable::parse(&source, lexicon).expect("the emittable set parses")
 }
 
@@ -50,7 +52,7 @@ fn emittable(dir: &Path, lexicon: &Lexicon) -> Emittable {
 /// it.
 fn lattice(dir: &Path) -> Vec<LatticeRecord> {
     fs::read_to_string(dir.join("lattice.jsonl"))
-        .expect("lattice.jsonl is committed with the fixtures")
+        .expect("lattice.jsonl is assembled with the fixtures")
         .lines()
         .map(|line| serde_json::from_str(line).expect("a lattice record parses"))
         .collect()
@@ -73,7 +75,7 @@ struct Expected {
 fn expected(dir: &Path) -> Vec<Expected> {
     serde_json::from_str(
         &fs::read_to_string(dir.join("expected.json"))
-            .expect("expected.json is committed with the fixture"),
+            .expect("expected.json is assembled with the fixture"),
     )
     .expect("expected.json parses")
 }
@@ -168,9 +170,9 @@ const INT8_ATOL: f32 = 0.05;
 fn the_exported_towers_reproduce_the_recorded_tables() {
     let dir = fixture_dir();
     let lexicon = lexicon();
-    let emittable = emittable(&dir, &lexicon);
-    let records = lattice(&dir);
-    let expected = expected(&dir);
+    let emittable = emittable(dir, &lexicon);
+    let records = lattice(dir);
+    let expected = expected(dir);
     for record in &records {
         rebuild(record, &lexicon, &emittable);
     }
@@ -215,9 +217,9 @@ fn the_exported_towers_reproduce_the_recorded_tables() {
 fn scored_attaches_the_table_to_the_lattice() {
     let dir = fixture_dir();
     let lexicon = lexicon();
-    let emittable = emittable(&dir, &lexicon);
-    let records = lattice(&dir);
-    let expected = expected(&dir);
+    let emittable = emittable(dir, &lexicon);
+    let records = lattice(dir);
+    let expected = expected(dir);
     let model = RouteA::open(environment(), &dir.join("fp32"), SessionShape::default())
         .expect("the fixture opens");
     let floor = -30.0f32;

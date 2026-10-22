@@ -2735,7 +2735,7 @@ mod tests {
 
     #[test]
     fn select_on_dev_resumes_each_pass_on_its_own_file() {
-        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ime-lm/tests/fixtures");
+        let fixtures = ime_fixtures::charlm();
         let lexicon =
             fs::read_to_string(fixtures.join("char_pinyin.tsv")).expect("the table reads");
         // The fixture lexicon covers eight syllables, and a record fails to
@@ -2941,7 +2941,7 @@ mod tests {
 
     #[test]
     fn the_character_model_reads_the_context_only_in_a_context_on_run() {
-        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ime-lm/tests/fixtures");
+        let fixtures = ime_fixtures::charlm();
         let lexicon =
             fs::read_to_string(fixtures.join("char_pinyin.tsv")).expect("the table reads");
         // The fixture lexicon's `ni`, `zai` and `wo` segment one way each.

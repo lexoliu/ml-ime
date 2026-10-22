@@ -34,12 +34,14 @@ from typing import Any, ClassVar
 
 import torch
 from torch import nn
-from transformers import BertConfig, BertForMaskedLM, BertModel
+from transformers import BertConfig, BertForMaskedLM
 
 from mlime.train.charlm_model import Block, CharLmConfig, TransformerCharLm
 from mlime.train.charlm_vocab import BOS, CharVocab
 from mlime.train.lexicon import Lexicon
 from mlime.train.model import (
+    BertContextTower,
+    ContextTower,
     RouteAConfig,
     RouteAModel,
     RouteAOutput,
@@ -47,6 +49,7 @@ from mlime.train.model import (
     restricted_cross_entropy,
     smoothed_cross_entropy,
 )
+from mlime.train.qwen_tower import QwenContextConfig, build_tower
 from mlime.train.samples import IGNORE_INDEX, Batch
 
 #: Decoder-side parameter name prefixes that train at the higher learning rate,
@@ -114,6 +117,13 @@ class E2EConfig(RouteAConfig):
     #: Normalise the decoder's per-position term over the whole emittable set,
     #: as its path score is, rather than over each span's candidates (#121).
     whole_alphabet: bool = False
+    #: The Qwen tower that reads the context (#222); None is the base model's
+    #: own MacBERT tower, which every checkpoint before it holds.
+    context: QwenContextConfig | None = None
+    #: Train only the context path -- the gated cross-attention blocks and
+    #: whatever the tower adds -- with everything else frozen: the warm-up a
+    #: new tower enters through (S0).
+    context_warm_up: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -131,7 +141,21 @@ class E2EConfig(RouteAConfig):
         fields["decoder"] = CharLmConfig(**fields["decoder"])
         if fields.get("ranking") is not None:
             fields["ranking"] = RankingConfig(**fields["ranking"])
+        if fields.get("context") is not None:
+            fields["context"] = QwenContextConfig.from_record(fields["context"])
         return cls(**fields)
+
+
+def context_tower(config: E2EConfig, bert_config: BertConfig) -> ContextTower:
+    """The context tower *config* names, randomly initialised: MacBERT's or Qwen's.
+
+    The weights come from a checkpoint, or for a tower swapped in, from
+    Qwen's own release (:func:`mlime.train.qwen_tower.load_pretrained`).
+    """
+    if config.context is None:
+        tower: ContextTower = BertContextTower(bert_config, add_pooling_layer=False)
+        return tower
+    return build_tower(config.context)
 
 
 def emittable_ids(lexicon: Lexicon, vocab: CharVocab) -> torch.Tensor:
@@ -523,7 +547,7 @@ class E2EModel(RouteAModel):
     def __init__(
         self,
         fill: BertForMaskedLM,
-        context: BertModel,
+        context: ContextTower,
         lexicon: Lexicon,
         config: E2EConfig,
         reader: TransformerCharLm,
@@ -551,7 +575,7 @@ class E2EModel(RouteAModel):
         """
         return cls(
             BertForMaskedLM(bert_config),
-            BertModel(bert_config, add_pooling_layer=False),
+            context_tower(config, bert_config),
             lexicon,
             config,
             TransformerCharLm(reader_vocab, config.decoder),
@@ -563,25 +587,40 @@ class E2EModel(RouteAModel):
 
         The towers, the span table, the context gates and the reader all arrive
         trained; only the span-input projection and the decoder's
-        cross-attention are new. The letter encoder trails the group so a
-        checkpoint that predates it resumes with its saved states landing on
-        the parameters they were trained beside.
+        cross-attention are new, and whatever a swapped-in context tower adds
+        (its LayerNorm, its blocks' key and value weights, any adapters). The
+        letter encoder trails the group so a checkpoint that predates it
+        resumes with its saved states landing on the parameters they were
+        trained beside.
         """
         base: list[nn.Parameter] = []
         new: list[nn.Parameter] = []
         letters: list[nn.Parameter] = []
+        added = self.new_context_parameters()
         for name, parameter in self.named_parameters():
             if not parameter.requires_grad:
                 continue
             if name.startswith("letter_encoder"):
                 letters.append(parameter)
                 continue
-            target = new if name.startswith(NEW_PARAMETER_PREFIXES) else base
+            target = new if name.startswith(NEW_PARAMETER_PREFIXES) or name in added else base
             target.append(parameter)
         new += letters
         if not new:
             raise ValueError("no new parameters found; the naming convention has drifted")
         return [{"params": base, "lr": base_lr}, {"params": new, "lr": new_lr}]
+
+    def freeze_for_context_warm_up(self) -> None:
+        """Leave only the context path trainable: the gated blocks and the tower's additions.
+
+        The fill tower, the span tables, the head and the decoder are the
+        previous model's and stay as they are, so the warm-up can only teach
+        the blocks to read the new tower; the tower's own weights stay frozen
+        unless it carries adapters.
+        """
+        added = self.new_context_parameters()
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_(name.startswith("cross_attention.") or name in added)
 
     def gate_parameters(self) -> list[nn.Parameter]:
         """The encoder's context gates, then each decoder block's cross gate."""

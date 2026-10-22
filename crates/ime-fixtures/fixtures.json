@@ -1,0 +1,48 @@
+{
+  "repository": "lexoliu/mlime-test-fixtures",
+  "revision": "57fcaba322d2810cc67c3d56c7e8579ee8cb92c3",
+  "sets": {
+    "charlm": {
+      "committed": "crates/ime-lm/tests/fixtures",
+      "files": {
+        "lstm/charlm.onnx": "67f02e37d4a0b0c251e742544df333abeee48d506514f17db1fc5453083b2ab7",
+        "lstm/charlm.weights": "d55258177b00096d22129ec9b577e22ebc35dad3248bf245085784f20243b01f",
+        "lstm/prefill.onnx": "24bd15346a406c0258b18e6812e44c7ada838ac63ccba9285667a9062b080e3c",
+        "lstm/prefill.weights": "d55258177b00096d22129ec9b577e22ebc35dad3248bf245085784f20243b01f",
+        "lstm-fp16/charlm.onnx": "8299de919da8409ec6acd27c82bdd2d080369da7392151ede832a98873ee7e43",
+        "lstm-fp16/charlm.weights": "fa05e7d6b9cbfebdd83e0cbd243dc053b7d2af76025ed6abcb0239f7ff723cf6",
+        "lstm-fp16/prefill.onnx": "7868fb6666c8e6ba4161612dd4cb70ad26f7665432cb7af915d412373f89c865",
+        "lstm-fp16/prefill.weights": "fa05e7d6b9cbfebdd83e0cbd243dc053b7d2af76025ed6abcb0239f7ff723cf6",
+        "lstm-int8/charlm.onnx": "45fa5a3a78fec3c19f018ba54e7e6e54367b57dac2d2ca255e80cdf61ae05ed1",
+        "lstm-int8/charlm.weights": "7746aec9cba1c2e4d127a1a00360c1bd888f1b9865707d1d5168ffd2a8934ad1",
+        "lstm-int8/prefill.onnx": "4367f8184ad0b055e4f96775bf7a3e8e39fd786890df97326725939ecea81260",
+        "lstm-int8/prefill.weights": "7746aec9cba1c2e4d127a1a00360c1bd888f1b9865707d1d5168ffd2a8934ad1",
+        "transformer/charlm.onnx": "733b0ba9e415fdbd8277148f35d8d46e032cfb803e87e260d062428ea7a55519",
+        "transformer/charlm.weights": "f995021dd4cc2865f579da19f0a6294241760f5da0e32ae6dcc5755844677324",
+        "transformer/prefill.onnx": "253bc7154f31107618157b0f60c2aaa3f99e20eaf7991e005ea36d01dbc8b0cd",
+        "transformer/prefill.weights": "f995021dd4cc2865f579da19f0a6294241760f5da0e32ae6dcc5755844677324",
+        "transformer-fp16/charlm.onnx": "ba0d06f6f8babd844e0c52f55d6054d7482a4452cff6665dfc6199ba8ad9f9d1",
+        "transformer-fp16/charlm.weights": "03248cbdf07c13eba0c9f88a502645507808c593696603f99a5161569a899abf",
+        "transformer-fp16/prefill.onnx": "c062c410fe05db8ea25906abfdcd1ee8d65906b7047416d5c2921b449969e791",
+        "transformer-fp16/prefill.weights": "03248cbdf07c13eba0c9f88a502645507808c593696603f99a5161569a899abf",
+        "transformer-int8/charlm.onnx": "7e6e8a125524b50cd9634422c0b9ab8117e3096b56d29b692487d5d2ba77e665",
+        "transformer-int8/charlm.weights": "4ba493a4f13b3a0abfb4615c06cd67f9b79dc981c9b0707ac4e05ae3326217a8",
+        "transformer-int8/prefill.onnx": "9db080eb08537471405c335c49033892e37cc1e03a227a45b69ca7e9155af855",
+        "transformer-int8/prefill.weights": "4ba493a4f13b3a0abfb4615c06cd67f9b79dc981c9b0707ac4e05ae3326217a8"
+      }
+    },
+    "route-a": {
+      "committed": "crates/ime-neural/tests/fixtures",
+      "files": {
+        "fp32/context.onnx": "feb7f3729e97ba4f09386a75f2e6a6a0451b8f85a398e518ef2adcd37b393db1",
+        "fp32/context.weights": "ab89167e84b107be1661e5744c61329f1c6a0a8e0a0f2da853a9d7e1b83b543f",
+        "fp32/fill.onnx": "217afd6ab297ab0991b8f2ef3ac9a6d0f04b5bb97ca0ba370102b4da61798735",
+        "fp32/fill.weights": "d3b4edf30ae360b753ed5e5ce42a148f33653dc9556ce41e51521a62935a2bc4",
+        "int8/context.onnx": "632f8adae3cb0b1ea6d97d76ee01244c5ba4c4fbf69d344d2f3fb499d0c21d8e",
+        "int8/context.weights": "c0c012f7529dd09593dc73c6e95413dc5f48feac066103c7c99870b07fce0219",
+        "int8/fill.onnx": "b6083734c7c933f5fc580ae6cbd1ab2cbfb18499dc03228e6430c48cb39bb75b",
+        "int8/fill.weights": "ca9ef2affba451d0d324ce042f78012d30daf423ade605f938e3eb0d97029b17"
+      }
+    }
+  }
+}

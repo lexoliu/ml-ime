@@ -260,8 +260,12 @@ def run_both(
     tokens as well as known ones.
     """
     tokenizer = fast_tokenizer(characters[::2])
-    new = Collator(tokenizer, candidates, context_dropout=0.3, max_context_tokens=64, seed=11)
-    old = Collator(tokenizer, candidates, context_dropout=0.3, max_context_tokens=64, seed=11)
+    new = Collator(
+        tokenizer, tokenizer, candidates, context_dropout=0.3, max_context_tokens=64, seed=11
+    )
+    old = Collator(
+        tokenizer, tokenizer, candidates, context_dropout=0.3, max_context_tokens=64, seed=11
+    )
     for group in groups:
         examples = [example for example, _ in group]
         if shared_contexts:
@@ -357,7 +361,9 @@ def test_refusals_are_the_per_position_collations(lexicon: Lexicon, spans: SpanV
     for bad in cases:
         group = [fine, bad]
         with pytest.raises(ValueError) as old:
-            legacy_collate(Collator(tokenizer, candidates), tokenizer, group, [None, None], [0, 1])
+            legacy_collate(
+                Collator(tokenizer, tokenizer, candidates), tokenizer, group, [None, None], [0, 1]
+            )
         with pytest.raises(ValueError) as new:
-            Collator(tokenizer, candidates)(group)
+            Collator(tokenizer, tokenizer, candidates)(group)
         assert str(new.value) == str(old.value)
