@@ -336,12 +336,16 @@ def test_a_key_warm_up_stamps_its_front_over_the_parent_a_flag_names(tmp_path: P
     assert "pass --init-from" in error(refused.output)
 
 
-def test_a_key_warm_up_that_trains_the_tower_stamps_one_switch_more(tmp_path: Path) -> None:
-    """#241: the tower switch is the only line it changes beside S1's own."""
+@pytest.mark.parametrize("cross_attention", [False, True])
+def test_a_key_warm_up_that_trains_the_tower_stamps_one_switch_more(
+    tmp_path: Path, cross_attention: bool
+) -> None:
+    """#241: the tower switch, and what of the fill path it trains, is the only line it adds."""
     out = tmp_path / "tower"
     argv = ["e2e", "stamp", "mlime-e2e-keys-s1-tower", "--out", str(out)]
     stage = ["--init-from", "mlime-e2e-v2-rank-g4", "--keys", "--key-warm-up"]
-    result = CliRunner().invoke(app, [*argv, *stage, "--train-fill-tower"])
+    switches = ["--train-fill-tower", *(["--train-cross-attention"] if cross_attention else [])]
+    result = CliRunner().invoke(app, [*argv, *stage, *switches])
     assert result.exit_code == 0, result.output
     template = (TEMPLATE / "kernel.py").read_text()
     kernel = (out / "kernel.py").read_text()
@@ -352,16 +356,45 @@ def test_a_key_warm_up_that_trains_the_tower_stamps_one_switch_more(tmp_path: Pa
             "INIT_FROM": "mlime-e2e-v2-rank-g4",
             "KEYS": keys,
             "KEY_WARM_UP": True,
-            "TRAIN_FILL_TOWER": True,
+            "TRAIN_FILL_TOWER": {"cross_attention": cross_attention},
             "PROFILE_STEPS": 30,
             "TRACE_STEPS": 3,
         }.items()
     )
+    tower = {"cross_attention": cross_attention}
     with pytest.raises(ValueError, match="stamp KEY_WARM_UP"):
-        E2EV2Stage(init_from="mlime-e2e-v2-rank-g4", keys=keys, train_fill_tower=True)
+        E2EV2Stage(init_from="mlime-e2e-v2-rank-g4", keys=keys, train_fill_tower=tower)
+    with pytest.raises(ValueError, match="a fill tower switch names"):
+        E2EV2Stage(
+            init_from="mlime-e2e-v2-rank-g4",
+            keys=keys,
+            key_warm_up=True,
+            train_fill_tower={"cross_attention": cross_attention, "head": True},
+        )
     refused = CliRunner().invoke(
         app,
-        ["e2e", "stamp", "mlime-e2e-v2-tower", "--out", str(tmp_path / "x"), "--train-fill-tower"],
+        ["e2e", "stamp", "mlime-e2e-v2-tower", "--out", str(tmp_path / "x"), *switches],
     )
     assert refused.exit_code == 2, refused.output
     assert "pass --init-from" in error(refused.output)
+
+
+def test_the_context_blocks_train_only_with_the_tower(tmp_path: Path) -> None:
+    """``--train-cross-attention`` names a part of the tower ``--train-fill-tower`` trains."""
+    refused = CliRunner().invoke(
+        app,
+        [
+            "e2e",
+            "stamp",
+            "mlime-e2e-keys-s1-xattn",
+            "--out",
+            str(tmp_path / "x"),
+            "--init-from",
+            "mlime-e2e-v2-rank-g4",
+            "--keys",
+            "--key-warm-up",
+            "--train-cross-attention",
+        ],
+    )
+    assert refused.exit_code == 2, refused.output
+    assert "pass --train-fill-tower" in error(refused.output)

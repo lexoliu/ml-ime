@@ -499,7 +499,7 @@ def test_a_key_stage_passes_its_front_to_the_count_and_the_trainer(
         kernel, "KEYS", {"layers": 3, "distill_weight": 0.5, "correct_syllables": False}
     )
     monkeypatch.setattr(kernel, "KEY_WARM_UP", True)
-    monkeypatch.setattr(kernel, "TRAIN_FILL_TOWER", True)
+    monkeypatch.setattr(kernel, "TRAIN_FILL_TOWER", {"cross_attention": True})
     monkeypatch.setattr(kernel, "TYPOS", True)
     assert kernel.stage()["keys"] == {
         "layers": 3,
@@ -520,12 +520,13 @@ def test_a_key_stage_passes_its_front_to_the_count_and_the_trainer(
     )
     command = train_argv.index("mlime")
     tail = [str(arg) for arg in train_argv[command + 3 :]]
-    assert kernel.stage()["train_fill_tower"] is True
+    assert kernel.stage()["train_fill_tower"] == {"cross_attention": True}
     for switch in (
         "--keys",
         "--no-correct-syllables",
         "--key-warm-up",
         "--train-fill-tower",
+        "--train-cross-attention",
         "--typos",
     ):
         assert switch in tail, switch
@@ -538,7 +539,12 @@ def test_a_key_stage_passes_its_front_to_the_count_and_the_trainer(
     train.commands["e2e"].make_context("e2e", tail)
 
     count_argv = kernel.count_argv(tmp_path / "char_pinyin.tsv", tmp_path / "counts.json", None)
-    for switch in ("--key-front-layers", "--key-warm-up", "--train-fill-tower"):
+    for switch in (
+        "--key-front-layers",
+        "--key-warm-up",
+        "--train-fill-tower",
+        "--train-cross-attention",
+    ):
         assert switch not in count_argv, switch
     asked: dict[str, object] = {}
 
@@ -577,6 +583,6 @@ def test_a_key_stage_needs_the_run_it_warms_up_over(
     with pytest.raises(RuntimeError, match="stamp KEYS"):
         kernel.main()
     monkeypatch.setattr(kernel, "KEY_WARM_UP", False)
-    monkeypatch.setattr(kernel, "TRAIN_FILL_TOWER", True)
+    monkeypatch.setattr(kernel, "TRAIN_FILL_TOWER", {"cross_attention": False})
     with pytest.raises(RuntimeError, match="stamp KEY_WARM_UP"):
         kernel.main()

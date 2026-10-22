@@ -26,6 +26,7 @@ import pytest
 import torch
 from conftest import CORPUS, READINGS, StubTokenizer
 from test_e2e_model import READER_TINY, TINY
+from torch import nn
 from transformers import BertConfig
 
 from mlime.data.corpus import Sample
@@ -44,6 +45,7 @@ from mlime.train.key_model import (
 )
 from mlime.train.keys import (
     QWERTY_ROWS,
+    FillTowerTraining,
     KeyBatch,
     KeyCollator,
     KeyExample,
@@ -65,6 +67,16 @@ DATA = ROOT / "crates/ime-pinyin/data"
 
 #: The tiny tower has 64 positions; two are the sentinels.
 KEYS = KeyFrontConfig(layers=2, max_keys=62)
+
+#: What S1 trains of the fill path beside the front and the head (#241).
+TOWER = FillTowerTraining()
+CROSS_ATTENTION = FillTowerTraining(cross_attention=True)
+TRAINED_PARTS = [
+    pytest.param(None, id="frozen"),
+    pytest.param(TOWER, id="tower"),
+    pytest.param(CROSS_ATTENTION, id="cross-attention"),
+]
+TRAINED_TOWERS = TRAINED_PARTS[1:]
 
 
 class KeyTokenizer(StubTokenizer):
@@ -99,23 +111,49 @@ def reader_vocab_fixture(lexicon: Lexicon) -> CharVocab:
     return CharVocab(chars=SPECIALS + tuple(lexicon.characters))
 
 
-def key_config(train_fill_tower: bool = False) -> E2EConfig:
-    return E2EConfig(
+def key_config(
+    train_fill_tower: FillTowerTraining | None = None, cross_attention_dropout: float | None = None
+) -> E2EConfig:
+    config = E2EConfig(
         cross_attention_layers=1,
         decoder=READER_TINY,
         keys=KEYS,
         key_warm_up=True,
         train_fill_tower=train_fill_tower,
     )
+    if cross_attention_dropout is None:
+        return config
+    return replace(config, cross_attention_dropout=cross_attention_dropout)
 
 
 def tiny_key_model(
-    lexicon: Lexicon, vocab: CharVocab, train_fill_tower: bool = False, tower: BertConfig = TINY
+    lexicon: Lexicon,
+    vocab: CharVocab,
+    train_fill_tower: FillTowerTraining | None = None,
+    tower: BertConfig = TINY,
+    cross_attention_dropout: float | None = None,
 ) -> KeyE2EModel:
     torch.manual_seed(0)
     return KeyE2EModel.compose(
-        tower, lexicon, key_config(train_fill_tower), len(vocab), emittable_ids(lexicon, vocab)
+        tower,
+        lexicon,
+        key_config(train_fill_tower, cross_attention_dropout),
+        len(vocab),
+        emittable_ids(lexicon, vocab),
     )
+
+
+def open_gates(model: E2EModel, value: float = 0.5) -> None:
+    """Open the fill tower's context gates, as a trained parent's are.
+
+    A fresh block's gate is zero, which multiplies its attention away: the
+    attention's weights would get an exactly zero gradient and the teacher's
+    states would not depend on them at all, so a test of either would pass
+    whatever the blocks did.
+    """
+    with torch.no_grad():
+        for layer in model.gated_layers():
+            layer.gate.fill_(value)
 
 
 def tiny_parent(lexicon: Lexicon, vocab: CharVocab, seed: int) -> E2EModel:
@@ -367,43 +405,66 @@ def test_the_parent_loads_whole_and_seeds_the_letters(
         letter_token_ids({"a": 1})
 
 
-@pytest.mark.parametrize("train_fill_tower", [False, True])
-def test_s1_trains_only_the_front_the_head_and_the_tower_it_names_and_keeps_the_rest_in_eval(
+@pytest.mark.parametrize("train_fill_tower", TRAINED_PARTS)
+def test_s1_trains_only_the_front_the_head_and_the_parts_it_names_and_keeps_the_rest_in_eval(
     vocabularies: Vocabularies,
     spans: SpanVocab,
     lexicon: Lexicon,
     reader_vocab: CharVocab,
-    train_fill_tower: bool,
+    train_fill_tower: FillTowerTraining | None,
 ) -> None:
+    """Exactly the named parts get a gradient -- the parent's a nonzero one -- the copies none.
+
+    The context gates are open, so a trained block's attention has a
+    gradient to get; the decoder's own cross-attention is not the fill
+    tower's and stays frozen whatever trains.
+    """
     model = tiny_key_model(lexicon, reader_vocab, train_fill_tower)
+    open_gates(model)
     model.freeze_for_key_warm_up()
-    trained = (*KEY_PARAMETER_PREFIXES, "head.", *(("fill.",) if train_fill_tower else ()))
+    parts = {
+        None: (),
+        TOWER: ("fill",),
+        CROSS_ATTENTION: ("fill", "cross_attention"),
+    }[train_fill_tower]
+    assert model.trained_parts() == parts
+    trained = (*KEY_PARAMETER_PREFIXES, "head.", *(f"{part}." for part in parts))
     trainable = {name for name, p in model.named_parameters() if p.requires_grad}
     assert trainable == {name for name, _ in model.named_parameters() if name.startswith(trained)}
     assert any(name.startswith("key_front.blocks.") for name in trainable)
     assert "blank.weight" in trainable
-    assert any(name.startswith("fill.encoder.") for name in trainable) == train_fill_tower
-    assert (model.teacher_fill is not None) == train_fill_tower
+    assert any(name.startswith("fill.encoder.") for name in trainable) == ("fill" in parts)
+    crossing = "cross_attention" in parts
+    assert ("cross_attention.0.attention.in_proj_weight" in trainable) == crossing
+    assert not any(name.startswith(("decoder.", "teacher_")) for name in trainable)
+    assert (model.teacher_fill is not None) == ("fill" in parts)
+    assert (model.teacher_cross_attention is not None) == crossing
     model.train()
-    frozen = ["context", "cross_attention", "decoder", "letter_encoder"]
-    if train_fill_tower:
-        frozen.append("teacher_fill")
-        assert all(module.training for module in model.fill.modules())
-    else:
-        frozen.append("fill")
+    frozen = ["context", "decoder", "letter_encoder"]
+    for part in ("fill", "cross_attention"):
+        if part in parts:
+            frozen.append(f"teacher_{part}")
+            assert all(module.training for module in getattr(model, part).modules()), part
+        else:
+            frozen.append(part)
     for name in frozen:
         assert not any(module.training for module in getattr(model, name).modules()), name
     assert model.key_front.training
 
     batch = key_collator(spans, lexicon, dropout=0.3)(build_examples(vocabularies)[:8])
+    assert bool(batch.spans.has_context.any())
     output = model(batch)
     assert output.loss is not None and torch.isfinite(output.loss)
     output.loss.backward()
     for name, parameter in model.named_parameters():
-        if name in trainable:
-            assert parameter.grad is not None, name
-        else:
+        if name not in trainable:
             assert parameter.grad is None, name
+            continue
+        assert parameter.grad is not None, name
+        # A fresh front's blocks sit behind zero output projections, so only
+        # the parent's parts are sure of a gradient that is not zero.
+        if name.startswith(tuple(f"{part}." for part in parts)):
+            assert bool(parameter.grad.any()), name
     for component in (
         "ctc_loss",
         "distill_loss",
@@ -421,17 +482,24 @@ def test_s1_trains_only_the_front_the_head_and_the_tower_it_names_and_keeps_the_
     base = {id(p) for p in groups[0]["params"]}  # type: ignore[attr-defined]
     new = {id(p) for p in groups[1]["params"]}  # type: ignore[attr-defined]
     named = dict(model.named_parameters())
-    assert base == {id(named[name]) for name in trainable if name.startswith(("head.", "fill."))}
+    assert base == {
+        id(named[name]) for name in trainable if not name.startswith(KEY_PARAMETER_PREFIXES)
+    }
+    assert base == {
+        id(named[name])
+        for name in trainable
+        if name.startswith(("head.", *(f"{part}." for part in parts)))
+    }
     assert new == {id(named[name]) for name in trainable if name.startswith(KEY_PARAMETER_PREFIXES)}
 
 
-@pytest.mark.parametrize("train_fill_tower", [False, True])
+@pytest.mark.parametrize("train_fill_tower", TRAINED_PARTS)
 def test_the_s1_loss_falls_on_a_fixed_batch(
     vocabularies: Vocabularies,
     spans: SpanVocab,
     lexicon: Lexicon,
     reader_vocab: CharVocab,
-    train_fill_tower: bool,
+    train_fill_tower: FillTowerTraining | None,
 ) -> None:
     model = tiny_key_model(lexicon, reader_vocab, train_fill_tower)
     model.freeze_for_key_warm_up()
@@ -452,30 +520,50 @@ def test_the_s1_loss_falls_on_a_fixed_batch(
     assert totals[-1] < 0.5 * totals[0]
 
 
-def test_the_teacher_stays_the_parents_tower_while_the_trained_tower_moves(
+@pytest.mark.parametrize("train_fill_tower", TRAINED_TOWERS)
+def test_the_teacher_stays_the_parents_while_the_trained_parts_move(
     vocabularies: Vocabularies,
     spans: SpanVocab,
     lexicon: Lexicon,
     reader_vocab: CharVocab,
     tmp_path: Path,
+    train_fill_tower: FillTowerTraining,
 ) -> None:
-    """The copy is seeded from the parent, gets no gradient and no update, and its states hold.
+    """The copies are seeded from the parent, get no gradient and no update, and their states hold.
 
-    Its states are the parent's own encoder pass over the spans before any
-    step and after many, while the tower the front feeds has moved, and the
-    gate's parent frame is the parent's frame throughout.
+    The teacher's states are the frozen parent's own encoder pass over the
+    spans before any step and after many, bit for bit, while the parts the front
+    feeds have moved, and the gate's parent frame is the parent's frame
+    throughout. The parent's context gates are open, so its states read its
+    blocks; once the student's blocks have moved, the teacher's tower run
+    through them is no longer the parent, so the copy is what holds it.
     """
-    parent = tiny_parent(lexicon, reader_vocab, seed=1).eval()
-    model = tiny_key_model(lexicon, reader_vocab, train_fill_tower=True)
+    parent = tiny_parent(lexicon, reader_vocab, seed=1)
+    open_gates(parent)
+    # Frozen as a parent is: nn.MultiheadAttention takes another kernel when
+    # none of its weights wants a gradient, a rounding apart from the one it
+    # takes otherwise, and the teacher's copies want none.
+    parent.requires_grad_(False).eval()
+    model = tiny_key_model(lexicon, reader_vocab, train_fill_tower)
     model.load_parent(
         parent.state_dict(), tmp_path / "parent.pt", letter_token_ids(KeyTokenizer().get_vocab())
     )
-    teacher = model.teacher_fill
-    assert teacher is not None
-    for name, tensor in parent.fill.state_dict().items():
-        assert torch.equal(teacher.state_dict()[name], tensor), name
+    teachers: list[tuple[nn.Module, nn.Module, nn.Module]] = []
+    assert model.teacher_fill is not None
+    teachers.append((model.teacher_fill, parent.fill, model.fill))
+    if train_fill_tower.cross_attention:
+        assert model.teacher_cross_attention is not None
+        teachers.append(
+            (model.teacher_cross_attention, parent.cross_attention, model.cross_attention)
+        )
+    else:
+        assert model.teacher_cross_attention is None
+    for teacher, held, _ in teachers:
+        for name, tensor in held.state_dict().items():
+            assert torch.equal(teacher.state_dict()[name], tensor), name
     model.freeze_for_key_warm_up()
     batch = key_collator(spans, lexicon)(build_examples(vocabularies)[:8])
+    assert bool(batch.spans.has_context.any())
     with torch.no_grad():
         expected = parent.encode(batch.spans)
         frame = parent.scores(batch.spans)
@@ -486,23 +574,49 @@ def test_the_teacher_stays_the_parents_tower_while_the_trained_tower_moves(
 
     model.train()
     torch.testing.assert_close(teacher_states(), expected, rtol=0, atol=0)
-    before = {name: tensor.clone() for name, tensor in model.fill.state_dict().items()}
+    before = [
+        {name: tensor.clone() for name, tensor in part.state_dict().items()}
+        for _, _, part in teachers
+    ]
     optimiser = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=3e-3)
     for _ in range(10):
         optimiser.zero_grad()
         output = model(batch)
         assert output.loss is not None
         output.loss.backward()
-        assert all(parameter.grad is None for parameter in teacher.parameters())
+        for teacher, _, _ in teachers:
+            assert all(parameter.grad is None for parameter in teacher.parameters())
         optimiser.step()
-    assert teacher.training is False
-    for name, tensor in teacher.state_dict().items():
-        assert torch.equal(tensor, parent.fill.state_dict()[name]), name
-    moved = model.fill.state_dict()
-    assert not torch.equal(
-        moved["encoder.layer.0.attention.self.query.weight"],
-        before["encoder.layer.0.attention.self.query.weight"],
-    )
+    for (teacher, held, part), started in zip(teachers, before, strict=True):
+        assert teacher.training is False
+        for name, tensor in teacher.state_dict().items():
+            assert torch.equal(tensor, held.state_dict()[name]), name
+        moved = [
+            name
+            for name, tensor in part.state_dict().items()
+            if not torch.equal(tensor, started[name])
+        ]
+        assert moved, type(part).__name__
+    if train_fill_tower.cross_attention:
+        block = model.cross_attention[0]
+        assert not torch.equal(
+            block.attention.in_proj_weight, parent.cross_attention[0].attention.in_proj_weight
+        )
+        assert not torch.equal(block.gate, parent.cross_attention[0].gate)
+        with torch.no_grad():
+            spans_ = batch.spans
+            memory = model.encode_context(spans_)
+            tower = model.teacher_tower
+            through_student = model.fill_pass(
+                tower,
+                model.cross_attention,
+                model._fill_inputs(spans_, tower),
+                spans_.attention_mask,
+                memory,
+                spans_.context_rows,
+                spans_.has_context,
+            )
+        assert not torch.allclose(through_student, expected)
     torch.testing.assert_close(teacher_states(), expected, rtol=0, atol=0)
     model.eval()
     torch.testing.assert_close(teacher_states(), expected, rtol=0, atol=0)
@@ -510,29 +624,32 @@ def test_the_teacher_stays_the_parents_tower_while_the_trained_tower_moves(
         torch.testing.assert_close(model.parent_frame(batch), frame, rtol=0, atol=0)
 
 
-def test_the_teacher_loads_as_saved_or_from_a_tower_that_never_trained(
+def test_the_teacher_loads_as_saved_or_from_parts_that_never_trained(
     lexicon: Lexicon, reader_vocab: CharVocab, tmp_path: Path
 ) -> None:
-    """A key checkpoint without a teacher seeds it from its tower; one with a teacher keeps it."""
+    """A checkpoint without a copy of a part seeds it from the part; one with the copy keeps it."""
     frozen = tiny_key_model(lexicon, reader_vocab)
     frozen.load_parent(
         tiny_parent(lexicon, reader_vocab, seed=1).state_dict(),
         tmp_path / "parent.pt",
         letter_token_ids(KeyTokenizer().get_vocab()),
     )
-    tower = tiny_key_model(lexicon, reader_vocab, train_fill_tower=True)
+    tower = tiny_key_model(lexicon, reader_vocab, TOWER)
     tower.load_resumed(frozen.state_dict(), tmp_path / "frozen.pt")
     assert tower.teacher_fill is not None
     for name, tensor in frozen.fill.state_dict().items():
         assert torch.equal(tower.teacher_fill.state_dict()[name], tensor), name
 
+    def moved(state: dict[str, torch.Tensor], prefix: str) -> dict[str, torch.Tensor]:
+        """*state* as a run that trained the part under *prefix* saves it: the part moved."""
+        return {
+            name: tensor + 1.0 if name.startswith(prefix) else tensor
+            for name, tensor in state.items()
+        }
+
     # A run that trained its tower saved the teacher beside it, and resumes it as saved.
-    saved = tower.state_dict()
-    with torch.no_grad():
-        for name in saved:
-            if name.startswith("fill.encoder."):
-                saved[name] = saved[name] + 1.0
-    resumed = tiny_key_model(lexicon, reader_vocab, train_fill_tower=True)
+    saved = moved(tower.state_dict(), "fill.encoder.")
+    resumed = tiny_key_model(lexicon, reader_vocab, TOWER)
     resumed.load_resumed(saved, tmp_path / "tower.pt")
     assert resumed.teacher_fill is not None
     for name, tensor in frozen.fill.state_dict().items():
@@ -543,8 +660,32 @@ def test_the_teacher_loads_as_saved_or_from_a_tower_that_never_trained(
     )
     with pytest.raises(ValueError, match="unexpected"):
         tiny_key_model(lexicon, reader_vocab).load_resumed(saved, tmp_path / "tower.pt")
+
+    # That run never trained its blocks, so they are its parent's, and a run
+    # that trains them seeds their copy from them; its tower's copy loads as saved.
+    crossing = tiny_key_model(lexicon, reader_vocab, CROSS_ATTENTION)
+    crossing.load_resumed(saved, tmp_path / "tower.pt")
+    assert crossing.teacher_fill is not None and crossing.teacher_cross_attention is not None
+    for name, tensor in frozen.fill.state_dict().items():
+        assert torch.equal(crossing.teacher_fill.state_dict()[name], tensor), name
+    for name, tensor in frozen.cross_attention.state_dict().items():
+        assert torch.equal(crossing.teacher_cross_attention.state_dict()[name], tensor), name
+
+    # A run that trained its blocks saved their copy too, and resumes both as saved.
+    saved = moved(crossing.state_dict(), "cross_attention.")
+    resumed = tiny_key_model(lexicon, reader_vocab, CROSS_ATTENTION)
+    resumed.load_resumed(saved, tmp_path / "cross.pt")
+    assert resumed.teacher_cross_attention is not None
+    for name, tensor in frozen.cross_attention.state_dict().items():
+        assert torch.equal(resumed.teacher_cross_attention.state_dict()[name], tensor), name
+        assert not torch.equal(resumed.cross_attention.state_dict()[name], tensor), name
+    for name, tensor in frozen.fill.state_dict().items():
+        assert torch.equal(resumed.teacher_fill.state_dict()[name], tensor), name
+    # Its blocks moved: a model that would distil through them refuses the run.
+    with pytest.raises(ValueError, match="unexpected"):
+        tiny_key_model(lexicon, reader_vocab, TOWER).load_resumed(saved, tmp_path / "cross.pt")
     with pytest.raises(ValueError, match="fill tower trains"):
-        E2EConfig(cross_attention_layers=1, decoder=READER_TINY, train_fill_tower=True)
+        E2EConfig(cross_attention_layers=1, decoder=READER_TINY, train_fill_tower=TOWER)
 
 
 def test_the_gates_frame_is_the_parents_when_the_student_matches_the_teacher(
@@ -597,7 +738,7 @@ def run_records(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
-@pytest.mark.parametrize("train_fill_tower", [False, True])
+@pytest.mark.parametrize("train_fill_tower", TRAINED_PARTS)
 def test_an_s1_run_logs_every_component_resumes_exactly_and_is_scored_against_its_parent(
     corpus: tuple[Path, Path],
     vocabularies: Vocabularies,
@@ -605,7 +746,7 @@ def test_an_s1_run_logs_every_component_resumes_exactly_and_is_scored_against_it
     reader_vocab: CharVocab,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    train_fill_tower: bool,
+    train_fill_tower: FillTowerTraining | None,
 ) -> None:
     monkeypatch.setattr(Vocabularies, "load", classmethod(lambda cls, *_: vocabularies))
     monkeypatch.setattr(BertConfig, "from_pretrained", classmethod(lambda cls, *_: TINY))
@@ -654,7 +795,9 @@ def test_an_s1_run_logs_every_component_resumes_exactly_and_is_scored_against_it
     assert summary["build_counts"]["illegal_gold"] == 0
     provenance = next(record for record in records if record.get("event") == "provenance")
     assert provenance["e2e"]["keys"] == asdict(KEYS)
-    assert provenance["e2e"]["train_fill_tower"] is train_fill_tower
+    assert provenance["e2e"]["train_fill_tower"] == (
+        None if train_fill_tower is None else asdict(train_fill_tower)
+    )
 
     resumed = e2e(
         paths("resumed"),
@@ -669,7 +812,8 @@ def test_an_s1_run_logs_every_component_resumes_exactly_and_is_scored_against_it
         record["loss"] for record in run_records(resumed.metrics) if record.get("event") == "step"
     ]
     assert resumed_losses == [record["loss"] for record in steps[2:]]
-    # The resumed run is this one: the tower switch is part of its record.
+    # The resumed run is this one: what of the tower trains is part of its record.
+    switched = {None: TOWER, TOWER: CROSS_ATTENTION, CROSS_ATTENTION: TOWER}[train_fill_tower]
     with pytest.raises(ValueError, match="train_fill_tower"):
         e2e(
             paths("switched"),
@@ -678,7 +822,7 @@ def test_an_s1_run_logs_every_component_resumes_exactly_and_is_scored_against_it
             resume=tmp_path / "whole" / "checkpoint-000002.pt",
             keys=KEYS,
             key_warm_up=True,
-            train_fill_tower=not train_fill_tower,
+            train_fill_tower=switched,
         )
 
     # A key checkpoint is not a span model the lattice search can decode.
@@ -740,13 +884,13 @@ def test_the_count_is_the_key_loops_own(
     assert plain.ranks[0].epochs[0] < taken
 
 
-@pytest.mark.parametrize("train_fill_tower", [False, True])
+@pytest.mark.parametrize("train_fill_tower", TRAINED_PARTS)
 def test_the_s1_forward_compiles_once_across_key_lengths(
     vocabularies: Vocabularies,
     spans: SpanVocab,
     lexicon: Lexicon,
     reader_vocab: CharVocab,
-    train_fill_tower: bool,
+    train_fill_tower: FillTowerTraining | None,
 ) -> None:
     """Marked dims make every compiled callable dynamic from its first call.
 
@@ -843,13 +987,23 @@ def test_the_compiled_s1_step_matches_the_eager_one_on_cuda(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="sync detection needs CUDA")
+@pytest.mark.parametrize("train_fill_tower", TRAINED_TOWERS)
 def test_a_compiled_s1_step_training_the_tower_issues_no_host_syncs(
-    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon, reader_vocab: CharVocab
+    vocabularies: Vocabularies,
+    spans: SpanVocab,
+    lexicon: Lexicon,
+    reader_vocab: CharVocab,
+    train_fill_tower: FillTowerTraining,
 ) -> None:
-    """Forward, backward and the loop's fused AdamW step, compiled as a run compiles them."""
+    """Forward, backward and the loop's fused AdamW step, compiled as a run compiles them.
+
+    The context gates are open, so the blocks' attention -- trained, or the
+    frozen path the tower's gradient crosses -- does the work a parent's does.
+    """
     from mlime.train.e2e import compile_modules
 
-    model = tiny_key_model(lexicon, reader_vocab, train_fill_tower=True).cuda()
+    model = tiny_key_model(lexicon, reader_vocab, train_fill_tower).cuda()
+    open_gates(model)
     compile_modules(model, "default")
     model.freeze_for_key_warm_up()
     model.train()
@@ -878,14 +1032,22 @@ def test_a_compiled_s1_step_training_the_tower_issues_no_host_syncs(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="inductor's CUDA graphs need CUDA")
+@pytest.mark.parametrize("train_fill_tower", TRAINED_TOWERS)
 def test_the_compiled_s1_step_training_the_tower_matches_the_eager_one_on_cuda(
-    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon, reader_vocab: CharVocab
+    vocabularies: Vocabularies,
+    spans: SpanVocab,
+    lexicon: Lexicon,
+    reader_vocab: CharVocab,
+    train_fill_tower: FillTowerTraining,
 ) -> None:
     """The loss and every trained gradient agree; the towers drop nothing, so both draw alike.
 
-    The trained tower runs in training mode, and eager and inductor draw
+    The trained parts run in training mode, and eager and inductor draw
     their dropout masks from different generators, so the comparison is made
-    on a tower whose dropout is zero.
+    on a tower and context blocks whose dropout is zero. The context gates
+    are open: at a fresh block's zero gate the attention's gradient is
+    exactly zero both ways, and its comparison would pass whatever the
+    compiled blocks computed.
     """
     from mlime.train.e2e import compile_modules
 
@@ -893,10 +1055,14 @@ def test_the_compiled_s1_step_training_the_tower_matches_the_eager_one_on_cuda(
     tower.hidden_dropout_prob = 0.0
     tower.attention_probs_dropout_prob = 0.0
     batch = key_collator(spans, lexicon)(build_examples(vocabularies)[:8]).to(torch.device("cuda"))
+    assert bool(batch.spans.has_context.any())
     losses = []
     gradients = []
     for compiled in (False, True):
-        model = tiny_key_model(lexicon, reader_vocab, train_fill_tower=True, tower=tower).cuda()
+        model = tiny_key_model(
+            lexicon, reader_vocab, train_fill_tower, tower=tower, cross_attention_dropout=0.0
+        ).cuda()
+        open_gates(model)
         if compiled:
             compile_modules(model, "default")
         model.freeze_for_key_warm_up()
@@ -915,5 +1081,15 @@ def test_the_compiled_s1_step_training_the_tower_matches_the_eager_one_on_cuda(
     torch.testing.assert_close(losses[1], losses[0], rtol=1e-3, atol=1e-3)
     assert gradients[1].keys() == gradients[0].keys()
     assert any(name.startswith("fill.encoder.") for name in gradients[0])
+    crossing = {name for name in gradients[0] if name.startswith("cross_attention.")}
+    if train_fill_tower.cross_attention:
+        assert crossing == {
+            f"cross_attention.0.{name}" for name, _ in model.cross_attention[0].named_parameters()
+        }
+        for name in crossing:
+            assert bool(gradients[0][name].any()), name
+    else:
+        assert not crossing
+    assert not any(name.startswith(("teacher_", "decoder.")) for name in gradients[0])
     for name, gradient in gradients[0].items():
         torch.testing.assert_close(gradients[1][name], gradient, rtol=1e-3, atol=1e-4, msg=name)

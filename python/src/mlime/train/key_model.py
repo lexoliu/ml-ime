@@ -33,12 +33,14 @@ parent's frozen decoder the front's states at the span ends, in place of its
 encoder's (:meth:`KeyE2EModel.student_frame`).
 
 **S1 with the tower** (``train_fill_tower``, #241) trains the fill tower too,
-beside the front and the head and at the head's rate, in training mode. The
-teacher must stay the parent, so the model keeps a frozen copy of the parent's
-tower -- ``teacher_fill``, always in evaluation mode -- and the teacher's pass
-and the gate's parent frame run through it; the gated context blocks, the span
-tables and the context tower they share stay frozen, so the copy's states are
-the parent's exactly. The copy is a parameter set the size of the tower and is
+beside the front and the head and at the head's rate, in training mode, and
+with ``cross_attention`` the tower's gated context blocks as well. The teacher
+must stay the parent, so the model keeps a frozen copy of each parent part
+that trains -- ``teacher_fill`` of the tower, ``teacher_cross_attention`` of
+the blocks, always in evaluation mode -- and the teacher's pass and the gate's
+parent frame run through the copies; the span tables and the context tower
+they share with the student stay frozen, so the copies' states are the
+parent's exactly. Each copy is a parameter set the size of its part and is
 saved with the run, so a resume distils towards the same targets.
 """
 
@@ -68,9 +70,10 @@ KEY_PARAMETER_PREFIXES = ("key_front.", "blank.")
 #: The submodules S1 leaves frozen and runs in evaluation mode.
 FROZEN_IN_WARM_UP = ("fill", "context", "cross_attention", "decoder", "letter_encoder")
 
-#: Parameter prefix of the frozen copy of the parent's fill tower, the teacher
-#: of an S1 that trains the tower.
-TEACHER_PREFIX = "teacher_fill."
+#: Parameter prefixes of the frozen copies of the parent's fill tower and of its
+#: gated context blocks: the teacher of an S1 that trains them.
+TEACHER_FILL_PREFIX = "teacher_fill."
+TEACHER_CROSS_ATTENTION_PREFIX = "teacher_cross_attention."
 
 
 class KeyBlock(nn.Module):
@@ -174,6 +177,7 @@ class KeyE2EModel(E2EModel):
     key_front: KeyFront
     blank: nn.Linear
     teacher_fill: BertModel | None
+    teacher_cross_attention: nn.ModuleList | None
 
     def __init__(
         self,
@@ -200,9 +204,15 @@ class KeyE2EModel(E2EModel):
         self.blank = nn.Linear(width, 1)
         nn.init.zeros_(self.blank.weight)
         nn.init.zeros_(self.blank.bias)
-        # Seeded with the parent's tower when the weights load (load_resumed).
+        # Seeded with the parent's parts when the weights load (load_resumed).
+        trains = config.train_fill_tower
         self.teacher_fill = (
-            copy.deepcopy(self.fill).requires_grad_(False) if config.train_fill_tower else None
+            None if trains is None else copy.deepcopy(self.fill).requires_grad_(False)
+        )
+        self.teacher_cross_attention = (
+            copy.deepcopy(self.cross_attention).requires_grad_(False)
+            if trains is not None and trains.cross_attention
+            else None
         )
 
     @classmethod
@@ -250,54 +260,81 @@ class KeyE2EModel(E2EModel):
         path: Path | str,
         fresh: tuple[str, ...] = (),
     ) -> None:
-        """Load *weights*, seeding the teacher's tower from them when they hold none.
+        """Load *weights*, seeding each teacher copy from its part when they hold none of it.
 
-        A checkpoint without a teacher never trained its fill tower -- a run
-        that trains it keeps and saves the frozen copy -- so its tower is its
-        parent's, and the copy starts as that. A checkpoint that holds a
-        teacher loads it as saved; one loaded by a model that keeps none is
-        refused as unexpected weights.
+        A checkpoint without a copy of a part never trained that part -- a run
+        that trains it keeps and saves the frozen copy -- so the part is its
+        parent's, and the copy starts as that. A copy the checkpoint holds
+        loads as saved; one loaded by a model that keeps none is refused as
+        unexpected weights.
         """
-        teacher = self.teacher_fill
-        if teacher is None or any(name.startswith(TEACHER_PREFIX) for name in weights):
-            super().load_resumed(weights, path, fresh)
-            return
-        super().load_resumed(weights, path, (*fresh, TEACHER_PREFIX))
-        teacher.load_state_dict(self.fill.state_dict())
+        seeded = [
+            (prefix, teacher, part)
+            for prefix, teacher, part in (
+                (TEACHER_FILL_PREFIX, self.teacher_fill, self.fill),
+                (
+                    TEACHER_CROSS_ATTENTION_PREFIX,
+                    self.teacher_cross_attention,
+                    self.cross_attention,
+                ),
+            )
+            if teacher is not None and not any(name.startswith(prefix) for name in weights)
+        ]
+        super().load_resumed(weights, path, (*fresh, *(prefix for prefix, _, _ in seeded)))
+        for _, teacher, part in seeded:
+            teacher.load_state_dict(part.state_dict())
 
     @property
     def teacher_tower(self) -> BertModel:
         """The parent's fill tower: the frozen copy while ``fill`` trains, ``fill`` otherwise."""
         return self.fill if self.teacher_fill is None else self.teacher_fill
 
+    @property
+    def teacher_blocks(self) -> nn.ModuleList:
+        """The parent's gated context blocks: the frozen copy while they train, else the blocks."""
+        if self.teacher_cross_attention is None:
+            return self.cross_attention
+        return self.teacher_cross_attention
+
+    def trained_parts(self) -> tuple[str, ...]:
+        """The parent's submodules S1 trains beside the front and the head."""
+        trains = self.e2e_config.train_fill_tower
+        if trains is None:
+            return ()
+        return ("fill", "cross_attention") if trains.cross_attention else ("fill",)
+
     def freeze_for_key_warm_up(self) -> None:
         """Leave only the key front and the CTC head -- the MLM head and the blank -- trainable.
 
-        With ``train_fill_tower`` the fill tower trains as well; its frozen
-        copy, the teacher, never does.
+        With ``train_fill_tower`` the fill tower trains as well, and its gated
+        context blocks when it names them; their frozen copies, the teacher,
+        never do.
         """
-        trained: tuple[str, ...] = (*KEY_PARAMETER_PREFIXES, "head.")
-        if self.e2e_config.train_fill_tower:
-            trained = (*trained, "fill.")
+        trained = (
+            *KEY_PARAMETER_PREFIXES,
+            "head.",
+            *(f"{part}." for part in self.trained_parts()),
+        )
         for name, parameter in self.named_parameters():
             parameter.requires_grad_(name.startswith(trained))
 
     def train(self, mode: bool = True) -> KeyE2EModel:
         """Train mode for what trains; in the warm-up, the frozen parts stay in evaluation mode.
 
-        The fill tower runs in training mode when the warm-up trains it, and
-        the teacher's copy of it always runs in evaluation mode.
+        The fill tower and its gated context blocks run in training mode when
+        the warm-up trains them, and the teacher's copies of them always run in
+        evaluation mode.
         """
         super().train(mode)
         if self.e2e_config.key_warm_up:
+            trained = self.trained_parts()
             for name in FROZEN_IN_WARM_UP:
-                if name == "fill" and self.e2e_config.train_fill_tower:
-                    continue
                 module = getattr(self, name)
-                if isinstance(module, nn.Module):
+                if name not in trained and isinstance(module, nn.Module):
                     module.eval()
-        if self.teacher_fill is not None:
-            self.teacher_fill.eval()
+        for teacher in (self.teacher_fill, self.teacher_cross_attention):
+            if teacher is not None:
+                teacher.eval()
         return self
 
     def parameter_groups(self, base_lr: float, new_lr: float) -> list[dict[str, object]]:
@@ -321,17 +358,29 @@ class KeyE2EModel(E2EModel):
         inputs = words + front * at_key
         _mark_fill(inputs, batch.key_attention, memory, spans.context_rows, spans.has_context)
         return self.fill_pass(
-            self.fill, inputs, batch.key_attention, memory, spans.context_rows, spans.has_context
+            self.fill,
+            self.cross_attention,
+            inputs,
+            batch.key_attention,
+            memory,
+            spans.context_rows,
+            spans.has_context,
         )
 
     def span_states(self, batch: KeyBatch, memory: Any) -> torch.Tensor:
-        """The parent's fill tower over the spans the typist meant, ``[B, W, H]``."""
+        """The parent's fill path over the spans the typist meant, ``[B, W, H]``."""
         spans = batch.spans
         tower = self.teacher_tower
         inputs = self._fill_inputs(spans, tower)
         _mark_fill(inputs, spans.attention_mask, memory, spans.context_rows, spans.has_context)
         return self.fill_pass(
-            tower, inputs, spans.attention_mask, memory, spans.context_rows, spans.has_context
+            tower,
+            self.teacher_blocks,
+            inputs,
+            spans.attention_mask,
+            memory,
+            spans.context_rows,
+            spans.has_context,
         )
 
     def ctc_log_probs(self, states: torch.Tensor) -> torch.Tensor:
@@ -399,7 +448,8 @@ class KeyE2EModel(E2EModel):
         """The parent's own frame over the spans: what the gate compares the student against.
 
         Its encoder states are the teacher's (:meth:`span_states`), the span
-        model's own pass through the parent's tower even while ``fill`` trains.
+        model's own pass through the parent's tower and context blocks even
+        while the student's train.
         """
         spans = batch.spans
         mark_dynamic(spans)

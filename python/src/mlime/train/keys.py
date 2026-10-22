@@ -111,6 +111,23 @@ class KeyFrontConfig:
 
 
 @dataclass(frozen=True)
+class FillTowerTraining:
+    """What of the parent's fill path S1 trains beside the key front and the head (#241).
+
+    The fill tower always, at the head's rate; ``cross_attention`` adds the
+    tower's gated context blocks. Each part that trains is the student's
+    alone: the model keeps a frozen copy of the parent's for the teacher.
+    """
+
+    cross_attention: bool = False
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> FillTowerTraining:
+        """Rebuild the switch a checkpoint's ``e2e`` record holds."""
+        return cls(**record)
+
+
+@dataclass(frozen=True)
 class KeyExample(TrainingExample):
     """A training example as keystrokes, with the gold's legal alignments over them.
 

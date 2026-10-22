@@ -25,7 +25,7 @@ from mlime.logging import configure
 
 if TYPE_CHECKING:  # the training modules pull in torch; --help must not
     from mlime.train.e2e_model import E2EConfig, RankingConfig
-    from mlime.train.keys import KeyFrontConfig
+    from mlime.train.keys import FillTowerTraining, KeyFrontConfig
     from mlime.train.qwen_tower import QwenContextConfig
     from mlime.train.run import RunPaths, Slices
 
@@ -142,6 +142,11 @@ TRAIN_FILL_TOWER = typer.Option(
     False,
     "--train-fill-tower/--no-train-fill-tower",
     help="Train the fill tower too in the key warm-up, at --base-lr, against a frozen parent copy",
+)
+TRAIN_CROSS_ATTENTION = typer.Option(
+    False,
+    "--train-cross-attention/--no-train-cross-attention",
+    help="With --train-fill-tower, train its gated context blocks too, against a frozen copy",
 )
 
 
@@ -529,6 +534,20 @@ def key_settings(
     )
 
 
+def fill_tower_settings(tower: bool, cross_attention: bool) -> FillTowerTraining | None:
+    """What of the fill path S1 trains, from ``--train-fill-tower`` and its knob; None is none."""
+    if not tower:
+        if cross_attention:
+            raise typer.BadParameter(
+                "--train-cross-attention trains the fill tower's context blocks; pass "
+                "--train-fill-tower"
+            )
+        return None
+    from mlime.train.keys import FillTowerTraining
+
+    return FillTowerTraining(cross_attention=cross_attention)
+
+
 def route_a_slices(
     data_dir: Path, train_shard: list[str], held_out_shard: list[str], max_held_out: int = 4096
 ) -> Slices:
@@ -669,6 +688,7 @@ def train_e2e(
     correct_syllables: bool = CORRECT_SYLLABLES,
     key_warm_up: bool = KEY_WARM_UP,
     train_fill_tower: bool = TRAIN_FILL_TOWER,
+    train_cross_attention: bool = TRAIN_CROSS_ATTENTION,
     max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
     token_budget: int = TOKEN_BUDGET,
     base_lr: float = typer.Option(3e-5, help="Learning rate for the pretrained weights"),
@@ -809,7 +829,7 @@ def train_e2e(
             tower_graphs=tower_graphs,
             keys=key_settings(keys, key_front_layers, distill_weight, correct_syllables),
             key_warm_up=key_warm_up,
-            train_fill_tower=train_fill_tower,
+            train_fill_tower=fill_tower_settings(train_fill_tower, train_cross_attention),
         )
     except torch.cuda.OutOfMemoryError as error:
         # The peak is recorded even at the crash, and the cache freed before
@@ -1223,6 +1243,7 @@ def e2e_stamp(
     correct_syllables: bool = CORRECT_SYLLABLES,
     key_warm_up: bool = KEY_WARM_UP,
     train_fill_tower: bool = TRAIN_FILL_TOWER,
+    train_cross_attention: bool = TRAIN_CROSS_ATTENTION,
 ) -> None:
     """Write a v2 run's kernel directory: v1's recipe, the run's slug, the v2 sources.
 
@@ -1233,8 +1254,9 @@ def e2e_stamp(
     accumulation, the Qwen context tower and its warm-up -- are the only
     fields of v1's recipe it changes; without it they are refused, since a
     plain v2 run is v1's recipe exactly. `--keys` with `--key-warm-up` makes the
-    stage S1 of the key-level model (#223), named mlime-e2e-keys-*, and
-    `--train-fill-tower` trains the fill tower in it (#241).
+    stage S1 of the key-level model (#223), named mlime-e2e-keys-*;
+    `--train-fill-tower` trains the fill tower in it, and with
+    `--train-cross-attention` its gated context blocks (#241).
     """
     from mlime.locate import find_upwards
     from mlime.stamp import E2E_V2_SOURCES, E2EV2Run, E2EV2Stage, stamp_e2e_v2
@@ -1259,6 +1281,7 @@ def e2e_stamp(
     }
     tower = context_settings(context_tower, context_revision, context_lora_rank, context_lora_alpha)
     front = key_settings(keys, key_front_layers, distill_weight, correct_syllables)
+    fill_tower = fill_tower_settings(train_fill_tower, train_cross_attention)
     stage = None
     if init_from is None:
         given = [option for option, value in recipe_options.items() if value is not None]
@@ -1298,7 +1321,9 @@ def e2e_stamp(
                 "correct_syllables": front.correct_syllables,
             },
             key_warm_up=key_warm_up,
-            train_fill_tower=train_fill_tower,
+            train_fill_tower=None
+            if fill_tower is None
+            else {"cross_attention": fill_tower.cross_attention},
             **overrides,
         )
     spec = E2EV2Run(
