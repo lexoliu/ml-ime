@@ -529,9 +529,13 @@ def s0_model(
 
 
 def s0_batch(
-    spans: SpanVocab, lexicon: Lexicon, tokenizer: StubTokenizer, qwen: QwenContextConfig
+    spans: SpanVocab,
+    lexicon: Lexicon,
+    tokenizer: StubTokenizer,
+    qwen: QwenContextConfig,
+    contexts: tuple[str, str] = ("明天下午三点见", "他说那个颜色"),
 ) -> Batch:
-    """Two examples with contexts, collated for the Qwen tower."""
+    """Two examples with *contexts*, collated for the Qwen tower."""
     collator = Collator(
         tokenizer,
         load_context_tokenizer(qwen),
@@ -542,9 +546,9 @@ def s0_batch(
         [
             replace(
                 example(spans, lexicon, "中和北京", ("zhong", "he", "bei", "jing")),
-                context="明天下午三点见",
+                context=contexts[0],
             ),
-            replace(example(spans, lexicon, "绿钟", ("lv", "zhong")), context="他说那个颜色"),
+            replace(example(spans, lexicon, "绿钟", ("lv", "zhong")), context=contexts[1]),
         ]
     )
 
@@ -656,6 +660,67 @@ def test_an_adapted_tower_trains_inside_the_compiled_pass_and_computes_the_eager
     for name, before, after in trained:
         assert before.grad is not None and after.grad is not None, name
         torch.testing.assert_close(after.grad, before.grad, msg=name)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton scheduling needs a CUDA device")
+def test_an_adapted_tower_compiled_on_cuda_computes_the_eager_step(
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    tokenizer: StubTokenizer,
+    reader_vocab: CharVocab,
+    e2e_config: E2EConfig,
+    qwen: QwenContextConfig,
+) -> None:
+    """#237: the adapted tower's compiled ``encode`` on CUDA, as the L4 leg runs it.
+
+    The CPU check above never reaches Triton's scheduler, and that is where
+    the leg failed: Inductor's tiling analysis asserted on the context
+    LayerNorm, whose rows were the head and the context together, ``C * (H + T)``
+    with ``T`` symbolic. Here the bf16 tower under fp16 autocast compiles
+    dynamic on its first batch and is reused on a batch of another context
+    width; each step's loss and gradients are the eager step's to the
+    precision's rounding.
+    """
+    from mlime.train.e2e import compile_modules
+
+    device = torch.device("cuda")
+    tower = replace(qwen, dtype="bfloat16", lora=LoraConfig(rank=2, alpha=4.0))
+    eager = s0_model(lexicon, reader_vocab, e2e_config, tower).to(device).eval()
+    torch.manual_seed(5)
+    with torch.no_grad():
+        for name, parameter in eager.named_parameters():
+            if name.endswith("lora_b"):
+                parameter.normal_(std=0.1)
+    compiled = s0_model(lexicon, reader_vocab, e2e_config, tower).to(device).eval()
+    compiled.load_state_dict(eager.state_dict())
+    compile_modules(compiled, "default")
+    batches = [
+        s0_batch(spans, lexicon, tokenizer, tower),
+        s0_batch(spans, lexicon, tokenizer, tower, ("昨天晚上我们一起去看了电影", "好")),
+    ]
+    assert batches[0].context_ids.shape[1] != batches[1].context_ids.shape[1]
+
+    torch._dynamo.utils.counters.clear()
+    for batch in (batch.to(device) for batch in batches):
+        losses = []
+        for model in (eager, compiled):
+            model.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                loss = model(batch).loss
+            assert loss is not None
+            loss.backward()
+            losses.append(loss.detach().float())
+        torch.testing.assert_close(losses[1], losses[0], rtol=1e-2, atol=1e-3)
+        parameters = dict(compiled.named_parameters())
+        for name, before in eager.named_parameters():
+            if not before.requires_grad:
+                continue
+            after = parameters[name]
+            assert before.grad is not None and after.grad is not None, name
+            torch.testing.assert_close(
+                after.grad.float(), before.grad.float(), rtol=5e-2, atol=1e-3, msg=name
+            )
+    assert not torch._dynamo.utils.counters["graph_break"]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="device syncs need a CUDA device")

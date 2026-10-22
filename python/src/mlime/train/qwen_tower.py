@@ -536,12 +536,18 @@ class QwenContextTower(ContextTower):
             # The head this forward already computed: an adapted tower's head
             # is a forward of its own, and the rows and the prefix are one.
             states = self.states(ids, mask, head)
-        joined = torch.cat([head.rows.expand(rows, -1, -1), states], dim=1)
+        # The LayerNorm reads one row at a time, so the head's rows are normed
+        # once and broadcast, and the context's on their own. Normed after the
+        # join instead, its rows would be C * (H + T): under a dynamic T,
+        # torch 2.11's Inductor compares that product with its expanded form
+        # and asserts in its tiling analysis on CUDA (#237).
+        normed = self.norm(head.rows.float()).expand(rows, -1, -1)
+        joined = torch.cat([normed, self.norm(states.float())], dim=1)
         real = torch.cat(
             [torch.ones(rows, head.length, dtype=torch.bool, device=ids.device), mask.bool()],
             dim=1,
         )
-        return ContextMemory(states=self.norm(joined.float()), mask=real)
+        return ContextMemory(states=joined, mask=real)
 
 
 #: The parameter names a :class:`LoraLinear` adds.
