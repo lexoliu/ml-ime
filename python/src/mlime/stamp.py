@@ -68,7 +68,7 @@ E2E_V2_SOURCES = (
 E2E_V2_RUN = re.compile(r"mlime-e2e-v2-[a-z0-9]+(-[a-z0-9]+)*")
 
 #: What a stamped ``CONTEXT_TOWER`` holds: the kernel's ``--context-*`` options.
-CONTEXT_TOWER_FIELDS = frozenset({"tower", "revision", "lora_rank", "lora_alpha"})
+CONTEXT_TOWER_FIELDS = frozenset({"tower", "revision", "lora_rank", "lora_alpha", "layers"})
 
 
 def literal(source: str, name: str) -> Any:
@@ -133,8 +133,9 @@ class E2EV2Stage:
     pair, None for ``mlime train e2e``'s defaults; *token_budget* and
     *accumulate* default to v1's. *context_tower* (``CONTEXT_TOWER``) reads
     the context with a Qwen model, swapped in over *init_from*'s MacBERT tower
-    (#222): its ``tower`` and ``revision``, and a ``lora_rank`` and
-    ``lora_alpha`` where 0 keeps it frozen. *context_warm_up*
+    (#222): its ``tower`` and ``revision``, a ``lora_rank`` and
+    ``lora_alpha`` where 0 keeps it frozen, and ``layers``, the decoder blocks
+    the tower keeps from the bottom, None for all of them (#237). *context_warm_up*
     (``CONTEXT_WARM_UP``) trains only the context path, which is S0.
     """
 

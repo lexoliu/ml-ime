@@ -109,6 +109,12 @@ CONTEXT_LORA_RANK = typer.Option(
 CONTEXT_LORA_ALPHA = typer.Option(
     16.0, "--context-lora-alpha", help="LoRA alpha, with --context-lora-rank"
 )
+CONTEXT_LAYERS = typer.Option(
+    None,
+    "--context-layers",
+    help="Keep only the Qwen tower's first N decoder blocks and read the context after "
+    "block N (#237); the blocks above are never built. Omitted, every block",
+)
 CONTEXT_WARM_UP = typer.Option(
     False,
     "--context-warm-up/--no-context-warm-up",
@@ -460,22 +466,27 @@ def ranking_settings(
 
 
 def context_settings(
-    tower: str | None, revision: str | None, lora_rank: int, lora_alpha: float
+    tower: str | None,
+    revision: str | None,
+    lora_rank: int,
+    lora_alpha: float,
+    layers: int | None,
 ) -> QwenContextConfig | None:
     """The Qwen context tower's settings from ``--context-*``; None keeps MacBERT's."""
     from mlime.train.qwen_tower import QWEN_REVISION, LoraConfig, QwenContextConfig
 
     if tower is None:
-        if revision is not None or lora_rank:
+        if revision is not None or lora_rank or layers is not None:
             raise typer.BadParameter(
-                "--context-revision and --context-lora-rank set the Qwen tower; "
-                "pass --context-tower"
+                "--context-revision, --context-lora-rank and --context-layers set the Qwen "
+                "tower; pass --context-tower"
             )
         return None
     return QwenContextConfig(
         model=tower,
         revision=QWEN_REVISION if revision is None else revision,
         lora=LoraConfig(rank=lora_rank, alpha=lora_alpha) if lora_rank else None,
+        layers=layers,
     )
 
 
@@ -607,6 +618,7 @@ def train_e2e(
     context_revision: str | None = CONTEXT_REVISION,
     context_lora_rank: int = CONTEXT_LORA_RANK,
     context_lora_alpha: float = CONTEXT_LORA_ALPHA,
+    context_layers: int | None = CONTEXT_LAYERS,
     context_warm_up: bool = CONTEXT_WARM_UP,
     tower_graphs: bool = typer.Option(
         False,
@@ -747,7 +759,11 @@ def train_e2e(
             whole_alphabet=whole_alphabet,
             search_graphs=search_graphs,
             context=context_settings(
-                context_tower, context_revision, context_lora_rank, context_lora_alpha
+                context_tower,
+                context_revision,
+                context_lora_rank,
+                context_lora_alpha,
+                context_layers,
             ),
             context_warm_up=context_warm_up,
             tower_graphs=tower_graphs,
@@ -1140,6 +1156,7 @@ def e2e_stamp(
     context_revision: str | None = CONTEXT_REVISION,
     context_lora_rank: int = CONTEXT_LORA_RANK,
     context_lora_alpha: float = CONTEXT_LORA_ALPHA,
+    context_layers: int | None = CONTEXT_LAYERS,
     context_warm_up: bool = CONTEXT_WARM_UP,
     tower_graphs: bool = typer.Option(
         False,
@@ -1175,7 +1192,9 @@ def e2e_stamp(
         "--context-tower": context_tower,
         "--context-warm-up": context_warm_up or None,
     }
-    tower = context_settings(context_tower, context_revision, context_lora_rank, context_lora_alpha)
+    tower = context_settings(
+        context_tower, context_revision, context_lora_rank, context_lora_alpha, context_layers
+    )
     stage = None
     if init_from is None:
         given = [option for option, value in recipe_options.items() if value is not None]
@@ -1205,6 +1224,7 @@ def e2e_stamp(
                 "revision": tower.revision,
                 "lora_rank": context_lora_rank,
                 "lora_alpha": context_lora_alpha,
+                "layers": context_layers,
             },
             context_warm_up=context_warm_up,
             **overrides,
