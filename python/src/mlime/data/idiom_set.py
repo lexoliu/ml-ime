@@ -21,7 +21,20 @@ idiom. A stratum without enough idioms fails the draw and names the largest
 size that fits. The draw is written as a candidate set for ``mlime corpus
 judge --input candidates``, with its census beside it.
 
-**The set** (:func:`build`). Once the judge has finished every file, each idiom
+**The top-up** (:func:`top_up`). The judge rejects rare idioms more often, so
+what it keeps drifts from eval3's proportions. One more round, drawn once the
+judge has finished the first, puts them back: :func:`plan` finds the size the
+strata can reach at their round-one keep rates and each stratum's shortfall at
+it, and each short stratum draws that shortfall over its keep rate. A stratum
+continues its seeded idiom order past the idioms the first round drew; where it
+has none left, its rejected idioms give their next admissible sentence. The
+first round is drawn again from the same inputs and must be what the judge
+read, and no record or sentence of it is drawn again. The top-up's files are
+numbered after the first round's, so the judge resumes over the set and judges
+only them.
+
+**The set** (:func:`build`). Once the judge has finished every file of both
+rounds, each idiom
 contributes the record it kept, checked against evaluation once more, to a
 samples shard ``ime-cli g2p annotate`` reads; the annotation and ``ime-cli
 export eval-set --typing abbreviated`` make it a set the way eval3's
@@ -47,6 +60,11 @@ held-out file the ingestion was guarded with, each after ``--against``::
     mlime corpus judge --input candidates --data-dir data/idiom-select-243/pool \\
         --entries data/corpus-225/inputs/entries-215.tsv \\
         --ordinary-cache data/corpus-225/.knowledge-cache
+    mlime eval idiom-topup <the draw's inputs, without --size and --seed> \\
+        --pool data/idiom-select-243/pool
+    mlime corpus judge --input candidates --data-dir data/idiom-select-243/pool \\
+        --entries data/corpus-225/inputs/entries-215.tsv \\
+        --ordinary-cache data/corpus-225/.knowledge-cache
     mlime eval idiom-set --judged data/idiom-select-243/pool \\
         --entries data/corpus-225/inputs/entries-215.tsv <against> --out <root>
     ime-cli g2p annotate --data-dir <root>
@@ -63,6 +81,7 @@ from bisect import bisect_right
 from collections import Counter
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +107,12 @@ STRATA = 10
 
 #: The quantiles the census compares between the drawn idioms and eval3's.
 QUANTILES = (0.1, 0.25, 0.5, 0.75, 0.9)
+
+#: The draw's census, beside its candidate files.
+DRAW_CENSUS = "draw.json"
+
+#: The top-up's census, beside the candidate files of both rounds.
+TOP_UP_CENSUS = "topup.json"
 
 
 class SelectionError(RuntimeError):
@@ -349,15 +374,140 @@ class Candidate:
     verdicts: dict[int, str | None] = field(default_factory=dict)
 
 
-def draw(
-    pool: pl.DataFrame, inputs: Inputs, strata_count: int, size: int, seed: int
-) -> tuple[pl.DataFrame, DrawCensus]:
-    """One sentence for each of *size* idioms, stratified on eval3's frequencies; and the census.
+#: A pool record as the draw handles it: ``id``, ``source``, ``text``, ``context``.
+Row = tuple[str, str, str, str | None]
 
-    The result has a row per drawn idiom: the record's ``id``, ``source``,
-    ``text`` and ``context``, and the ``entry``.
-    """
-    census = DrawCensus(seed=seed, size=size, pool_records=pool.height)
+
+@dataclass
+class Taken:
+    """The records drawn so far, by id and by sentence, each with the idiom it was drawn for."""
+
+    ids: dict[str, str] = field(default_factory=dict)
+    texts: dict[str, str] = field(default_factory=dict)
+
+    def owner(self, row: Row) -> str | None:
+        """The idiom *row*'s record or sentence was drawn for, or ``None`` when it is free."""
+        return self.ids.get(row[0]) or self.texts.get(row[2])
+
+    def add(self, row: Row, entry: str) -> None:
+        """Mark *row* drawn for *entry*."""
+        self.ids[row[0]] = entry
+        self.texts[row[2]] = entry
+
+
+@dataclass
+class Prepared:
+    """The pool read against the inputs: the strata, and the idioms each may draw from."""
+
+    inputs: Inputs
+    seed: int
+    strata: Strata
+    #: eval3's idioms with their run3 occurrences.
+    in_eval: dict[str, int]
+    #: The idioms a draw may take, with their run3 occurrences.
+    eligible: dict[str, int]
+    #: Per stratum, the eligible idioms with at least one admissible sentence.
+    available: list[list[Candidate]]
+    #: What the reading found, the census a draw goes on to fill.
+    census: DrawCensus
+
+    def verdict(self, candidate: Candidate, position: int) -> str | None:
+        """Why *candidate*'s sentence at *position* may not be drawn, or ``None`` when it may."""
+        if position not in candidate.verdicts:
+            _, _, text, context = candidate.rows[position]
+            if self.inputs.lexicon.false_match(text, candidate.entry) is not None:
+                reason: str | None = "word boundary"
+            else:
+                collides = self.inputs.collisions.reason(Record(text=text, context=context))
+                reason = None if collides is None else f"collides by {collides}"
+            candidate.verdicts[position] = reason
+            if reason is not None:
+                self.census.rejected_sentences[reason] += 1
+        return candidate.verdicts[position]
+
+    def order(self, index: int) -> list[Candidate]:
+        """Stratum *index*'s available idioms in the seeded order every round draws them in."""
+        order = sorted(self.available[index], key=lambda candidate: candidate.entry)
+        random.Random(f"{self.seed}:idioms:{index}").shuffle(order)
+        return order
+
+    def free(self, candidate: Candidate, taken: Taken) -> Row | None:
+        """*candidate*'s first admissible sentence, in its seeded order, that is not drawn yet."""
+        for position, row in enumerate(candidate.rows):
+            if self.verdict(candidate, position) is None and taken.owner(row) is None:
+                return row
+        return None
+
+    def take(self, candidate: Candidate, taken: Taken, skipped: Counter[str]) -> Row | None:
+        """Draw :meth:`free`'s sentence for *candidate*, counting in *skipped* the drawn ones passed."""
+        for position, row in enumerate(candidate.rows):
+            if self.verdict(candidate, position) is not None:
+                continue
+            owner = taken.owner(row)
+            if owner is None:
+                taken.add(row, candidate.entry)
+                return row
+            skipped[
+                "drawn for this idiom before" if owner == candidate.entry else "drawn for another idiom"
+            ] += 1
+        return None
+
+    def draw(self, size: int) -> tuple[pl.DataFrame, DrawCensus]:
+        """One sentence for each of *size* idioms, in eval3's proportions; and the census."""
+        census = self.census
+        census.size = size
+        available = [len(group) for group in self.available]
+        if size > census.largest_size:
+            raise SelectionError(
+                f"the pool holds too few idioms for {size} at eval3's frequencies: per stratum "
+                f"{available} against eval3's {list(self.strata.targets)}; "
+                f"the largest size that fits is {census.largest_size}"
+            )
+        quotas = self.strata.allocate(size)
+        taken = Taken()
+        chosen: list[tuple[str, str, str, str | None, str]] = []
+        census.strata = []
+        # The scarcest strata draw first, so a sentence two idioms share goes to the scarce one.
+        for index in sorted(range(len(self.strata)), key=lambda i: available[i] - quotas[i]):
+            drawn = 0
+            for candidate in self.order(index):
+                if drawn == quotas[index]:
+                    break
+                row = self.take(candidate, taken, census.rejected_sentences)
+                if row is not None:
+                    chosen.append((*row, candidate.entry))
+                    drawn += 1
+            if drawn < quotas[index]:
+                raise SelectionError(
+                    f"stratum {index} ran out of idioms at {drawn} of {quotas[index]}: the "
+                    "sentences its idioms share are drawn for other idioms"
+                )
+            census.strata.append(
+                {
+                    "stratum": index,
+                    "lower": self.strata.lowers[index],
+                    "upper": self.strata.upper(index),
+                    "eval3": self.strata.targets[index],
+                    "available": available[index],
+                    "drawn": drawn,
+                }
+            )
+        census.strata.sort(key=lambda stratum: stratum["stratum"])
+        frame = drawn_frame(chosen)
+        census.checks = record_checks(frame, self.inputs, self.eligible, self.in_eval)
+        drawn_occurrences = sorted(self.eligible[entry] for entry in frame["entry"])
+        census.quantiles = compare_quantiles(drawn_occurrences, self.in_eval.values())
+        census.ks_distance = round(
+            ks_distance(drawn_occurrences, sorted(self.in_eval.values())), 4
+        )
+        census.sources = Counter(frame["source"].to_list())
+        census.entry_lengths = Counter(len(entry) for entry in frame["entry"])
+        return frame, census
+
+
+def prepare(pool: pl.DataFrame, inputs: Inputs, strata_count: int, seed: int) -> Prepared:
+    """Read *pool* against *inputs*: eval3's strata, and every eligible idiom's sentences."""
+    census = DrawCensus(seed=seed, pool_records=pool.height)
     in_eval = eval_idioms(inputs)
     census.eval3_idioms = len(in_eval)
     strata = Strata.of(list(in_eval.values()), strata_count)
@@ -379,89 +529,54 @@ def draw(
         candidates.append(Candidate(str(entry), strata.index(eligible[str(entry)]), rows))
     census.pool_idioms = len(candidates)
 
-    def verdict(candidate: Candidate, position: int) -> str | None:
-        if position not in candidate.verdicts:
-            _, _, text, context = candidate.rows[position]
-            if inputs.lexicon.false_match(text, candidate.entry) is not None:
-                reason: str | None = "word boundary"
-            else:
-                collides = inputs.collisions.reason(Record(text=text, context=context))
-                reason = None if collides is None else f"collides by {collides}"
-            candidate.verdicts[position] = reason
-            if reason is not None:
-                census.rejected_sentences[reason] += 1
-        return candidate.verdicts[position]
-
-    available: list[list[Candidate]] = [[] for _ in range(len(strata))]
+    prepared = Prepared(
+        inputs=inputs,
+        seed=seed,
+        strata=strata,
+        in_eval=in_eval,
+        eligible=eligible,
+        available=[[] for _ in range(len(strata))],
+        census=census,
+    )
     for candidate in candidates:
-        if any(verdict(candidate, position) is None for position in range(len(candidate.rows))):
-            available[candidate.stratum].append(candidate)
+        if any(
+            prepared.verdict(candidate, position) is None
+            for position in range(len(candidate.rows))
+        ):
+            prepared.available[candidate.stratum].append(candidate)
         else:
             census.idioms_without_sentence += 1
-    census.largest_size = strata.largest_size([len(group) for group in available])
-    if size > census.largest_size:
-        raise SelectionError(
-            f"the pool holds too few idioms for {size} at eval3's frequencies: per stratum "
-            f"{[len(group) for group in available]} against eval3's {list(strata.targets)}; "
-            f"the largest size that fits is {census.largest_size}"
-        )
+    census.largest_size = strata.largest_size([len(group) for group in prepared.available])
+    return prepared
 
-    quotas = strata.allocate(size)
-    taken_ids: set[str] = set()
-    taken_texts: set[str] = set()
-    chosen: list[tuple[str, str, str, str | None, str]] = []
-    # The scarcest strata draw first, so a sentence two idioms share goes to the scarce one.
-    for index in sorted(range(len(strata)), key=lambda i: len(available[i]) - quotas[i]):
-        order = sorted(available[index], key=lambda candidate: candidate.entry)
-        random.Random(f"{seed}:idioms:{index}").shuffle(order)
-        drawn = 0
-        for candidate in order:
-            if drawn == quotas[index]:
-                break
-            for position, row in enumerate(candidate.rows):
-                if verdict(candidate, position) is not None:
-                    continue
-                if row[0] in taken_ids or row[2] in taken_texts:
-                    census.rejected_sentences["drawn for another idiom"] += 1
-                    continue
-                taken_ids.add(row[0])
-                taken_texts.add(row[2])
-                chosen.append((*row, candidate.entry))
-                drawn += 1
-                break
-        if drawn < quotas[index]:
-            raise SelectionError(
-                f"stratum {index} ran out of idioms at {drawn} of {quotas[index]}: the sentences "
-                "its idioms share are drawn for other idioms"
-            )
-        census.strata.append(
-            {
-                "stratum": index,
-                "lower": strata.lowers[index],
-                "upper": strata.upper(index),
-                "eval3": strata.targets[index],
-                "available": len(available[index]),
-                "drawn": drawn,
-            }
-        )
-    census.strata.sort(key=lambda stratum: stratum["stratum"])
-    frame = pl.DataFrame(
-        chosen, schema=[*SAMPLE_COLUMNS, "entry"], orient="row"
-    ).sort("entry")
-    record_checks(frame, inputs, eligible, in_eval, census)
-    drawn_occurrences = sorted(eligible[entry] for entry in frame["entry"])
-    eval_occurrences = sorted(in_eval.values())
-    census.quantiles = {
+
+def draw(
+    pool: pl.DataFrame, inputs: Inputs, strata_count: int, size: int, seed: int
+) -> tuple[pl.DataFrame, DrawCensus]:
+    """One sentence for each of *size* idioms, stratified on eval3's frequencies; and the census.
+
+    The result has a row per drawn idiom: the record's ``id``, ``source``,
+    ``text`` and ``context``, and the ``entry``.
+    """
+    return prepare(pool, inputs, strata_count, seed).draw(size)
+
+
+def drawn_frame(chosen: Sequence[tuple[str, str, str, str | None, str]]) -> pl.DataFrame:
+    """Drawn rows as a frame of the record's columns and the ``entry``, by entry."""
+    schema = {**dict.fromkeys(SAMPLE_COLUMNS, pl.String), "entry": pl.String}
+    return pl.DataFrame(chosen, schema=schema, orient="row").sort("entry")
+
+
+def compare_quantiles(drawn: Sequence[int], in_eval: Iterable[int]) -> dict[str, dict[str, int]]:
+    """The :data:`QUANTILES` of the drawn idioms' run3 counts beside eval3's."""
+    eval_occurrences = sorted(in_eval)
+    return {
         f"p{round(share * 100)}": {
             "eval3": quantile(eval_occurrences, share),
-            "drawn": quantile(drawn_occurrences, share),
+            "drawn": quantile(sorted(drawn), share),
         }
         for share in QUANTILES
     }
-    census.ks_distance = round(ks_distance(drawn_occurrences, eval_occurrences), 4)
-    census.sources = Counter(frame["source"].to_list())
-    census.entry_lengths = Counter(len(entry) for entry in frame["entry"])
-    return frame, census
 
 
 def record_checks(
@@ -469,12 +584,11 @@ def record_checks(
     inputs: Inputs,
     eligible: Mapping[str, int],
     in_eval: Mapping[str, int],
-    census: DrawCensus,
-) -> None:
-    """Check the drawn records from scratch, recording what each check found."""
+) -> dict[str, int]:
+    """Check the drawn records from scratch; what each check found."""
     entries = frame["entry"].to_list()
     texts = " ".join(inputs.eval_texts)
-    census.checks = {
+    checks = {
         "records": frame.height,
         "idioms": len(set(entries)),
         "distinct ids": frame["id"].n_unique(),
@@ -505,25 +619,309 @@ def record_checks(
         "every character emittable",
         "eligible",
     ):
-        if census.checks[name] != expected:
-            raise SelectionError(f"{name}: {census.checks[name]} of {expected} drawn records")
+        if checks[name] != expected:
+            raise SelectionError(f"{name}: {checks[name]} of {expected} drawn records")
     for name in ("held by eval3", "colliding with evaluation", "crossed at the word boundary"):
-        if census.checks[name]:
-            raise SelectionError(f"{name}: {census.checks[name]} drawn records")
+        if checks[name]:
+            raise SelectionError(f"{name}: {checks[name]} drawn records")
+    return checks
 
 
 def write_draw(out: Path, frame: pl.DataFrame, census: DrawCensus) -> judge.CandidateSet:
     """Write the draw as a candidate set under *out*, its census beside it."""
+    if (out / DRAW_CENSUS).exists() or judge.CandidateSet(out).ordinals():
+        raise SelectionError(f"{out} already holds a draw; a draw is written into a fresh root")
     candidates = judge.write_candidates(out, frame)
-    (out / "draw.json").write_text(
-        json.dumps(census.as_dict(), ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-    )
+    write_json(out / DRAW_CENSUS, census.as_dict())
     log.info(
         "idiom draw written",
         records=frame.height,
         largest_size=census.largest_size,
         ks_distance=census.ks_distance,
         out=str(out),
+    )
+    return candidates
+
+
+def write_json(path: Path, data: Mapping[str, Any]) -> None:
+    """Write *data* to *path* as indented JSON."""
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# The top-up: one more round for the strata the judge left short.
+
+
+@dataclass(frozen=True)
+class JudgedRound:
+    """A judged round: every unit it drew, and the ones the judge kept."""
+
+    #: ``id``, ``source``, ``text``, ``context`` and ``entry`` of every drawn unit.
+    units: pl.DataFrame
+    #: The ``(id, entry)`` of every kept unit.
+    kept: frozenset[tuple[str, str]]
+
+
+def judged_round(layout: judge.CandidateSet) -> JudgedRound:
+    """Every unit of *layout*'s files with the judge's verdict; every file must be judged."""
+    ordinals = layout.ordinals()
+    if not ordinals:
+        raise SelectionError(f"{layout.candidates} holds no candidate file")
+    unfinished = [ordinal for ordinal in ordinals if not judge.finished_at_threshold(layout, ordinal)]
+    if unfinished:
+        raise SelectionError(f"the judge has not finished files {unfinished}")
+    units = []
+    kept: set[tuple[str, str]] = set()
+    for ordinal in ordinals:
+        rows = layout.read_entry_rows(ordinal)
+        records = layout.read_records(ordinal).select(SAMPLE_COLUMNS)
+        units.append(rows.join(records, on="id", how="left").select(*SAMPLE_COLUMNS, "entry"))
+        kept |= set(judge.read_entry_rows(layout.kept_rows(ordinal)).iter_rows())
+    frame = pl.concat(units)
+    if frame["text"].null_count():
+        raise SelectionError("an entry row names a record its file does not hold")
+    if not kept <= set(frame.select("id", "entry").iter_rows()):
+        raise SelectionError("the judge kept a unit its input does not list")
+    return JudgedRound(units=frame, kept=frozenset(kept))
+
+
+@dataclass(frozen=True)
+class RoundOne:
+    """The first round under a root: the seed and size it was drawn at, and the judge's verdicts."""
+
+    seed: int
+    size: int
+    judged: JudgedRound
+
+
+def round_one(root: Path) -> RoundOne:
+    """The judged first round under *root*, which must hold nothing past it."""
+    if (root / TOP_UP_CENSUS).exists():
+        raise SelectionError(f"{root} already holds a top-up; there is one top-up round")
+    drawn = json.loads((root / DRAW_CENSUS).read_text(encoding="utf-8"))
+    layout = judge.CandidateSet(root)
+    listed = sum(layout.read_entry_rows(ordinal).height for ordinal in layout.ordinals())
+    if listed != drawn["size"]:
+        raise SelectionError(
+            f"{layout.candidates} lists {listed} units, but the draw drew {drawn['size']}; "
+            "were files added past the first round?"
+        )
+    return RoundOne(seed=int(drawn["seed"]), size=int(drawn["size"]), judged=judged_round(layout))
+
+
+@dataclass(frozen=True)
+class Plan:
+    """How many each stratum draws in the top-up, from what the first round kept.
+
+    A stratum is expected to keep its round-one share of what it draws: the
+    round-one keep rate is the only yield the judge has shown on these idioms.
+    The target is the largest size whose allocation in eval3's proportions no
+    stratum falls short of when it draws every idiom it has left and keeps at
+    that rate; a stratum's need is its quota at that size less what it kept,
+    and it draws its need over its keep rate, rounded up, which the target keeps
+    within the idioms it has left.
+    """
+
+    #: Per stratum: units the first round drew, and kept.
+    drawn: tuple[int, ...]
+    kept: tuple[int, ...]
+    #: Per stratum: idioms it can still draw a sentence for.
+    supply: tuple[int, ...]
+    #: The size eval3's proportions are matched at, and each stratum's quota at it.
+    size: int
+    quotas: tuple[int, ...]
+    #: Per stratum: kept units short of its quota, and how many it draws for them.
+    needs: tuple[int, ...]
+    draws: tuple[int, ...]
+    #: Per stratum: kept units expected once the top-up is judged.
+    expected: tuple[Fraction, ...]
+
+
+def plan(strata: Strata, drawn: Sequence[int], kept: Sequence[int], supply: Sequence[int]) -> Plan:
+    """The top-up's :class:`Plan` for what each stratum drew and kept, and has left to draw."""
+    if not len(drawn) == len(kept) == len(supply) == len(strata):
+        raise SelectionError("the top-up needs a count for every stratum")
+    for index, (taken, held) in enumerate(zip(drawn, kept, strict=True)):
+        if taken < 1:
+            raise SelectionError(f"round one drew nothing in stratum {index}; its yield is unknown")
+        if not 0 <= held <= taken:
+            raise SelectionError(f"stratum {index} kept {held} of {taken} drawn")
+    rates = [Fraction(held, taken) for held, taken in zip(kept, drawn, strict=True)]
+    reach = [
+        math.floor(held + rate * left) for held, rate, left in zip(kept, rates, supply, strict=True)
+    ]
+    size = strata.largest_size(reach)
+    quotas = strata.allocate(size)
+    needs = [max(0, quota - held) for quota, held in zip(quotas, kept, strict=True)]
+    # quota <= floor(kept + rate * supply), so a positive need has a positive rate, and
+    # need / rate <= supply: no stratum is asked for more idioms than it has left.
+    draws = [math.ceil(need / rate) if need else 0 for need, rate in zip(needs, rates, strict=True)]
+    return Plan(
+        drawn=tuple(drawn),
+        kept=tuple(kept),
+        supply=tuple(supply),
+        size=size,
+        quotas=tuple(quotas),
+        needs=tuple(needs),
+        draws=tuple(draws),
+        expected=tuple(
+            held + rate * count for held, rate, count in zip(kept, rates, draws, strict=True)
+        ),
+    )
+
+
+@dataclass
+class TopUpCensus:
+    """How the top-up came out."""
+
+    seed: int = 0
+    round_one_size: int = 0
+    round_one_files: list[int] = field(default_factory=list)
+    target_size: int = 0
+    strata: list[dict[str, Any]] = field(default_factory=list)
+    drawn: int = 0
+    expected_kept: float = 0.0
+    skipped_sentences: Counter[str] = field(default_factory=Counter)
+    sources: Counter[str] = field(default_factory=Counter)
+    checks: dict[str, int] = field(default_factory=dict)
+
+    def as_dict(self) -> dict[str, Any]:
+        """The census as JSON-ready data, counters keyed by their value."""
+        values = {item.name: getattr(self, item.name) for item in fields(self)}
+        return {
+            name: dict(sorted(value.items())) if isinstance(value, Counter) else value
+            for name, value in values.items()
+        }
+
+
+def top_up(
+    prepared: Prepared, size: int, judged: JudgedRound
+) -> tuple[pl.DataFrame, TopUpCensus]:
+    """The second round's draw, for the strata whose kept units fall short of eval3's proportions.
+
+    *prepared* must read the pool the first round was drawn from, and *size* be
+    the first round's: the first round is drawn again from them and must be what
+    the judge read. Each stratum then continues its seeded idiom order past the
+    idioms the first round drew, one sentence each; once those run out, it goes
+    through the idioms the judge rejected, in the same order, each giving the
+    next admissible sentence in its own seeded order. No record or sentence of
+    the first round is drawn again.
+    """
+    round_one, _ = prepared.draw(size)
+    expected_units = set(round_one.select("id", "entry").iter_rows())
+    if set(judged.units.select("id", "entry").iter_rows()) != expected_units:
+        raise SelectionError(
+            "the judged round is not the draw these inputs give at this seed and size; "
+            "the top-up reads the pool and the inputs the first round was drawn from"
+        )
+    strata = prepared.strata
+    census = TopUpCensus(seed=prepared.seed, round_one_size=size)
+    taken = Taken()
+    for identifier, source, text, context, entry in judged.units.iter_rows():
+        taken.add((identifier, source, text, context), entry)
+    kept_entries = {entry for _, entry in judged.kept}
+    drawn_entries = set(judged.units["entry"].to_list())
+    rejected_entries = drawn_entries - kept_entries
+
+    unused: list[list[Candidate]] = []
+    second: list[list[Candidate]] = []
+    for index in range(len(strata)):
+        order = prepared.order(index)
+        unused.append([c for c in order if c.entry not in drawn_entries])
+        second.append([c for c in order if c.entry in rejected_entries])
+    supply = [
+        sum(prepared.free(c, taken) is not None for c in unused[index] + second[index])
+        for index in range(len(strata))
+    ]
+    drawn_per = Counter(strata.index(prepared.eligible[entry]) for entry in drawn_entries)
+    kept_per = Counter(strata.index(prepared.eligible[entry]) for entry in kept_entries)
+    the_plan = plan(
+        strata,
+        [drawn_per[index] for index in range(len(strata))],
+        [kept_per[index] for index in range(len(strata))],
+        supply,
+    )
+
+    chosen: list[tuple[str, str, str, str | None, str]] = []
+    by_stratum: dict[int, dict[str, int]] = {}
+    # The scarcest strata draw first, so a sentence two idioms share goes to the scarce one.
+    for index in sorted(range(len(strata)), key=lambda i: supply[i] - the_plan.draws[i]):
+        counts = {"unused": 0, "second": 0}
+        for kind, group in (("unused", unused[index]), ("second", second[index])):
+            for candidate in group:
+                if counts["unused"] + counts["second"] == the_plan.draws[index]:
+                    break
+                row = prepared.take(candidate, taken, census.skipped_sentences)
+                if row is not None:
+                    chosen.append((*row, candidate.entry))
+                    counts[kind] += 1
+        if counts["unused"] + counts["second"] < the_plan.draws[index]:
+            raise SelectionError(
+                f"stratum {index} ran out of idioms at {counts['unused'] + counts['second']} of "
+                f"{the_plan.draws[index]}: the sentences its idioms share are drawn for others"
+            )
+        by_stratum[index] = counts
+    if not chosen:
+        raise SelectionError(
+            f"no stratum falls short of eval3's proportions at {the_plan.size}; nothing to top up"
+        )
+
+    frame = drawn_frame(chosen)
+    checks = record_checks(frame, prepared.inputs, prepared.eligible, prepared.in_eval)
+    round_one_ids = set(judged.units["id"].to_list())
+    round_one_texts = set(judged.units["text"].to_list())
+    checks |= {
+        "kept in round one": sum(entry in kept_entries for entry in frame["entry"]),
+        "a record of round one": sum(identifier in round_one_ids for identifier in frame["id"]),
+        "a sentence of round one": sum(text in round_one_texts for text in frame["text"]),
+    }
+    for name in ("kept in round one", "a record of round one", "a sentence of round one"):
+        if checks[name]:
+            raise SelectionError(f"{name}: {checks[name]} top-up records")
+    census.checks = checks
+    census.target_size = the_plan.size
+    census.strata = [
+        {
+            "stratum": index,
+            "lower": strata.lowers[index],
+            "upper": strata.upper(index),
+            "eval3": strata.targets[index],
+            "round_one_drawn": the_plan.drawn[index],
+            "round_one_kept": the_plan.kept[index],
+            "unused_idioms": len(unused[index]),
+            "rejected_idioms": len(second[index]),
+            "supply": the_plan.supply[index],
+            "quota": the_plan.quotas[index],
+            "need": the_plan.needs[index],
+            "draw": the_plan.draws[index],
+            "drawn_unused": by_stratum[index]["unused"],
+            "drawn_second": by_stratum[index]["second"],
+            "expected_kept": round(float(the_plan.expected[index]), 2),
+        }
+        for index in range(len(strata))
+    ]
+    census.drawn = frame.height
+    census.expected_kept = round(float(sum(the_plan.expected)), 2)
+    census.sources = Counter(frame["source"].to_list())
+    return frame, census
+
+
+def write_top_up(
+    root: Path, frame: pl.DataFrame, census: TopUpCensus
+) -> judge.CandidateSet:
+    """Add the top-up to *root*'s candidate set as files after round one's, its census beside."""
+    if (root / TOP_UP_CENSUS).exists():
+        raise SelectionError(f"{root} already holds a top-up; there is one top-up round")
+    census.round_one_files = judge.CandidateSet(root).ordinals()
+    candidates = judge.write_candidates(root, frame)
+    write_json(root / TOP_UP_CENSUS, census.as_dict())
+    log.info(
+        "idiom top-up written",
+        records=frame.height,
+        target_size=census.target_size,
+        expected_kept=census.expected_kept,
+        files=[ordinal for ordinal in candidates.ordinals() if ordinal not in census.round_one_files],
+        root=str(root),
     )
     return candidates
 
