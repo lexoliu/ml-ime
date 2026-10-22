@@ -63,15 +63,30 @@ pub struct Hub {
 }
 
 impl Hub {
-    /// Build a client.
+    /// Build a client, authenticated when `HF_TOKEN` is set.
+    ///
+    /// Every dataset this crate reads is public, so the token only lifts the
+    /// Hub's rate limits for anonymous clients; it is sent marked sensitive, so
+    /// it never appears in a debug print of a request.
     ///
     /// # Errors
     ///
     /// If the HTTP client cannot be constructed, which means the platform has no
-    /// usable TLS backend.
+    /// usable TLS backend, or if `HF_TOKEN` is not a valid header value.
     pub fn new() -> Result<Self> {
+        let mut headers = reqwest::header::HeaderMap::new();
+        if let Ok(token) = std::env::var("HF_TOKEN") {
+            let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {token}"))
+                .map_err(|error| Error::Download {
+                    url: "https://huggingface.co".to_owned(),
+                    message: format!("HF_TOKEN is not a usable header value: {error}"),
+                })?;
+            value.set_sensitive(true);
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
         let client = reqwest::Client::builder()
             .user_agent(concat!("ime-corpus/", env!("CARGO_PKG_VERSION")))
+            .default_headers(headers)
             .build()
             .map_err(|error| Error::Download {
                 url: "https://huggingface.co".to_owned(),
@@ -80,37 +95,52 @@ impl Hub {
         Ok(Self { client })
     }
 
-    /// The files under `prefix` in `dataset`, sorted by path.
+    /// Every file under `prefix` in `dataset`, at any depth, sorted by path.
     ///
-    /// `prefix` is `""` for the repository root. The listing is sorted so that a
-    /// `--limit`ed run takes the same partitions every time.
+    /// `prefix` is `""` for the repository root. The Hub pages a long listing
+    /// and names the next page in a `Link` header, which is followed to the end.
+    /// The listing is sorted so that a `--limit`ed run takes the same partitions
+    /// every time.
     ///
     /// # Errors
     ///
     /// If the endpoint refuses, or answers with something that is not a file list.
     pub async fn files(&self, dataset: &str, prefix: &str) -> Result<Vec<RepoFile>> {
-        let url = format!("https://huggingface.co/api/datasets/{dataset}/tree/main/{prefix}");
-        let body = self
-            .client
-            .get(&url)
-            .send()
-            .await
-            .and_then(reqwest::Response::error_for_status)
-            .map_err(|error| Error::Download {
-                url: url.clone(),
-                message: error.to_string(),
-            })?
-            .text()
-            .await
-            .map_err(|error| Error::Download {
+        let mut url = format!(
+            "https://huggingface.co/api/datasets/{dataset}/tree/main/{prefix}?recursive=true"
+        );
+        let mut files: Vec<RepoFile> = Vec::new();
+        loop {
+            let response = self
+                .client
+                .get(&url)
+                .send()
+                .await
+                .and_then(reqwest::Response::error_for_status)
+                .map_err(|error| Error::Download {
+                    url: url.clone(),
+                    message: error.to_string(),
+                })?;
+            let next = response
+                .headers()
+                .get(reqwest::header::LINK)
+                .and_then(|value| value.to_str().ok())
+                .and_then(next_page);
+            let body = response.text().await.map_err(|error| Error::Download {
                 url: url.clone(),
                 message: error.to_string(),
             })?;
-        let mut files: Vec<RepoFile> =
-            serde_json::from_str(&body).map_err(|error| Error::Download {
-                url: url.clone(),
-                message: format!("the tree listing is not a file list: {error}"),
-            })?;
+            let page: Vec<RepoFile> =
+                serde_json::from_str(&body).map_err(|error| Error::Download {
+                    url: url.clone(),
+                    message: format!("the tree listing is not a file list: {error}"),
+                })?;
+            files.extend(page);
+            match next {
+                Some(link) => url = link,
+                None => break,
+            }
+        }
         files.retain(|entry| entry.kind == "file");
         files.sort_by(|left, right| left.path.cmp(&right.path));
         Ok(files)
@@ -278,9 +308,36 @@ impl Hub {
     }
 }
 
+/// The `rel="next"` target of a `Link` header, if it names one.
+fn next_page(header: &str) -> Option<String> {
+    header.split(',').find_map(|link| {
+        let (target, parameters) = link.split_once(';')?;
+        parameters
+            .split(';')
+            .any(|parameter| parameter.trim() == r#"rel="next""#)
+            .then(|| {
+                target
+                    .trim()
+                    .trim_start_matches('<')
+                    .trim_end_matches('>')
+                    .to_owned()
+            })
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_next_page_is_read_off_a_link_header() {
+        let header = r#"<https://huggingface.co/api/datasets/a/b/tree/main/x?recursive=true&cursor=abc>; rel="next""#;
+        assert_eq!(
+            next_page(header).as_deref(),
+            Some("https://huggingface.co/api/datasets/a/b/tree/main/x?recursive=true&cursor=abc")
+        );
+        assert_eq!(next_page(r#"<https://x>; rel="prev""#), None);
+    }
 
     #[test]
     fn an_lfs_size_wins_over_the_pointer_size() {
