@@ -36,7 +36,7 @@ from transformers.models.bert.modeling_bert import BertEmbeddings, BertLayer
 from mlime.logging import log
 from mlime.train.charlm import _externalize, _weights_table
 from mlime.train.lexicon import Lexicon
-from mlime.train.model import GatedCrossAttention, RouteAModel
+from mlime.train.model import ContextCrossAttention, GatedCrossAttention, RouteAModel
 from mlime.train.samples import (
     DEFAULT_CONTEXT_TOKENS,
     LETTER_PAD,
@@ -126,6 +126,13 @@ def _cross_attention(
     return gated
 
 
+def _bert_block(layer: ContextCrossAttention) -> GatedCrossAttention:
+    """A cross-attention block as MacBERT's, which is the only one route A exports."""
+    if not isinstance(layer, GatedCrossAttention):
+        raise TypeError(f"route A exports MacBERT's blocks, not a {type(layer).__name__}")
+    return layer
+
+
 class _ContextGraph(nn.Module):
     """The context tower alone: ``(context_ids, context_mask) -> last_hidden_state``."""
 
@@ -134,10 +141,11 @@ class _ContextGraph(nn.Module):
         self.model = model
 
     def forward(self, context_ids: torch.Tensor, context_mask: torch.Tensor) -> torch.Tensor:
-        embeds: torch.Tensor = self.model.context.embeddings.word_embeddings(context_ids)
-        hidden = _embeddings(self.model.context.embeddings, embeds)
+        tower = self.model.bert_context()
+        embeds: torch.Tensor = tower.embeddings.word_embeddings(context_ids)
+        hidden = _embeddings(tower.embeddings, embeds)
         mask = _additive_mask(context_mask)
-        for layer in self.model.context.encoder.layer:
+        for layer in tower.encoder.layer:
             hidden = _encoder_layer(layer, hidden, mask)
         return hidden
 
@@ -169,7 +177,7 @@ class _FillGraph(nn.Module):
         )
         hidden = _embeddings(model.fill.embeddings, embeds)
         mask = _additive_mask(attention_mask)
-        gated = model.gated_layers()
+        gated = [_bert_block(layer) for layer in model.gated_layers()]
         gated_from = len(model.fill.encoder.layer) - len(gated)
         for depth, layer in enumerate(model.fill.encoder.layer):
             hidden = _encoder_layer(layer, hidden, mask)

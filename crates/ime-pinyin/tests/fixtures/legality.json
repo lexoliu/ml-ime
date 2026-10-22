@@ -1,0 +1,1724 @@
+{
+ "records": [
+  {
+   "keys": "shizhouniankuaile",
+   "sentence": "十周年快乐"
+  },
+  {
+   "keys": "liyunlongnagetaihuanlele",
+   "sentence": "李云龙那个太欢乐了"
+  },
+  {
+   "keys": "huoguowozaichongqingchengduchileqibadunhuoguo",
+   "sentence": "火锅我在重庆成都吃了七八顿火锅"
+  },
+  {
+   "keys": "baoqinijiuyigefeiben",
+   "sentence": "抱起你就一个飞奔"
+  },
+  {
+   "keys": "zhegenvrenkebuhaore",
+   "sentence": "这个女人可不好惹"
+  },
+  {
+   "keys": "yuminongtanggaifan",
+   "sentence": "玉米浓汤盖饭"
+  },
+  {
+   "keys": "zhuguangjianjin",
+   "sentence": "逐光捡金"
+  },
+  {
+   "keys": "yuqiheqimeichaocangyinmenggongtongzhangda",
+   "sentence": "与其和其妹朝仓音梦共同长大"
+  },
+  {
+   "keys": "qixiangyubaoxianshidangtianxiawushenyangjiuyoudayu",
+   "sentence": "气象预报显示当天下午沈阳就有大雨"
+  },
+  {
+   "keys": "zhegewanshangtajiangrangduoxishoufa",
+   "sentence": "这个晚上他将让多西首发"
+  },
+  {
+   "keys": "shuxuejiamentuozhanzhexiegainian",
+   "sentence": "数学家们拓展这些概念"
+  },
+  {
+   "keys": "houlaishijinierweixieyaoyizhouyuzuzhouta",
+   "sentence": "后来史基尼尔威胁要以咒语诅咒她"
+  },
+  {
+   "keys": "shzhnkl",
+   "sentence": "十周年快乐"
+  },
+  {
+   "keys": "liylngetaihlel",
+   "sentence": "李云龙那个太欢乐了"
+  },
+  {
+   "keys": "huogwzaichqchdchlqbdunhg",
+   "sentence": "火锅我在重庆成都吃了七八顿火锅"
+  },
+  {
+   "keys": "bqinjygfeib",
+   "sentence": "抱起你就一个飞奔"
+  },
+  {
+   "keys": "zhgenvrkbhr",
+   "sentence": "这个女人可不好惹"
+  },
+  {
+   "keys": "ymintanggf",
+   "sentence": "玉米浓汤盖饭"
+  },
+  {
+   "keys": "zhgjj",
+   "sentence": "逐光捡金"
+  },
+  {
+   "keys": "yqheqmchaocymgtongzhda",
+   "sentence": "与其和其妹朝仓音梦共同长大"
+  },
+  {
+   "keys": "qxiangybxianshdtxwushenyjydy",
+   "sentence": "气象预报显示当天下午沈阳就有大雨"
+  },
+  {
+   "keys": "zhgwshtajrdxshf",
+   "sentence": "这个晚上他将让多西首发"
+  },
+  {
+   "keys": "shxjmentzhzhxgnian",
+   "sentence": "数学家们拓展这些概念"
+  },
+  {
+   "keys": "hlshjneweixyyzhouyzzhta",
+   "sentence": "后来史基尼尔威胁要以咒语诅咒她"
+  },
+  {
+   "keys": "shizhounkl",
+   "sentence": "十周年快乐"
+  },
+  {
+   "keys": "liyunlngthll",
+   "sentence": "李云龙那个太欢乐了"
+  },
+  {
+   "keys": "huoguowozaichongqingchengduchileqibdhg",
+   "sentence": "火锅我在重庆成都吃了七八顿火锅"
+  },
+  {
+   "keys": "baoqinijiuyigfb",
+   "sentence": "抱起你就一个飞奔"
+  },
+  {
+   "keys": "zhegenvrkbhr",
+   "sentence": "这个女人可不好惹"
+  },
+  {
+   "keys": "yuminongtanggf",
+   "sentence": "玉米浓汤盖饭"
+  },
+  {
+   "keys": "zhuguangjj",
+   "sentence": "逐光捡金"
+  },
+  {
+   "keys": "yuqiheqimeichcymgtzhd",
+   "sentence": "与其和其妹朝仓音梦共同长大"
+  },
+  {
+   "keys": "qixiangybxshdtxwshyjydy",
+   "sentence": "气象预报显示当天下午沈阳就有大雨"
+  },
+  {
+   "keys": "zhegewanshangtajiangrangdxshf",
+   "sentence": "这个晚上他将让多西首发"
+  },
+  {
+   "keys": "shuxuejiamentuozhanzhexgn",
+   "sentence": "数学家们拓展这些概念"
+  },
+  {
+   "keys": "houlaishjnewxyyzhyzzht",
+   "sentence": "后来史基尼尔威胁要以咒语诅咒她"
+  }
+ ],
+ "cases": [
+  {
+   "keys": "wmzyq",
+   "sentence": "我们吃水饺",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": null
+  },
+  {
+   "keys": "shuijiap",
+   "sentence": "水饺",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 3.3741257414473664
+  },
+  {
+   "keys": "shuijiap",
+   "sentence": "水家铺",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "sj",
+   "sentence": "水饺",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "sk",
+   "sentence": "烧烤",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "sl",
+   "sentence": "沙拉",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "sn",
+   "sentence": "酸奶",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zgrm",
+   "sentence": "中国人民",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "xian",
+   "sentence": "西安",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "xian",
+   "sentence": "先",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "hm",
+   "sentence": "噷",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "hm",
+   "sentence": "好们",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "wmzyq",
+   "sentence": "我们吃水饺",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": null
+  },
+  {
+   "keys": "wmcsj",
+   "sentence": "我们吃水饺",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "z",
+   "sentence": "啊",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": null
+  },
+  {
+   "keys": "zh",
+   "sentence": "啊",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": null
+  },
+  {
+   "keys": "zh",
+   "sentence": "啊",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": null
+  },
+  {
+   "keys": "nihao",
+   "sentence": "你好",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "cost": 0.0
+  },
+  {
+   "keys": "nihao",
+   "sentence": "你们",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "cost": null
+  },
+  {
+   "keys": "zg",
+   "sentence": "中国",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhg",
+   "sentence": "中国",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "cost": 0.0
+  },
+  {
+   "keys": "chf",
+   "sentence": "吃饭",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhg",
+   "sentence": "中",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "cost": 5.967748020490665
+  },
+  {
+   "keys": "guozho",
+   "sentence": "国中",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "guozho",
+   "sentence": "国中",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": null
+  },
+  {
+   "keys": "zhoguo",
+   "sentence": "中国",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 5.773741527031335
+  },
+  {
+   "keys": "wojaijia",
+   "sentence": "我家家",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "cost": 2.436116485618568
+  },
+  {
+   "keys": "shuijiap",
+   "sentence": "水饺",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "cost": 3.3741257414473664
+  },
+  {
+   "keys": "zao",
+   "sentence": "找",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 1.3927149289228133
+  },
+  {
+   "keys": "zao",
+   "sentence": "找",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "cost": null
+  },
+  {
+   "keys": "zao",
+   "sentence": "早",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "cost": 0.0
+  },
+  {
+   "keys": "aa",
+   "sentence": "啊啊",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "a",
+   "sentence": "啊啊",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": null
+  },
+  {
+   "keys": "ab",
+   "sentence": "啊",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": null
+  },
+  {
+   "keys": "chong",
+   "sentence": "重",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhong",
+   "sentence": "重",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "cost": 0.0
+  },
+  {
+   "keys": "shizhouniankuaile",
+   "sentence": "十周年快乐",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "shizhouniankuaile",
+   "sentence": "十周年快乐",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "liyunlongnagetaihuanlele",
+   "sentence": "李云龙那个太欢乐了",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "liyunlongnagetaihuanlele",
+   "sentence": "李云龙那个太欢乐了",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "huoguowozaichongqingchengduchileqibadunhuoguo",
+   "sentence": "火锅我在重庆成都吃了七八顿火锅",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "huoguowozaichongqingchengduchileqibadunhuoguo",
+   "sentence": "火锅我在重庆成都吃了七八顿火锅",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "baoqinijiuyigefeiben",
+   "sentence": "抱起你就一个飞奔",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "baoqinijiuyigefeiben",
+   "sentence": "抱起你就一个飞奔",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhegenvrenkebuhaore",
+   "sentence": "这个女人可不好惹",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhegenvrenkebuhaore",
+   "sentence": "这个女人可不好惹",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "yuminongtanggaifan",
+   "sentence": "玉米浓汤盖饭",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "yuminongtanggaifan",
+   "sentence": "玉米浓汤盖饭",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhuguangjianjin",
+   "sentence": "逐光捡金",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhuguangjianjin",
+   "sentence": "逐光捡金",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "yuqiheqimeichaocangyinmenggongtongzhangda",
+   "sentence": "与其和其妹朝仓音梦共同长大",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "yuqiheqimeichaocangyinmenggongtongzhangda",
+   "sentence": "与其和其妹朝仓音梦共同长大",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "qixiangyubaoxianshidangtianxiawushenyangjiuyoudayu",
+   "sentence": "气象预报显示当天下午沈阳就有大雨",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "qixiangyubaoxianshidangtianxiawushenyangjiuyoudayu",
+   "sentence": "气象预报显示当天下午沈阳就有大雨",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhegewanshangtajiangrangduoxishoufa",
+   "sentence": "这个晚上他将让多西首发",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhegewanshangtajiangrangduoxishoufa",
+   "sentence": "这个晚上他将让多西首发",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "shuxuejiamentuozhanzhexiegainian",
+   "sentence": "数学家们拓展这些概念",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "shuxuejiamentuozhanzhexiegainian",
+   "sentence": "数学家们拓展这些概念",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "houlaishijinierweixieyaoyizhouyuzuzhouta",
+   "sentence": "后来史基尼尔威胁要以咒语诅咒她",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "houlaishijinierweixieyaoyizhouyuzuzhouta",
+   "sentence": "后来史基尼尔威胁要以咒语诅咒她",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "shzhnkl",
+   "sentence": "十周年快乐",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "shzhnkl",
+   "sentence": "十周年快乐",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "liylngetaihlel",
+   "sentence": "李云龙那个太欢乐了",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "liylngetaihlel",
+   "sentence": "李云龙那个太欢乐了",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "huogwzaichqchdchlqbdunhg",
+   "sentence": "火锅我在重庆成都吃了七八顿火锅",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "huogwzaichqchdchlqbdunhg",
+   "sentence": "火锅我在重庆成都吃了七八顿火锅",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "bqinjygfeib",
+   "sentence": "抱起你就一个飞奔",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "bqinjygfeib",
+   "sentence": "抱起你就一个飞奔",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhgenvrkbhr",
+   "sentence": "这个女人可不好惹",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhgenvrkbhr",
+   "sentence": "这个女人可不好惹",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "ymintanggf",
+   "sentence": "玉米浓汤盖饭",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "ymintanggf",
+   "sentence": "玉米浓汤盖饭",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhgjj",
+   "sentence": "逐光捡金",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhgjj",
+   "sentence": "逐光捡金",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "yqheqmchaocymgtongzhda",
+   "sentence": "与其和其妹朝仓音梦共同长大",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "yqheqmchaocymgtongzhda",
+   "sentence": "与其和其妹朝仓音梦共同长大",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "qxiangybxianshdtxwushenyjydy",
+   "sentence": "气象预报显示当天下午沈阳就有大雨",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "qxiangybxianshdtxwushenyjydy",
+   "sentence": "气象预报显示当天下午沈阳就有大雨",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhgwshtajrdxshf",
+   "sentence": "这个晚上他将让多西首发",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhgwshtajrdxshf",
+   "sentence": "这个晚上他将让多西首发",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "shxjmentzhzhxgnian",
+   "sentence": "数学家们拓展这些概念",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "shxjmentzhzhxgnian",
+   "sentence": "数学家们拓展这些概念",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "hlshjneweixyyzhouyzzhta",
+   "sentence": "后来史基尼尔威胁要以咒语诅咒她",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "hlshjneweixyyzhouyzzhta",
+   "sentence": "后来史基尼尔威胁要以咒语诅咒她",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "shizhounkl",
+   "sentence": "十周年快乐",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "shizhounkl",
+   "sentence": "十周年快乐",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "liyunlngthll",
+   "sentence": "李云龙那个太欢乐了",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "liyunlngthll",
+   "sentence": "李云龙那个太欢乐了",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "huoguowozaichongqingchengduchileqibdhg",
+   "sentence": "火锅我在重庆成都吃了七八顿火锅",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "huoguowozaichongqingchengduchileqibdhg",
+   "sentence": "火锅我在重庆成都吃了七八顿火锅",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "baoqinijiuyigfb",
+   "sentence": "抱起你就一个飞奔",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "baoqinijiuyigfb",
+   "sentence": "抱起你就一个飞奔",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhegenvrkbhr",
+   "sentence": "这个女人可不好惹",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhegenvrkbhr",
+   "sentence": "这个女人可不好惹",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "yuminongtanggf",
+   "sentence": "玉米浓汤盖饭",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "yuminongtanggf",
+   "sentence": "玉米浓汤盖饭",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhuguangjj",
+   "sentence": "逐光捡金",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhuguangjj",
+   "sentence": "逐光捡金",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "yuqiheqimeichcymgtzhd",
+   "sentence": "与其和其妹朝仓音梦共同长大",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "yuqiheqimeichcymgtzhd",
+   "sentence": "与其和其妹朝仓音梦共同长大",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "qixiangybxshdtxwshyjydy",
+   "sentence": "气象预报显示当天下午沈阳就有大雨",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "qixiangybxshdtxwshyjydy",
+   "sentence": "气象预报显示当天下午沈阳就有大雨",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhegewanshangtajiangrangdxshf",
+   "sentence": "这个晚上他将让多西首发",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "zhegewanshangtajiangrangdxshf",
+   "sentence": "这个晚上他将让多西首发",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "shuxuejiamentuozhanzhexgn",
+   "sentence": "数学家们拓展这些概念",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "shuxuejiamentuozhanzhexgn",
+   "sentence": "数学家们拓展这些概念",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "houlaishjnewxyyzhyzzht",
+   "sentence": "后来史基尼尔威胁要以咒语诅咒她",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "cost": 0.0
+  },
+  {
+   "keys": "houlaishjnewxyyzhyzzht",
+   "sentence": "后来史基尼尔威胁要以咒语诅咒她",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "cost": 0.0
+  }
+ ],
+ "lattices": [
+  {
+   "keys": "wmzyq",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 18647,
+   "cost_sum": 21896.513011121602,
+   "digest": "12476329f8a86433"
+  },
+  {
+   "keys": "shuijiap",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 30399,
+   "cost_sum": 54197.13660658064,
+   "digest": "8bf5342fdbba3ee7"
+  },
+  {
+   "keys": "sj",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 8063,
+   "cost_sum": 5259.992864700546,
+   "digest": "72532e98c3435372"
+  },
+  {
+   "keys": "sk",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 5593,
+   "cost_sum": 4860.030924364664,
+   "digest": "d5cb31e3a4ef5632"
+  },
+  {
+   "keys": "sl",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 7329,
+   "cost_sum": 4549.30159926396,
+   "digest": "a9119b3314d9955d"
+  },
+  {
+   "keys": "sn",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 5030,
+   "cost_sum": 2431.0481880516945,
+   "digest": "b2b44779771614ba"
+  },
+  {
+   "keys": "zgrm",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 10351,
+   "cost_sum": 10272.764431687612,
+   "digest": "51f0d7d948cbb743"
+  },
+  {
+   "keys": "xian",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 12742,
+   "cost_sum": 18765.186406273686,
+   "digest": "99fc7e501bc9f7e2"
+  },
+  {
+   "keys": "hm",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 5227,
+   "cost_sum": 4518.558033184159,
+   "digest": "902090517a4a3be8"
+  },
+  {
+   "keys": "wmzyq",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 18647,
+   "cost_sum": 21896.513011121602,
+   "digest": "12476329f8a86433"
+  },
+  {
+   "keys": "wmcsj",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 16349,
+   "cost_sum": 14409.656577455673,
+   "digest": "d61ec0724175b58e"
+  },
+  {
+   "keys": "z",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 4012,
+   "cost_sum": 0.0,
+   "digest": "468a755483cca472"
+  },
+  {
+   "keys": "zh",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 9473,
+   "cost_sum": 0.0,
+   "digest": "3f123f6ecb47f268"
+  },
+  {
+   "keys": "zh",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 9473,
+   "cost_sum": 0.0,
+   "digest": "3f123f6ecb47f268"
+  },
+  {
+   "keys": "nihao",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "arcs": 10305,
+   "cost_sum": 23747.16134611083,
+   "digest": "f8b62a02a6324cd2"
+  },
+  {
+   "keys": "zg",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "arcs": 6645,
+   "cost_sum": 4112.486481605578,
+   "digest": "d1002adb5d0b023c"
+  },
+  {
+   "keys": "zhg",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "arcs": 13127,
+   "cost_sum": 9497.55466611945,
+   "digest": "6d7b3e3b6dc6d277"
+  },
+  {
+   "keys": "chf",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "arcs": 10382,
+   "cost_sum": 3973.285792173592,
+   "digest": "68aae91c20c48235"
+  },
+  {
+   "keys": "guozho",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 18358,
+   "cost_sum": 18865.769928428796,
+   "digest": "f2449602f6d82187"
+  },
+  {
+   "keys": "guozho",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 18039,
+   "cost_sum": 19699.383430370657,
+   "digest": "42796e6941ef2bea"
+  },
+  {
+   "keys": "zhoguo",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 19909,
+   "cost_sum": 28642.878699817393,
+   "digest": "179df5bf3e6e325a"
+  },
+  {
+   "keys": "wojaijia",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "arcs": 20985,
+   "cost_sum": 41238.16365600807,
+   "digest": "57b87594dbe10ede"
+  },
+  {
+   "keys": "shuijiap",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "arcs": 24224,
+   "cost_sum": 36483.03689033226,
+   "digest": "7b0b58fcf89920ab"
+  },
+  {
+   "keys": "zao",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 7181,
+   "cost_sum": 7475.699395604806,
+   "digest": "7aff03679e0307a5"
+  },
+  {
+   "keys": "zao",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "arcs": 4895,
+   "cost_sum": 0.0,
+   "digest": "d8425fa6931c4cfc"
+  },
+  {
+   "keys": "aa",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 1867,
+   "cost_sum": 3054.490451607244,
+   "digest": "60d984736071e503"
+  },
+  {
+   "keys": "a",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 488,
+   "cost_sum": 0.0,
+   "digest": "9cdd648db6d4ad7d"
+  },
+  {
+   "keys": "ab",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 3289,
+   "cost_sum": 2598.4484608079442,
+   "digest": "964448dbc7a64ebd"
+  },
+  {
+   "keys": "chong",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "arcs": 16810,
+   "cost_sum": 19312.877078043315,
+   "digest": "375cf8b9f2b26cec"
+  },
+  {
+   "keys": "zhong",
+   "unfinished_tail": false,
+   "correct_syllables": false,
+   "arcs": 18521,
+   "cost_sum": 20597.454189367065,
+   "digest": "6ce1345303c6615f"
+  },
+  {
+   "keys": "shizhouniankuaile",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 55952,
+   "cost_sum": 95689.85402966817,
+   "digest": "8c67fe329f299c5e"
+  },
+  {
+   "keys": "shizhouniankuaile",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 55976,
+   "cost_sum": 95232.24809204572,
+   "digest": "4b2855aa839b099f"
+  },
+  {
+   "keys": "liyunlongnagetaihuanlele",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 75911,
+   "cost_sum": 145809.5310951255,
+   "digest": "3f4fde394725a9c1"
+  },
+  {
+   "keys": "liyunlongnagetaihuanlele",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 75935,
+   "cost_sum": 145351.92515750305,
+   "digest": "60dca55f537c80c7"
+  },
+  {
+   "keys": "huoguowozaichongqingchengduchileqibadunhuoguo",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 135782,
+   "cost_sum": 227218.98716166505,
+   "digest": "c48b977d31697ec1"
+  },
+  {
+   "keys": "huoguowozaichongqingchengduchileqibadunhuoguo",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 135782,
+   "cost_sum": 227218.98716166505,
+   "digest": "c48b977d31697ec1"
+  },
+  {
+   "keys": "baoqinijiuyigefeiben",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 57582,
+   "cost_sum": 117200.34277049475,
+   "digest": "7f5865fc31251742"
+  },
+  {
+   "keys": "baoqinijiuyigefeiben",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 57582,
+   "cost_sum": 117062.21472231083,
+   "digest": "646888fdacb2c6bc"
+  },
+  {
+   "keys": "zhegenvrenkebuhaore",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 45454,
+   "cost_sum": 79949.25994572738,
+   "digest": "91a0d701691715f9"
+  },
+  {
+   "keys": "zhegenvrenkebuhaore",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 45454,
+   "cost_sum": 79604.00653365564,
+   "digest": "6ab2a625aa2d6fe4"
+  },
+  {
+   "keys": "yuminongtanggaifan",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 51590,
+   "cost_sum": 104079.55864361531,
+   "digest": "38c276b057a6a595"
+  },
+  {
+   "keys": "yuminongtanggaifan",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 51590,
+   "cost_sum": 103945.359323571,
+   "digest": "248fb503fc24c42f"
+  },
+  {
+   "keys": "zhuguangjianjin",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 58049,
+   "cost_sum": 106297.89668064649,
+   "digest": "0c6a67d284bc885a"
+  },
+  {
+   "keys": "zhuguangjianjin",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 58049,
+   "cost_sum": 106035.44716662468,
+   "digest": "a303737ee0c6426c"
+  },
+  {
+   "keys": "yuqiheqimeichaocangyinmenggongtongzhangda",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 138894,
+   "cost_sum": 258420.79355947973,
+   "digest": "0b68b4cda7987f1b"
+  },
+  {
+   "keys": "yuqiheqimeichaocangyinmenggongtongzhangda",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 138995,
+   "cost_sum": 257312.1771528807,
+   "digest": "f1bfede255ac721c"
+  },
+  {
+   "keys": "qixiangyubaoxianshidangtianxiawushenyangjiuyoudayu",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 171054,
+   "cost_sum": 323252.475311044,
+   "digest": "b3d13cbe8d766c17"
+  },
+  {
+   "keys": "qixiangyubaoxianshidangtianxiawushenyangjiuyoudayu",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 171265,
+   "cost_sum": 322400.8843150885,
+   "digest": "63050011f1e1a497"
+  },
+  {
+   "keys": "zhegewanshangtajiangrangduoxishoufa",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 111489,
+   "cost_sum": 181244.46103021767,
+   "digest": "11ecc9e49b65e717"
+  },
+  {
+   "keys": "zhegewanshangtajiangrangduoxishoufa",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 111489,
+   "cost_sum": 180502.7750941151,
+   "digest": "82bee625c529c73f"
+  },
+  {
+   "keys": "shuxuejiamentuozhanzhexiegainian",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 103644,
+   "cost_sum": 163335.4875676869,
+   "digest": "40c4cc2eb2dbe631"
+  },
+  {
+   "keys": "shuxuejiamentuozhanzhexiegainian",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 103644,
+   "cost_sum": 163260.6665075326,
+   "digest": "0e9d85a6eee1b3fb"
+  },
+  {
+   "keys": "houlaishijinierweixieyaoyizhouyuzuzhouta",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 143110,
+   "cost_sum": 254250.839600788,
+   "digest": "372fd53cf4cf698a"
+  },
+  {
+   "keys": "houlaishijinierweixieyaoyizhouyuzuzhouta",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 143110,
+   "cost_sum": 252666.53941718442,
+   "digest": "c73a25feeecd438d"
+  },
+  {
+   "keys": "shzhnkl",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 29969,
+   "cost_sum": 31278.66569130302,
+   "digest": "f4548806b64be1aa"
+  },
+  {
+   "keys": "shzhnkl",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 29969,
+   "cost_sum": 31278.66569130302,
+   "digest": "f4548806b64be1aa"
+  },
+  {
+   "keys": "liylngetaihlel",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 48439,
+   "cost_sum": 81585.61238899473,
+   "digest": "e6b2e784ca5a93f5"
+  },
+  {
+   "keys": "liylngetaihlel",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 48439,
+   "cost_sum": 81585.61238899473,
+   "digest": "e6b2e784ca5a93f5"
+  },
+  {
+   "keys": "huogwzaichqchdchlqbdunhg",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 79740,
+   "cost_sum": 93097.65011202807,
+   "digest": "d8a5565337944584"
+  },
+  {
+   "keys": "huogwzaichqchdchlqbdunhg",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 79740,
+   "cost_sum": 93097.65011202807,
+   "digest": "d8a5565337944584"
+  },
+  {
+   "keys": "bqinjygfeib",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 34891,
+   "cost_sum": 58869.2726676948,
+   "digest": "ca85a171a22fb5e7"
+  },
+  {
+   "keys": "bqinjygfeib",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 34891,
+   "cost_sum": 58869.2726676948,
+   "digest": "ca85a171a22fb5e7"
+  },
+  {
+   "keys": "zhgenvrkbhr",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 30586,
+   "cost_sum": 47909.60865375817,
+   "digest": "09b5f63632e20a03"
+  },
+  {
+   "keys": "zhgenvrkbhr",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 30586,
+   "cost_sum": 47909.60865375817,
+   "digest": "09b5f63632e20a03"
+  },
+  {
+   "keys": "ymintanggf",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 31973,
+   "cost_sum": 62509.80047121148,
+   "digest": "a447bcd0fe1943f4"
+  },
+  {
+   "keys": "ymintanggf",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 31973,
+   "cost_sum": 62509.80047121148,
+   "digest": "a447bcd0fe1943f4"
+  },
+  {
+   "keys": "zhgjj",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 23961,
+   "cost_sum": 23888.340704096987,
+   "digest": "733a230b41943393"
+  },
+  {
+   "keys": "zhgjj",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 23961,
+   "cost_sum": 23888.340704096987,
+   "digest": "733a230b41943393"
+  },
+  {
+   "keys": "yqheqmchaocymgtongzhda",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 78992,
+   "cost_sum": 116236.07607837048,
+   "digest": "5541acef7c61e7b4"
+  },
+  {
+   "keys": "yqheqmchaocymgtongzhda",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 79093,
+   "cost_sum": 115127.45967177144,
+   "digest": "d31cadc5277e3808"
+  },
+  {
+   "keys": "qxiangybxianshdtxwushenyjydy",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 109892,
+   "cost_sum": 155157.92186630762,
+   "digest": "ced803b7f0bb8a2e"
+  },
+  {
+   "keys": "qxiangybxianshdtxwushenyjydy",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 109892,
+   "cost_sum": 155157.92186630762,
+   "digest": "ced803b7f0bb8a2e"
+  },
+  {
+   "keys": "zhgwshtajrdxshf",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 54569,
+   "cost_sum": 59684.783217583696,
+   "digest": "f4d733d97dc143f7"
+  },
+  {
+   "keys": "zhgwshtajrdxshf",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 54569,
+   "cost_sum": 59684.783217583696,
+   "digest": "f4d733d97dc143f7"
+  },
+  {
+   "keys": "shxjmentzhzhxgnian",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 68844,
+   "cost_sum": 88846.09864057876,
+   "digest": "5850ea14e69b0bbe"
+  },
+  {
+   "keys": "shxjmentzhzhxgnian",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 68844,
+   "cost_sum": 88771.27758042443,
+   "digest": "8e5810f262a1850c"
+  },
+  {
+   "keys": "hlshjneweixyyzhouyzzhta",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 100207,
+   "cost_sum": 154654.71212766677,
+   "digest": "d8aa7f0e550984c9"
+  },
+  {
+   "keys": "hlshjneweixyyzhouyzzhta",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 100207,
+   "cost_sum": 153070.4119440632,
+   "digest": "28db78d3ce38400e"
+  },
+  {
+   "keys": "shizhounkl",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 39400,
+   "cost_sum": 54836.77324515763,
+   "digest": "a8eeb9257fa2e1d6"
+  },
+  {
+   "keys": "shizhounkl",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 39400,
+   "cost_sum": 54836.77324515763,
+   "digest": "a8eeb9257fa2e1d6"
+  },
+  {
+   "keys": "liyunlngthll",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 43999,
+   "cost_sum": 61151.03529940142,
+   "digest": "bdc4dbe7f6e015a8"
+  },
+  {
+   "keys": "liyunlngthll",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 43999,
+   "cost_sum": 61151.03529940142,
+   "digest": "bdc4dbe7f6e015a8"
+  },
+  {
+   "keys": "huoguowozaichongqingchengduchileqibdhg",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 121701,
+   "cost_sum": 192935.09408640862,
+   "digest": "aa8eff21f814b5e3"
+  },
+  {
+   "keys": "huoguowozaichongqingchengduchileqibdhg",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 121701,
+   "cost_sum": 192935.09408640862,
+   "digest": "aa8eff21f814b5e3"
+  },
+  {
+   "keys": "baoqinijiuyigfb",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 49109,
+   "cost_sum": 99939.19259119328,
+   "digest": "dbe0ee94013581a2"
+  },
+  {
+   "keys": "baoqinijiuyigfb",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 49109,
+   "cost_sum": 99939.19259119328,
+   "digest": "dbe0ee94013581a2"
+  },
+  {
+   "keys": "zhegenvrkbhr",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 32018,
+   "cost_sum": 46060.377689452434,
+   "digest": "446b47eab6b8c4d9"
+  },
+  {
+   "keys": "zhegenvrkbhr",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 32018,
+   "cost_sum": 46060.377689452434,
+   "digest": "446b47eab6b8c4d9"
+  },
+  {
+   "keys": "yuminongtanggf",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 41397,
+   "cost_sum": 77734.07295534054,
+   "digest": "830fe40a1e62280e"
+  },
+  {
+   "keys": "yuminongtanggf",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 41397,
+   "cost_sum": 77734.07295534054,
+   "digest": "830fe40a1e62280e"
+  },
+  {
+   "keys": "zhuguangjj",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 39545,
+   "cost_sum": 57780.11383632403,
+   "digest": "cfd3dd54878c4621"
+  },
+  {
+   "keys": "zhuguangjj",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 39545,
+   "cost_sum": 57780.11383632403,
+   "digest": "cfd3dd54878c4621"
+  },
+  {
+   "keys": "yuqiheqimeichcymgtzhd",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 81870,
+   "cost_sum": 135792.31386589672,
+   "digest": "52a46f076a8d25d4"
+  },
+  {
+   "keys": "yuqiheqimeichcymgtzhd",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 81870,
+   "cost_sum": 135792.31386589672,
+   "digest": "52a46f076a8d25d4"
+  },
+  {
+   "keys": "qixiangybxshdtxwshyjydy",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 98478,
+   "cost_sum": 138847.40849410678,
+   "digest": "4142d7120a6fbf7c"
+  },
+  {
+   "keys": "qixiangybxshdtxwshyjydy",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 98478,
+   "cost_sum": 138847.40849410678,
+   "digest": "4142d7120a6fbf7c"
+  },
+  {
+   "keys": "zhegewanshangtajiangrangdxshf",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 96477,
+   "cost_sum": 139359.39266857173,
+   "digest": "6d90b7597003d0c0"
+  },
+  {
+   "keys": "zhegewanshangtajiangrangdxshf",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 96477,
+   "cost_sum": 139359.39266857173,
+   "digest": "6d90b7597003d0c0"
+  },
+  {
+   "keys": "shuxuejiamentuozhanzhexgn",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 84412,
+   "cost_sum": 117115.43685209012,
+   "digest": "d1c11e453c2f687a"
+  },
+  {
+   "keys": "shuxuejiamentuozhanzhexgn",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 84412,
+   "cost_sum": 117115.43685209012,
+   "digest": "d1c11e453c2f687a"
+  },
+  {
+   "keys": "houlaishjnewxyyzhyzzht",
+   "unfinished_tail": false,
+   "correct_syllables": true,
+   "arcs": 96141,
+   "cost_sum": 143051.8434951008,
+   "digest": "8144f41e4efed98b"
+  },
+  {
+   "keys": "houlaishjnewxyyzhyzzht",
+   "unfinished_tail": true,
+   "correct_syllables": true,
+   "arcs": 96141,
+   "cost_sum": 143051.8434951008,
+   "digest": "8144f41e4efed98b"
+  }
+ ]
+}

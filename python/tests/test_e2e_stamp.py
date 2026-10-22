@@ -24,6 +24,7 @@ from mlime.stamp import (
     stamp,
     stamp_e2e_v2,
 )
+from mlime.train.qwen_tower import QWEN_REVISION
 
 TEMPLATE = Path(__file__).resolve().parents[2] / "kaggle" / "e2e"
 
@@ -242,3 +243,49 @@ def test_search_graphs_without_a_ranking_stage_are_refused(tmp_path: Path) -> No
         )
     with pytest.raises(ValueError, match="only a ranking stage"):
         E2EV2Run(run="mlime-e2e-v2-a100", search_graphs=True)
+
+
+def test_a_context_warm_up_stamps_its_tower_and_its_graphs(tmp_path: Path) -> None:
+    """S0 (#222): the Qwen tower and the warm-up are recipe, the graphs are not."""
+    out = tmp_path / "qwen"
+    stage = ["--init-from", "mlime-e2e-v2-rank-g4", "--context-tower", "Qwen/Qwen3-0.6B-Base"]
+    argv = ["e2e", "stamp", "mlime-e2e-v2-qwen-g4", "--out", str(out), *stage]
+    result = CliRunner().invoke(app, [*argv, "--context-warm-up", "--tower-graphs"])
+    assert result.exit_code == 0, result.output
+    kernel = (out / "kernel.py").read_text()
+    assert literal(kernel, "CONTEXT_TOWER") == {
+        "tower": "Qwen/Qwen3-0.6B-Base",
+        "revision": QWEN_REVISION,
+        "lora_rank": 0,
+        "lora_alpha": 16.0,
+    }
+    assert literal(kernel, "CONTEXT_WARM_UP") is True
+    assert literal(kernel, "TOWER_GRAPHS") is True
+
+    refused = CliRunner().invoke(
+        app,
+        [
+            "e2e",
+            "stamp",
+            "mlime-e2e-v2-qwen-g4",
+            "--out",
+            str(tmp_path / "plain"),
+            "--context-tower",
+            "Qwen/Qwen3-0.6B-Base",
+        ],
+    )
+    assert refused.exit_code == 2, refused.output
+    assert "pass --init-from" in error(refused.output)
+    adapted = E2EV2Stage(
+        init_from="mlime-e2e-v2-rank-g4",
+        context_tower={
+            "tower": "Qwen/Qwen3-0.6B-Base",
+            "revision": QWEN_REVISION,
+            "lora_rank": 8,
+            "lora_alpha": 16.0,
+        },
+    )
+    with pytest.raises(ValueError, match="only a frozen Qwen context tower"):
+        E2EV2Run(run="mlime-e2e-v2-qwen-lora", stage=adapted, tower_graphs=True)
+    with pytest.raises(ValueError, match="a context tower names"):
+        E2EV2Stage(init_from="mlime-e2e-v2-rank-g4", context_tower={"tower": "x"})

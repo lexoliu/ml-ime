@@ -13,6 +13,10 @@ dir>/<arch>/` holds `charlm.json`, `prefill.onnx`, `charlm.onnx` and
 for and their gathered scores, plus the full vocabulary rows the gather is
 checked against), and `<out dir>/char_pinyin.tsv` is the character table the
 Rust `Lexicon` parses.
+
+Written into `crates/ime-lm/tests/fixtures`, the text files are committed and
+the graphs and weights are published with `scripts/publish_fixtures.py`,
+which pins them in `crates/ime-fixtures/fixtures.json`.
 """
 
 import json

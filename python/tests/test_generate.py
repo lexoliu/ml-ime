@@ -9,7 +9,7 @@ from mlime.rescore import DumpedRecord, Hypothesis
 def test_parse_sentence_takes_the_first_line_without_quotes_or_final_punctuation() -> None:
     assert parse_sentence("你可以看看") == "你可以看看"
     assert parse_sentence("「你可以看看。」\n（根据上文）") == "你可以看看"
-    assert parse_sentence("\n  “二次元辣么美”！ \n") == "二次元辣么美"
+    assert parse_sentence("\n  “今天的晚饭真香”！ \n") == "今天的晚饭真香"
 
 
 @pytest.mark.parametrize("content", ["", "\n\n", "。", "你可以 看看", '""'])

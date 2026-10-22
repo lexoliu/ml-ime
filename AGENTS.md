@@ -100,6 +100,23 @@ table does not load, so an export and the decoder always move together.
   the input method's latency, so the levers there are bytes per weight and a faster backend, not
   more threads.
 
+## Training
+
+- Training is staged, as for a language model: general pretraining, task training on typed
+  input, data enrichment, then sequence-level post-training. Every stage starts from the
+  previous stage's final checkpoint; only parameters new to the architecture are initialised,
+  and a trained component is never reinitialised.
+- A new architecture enters through a warm-up stage that trains only its new parts against the
+  previous model, with the inherited parts frozen.
+- Each stage ends in a gate on the dev slice. A checkpoint that does not beat its parent there
+  does not seed the next stage.
+- Quality comes from the data first. The model grows only when the per-component losses show
+  that its capacity is the limit.
+- A stage that shifts the data distribution keeps a replay share of the distribution before it.
+- The output is always a legal reading of the keys: one constraint restricts both the
+  alignments training learns from and the search at inference, and typo tolerance widens it
+  only by the corrections the noise model defines.
+
 ## GPUs
 
 - No Devin, local or cloud, works on this repository: its code runs straight on expensive GPUs,

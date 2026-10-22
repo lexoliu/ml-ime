@@ -454,6 +454,24 @@ class CorpusStream(IterableDataset[TrainingExample]):
             log.debug("shard streamed", shard=shard.name, **self.builder.counts.as_dict())
 
 
+class ContextTokenizer(Protocol):
+    """What the collator needs of the tokenizer the context tower reads.
+
+    MacBERT's tower reads the base model's own tokens, sentinels included;
+    Qwen's reads its BPE with no special tokens, its head being the tower's.
+    """
+
+    def __call__(
+        self,
+        text: list[str],
+        padding: bool,
+        truncation: bool,
+        max_length: int,
+    ) -> Mapping[str, list[list[int]]]:
+        """Encode a batch of strings into padded ``input_ids`` and ``attention_mask`` rows."""
+        ...
+
+
 class BaseTokenizer(Protocol):
     """What the collator needs of the base model's tokenizer."""
 
@@ -638,11 +656,18 @@ class Collator:
     Context is dropped per example rather than per batch, because the model has
     to work both ways at inference and a whole-batch drop would correlate the
     decision with everything else in the step.
+
+    The fill rows are the base model's tokens (*tokenizer*) and the context
+    rows are whatever the context tower reads (*context_tokenizer*): the same
+    tokenizer for MacBERT's tower, Qwen's BPE for Qwen's. Both are named at
+    every construction, because a context in the wrong vocabulary is still a
+    row of valid ids, and nothing downstream could tell.
     """
 
     def __init__(
         self,
         tokenizer: BaseTokenizer,
+        context_tokenizer: ContextTokenizer,
         candidates: CandidateSpace,
         context_dropout: float = 0.3,
         max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
@@ -651,6 +676,7 @@ class Collator:
         if not 0.0 <= context_dropout <= 1.0:
             raise ValueError(f"context_dropout must be a probability, got {context_dropout}")
         self.tokenizer = tokenizer
+        self.context_tokenizer = context_tokenizer
         #: The per-position candidate resolver -- the lexicon mask under clean
         #: input, the corrections' union under the typo model. The batch is
         #: where the examples become tensors, so it is also where an example
@@ -774,7 +800,7 @@ class Collator:
             keep = context is not None and self.rng.random() >= self.context_dropout
             kept.append(context_tail(context, self.max_context_tokens) if keep and context else "")
             has_context[index] = 1.0 if keep else 0.0
-        encoded = self.tokenizer(
+        encoded = self.context_tokenizer(
             kept,
             padding=True,
             truncation=True,

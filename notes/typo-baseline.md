@@ -140,10 +140,9 @@ Three layers fail in sequence:
    weight trusts a signal that is wrong at exactly the typo positions. What
    rescues a record is the transition side (trigram + char LM) re-reading the
    context when the corruption still leaves the intended reading reachable:
-   `kongpasguyideba` (恐怕是故意的吧, `shi` typed `s`) and
-   `bixushizoudaon` (必须是走到哪, `na` typed `n`) both decode correctly,
-   while `shougepoqianwandeerchuantshiping` comes back 首个破千万的二传提示屏
-   against 首个破千万的二创视屏.
+   a record with `shi` typed `s` and one with `na` typed `n` both decode
+   correctly, while a record whose corrupted `shi` sits inside a long
+   compound comes back with the compound misread.
 
 And top-8 (1.31%) barely exceeds top-1 (1.19%): the right sentence is absent
 from the beam, not merely outranked. This is the honest baseline -- a fusion
