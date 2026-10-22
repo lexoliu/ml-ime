@@ -136,13 +136,18 @@ class ContextTower(nn.Module):
     """What reads the context, and how the fill tower's blocks read it back.
 
     :attr:`separate` says where the tower runs: inside the compiled encoder
-    pass (a tower that trains with it), or before it, outside the compiled
-    region (a frozen tower, which may run from captured graphs of its own).
+    pass, or before it, outside the compiled region, where it compiles what
+    it needs compiled itself (:meth:`compile_layers`) -- a frozen tower may
+    run from captured graphs of its own instead.
     """
 
     @property
     def separate(self) -> bool:
         """Whether the tower runs before the compiled encoder pass rather than inside it."""
+        raise NotImplementedError
+
+    def compile_layers(self, options: Mapping[str, Any]) -> None:
+        """torch.compile a separate tower's own layers with Inductor *options*, in place."""
         raise NotImplementedError
 
     def memory(self, ids: torch.Tensor, mask: torch.Tensor) -> ContextMemory:
