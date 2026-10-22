@@ -46,6 +46,7 @@ from typing import Any
 
 from mlime.logging import log
 from mlime.train.e2e_model import RankingConfig
+from mlime.train.keys import KeyFrontConfig
 from mlime.train.ranking import RankCollator
 from mlime.train.run import RunPaths, Slices, Vocabularies
 from mlime.train.samples import (
@@ -110,6 +111,11 @@ class BatchCensus:
     #: every row the ranking step makes of it (see :func:`ranking_shape`);
     #: ``None`` for a plain run.
     ranking: dict[str, Any] | None = None
+    #: The key-level sampling the count typed its examples under
+    #: (:meth:`~mlime.train.keys.KeyFrontConfig.sampling`): which golds are
+    #: legal and how long a key string may be, and every example's width is
+    #: its keys' and its spans'. ``None`` for a span-level run.
+    keys: dict[str, Any] | None = None
 
     def write(self, path: Path) -> None:
         """Write the census as JSON, which is how the kernel reads it back."""
@@ -128,6 +134,8 @@ class BatchCensus:
         data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
         data["ranks"] = [RankBatches(**rank) for rank in data["ranks"]]
         data.setdefault("census_version", 0)
+        # A span-level census written before key-level counts existed.
+        data.setdefault("keys", None)
         return cls(**data)
 
 
@@ -150,6 +158,7 @@ class CountSpec:
     accumulate: int
     census_version: int
     ranking: dict[str, Any] | None
+    keys: dict[str, Any] | None = None
 
 
 def ranking_shape(ranking: RankingConfig | None) -> dict[str, Any] | None:
@@ -187,6 +196,8 @@ def matching_census(path: Path, spec: CountSpec) -> tuple[BatchCensus | None, li
         data: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None, ["<unreadable>"]
+    # A span-level census from before key-level counts records no keys.
+    data.setdefault("keys", None)
     declared = {field.name for field in fields(BatchCensus)}
     differed = sorted(set(data) ^ declared)
     if differed:
@@ -219,6 +230,7 @@ class _CountContext:
     world_size: int
     ranking: RankingConfig | None
     segmenter: Path | None
+    keys: KeyFrontConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -261,7 +273,11 @@ def _count_shard(context: _CountContext, collator: BatchCollator, task: _ShardTa
     rows :class:`~mlime.train.samples.CorpusStream` would hand that rank --
     with a builder of the run's seed, so the draws are the run's draws.
     """
-    builder = context.vocabularies.builder(context.augmentation, context.seed)
+    builder = (
+        context.vocabularies.builder(context.augmentation, context.seed)
+        if context.keys is None
+        else context.vocabularies.key_builder(context.augmentation, context.seed, context.keys)
+    )
     pairs = list(read_pair(task.path, context.labels))
     world = context.world_size
     shapes: list[list[_Shapes]] = []
@@ -368,6 +384,7 @@ def count_batches(
     ranking: RankingConfig | None = None,
     segmenter: Path | None = None,
     workers: int = 1,
+    keys: KeyFrontConfig | None = None,
 ) -> BatchCensus:
     """Count the batches every rank takes over *epochs*, the way the loop would.
 
@@ -386,6 +403,9 @@ def count_batches(
 
     *workers* is how many processes build the examples; the census does not
     depend on it.
+
+    *keys* counts a key-level run: its builder types keys and drops the golds
+    the automaton rejects, and an example's width is its keys' and its spans'.
     """
     if workers < 1:
         raise ValueError(f"a count needs at least one worker, got {workers}")
@@ -395,7 +415,10 @@ def count_batches(
         raise ValueError(f"a count covers at least one epoch, got {epochs}")
     if accumulate < 1:
         raise ValueError(f"an optimiser step holds at least one micro-batch, got {accumulate}")
+    if keys is not None and ranking is not None:
+        raise ValueError("a key-level run has no lattice readings to rank")
     augmentation = augmentation or Augmentation()
+    sampling = None if keys is None else keys.sampling()
     spec = CountSpec(
         world_size=world_size,
         epochs=epochs,
@@ -407,6 +430,7 @@ def count_batches(
         accumulate=accumulate,
         census_version=CENSUS_VERSION,
         ranking=ranking_shape(ranking),
+        keys=sampling,
     )
     if reuse_census is not None:
         stored, differed = matching_census(reuse_census, spec)
@@ -424,6 +448,7 @@ def count_batches(
         world_size=world_size,
         ranking=ranking,
         segmenter=segmenter,
+        keys=keys,
     )
     # The stream decides the reading order and where each shard starts in it,
     # exactly as each rank's stream will in the run.
@@ -449,6 +474,7 @@ def count_batches(
         census_version=CENSUS_VERSION,
         build_counts=build_counts,
         ranking=ranking_shape(ranking),
+        keys=sampling,
     )
     log.info(
         "batches counted",
