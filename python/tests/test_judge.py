@@ -530,10 +530,44 @@ def test_a_candidate_set_faces_the_same_rules_and_keeps_each_source_apart(
     assert again_jev.asked == [] and again_review.asked == []
 
 
-def test_a_candidate_set_is_written_once(tmp_path: Path) -> None:
+def test_a_later_round_is_numbered_after_the_first_and_judged_alone(tmp_path: Path) -> None:
+    units = candidate_units(TWO_SOURCES)
+    first, second = units.head(4), units.tail(2)
+    candidates = judge.write_candidates(tmp_path, first)
+    census = run(candidates, FakeJev(), FakeReview())
+    assert candidates.ordinals() == [0, 1]
+
+    assert judge.write_candidates(tmp_path, second).ordinals() == [0, 1, 2, 3]
+    assert sorted(path.name for path in candidates.candidates.glob("*.parquet")) == [
+        "forum-0000000.parquet",
+        "forum-0002000.parquet",
+        "web-0001000.parquet",
+        "web-0003000.parquet",
+    ]
+    jev, review = FakeJev(), FakeReview()
+    total = run(candidates, jev, review)
+    asked = set(jev.asked) | set(review.asked)
+    assert asked, "the second round is judged"
+    assert asked.isdisjoint(first.get_column("text").to_list()), (
+        "the first round is not asked again"
+    )
+    assert total.records == census.records + 2
+    assert [judge.finished_at_threshold(candidates, ordinal) for ordinal in range(4)] == [True] * 4
+
+
+def test_a_record_of_an_earlier_round_is_refused(tmp_path: Path) -> None:
     judge.write_candidates(tmp_path, candidate_units(TWO_SOURCES))
-    with pytest.raises(JudgeError, match="written once"):
-        judge.write_candidates(tmp_path, candidate_units(TWO_SOURCES))
+    with pytest.raises(JudgeError, match="earlier round come again"):
+        judge.write_candidates(tmp_path, candidate_units(TWO_SOURCES).head(1))
+
+
+def test_a_round_cut_short_is_refused(tmp_path: Path) -> None:
+    candidates = judge.write_candidates(tmp_path, candidate_units(TWO_SOURCES))
+    (candidates.candidates / "0001.tsv").unlink()
+    with pytest.raises(JudgeError, match="cut short"):
+        judge.write_candidates(
+            tmp_path, candidate_units(TWO_SOURCES).tail(1).with_columns(pl.lit("new").alias("id"))
+        )
 
 
 def test_a_unit_listed_twice_is_refused(tmp_path: Path) -> None:
