@@ -12,13 +12,15 @@
 # the evaluation and held-out records. fineweb2-hq stops once it has written 14M
 # targets; fineweb2-mined is the 10% pass, the first 37 of FineWeb-2's 370 Mandarin
 # files in spread order, and reads #215's entry table from
-# <data dir>/corpus-225/inputs/entries-215.tsv. A chunk stops cleanly before a
+# <data dir>/corpus-225/inputs/entries-215.tsv; its shards wait in
+# <data dir>/corpus-225/ingest/fineweb2-mined/unjudged until `mlime corpus judge`
+# writes the records it keeps into samples/. A chunk stops cleanly before a
 # download would leave less than 60 GB free. Build first:
 # cargo build --release -p ime-cli
 set -euo pipefail
 
 if [[ $# -ne 3 ]]; then
-  sed -n '2,17p' "$0" >&2
+  sed -n '2,19p' "$0" >&2
   exit 2
 fi
 source=$1

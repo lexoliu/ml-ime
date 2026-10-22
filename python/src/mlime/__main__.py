@@ -181,6 +181,42 @@ def corpus_prepare(
     )
 
 
+@corpus_app.command("judge")
+def corpus_judge(
+    data_dir: Path = typer.Option(
+        ..., "--data-dir", help="The streamed corpus root holding ingest/fineweb2-mined"
+    ),
+    entries: Path = typer.Option(
+        None, help="#215's entry table; defaults to <data-dir>/inputs/entries-215.tsv"
+    ),
+    ordinary_cache: Path = typer.Option(
+        None,
+        help="Where jieba's pinned dictionary is kept; defaults to <data-dir>/.knowledge-cache",
+    ),
+    jev_concurrency: int = typer.Option(32, help="Jev requests in flight at once"),
+    review_concurrency: int = typer.Option(32, help="Review-model requests in flight at once"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Keep only the mined sentences that are natural usage of their entry, resuming.
+
+    Reads JEV_API_KEY and MLIME_JUDGE_LLM_BASE_URL, _MODEL and _KEY_FILE.
+    """
+    configure(verbose)
+    from mlime.data import judge, knowledge
+
+    ordinary = knowledge.read_ordinary_vocabulary(
+        knowledge.fetch_ordinary_vocabulary(ordinary_cache or data_dir / ".knowledge-cache")
+    )
+    lexicon = judge.BoundaryLexicon.load(
+        entries or data_dir / "inputs" / "entries-215.tsv", ordinary
+    )
+    asyncio.run(
+        judge.judge_with_endpoints(
+            judge.MinedLayout(data_dir), lexicon, jev_concurrency, review_concurrency
+        )
+    )
+
+
 @g2p_app.command("probe")
 def g2p_probe(
     sentence: str = typer.Option(PROBE_SENTENCE, help="Sentence to annotate with both systems"),
