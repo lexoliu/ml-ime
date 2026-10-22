@@ -48,9 +48,26 @@ kaggle kernels push -p $d
 ```
 
 A segment that finishes the run scores every `lattice*.jsonl` in the assets (full,
-abbreviated and mixed typing), with context on and off, and writes
-`run-summary.json` with `"finished": true`; one that pauses says which segment
-to push next.
+abbreviated and mixed typing), with context on and off, one pair per GPU at a
+time, and writes `run-summary.json` with `"finished": true`; one that pauses
+says which segment to push next.
+
+A lattice rebuilt by a changed segmenter needs new scores, not a new run. With
+`RESCORE_FROM` stamped as a finished segment's kernel name, the script trains
+nothing: it mounts that segment's output as its kernel source and one dataset
+holding the new `lattice*.jsonl`, the run's `char_pinyin.tsv` and the `mlime`
+package, and scores the lattices with the segment's `checkpoint-final.pt`:
+
+```
+d=$(mktemp -d)
+sed 's/^RESCORE_FROM = ""$/RESCORE_FROM = "mlime-route-a-v2-s6"/' kaggle/route-a-v2/kernel.py > $d/kernel.py
+python3 -c "
+import json,sys; m=json.load(open('kaggle/route-a-v2/kernel-metadata.json'))
+m['id']=f'lexoliu/{sys.argv[1]}'; m['title']=sys.argv[1]
+m['dataset_sources']=[f'lexoliu/{sys.argv[2]}']; m['kernel_sources']=['lexoliu/mlime-route-a-v2-s6']
+json.dump(m,open('$d/kernel-metadata.json','w'),indent=2)" <kernel> <dataset>
+kaggle kernels push -p $d
+```
 
 ## Colab
 
