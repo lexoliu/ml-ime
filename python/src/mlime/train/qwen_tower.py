@@ -23,11 +23,12 @@ Three things make it a context tower rather than a language model:
   new.
 - **Frozen, or LoRA.** The tower's own weights never train. With
   :class:`LoraConfig` its attention projections carry low-rank adapters that
-  do, and the tower trains inside the compiled encoder pass like any tower
-  with a backward; without, it runs apart from that pass under ``no_grad``
-  -- no autograd graph through its layers -- and on CUDA it can be replayed
-  from captured graphs (:class:`TowerGraphs`), one launch for the whole
-  forward.
+  do, and the tower trains with a backward through every block, each block
+  a call of one compiled layer graph (:meth:`QwenContextTower.compile_layers`);
+  without, it runs under ``no_grad`` -- no autograd graph through its layers --
+  and on CUDA it can be replayed from captured graphs (:class:`TowerGraphs`),
+  one launch for the whole forward. Either way it runs apart from the
+  compiled fill pass.
 - **Whole, or cut at a layer.** ``layers`` keeps only the first N decoder
   blocks (#237): the blocks above are never built, loaded or run, so the
   cross-attention reads the residual stream after block N and the context
@@ -40,8 +41,9 @@ and the fill side keeps MacBERT's one character a position.
 
 from __future__ import annotations
 
+import functools
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -185,42 +187,112 @@ class HeadState:
 
 
 class _Recorder:
-    """The cache a head forward writes: it keeps each layer's keys and values."""
+    """One layer's cache in a head forward: it keeps the keys and values it is handed.
+
+    Qwen's attention hands its layer's new keys and values to the cache with
+    the layer's index; a cache made for one layer call has no use for the
+    index, and reading it would tie a compiled layer to one layer.
+    """
 
     def __init__(self) -> None:
-        self.keys: list[torch.Tensor] = []
-        self.values: list[torch.Tensor] = []
+        self.keys: torch.Tensor | None = None
+        self.values: torch.Tensor | None = None
 
     def update(
-        self, keys: torch.Tensor, values: torch.Tensor, layer: int, *_: object, **__: object
+        self, keys: torch.Tensor, values: torch.Tensor, *_: object, **__: object
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if layer != len(self.keys):
-            raise RuntimeError(
-                f"the head's layers ran out of order: {layer} after {len(self.keys)}"
-            )
-        self.keys.append(keys)
-        self.values.append(values)
+        self.keys = keys
+        self.values = values
         return keys, values
 
 
 class _HeadPrefix:
-    """The cache a context forward reads: the head's keys and values before its own.
+    """One layer's cache in a context forward: the head's keys and values before its own.
 
-    Qwen's attention hands each layer's new keys and values to its cache and
-    attends to what comes back; this one puts the head in front, broadcast to
-    every row, and keeps nothing.
+    Qwen's attention attends to what its cache hands back; this one puts the
+    layer's head keys and values in front, broadcast to every row, and keeps
+    nothing. Like :class:`_Recorder` it ignores the layer's index.
     """
 
-    def __init__(self, head: HeadState):
-        self.head = head
+    def __init__(self, keys: torch.Tensor, values: torch.Tensor):
+        self.keys = keys
+        self.values = values
 
     def update(
-        self, keys: torch.Tensor, values: torch.Tensor, layer: int, *_: object, **__: object
+        self, keys: torch.Tensor, values: torch.Tensor, *_: object, **__: object
     ) -> tuple[torch.Tensor, torch.Tensor]:
         rows = keys.shape[0]
-        head_keys = self.head.keys[layer].expand(rows, -1, -1, -1)
-        head_values = self.head.values[layer].expand(rows, -1, -1, -1)
+        head_keys = self.keys.expand(rows, -1, -1, -1)
+        head_values = self.values.expand(rows, -1, -1, -1)
         return torch.cat([head_keys, keys], dim=2), torch.cat([head_values, values], dim=2)
+
+
+#: Qwen's rotary embedding at each position: its cosines and sines.
+Rotary = tuple[torch.Tensor, torch.Tensor]
+
+#: :func:`head_block`'s signature, eager or compiled.
+HeadBlock = Callable[
+    [nn.Module, torch.Tensor, torch.Tensor, Rotary],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]
+
+#: :func:`context_block`'s signature, eager or compiled.
+ContextBlock = Callable[
+    [nn.Module, torch.Tensor, torch.Tensor, Rotary, torch.Tensor, torch.Tensor], torch.Tensor
+]
+
+
+def _sizes_apart[**P, R](block: Callable[P, R]) -> Callable[P, R]:
+    """*block*, compiled with every dynamic size its own symbol.
+
+    Dynamo's duck shaping gives sizes that are equal on the first call one
+    symbol. A block's first context batch of two rows, say, shares a symbol
+    with the head keys' two key-value heads, the concatenation then fixes it
+    at two, and every other row count compiles the layer again; the same
+    happens to a row count that equals the head dimension. Without duck
+    shaping a row count or a width is a symbol of its own, and only a size
+    the layer's arithmetic fixes is fixed.
+    """
+
+    @functools.wraps(block)
+    def call(*args: P.args, **kwargs: P.kwargs) -> R:
+        # install_config_module adds patch at import, which mypy cannot see.
+        with torch.fx.experimental._config.patch(use_duck_shape=False):  # type: ignore[attr-defined]
+            return block(*args, **kwargs)
+
+    return call
+
+
+def head_block(
+    layer: nn.Module, hidden: torch.Tensor, mask: torch.Tensor, rotary: Rotary
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One decoder *layer* over the head's rows: its output, and the keys and values it made."""
+    cache = _Recorder()
+    output = torch.as_tensor(
+        layer(hidden, attention_mask=mask, position_embeddings=rotary, past_key_values=cache)
+    )
+    if cache.keys is None or cache.values is None:
+        raise RuntimeError("the layer's attention never handed its keys and values to the cache")
+    return output, cache.keys, cache.values
+
+
+def context_block(
+    layer: nn.Module,
+    hidden: torch.Tensor,
+    mask: torch.Tensor,
+    rotary: Rotary,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+) -> torch.Tensor:
+    """One decoder *layer* over context rows that attend to its head *keys* and *values* first."""
+    return torch.as_tensor(
+        layer(
+            hidden,
+            attention_mask=mask,
+            position_embeddings=rotary,
+            past_key_values=_HeadPrefix(keys, values),
+        )
+    )
 
 
 class ProjectedCrossAttention(ContextCrossAttention):
@@ -326,7 +398,10 @@ class QwenContextTower(ContextTower):
     LayerNorm on the context rows, the only part of a frozen tower that trains
     in S0; an adapted tower trains its adapters beside it. ``graphs``, set by
     the trainer on a CUDA run that asks for it, replays a frozen tower's
-    forward from captured CUDA graphs.
+    forward from captured CUDA graphs. ``head_block`` and ``context_block``
+    run one layer of the head's pass and of the context's; they are the
+    module functions of those names until :meth:`compile_layers` compiles
+    them.
     """
 
     model: Any
@@ -351,6 +426,8 @@ class QwenContextTower(ContextTower):
         self.norm = nn.LayerNorm(model.config.hidden_size)
         self.register_buffer("head_ids", torch.tensor(head_ids, dtype=torch.long), persistent=False)
         self.graphs: TowerGraphs | None = None
+        self.head_block: HeadBlock = head_block
+        self.context_block: ContextBlock = context_block
         self.checkpoint_layers = False
         self._head: HeadState | None = None
         self.register_load_state_dict_post_hook(  # type: ignore[no-untyped-call]  # torch ships it untyped
@@ -384,14 +461,45 @@ class QwenContextTower(ContextTower):
 
     @property
     def separate(self) -> bool:
-        """A frozen tower runs apart from the compiled pass; an adapted one inside it.
+        """Qwen runs before the compiled fill pass, frozen or adapted.
 
-        An adapted tower has a backward through every block, and eager it is
-        some ten thousand launches a micro-batch, forward and backward, most
-        of them RMSNorm, rotary and adapter element-wise work in fp32 that
-        the compiled pass fuses.
+        Inside that pass, an adapted tower's blocks unrolled twice -- the
+        head's pass and the context's -- made one forward graph whose C++
+        wrapper g++ had not built after half an hour on an L4 (#237). Apart
+        from it, each block is a call of one compiled layer graph
+        (:meth:`compile_layers`).
         """
-        return self.frozen
+        return True
+
+    def compile_layers(self, options: Mapping[str, Any]) -> None:
+        """torch.compile an adapted tower's layer calls, in place: one graph for all its blocks.
+
+        The head's pass and the context's each compile one function of a
+        block -- the layer module, its input rows, the mask, the rotary
+        cosines and sines, and for the context the layer's head keys and
+        values -- so the blocks differ only in their inputs: the layer's
+        weights and adapters are its module's parameters, which dynamo lifts
+        to graph inputs, and nothing in the call reads the layer's index,
+        which is the one attribute the blocks do not share. A block's graph
+        is therefore reused by every block, with no guard on which block it
+        is, and ``dynamic=True`` keeps it across context widths and row
+        counts (:func:`_sizes_apart`). Inductor fuses within a block, as it
+        did across the unrolled stack, and each graph's C++ wrapper is one
+        block's. The first block's rows come from the frozen embedding and
+        need no gradient, the later blocks' do, so each pass compiles its
+        layer twice when it trains: four graphs, whatever the depth.
+
+        A frozen tower keeps its eager forward, which its captured graphs
+        replay (:class:`TowerGraphs`), and is left as it is.
+        """
+        if self.frozen:
+            return
+        self.head_block = _sizes_apart(
+            torch.compile(head_block, dynamic=True, options=dict(options))
+        )
+        self.context_block = _sizes_apart(
+            torch.compile(context_block, dynamic=True, options=dict(options))
+        )
 
     def new_parameters(self) -> tuple[str, ...]:
         """The LayerNorm on the context rows and every LoRA adapter."""
@@ -410,14 +518,20 @@ class QwenContextTower(ContextTower):
         """A projected block from this tower's width to the fill tower's."""
         return ProjectedCrossAttention(hidden_size, num_heads, dropout, self.width)
 
-    def _layers(
-        self,
-        ids: torch.Tensor,
-        mask: torch.Tensor,
-        positions: torch.Tensor,
-        cache: _Recorder | _HeadPrefix,
-    ) -> torch.Tensor:
-        """Qwen's stack over *ids* with the 4D *mask*, writing to and reading *cache*.
+    def _embed(self, ids: torch.Tensor, positions: torch.Tensor) -> tuple[torch.Tensor, Rotary]:
+        """The stack's input rows for *ids*, and the rotary embedding at *positions*."""
+        hidden: torch.Tensor = self.model.embed_tokens(ids)
+        cos, sin = self.model.rotary_emb(hidden, positions)
+        return hidden, (cos, sin)
+
+    def _block(self, block: Callable[..., Any], *args: object) -> Any:
+        """One layer call, recomputed in backward when the tower checkpoints its layers."""
+        if self.checkpoint_layers and torch.is_grad_enabled():
+            return torch.utils.checkpoint.checkpoint(block, *args, use_reentrant=False)
+        return block(*args)
+
+    def _close(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Qwen's final norm over the last block's rows.
 
         The final norm closes the stack whether or not it was cut: the residual
         stream carries Qwen's few massive-activation channels from its first
@@ -425,48 +539,28 @@ class QwenContextTower(ContextTower):
         the rows a cut tower hands the context LayerNorm are the kind the whole
         tower's were and the cut changes their depth alone.
         """
-        model = self.model
-        hidden: torch.Tensor = model.embed_tokens(ids)
-        rotary = model.rotary_emb(hidden, positions)
-        for layer in model.layers:
-            if self.checkpoint_layers and torch.is_grad_enabled():
-                hidden = torch.as_tensor(
-                    torch.utils.checkpoint.checkpoint(
-                        layer,
-                        hidden,
-                        attention_mask=mask,
-                        position_embeddings=rotary,
-                        position_ids=positions,
-                        past_key_values=cache,
-                        use_reentrant=False,
-                    )
-                )
-            else:
-                hidden = torch.as_tensor(
-                    layer(
-                        hidden,
-                        attention_mask=mask,
-                        position_embeddings=rotary,
-                        position_ids=positions,
-                        past_key_values=cache,
-                    )
-                )
-        normed: torch.Tensor = model.norm(hidden)
+        normed: torch.Tensor = self.model.norm(hidden)
         return normed
 
     def compute_head(self) -> HeadState:
         """The constant head through every layer, from the current weights."""
         length = self.head_ids.numel()
-        recorder = _Recorder()
-        causal = torch.ones(length, length, dtype=torch.bool, device=self.head_ids.device).tril()
-        with torch.autocast(self.head_ids.device.type, enabled=False):
-            rows = self._layers(
-                self.head_ids.unsqueeze(0),
-                causal[None, None],
-                torch.arange(length, device=self.head_ids.device).unsqueeze(0),
-                recorder,
+        device = self.head_ids.device
+        causal = torch.ones(length, length, dtype=torch.bool, device=device).tril()[None, None]
+        keys: list[torch.Tensor] = []
+        values: list[torch.Tensor] = []
+        with torch.autocast(device.type, enabled=False):
+            hidden, rotary = self._embed(
+                self.head_ids.unsqueeze(0), torch.arange(length, device=device).unsqueeze(0)
             )
-        return HeadState(keys=tuple(recorder.keys), values=tuple(recorder.values), rows=rows[0])
+            for layer in self.model.layers:
+                hidden, layer_keys, layer_values = self._block(
+                    self.head_block, layer, hidden, causal, rotary
+                )
+                keys.append(layer_keys)
+                values.append(layer_values)
+            rows = self._close(hidden)
+        return HeadState(keys=tuple(keys), values=tuple(values), rows=rows[0])
 
     def head_state(self) -> HeadState:
         """The head's state: computed once for a frozen tower, every call for an adapted one.
@@ -506,7 +600,12 @@ class QwenContextTower(ContextTower):
         )
         positions = (torch.arange(length, device=ids.device) + head.length).unsqueeze(0)
         with torch.autocast(ids.device.type, enabled=False):
-            return self._layers(ids, visible[:, None], positions, _HeadPrefix(head))
+            hidden, rotary = self._embed(ids, positions)
+            for layer, keys, values in zip(self.model.layers, head.keys, head.values, strict=True):
+                hidden = self._block(
+                    self.context_block, layer, hidden, visible[:, None], rotary, keys, values
+                )
+            return self._close(hidden)
 
     def frozen_states(self, ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """:meth:`states` without autograd: what a frozen tower runs and a graph captures."""
@@ -537,10 +636,8 @@ class QwenContextTower(ContextTower):
             # is a forward of its own, and the rows and the prefix are one.
             states = self.states(ids, mask, head)
         # The LayerNorm reads one row at a time, so the head's rows are normed
-        # once and broadcast, and the context's on their own. Normed after the
-        # join instead, its rows would be C * (H + T): under a dynamic T,
-        # torch 2.11's Inductor compares that product with its expanded form
-        # and asserts in its tiling analysis on CUDA (#237).
+        # once and broadcast, and the context's on their own, rather than the
+        # head normed again for every context row.
         normed = self.norm(head.rows.float()).expand(rows, -1, -1)
         joined = torch.cat([normed, self.norm(states.float())], dim=1)
         real = torch.cat(

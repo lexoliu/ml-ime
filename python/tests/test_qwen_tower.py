@@ -610,56 +610,177 @@ def test_s0_trains_the_gated_blocks_and_the_towers_additions_and_nothing_inherit
     rebuilt.load_state_dict(after, strict=True)
 
 
-def test_an_adapted_tower_trains_inside_the_compiled_pass_and_computes_the_eager_step(
+def adapted_pair(
+    lexicon: Lexicon,
+    vocab: CharVocab,
+    config: E2EConfig,
+    tower: QwenContextConfig,
+    device: torch.device,
+) -> tuple[E2EModel, E2EModel]:
+    """Two equal adapted S0 models on *device*, the second to compile.
+
+    The adapters' B is moved off zero, so A has a gradient to compare too.
+    """
+    eager = s0_model(lexicon, vocab, config, tower).to(device).eval()
+    torch.manual_seed(5)
+    with torch.no_grad():
+        for name, parameter in eager.named_parameters():
+            if name.endswith("lora_b"):
+                parameter.normal_(std=0.1)
+    compiled = s0_model(lexicon, vocab, config, tower).to(device).eval()
+    compiled.load_state_dict(eager.state_dict())
+    context = compiled.context
+    assert isinstance(context, QwenContextTower)
+    assert context.separate
+    return eager, compiled
+
+
+@pytest.mark.parametrize("checkpointed", [False, True], ids=["stored", "checkpointed"])
+def test_an_adapted_tower_compiled_block_by_block_computes_the_eager_step(
     lexicon: Lexicon,
     spans: SpanVocab,
     tokenizer: StubTokenizer,
     reader_vocab: CharVocab,
     e2e_config: E2EConfig,
     qwen: QwenContextConfig,
+    checkpointed: bool,
 ) -> None:
-    """#237: the adapted tower runs inside the compiled ``encode``, not eager before it.
+    """#237: each block of the adapted tower is a call of one compiled layer graph.
 
-    Eager, its forward and backward are a launch for every RMSNorm, rotary and
-    adapter op of every block, and the L4 sat idle half the step issuing them.
-    Compiled, it is one graph with no break, whose loss and gradients are the
-    eager step's. The adapters' B is moved off zero first, so A has a gradient
-    to compare too.
+    Compiled inside ``encode``, the tower's blocks unrolled twice -- the head's
+    pass and the context's -- into one forward graph, and on the L4 g++ never
+    finished its C++ wrapper. The tower now runs before the compiled fill
+    pass and each pass calls one compiled layer for every block. Over two
+    context widths, with the blocks stored or recomputed in backward, each
+    step's loss and gradients are the eager step's, with no graph break.
     """
     from mlime.train.e2e import compile_modules
 
     tower = replace(qwen, lora=LoraConfig(rank=2, alpha=4.0))
-    eager = s0_model(lexicon, reader_vocab, e2e_config, tower).eval()
+    eager, compiled = adapted_pair(lexicon, reader_vocab, e2e_config, tower, torch.device("cpu"))
+    if checkpointed:
+        for model in (eager, compiled):
+            model.context.enable_checkpointing()
+    compile_modules(compiled, "default")
+    batches = [
+        s0_batch(spans, lexicon, tokenizer, tower),
+        s0_batch(spans, lexicon, tokenizer, tower, ("昨天晚上我们一起去看了电影", "好")),
+    ]
+    assert batches[0].context_ids.shape[1] != batches[1].context_ids.shape[1]
+
+    torch._dynamo.utils.counters.clear()
+    for batch in batches:
+        losses = []
+        for model in (eager, compiled):
+            model.zero_grad(set_to_none=True)
+            loss = model(batch).loss
+            assert loss is not None
+            loss.backward()
+            losses.append(loss.detach())
+        torch.testing.assert_close(losses[1], losses[0])
+        parameters = dict(compiled.named_parameters())
+        trained = [(name, p) for name, p in eager.named_parameters() if p.requires_grad]
+        assert any(name.endswith("lora_a") for name, _ in trained)
+        for name, before in trained:
+            after = parameters[name]
+            assert before.grad is not None and after.grad is not None, name
+            torch.testing.assert_close(after.grad, before.grad, msg=name)
+    assert not torch._dynamo.utils.counters["graph_break"]
+
+
+#: Qwen3-0.6B's depth, which the bound on compiled graphs is checked at.
+QWEN_DEPTH = 28
+
+
+@pytest.fixture(name="deep_qwen", scope="module")
+def deep_qwen_fixture(
+    qwen_dir: Path, tmp_path_factory: pytest.TempPathFactory
+) -> QwenContextConfig:
+    """The tiny tower as deep as Qwen3-0.6B, adapted, in fp32: its tokenizer, new weights."""
+    directory = tmp_path_factory.mktemp("deep-qwen")
+    PreTrainedTokenizerFast.from_pretrained(qwen_dir).save_pretrained(directory)
+    torch.manual_seed(13)
+    Qwen3Model(
+        replace(
+            TINY_QWEN,
+            num_hidden_layers=QWEN_DEPTH,
+            layer_types=["full_attention"] * QWEN_DEPTH,
+        )
+    ).save_pretrained(directory)
+    return QwenContextConfig(
+        model=str(directory), revision=None, dtype="float32", lora=LoraConfig(rank=2, alpha=4.0)
+    )
+
+
+def compiled_tower_counts(config: QwenContextConfig) -> dict[str, int]:
+    """Dynamo's counts over two training passes of *config*'s tower, compiled from cold.
+
+    The tower's layers are compiled as the run compiles them, and each pass
+    -- two context widths and row counts -- is checked against the eager
+    tower's rows and adapter gradients.
+    """
+    from mlime.train.e2e import inductor_options
+
+    eager = tower_of(config)
     torch.manual_seed(5)
     with torch.no_grad():
         for name, parameter in eager.named_parameters():
             if name.endswith("lora_b"):
                 parameter.normal_(std=0.1)
-    compiled = s0_model(lexicon, reader_vocab, e2e_config, tower).eval()
+    compiled = tower_of(config)
     compiled.load_state_dict(eager.state_dict())
-    assert isinstance(compiled.context, QwenContextTower)
-    assert not compiled.context.separate
-    compile_modules(compiled, "default")
-    batch = s0_batch(spans, lexicon, tokenizer, tower)
-
-    torch._dynamo.utils.counters.clear()
-    losses = []
-    for model in (eager, compiled):
-        loss = model(batch).loss
-        assert loss is not None
-        loss.backward()
-        losses.append(loss.detach())
-    assert not torch._dynamo.utils.counters["graph_break"]
-    torch.testing.assert_close(losses[1], losses[0])
-    trained = [
-        (name, p, dict(compiled.named_parameters())[name])
-        for name, p in eager.named_parameters()
-        if p.requires_grad
+    compiled.compile_layers(inductor_options("default"))
+    widths = [
+        contexts(config, ["明天下午三点见", "他说那个颜色"]),
+        contexts(config, ["昨天晚上我们一起去看了电影", "好", "北京"]),
     ]
-    assert any(name.endswith("lora_a") for name, _, _ in trained)
-    for name, before, after in trained:
-        assert before.grad is not None and after.grad is not None, name
-        torch.testing.assert_close(after.grad, before.grad, msg=name)
+    assert widths[0][0].shape != widths[1][0].shape
+
+    torch._dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    for ids, mask in widths:
+        weights = torch.randn(ids.shape[0], ids.shape[1], eager.width)
+        rows = []
+        for tower in (eager, compiled):
+            tower.zero_grad(set_to_none=True)
+            states = tower.states(ids, mask, tower.head_state())
+            (states * weights * mask[..., None]).sum().backward()
+            rows.append(states.detach())
+        torch.testing.assert_close(rows[1], rows[0])
+        parameters = dict(compiled.named_parameters())
+        for name, before in eager.named_parameters():
+            if name.rsplit(".", 1)[-1] in ADAPTER_NAMES:
+                after = parameters[name]
+                assert before.grad is not None and after.grad is not None, name
+                # Fused, the sums run in another order, through as many as
+                # 28 blocks of gradients some hundred in size.
+                torch.testing.assert_close(after.grad, before.grad, rtol=1e-4, atol=1e-3, msg=name)
+    counters = torch._dynamo.utils.counters
+    assert not counters["graph_break"]
+    return {
+        "frames": counters["frames"]["ok"],
+        "graphs": counters["stats"]["unique_graphs"],
+        "traced": counters["stats"]["calls_captured"],
+    }
+
+
+def test_an_adapted_towers_blocks_share_four_compiled_graphs_at_any_depth(
+    qwen: QwenContextConfig, deep_qwen: QwenContextConfig
+) -> None:
+    """#237: 28 blocks over two context widths compile what 2 blocks compile.
+
+    Each pass compiles one function of a block, and nothing it reads tells the
+    blocks apart but their tensors, so every block reuses one graph, across
+    widths and row counts. The only split is the first block, whose rows
+    come from the frozen embedding and need no gradient: four frames and four
+    graphs in all, the head's pass and the context's. What dynamo traced is
+    the same at Qwen3-0.6B's depth as at two blocks -- one block a graph, not
+    the stack.
+    """
+    shallow = compiled_tower_counts(replace(qwen, lora=LoraConfig(rank=2, alpha=4.0)))
+    deep = compiled_tower_counts(deep_qwen)
+    assert deep == shallow
+    assert deep["frames"] == deep["graphs"] == 4
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton scheduling needs a CUDA device")
@@ -671,28 +792,20 @@ def test_an_adapted_tower_compiled_on_cuda_computes_the_eager_step(
     e2e_config: E2EConfig,
     qwen: QwenContextConfig,
 ) -> None:
-    """#237: the adapted tower's compiled ``encode`` on CUDA, as the L4 leg runs it.
+    """#237: the adapted tower compiled block by block on CUDA, as the L4 leg runs it.
 
-    The CPU check above never reaches Triton's scheduler, and that is where
-    the leg failed: Inductor's tiling analysis asserted on the context
-    LayerNorm, whose rows were the head and the context together, ``C * (H + T)``
-    with ``T`` symbolic. Here the bf16 tower under fp16 autocast compiles
-    dynamic on its first batch and is reused on a batch of another context
-    width; each step's loss and gradients are the eager step's to the
-    precision's rounding.
+    The CPU checks never reach Triton's scheduler, and that is where an
+    earlier leg failed. Here the bf16 tower under fp16 autocast compiles its
+    head's layer and its context's, dynamic on the first batch, and reuses
+    them for every block and for a batch of another context width; each
+    step's loss and gradients are the eager step's to the precision's
+    rounding.
     """
     from mlime.train.e2e import compile_modules
 
     device = torch.device("cuda")
     tower = replace(qwen, dtype="bfloat16", lora=LoraConfig(rank=2, alpha=4.0))
-    eager = s0_model(lexicon, reader_vocab, e2e_config, tower).to(device).eval()
-    torch.manual_seed(5)
-    with torch.no_grad():
-        for name, parameter in eager.named_parameters():
-            if name.endswith("lora_b"):
-                parameter.normal_(std=0.1)
-    compiled = s0_model(lexicon, reader_vocab, e2e_config, tower).to(device).eval()
-    compiled.load_state_dict(eager.state_dict())
+    eager, compiled = adapted_pair(lexicon, reader_vocab, e2e_config, tower, device)
     compile_modules(compiled, "default")
     batches = [
         s0_batch(spans, lexicon, tokenizer, tower),
