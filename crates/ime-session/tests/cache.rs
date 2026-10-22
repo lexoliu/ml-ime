@@ -1,7 +1,7 @@
 //! The state cache answers what the model would: `decode_many` over the
 //! fixture LM through `Cached` returns the uncached decode's hypotheses bit
 //! for bit, and re-decoding the same context is a hit. The fixture is
-//! `ime-lm`'s committed transformer export and its `char_pinyin.tsv`
+//! `ime-lm`'s fixture transformer export and its `char_pinyin.tsv`
 //! lexicon — a real graph with an eight-character alphabet — so the check
 //! runs the real `advance`/`compact` path, not a mock.
 
@@ -13,21 +13,18 @@ use ime_lm::{CharLm, SessionShape};
 use ime_pinyin::{Lexicon, SegmentLattice, SegmentOptions, SyllableTable};
 use ime_session::Cached;
 use std::num::NonZeroUsize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// `ime-lm`'s fixture directory.
-fn fixture_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../ime-lm/tests/fixtures")
-        .canonicalize()
-        .expect("the ime-lm fixtures are committed")
+/// `ime-lm`'s fixture set.
+fn fixture_dir() -> &'static Path {
+    ime_fixtures::charlm()
 }
 
 /// The fixture lexicon, parsed from its committed `char_pinyin.tsv`.
 fn lexicon() -> Lexicon {
     let table = SyllableTable::load();
     let source = std::fs::read_to_string(fixture_dir().join("char_pinyin.tsv"))
-        .expect("char_pinyin.tsv is committed with the fixtures");
+        .expect("char_pinyin.tsv is assembled with the fixtures");
     Lexicon::parse(&source, &table).expect("the fixture table parses")
 }
 

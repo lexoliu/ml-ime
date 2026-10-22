@@ -21,6 +21,7 @@ ime-corpus = { path = "crates/ime-corpus" }
 ime-synth = { path = "crates/ime-synth" }
 ime-lm = { path = "crates/ime-lm" }
 ime-session = { path = "crates/ime-session" }
+ime-fixtures = { path = "crates/ime-fixtures" }
 
 anyhow = "1.0.104"
 hashbrown = "0.15.5"

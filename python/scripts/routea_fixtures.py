@@ -17,6 +17,17 @@ export against the fp32 table at the bound `test_int8_export_tracks_fp32`
 uses. `<out>/char_pinyin.tsv` is the character
 table the Rust `Lexicon` parses, and `<out>/emittable.txt` the set
 `Emittable::parse` reads.
+
+Written into `crates/ime-neural/tests/fixtures`, the text files are committed
+and the graphs and weights are published with `scripts/publish_fixtures.py`,
+which pins them in `crates/ime-fixtures/fixtures.json`.
+
+A change to the segmenter moves the lattice and not the model. With
+`--keep-exports` after the directory, the script re-emits `lattice.jsonl` and
+rewrites `expected.json` over the graphs already in `<out>` instead of
+exporting new ones, whose bytes differ from machine to machine; since the
+graphs live off the tree, `<out>` is then a copy of the set `ime-fixtures`
+assembles, and the rewritten text files are copied back into the tree.
 """
 
 import json
@@ -221,7 +232,10 @@ def _score_record(
 
 def main() -> None:
     """Write the fixture directory."""
+    if len(sys.argv) not in (2, 3) or sys.argv[2:] not in ([], ["--keep-exports"]):
+        raise SystemExit(f"usage: {sys.argv[0]} <fixture dir> [--keep-exports]")
     out = Path(sys.argv[1])
+    keep_exports = sys.argv[2:] == ["--keep-exports"]
     out.mkdir(parents=True, exist_ok=True)
     (out / "char_pinyin.tsv").write_text(CHAR_PINYIN, encoding="utf-8")
     (out / "emittable.txt").write_text(
@@ -264,18 +278,26 @@ def main() -> None:
         {character: index + 100 for index, character in enumerate(sorted(READINGS))},
         spans,
     )
-    torch.manual_seed(0)
-    model = RouteAModel.from_config(
-        TINY, lexicon, RouteAConfig(cross_attention_layers=2, cross_attention_dropout=0.0)
-    )
-    with torch.no_grad():
-        for layer in model.gated_layers():
-            layer.gate.fill_(0.4)
-    model.eval()
+    if keep_exports:
+        for variant in ("fp32", "int8"):
+            for graph in ("context.onnx", "fill.onnx"):
+                if not (out / variant / graph).is_file():
+                    raise FileNotFoundError(
+                        f"--keep-exports, but {out / variant / graph} is missing"
+                    )
+    else:
+        torch.manual_seed(0)
+        model = RouteAModel.from_config(
+            TINY, lexicon, RouteAConfig(cross_attention_layers=2, cross_attention_dropout=0.0)
+        )
+        with torch.no_grad():
+            for layer in model.gated_layers():
+                layer.gate.fill_(0.4)
+        model.eval()
 
-    for variant, quantize in (("fp32", None), ("int8", "int8")):
-        export_onnx(model, 7, lexicon, spans, tokenizer, out / variant, quantize=quantize)
-        log.info("exported fixture", variant=variant)
+        for variant, quantize in (("fp32", None), ("int8", "int8")):
+            export_onnx(model, 7, lexicon, spans, tokenizer, out / variant, quantize=quantize)
+            log.info("exported fixture", variant=variant)
 
     span_ids = {span: index for index, span in enumerate(spans)}
     emissions = {character: index for index, character in enumerate(lexicon.characters)}

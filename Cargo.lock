@@ -1787,6 +1787,7 @@ dependencies = [
  "ime-corpus",
  "ime-decode",
  "ime-eval",
+ "ime-fixtures",
  "ime-g2p",
  "ime-lm",
  "ime-neural",
@@ -1857,6 +1858,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "ime-fixtures"
+version = "0.1.0"
+dependencies = [
+ "const-hex",
+ "serde",
+ "serde_json",
+ "sha2",
+ "ureq",
+]
+
+[[package]]
 name = "ime-g2p"
 version = "0.1.0"
 dependencies = [
@@ -1885,6 +1897,7 @@ dependencies = [
  "half",
  "hashbrown 0.15.5",
  "ime-decode",
+ "ime-fixtures",
  "ime-pinyin",
  "libc",
  "memmap2",
@@ -1904,6 +1917,7 @@ name = "ime-neural"
 version = "0.1.0"
 dependencies = [
  "ime-decode",
+ "ime-fixtures",
  "ime-pinyin",
  "memmap2",
  "ort",
@@ -1944,6 +1958,7 @@ version = "0.1.0"
 dependencies = [
  "hashbrown 0.15.5",
  "ime-decode",
+ "ime-fixtures",
  "ime-lm",
  "ime-neural",
  "ime-ngram",
