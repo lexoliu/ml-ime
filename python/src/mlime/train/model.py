@@ -135,12 +135,15 @@ class ContextCrossAttention(nn.Module):
 class ContextTower(nn.Module):
     """What reads the context, and how the fill tower's blocks read it back.
 
-    ``separate`` says where the tower runs: inside the compiled encoder pass
-    (a tower that trains with it), or before it, outside the compiled region
-    (a frozen tower, which may run from captured graphs of its own).
+    :attr:`separate` says where the tower runs: inside the compiled encoder
+    pass (a tower that trains with it), or before it, outside the compiled
+    region (a frozen tower, which may run from captured graphs of its own).
     """
 
-    separate: ClassVar[bool]
+    @property
+    def separate(self) -> bool:
+        """Whether the tower runs before the compiled encoder pass rather than inside it."""
+        raise NotImplementedError
 
     def memory(self, ids: torch.Tensor, mask: torch.Tensor) -> ContextMemory:
         """The context rows of ``[C, T]`` token *ids* under their padding *mask*."""
@@ -200,7 +203,10 @@ class BertContextTower(BertModel, ContextTower):  # type: ignore[misc]  # transf
     under. It trains with the fill tower, inside the same compiled pass.
     """
 
-    separate: ClassVar[bool] = False
+    @property
+    def separate(self) -> bool:
+        """MacBERT always trains, so it runs inside the compiled pass."""
+        return False
 
     # BertModel's attributes, which nn.Module's typed __getattr__ would
     # otherwise shadow with ``Tensor | Module``.
