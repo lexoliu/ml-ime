@@ -48,6 +48,7 @@ V1_RECIPE: dict[str, Any] = {
     "CONTEXT_WARM_UP": False,
     "KEYS": None,
     "KEY_WARM_UP": False,
+    "TRAIN_FILL_TOWER": False,
 }
 
 #: What a v2 leg mounts, each a Hugging Face dataset repo the stager downloads:
@@ -150,7 +151,9 @@ class E2EV2Stage:
     *keys* (``KEYS``) reads keystrokes through a key front with a per-key CTC
     head (#223): its ``layers``, ``distill_weight`` and ``correct_syllables``.
     *key_warm_up* (``KEY_WARM_UP``) trains only the front and the head,
-    distilling *init_from*'s encoder states, which is S1.
+    distilling *init_from*'s encoder states, which is S1. *train_fill_tower*
+    (``TRAIN_FILL_TOWER``) trains the fill tower in S1 as well, against a
+    frozen copy of *init_from*'s (#241).
     """
 
     init_from: str
@@ -162,6 +165,7 @@ class E2EV2Stage:
     context_warm_up: bool = False
     keys: dict[str, Any] | None = None
     key_warm_up: bool = False
+    train_fill_tower: bool = False
 
     def __post_init__(self) -> None:
         _v2_name(self.init_from)
@@ -183,6 +187,8 @@ class E2EV2Stage:
                 raise ValueError("a key front enters through its warm-up (S1); stamp KEY_WARM_UP")
         elif self.key_warm_up:
             raise ValueError("the key warm-up trains a key front; name one with keys")
+        if self.train_fill_tower and not self.key_warm_up:
+            raise ValueError("the fill tower trains in the key warm-up; stamp KEY_WARM_UP")
 
     def fields(self) -> dict[str, Any]:
         """The recipe fields this stage stamps over v1's."""
@@ -196,6 +202,7 @@ class E2EV2Stage:
             "CONTEXT_WARM_UP": self.context_warm_up,
             "KEYS": self.keys,
             "KEY_WARM_UP": self.key_warm_up,
+            "TRAIN_FILL_TOWER": self.train_fill_tower,
         }
 
 

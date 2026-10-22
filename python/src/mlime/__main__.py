@@ -138,6 +138,11 @@ KEY_WARM_UP = typer.Option(
     "--key-warm-up/--no-key-warm-up",
     help="Train only the key front and the CTC head, distilling the parent (S1)",
 )
+TRAIN_FILL_TOWER = typer.Option(
+    False,
+    "--train-fill-tower/--no-train-fill-tower",
+    help="Train the fill tower too in the key warm-up, at --base-lr, against a frozen parent copy",
+)
 
 
 @app.callback()
@@ -663,6 +668,7 @@ def train_e2e(
     distill_weight: float | None = DISTILL_WEIGHT,
     correct_syllables: bool = CORRECT_SYLLABLES,
     key_warm_up: bool = KEY_WARM_UP,
+    train_fill_tower: bool = TRAIN_FILL_TOWER,
     max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
     token_budget: int = TOKEN_BUDGET,
     base_lr: float = typer.Option(3e-5, help="Learning rate for the pretrained weights"),
@@ -803,6 +809,7 @@ def train_e2e(
             tower_graphs=tower_graphs,
             keys=key_settings(keys, key_front_layers, distill_weight, correct_syllables),
             key_warm_up=key_warm_up,
+            train_fill_tower=train_fill_tower,
         )
     except torch.cuda.OutOfMemoryError as error:
         # The peak is recorded even at the crash, and the cache freed before
@@ -1215,6 +1222,7 @@ def e2e_stamp(
     distill_weight: float | None = DISTILL_WEIGHT,
     correct_syllables: bool = CORRECT_SYLLABLES,
     key_warm_up: bool = KEY_WARM_UP,
+    train_fill_tower: bool = TRAIN_FILL_TOWER,
 ) -> None:
     """Write a v2 run's kernel directory: v1's recipe, the run's slug, the v2 sources.
 
@@ -1225,7 +1233,8 @@ def e2e_stamp(
     accumulation, the Qwen context tower and its warm-up -- are the only
     fields of v1's recipe it changes; without it they are refused, since a
     plain v2 run is v1's recipe exactly. `--keys` with `--key-warm-up` makes the
-    stage S1 of the key-level model (#223), named mlime-e2e-keys-*.
+    stage S1 of the key-level model (#223), named mlime-e2e-keys-*, and
+    `--train-fill-tower` trains the fill tower in it (#241).
     """
     from mlime.locate import find_upwards
     from mlime.stamp import E2E_V2_SOURCES, E2EV2Run, E2EV2Stage, stamp_e2e_v2
@@ -1246,6 +1255,7 @@ def e2e_stamp(
         "--context-warm-up": context_warm_up or None,
         "--keys": keys or None,
         "--key-warm-up": key_warm_up or None,
+        "--train-fill-tower": train_fill_tower or None,
     }
     tower = context_settings(context_tower, context_revision, context_lora_rank, context_lora_alpha)
     front = key_settings(keys, key_front_layers, distill_weight, correct_syllables)
@@ -1288,6 +1298,7 @@ def e2e_stamp(
                 "correct_syllables": front.correct_syllables,
             },
             key_warm_up=key_warm_up,
+            train_fill_tower=train_fill_tower,
             **overrides,
         )
     spec = E2EV2Run(
