@@ -19,16 +19,16 @@ passed the one before:
    preceding text not spun and the sentence natural. A record on a spun page is
    dropped whole, even when the sentence itself reads well.
 
-The question and the prompt were set on 120 hand-labelled mined records, which
-showed the judges the last :data:`CONTEXT_CHARACTERS` characters of the context;
-the judge shows them the same. On those records Jev at 0.7 followed by the review
-kept 27, all real, of the 57 real ones. The threshold was then raised to 0.8 on
-the run itself: among the first 1,188 reviews the review model rejected 33% of
-the units Jev put in [0.7, 0.8), 17% of [0.8, 0.9) and 4% of 0.9 and above, and
-the review serves one request at a time, so only units at 0.8 and above are
-kept, every one of them reviewed. On the labels 0.8 followed by the review keeps
-8, all real: the hand labels found 24 of the 25 records in [0.7, 0.8) real, and
-the review kept 19 of them, none of them wrongly.
+The question, the threshold and the prompt were set on 120 hand-labelled mined
+records, which showed the judges the last :data:`CONTEXT_CHARACTERS` characters
+of the context; the judge shows them the same. On those records Jev at 0.7
+followed by the review kept 27, all real, of the 57 real ones; at 0.8 it would
+keep 8, also all real, since the hand labels found 24 of the 25 records in
+[0.7, 0.8) real and the review kept 19 of them, none of them wrongly. On the run,
+among the first 1,188 reviews the review model rejected 33% of the units Jev put
+in [0.7, 0.8), 17% of [0.8, 0.9) and 4% of 0.9 and above. Every unit Jev passes
+is reviewed, so the threshold does not change how pure the kept records are, only
+how many there are against how long the review takes, and it stays at 0.7.
 
 A unit's Jev verdict is its probability, and :data:`JEV_THRESHOLD` is applied
 whenever a verdict is read (:func:`passes`), never stored: a log written under
@@ -76,7 +76,7 @@ JEV_URL = "https://api.typesafe.ai/v1/systemone"
 JEV_MODEL = "jev-latest"
 
 #: The least probability Jev must give :data:`QUESTION` for a record to go on.
-JEV_THRESHOLD = 0.8
+JEV_THRESHOLD = 0.7
 
 #: Requests in flight at once, to Jev and to the review model.
 JEV_CONCURRENCY = 32
