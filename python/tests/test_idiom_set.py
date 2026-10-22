@@ -14,9 +14,11 @@ import pytest
 
 from mlime.data import judge
 from mlime.data.idiom_set import (
+    Census,
     Collisions,
     Inputs,
     JudgedRound,
+    Proportions,
     Record,
     SelectionError,
     Strata,
@@ -29,6 +31,7 @@ from mlime.data.idiom_set import (
     round_one,
     select,
     top_up,
+    trim,
     write_draw,
     write_top_up,
 )
@@ -233,7 +236,7 @@ def test_build_writes_the_judged_idioms_as_samples_the_annotator_reads(tmp_path:
     table = tmp_path / "entries.tsv"
     TABLE.write_csv(table, separator="\t")
     out = tmp_path / "set"
-    census = build(candidates, table, [eval_set], out)
+    census = build(candidates, table, [eval_set], out, None)
     assert census.records == 2
     shards = sorted((out / "samples").iterdir())
     frames = [pl.read_parquet(path) for path in shards]
@@ -242,7 +245,7 @@ def test_build_writes_the_judged_idioms_as_samples_the_annotator_reads(tmp_path:
         f"{frame['source'][0]}-00000.parquet" for frame in frames
     ]
     with pytest.raises(SelectionError, match="not empty"):
-        build(candidates, table, [eval_set], out)
+        build(candidates, table, [eval_set], out, None)
 
 
 def test_build_waits_for_the_judge_to_finish(tmp_path: Path) -> None:
@@ -251,7 +254,7 @@ def test_build_waits_for_the_judge_to_finish(tmp_path: Path) -> None:
     table = tmp_path / "entries.tsv"
     TABLE.write_csv(table, separator="\t")
     with pytest.raises(SelectionError, match="has not finished"):
-        build(candidates, table, [], tmp_path / "set")
+        build(candidates, table, [], tmp_path / "set", None)
 
 
 ENTRIES = pl.DataFrame(
@@ -298,6 +301,68 @@ def test_a_colliding_record_gives_way_to_the_idioms_next_record() -> None:
 def test_a_kept_unit_that_does_not_hold_its_entry_is_an_error() -> None:
     with pytest.raises(SelectionError, match="does not hold"):
         select(units(("a", "别的句子", "一帆风顺")), ENTRIES, Collisions())
+
+
+# --- the trim to eval3's proportions ----------------------------------------------
+
+
+def test_strata_read_back_from_a_draw_census() -> None:
+    _, census = draw(POOL, inputs(), 2, 2, seed=243)
+    strata = Strata.of_census(census.strata)
+    assert strata == prepare(POOL, inputs(), 2, seed=243).strata
+    broken = [dict(stratum) for stratum in census.strata]
+    broken[0]["upper"] = 10**9
+    with pytest.raises(SelectionError, match="tile"):
+        Strata.of_census(broken)
+
+
+#: Twelve invented idiom-like entries: four rare (stratum 0), eight frequent (stratum 1).
+TRIM_OCCURRENCES = {f"成语{index:02d}": 5 if index < 4 else 500 for index in range(12)}
+
+
+def trim_frame() -> pl.DataFrame:
+    entries = sorted(TRIM_OCCURRENCES)
+    return pl.DataFrame(
+        {
+            "id": [f"r{index:02d}" for index in range(len(entries))],
+            "source": ["web"] * len(entries),
+            "text": [f"他说{entry}" for entry in entries],
+            "context": ["前文"] * len(entries),
+            "entry": entries,
+        }
+    )
+
+
+def test_the_trim_keeps_the_largest_set_in_eval3s_proportions() -> None:
+    # eval3 holds 1 rare to 3 frequent; the eight frequent records cap the set at 11,
+    # allocated (2.75, 8.25) -> [3, 8], so one rare record goes.
+    strata = Strata(lowers=(1, 100), targets=(1, 3))
+    census = Census()
+    trimmed = trim(trim_frame(), TRIM_OCCURRENCES, Proportions(strata, 243), census)
+    assert trimmed.height == strata.largest_size([4, 8]) == 11
+    rare = [entry for entry, occurrences in TRIM_OCCURRENCES.items() if occurrences == 5]
+    assert trimmed.filter(pl.col("entry").is_in(rare)).height == 3
+    assert census.trimmed == 1
+    assert [(s["selected"], s["kept"]) for s in census.strata] == [(4, 3), (8, 8)]
+
+
+def test_a_set_already_in_proportion_is_not_trimmed() -> None:
+    strata = Strata(lowers=(1, 100), targets=(1, 2))
+    census = Census()
+    trimmed = trim(trim_frame(), TRIM_OCCURRENCES, Proportions(strata, 243), census)
+    assert trimmed.height == 12 and census.trimmed == 0
+
+
+def test_the_trim_is_reproducible_from_its_seed() -> None:
+    strata = Strata(lowers=(1, 100), targets=(1, 1))
+
+    def kept(seed: int) -> list[str]:
+        frame = trim(trim_frame(), TRIM_OCCURRENCES, Proportions(strata, seed), Census())
+        return sorted(frame["entry"].to_list())
+
+    assert kept(243) == kept(243)
+    assert len(kept(243)) == 8
+    assert any(kept(seed) != kept(243) for seed in range(1, 20)), "the seed picks the records"
 
 
 # --- the top-up -------------------------------------------------------------------
@@ -507,6 +572,15 @@ def test_the_judge_resumes_over_both_rounds_and_the_set_builds_from_them(tmp_pat
     eval_set.write_text(json.dumps({"pinyin": "nh", "text": "你好", "context": None}) + "\n")
     table = tmp_path / "entries.tsv"
     TOP_UP_TABLE.write_csv(table, separator="\t")
-    built = build(candidates, table, [eval_set], tmp_path / "set")
+    built = build(candidates, table, [eval_set], tmp_path / "set", None)
     assert built.idioms == 6 + added.height
     assert built.records == 6 + added.height
+
+    proportions = Proportions.of_draw(root)
+    assert proportions == Proportions(prepare(TOP_UP_POOL, top_up_inputs(), 2, 243).strata, 243)
+    matched = build(candidates, table, [eval_set], tmp_path / "matched", proportions)
+    kept = [stratum["kept"] for stratum in matched.strata]
+    assert kept == proportions.strata.allocate(matched.records)
+    assert matched.records + matched.trimmed == built.records
+    with pytest.raises(SelectionError, match="no draw census"):
+        Proportions.of_draw(tmp_path)

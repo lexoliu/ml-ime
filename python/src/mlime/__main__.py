@@ -1790,6 +1790,11 @@ def eval_idiom_set(
         help="An evaluation set or pool the selection must not overlap; repeatable",
     ),
     out: Path = typer.Option(..., "--out", help="A fresh data root for the selection"),
+    match_strata: bool = typer.Option(
+        False,
+        "--match-strata",
+        help="Trim to the largest size in the draw's strata proportions, by the draw's seed",
+    ),
     verbose: bool = VERBOSE,
 ) -> None:
     """Build #243's idiom selection from what the judge kept, as samples to annotate.
@@ -1800,12 +1805,13 @@ def eval_idiom_set(
     """
     configure(verbose)
     from mlime.data import judge
-    from mlime.data.idiom_set import build
+    from mlime.data.idiom_set import Proportions, build
 
     candidates: judge.Candidates = (
         judge.MinedLayout(judged) if layout == "mined" else judge.CandidateSet(judged)
     )
-    census = build(candidates, entries, against, out)
+    proportions = Proportions.of_draw(judged) if match_strata else None
+    census = build(candidates, entries, against, out, proportions)
     typer.echo(json.dumps(census.as_dict(), ensure_ascii=False, indent=2))
 
 
