@@ -225,7 +225,8 @@ TRAIN_SHARDS = None
 
 #: The Qwen model that reads the context in place of MacBERT (#222), as
 #: `mlime train e2e`'s `--context-*` options: a dict of `tower`, `revision`,
-#: `lora_rank` (0 keeps it frozen) and `lora_alpha`. A stage swaps it into
+#: `lora_rank` (0 keeps it frozen), `lora_alpha` and `layers` (the decoder
+#: blocks the tower keeps, None for all of them). A stage swaps it into
 #: `INIT_FROM`'s weights. None keeps MacBERT's. Stamped per push.
 CONTEXT_TOWER = None
 
@@ -631,6 +632,8 @@ def context_argv():
             "--context-lora-alpha",
             str(CONTEXT_TOWER["lora_alpha"]),
         ]
+        if CONTEXT_TOWER["layers"] is not None:
+            argv += ["--context-layers", str(CONTEXT_TOWER["layers"])]
     if CONTEXT_WARM_UP:
         argv.append("--context-warm-up")
     return argv
