@@ -586,35 +586,58 @@ class RouteAModel(nn.Module):
 
     def encode_fill(self, batch: Batch, memory: ContextMemory | None) -> torch.Tensor:
         """The fill tower over the typed spans, its top layers reading *memory*."""
-        embeddings: torch.Tensor = self.fill.embeddings(inputs_embeds=self._fill_inputs(batch))
+        return self.fill_pass(
+            self._fill_inputs(batch),
+            batch.attention_mask,
+            memory,
+            batch.context_rows,
+            batch.has_context,
+        )
+
+    def fill_pass(
+        self,
+        inputs: torch.Tensor,
+        attention_mask: torch.Tensor,
+        memory: ContextMemory | None,
+        context_rows: torch.Tensor,
+        context_kept: torch.Tensor,
+    ) -> torch.Tensor:
+        """The fill tower over input embeddings ``[B, W, H]``, its top layers reading *memory*.
+
+        *attention_mask* ``[B, W]`` marks the real positions, fill row *i*
+        reads context row ``context_rows[i]``, and *context_kept* ``[C]`` says
+        which contexts survived the dropout. What fills the positions is the
+        caller's: the typed spans (:meth:`encode_fill`), or a key-level front.
+        """
+        embeddings: torch.Tensor = self.fill.embeddings(inputs_embeds=inputs)
         # A 4D mask early-exits ``_create_attention_masks`` before its padding
         # check -- ``padding_mask.all()`` is a device-to-host sync the step
         # cannot afford. The ``[B, 1, 1, W]`` boolean is what the built mask
         # becomes anyway under sdpa (True attends), so the towers see the same
         # values; eager attention would add it to the scores instead, which is
         # why the constructor refuses anything but sdpa.
-        attention_mask, _ = self.fill._create_attention_masks(
-            attention_mask=batch.attention_mask[:, None, None, :].bool(),
+        mask, _ = self.fill._create_attention_masks(
+            attention_mask=attention_mask[:, None, None, :].bool(),
             encoder_attention_mask=None,
             embedding_output=embeddings,
             encoder_hidden_states=None,
             past_key_values=None,
         )
         gated = self.gated_layers()
-        has_context = batch.has_context[batch.context_rows]
+        has_context = context_kept[context_rows]
         gated_from = len(self.fill.encoder.layer) - len(gated)
         hidden = embeddings
         for depth, layer in enumerate(self.fill.encoder.layer):
             if self.checkpoint_encoder:
                 hidden = torch.as_tensor(
                     torch.utils.checkpoint.checkpoint(
-                        layer, hidden, attention_mask=attention_mask, use_reentrant=False
+                        layer, hidden, attention_mask=mask, use_reentrant=False
                     )
                 )
             else:
-                hidden = torch.as_tensor(layer(hidden, attention_mask=attention_mask))
+                hidden = torch.as_tensor(layer(hidden, attention_mask=mask))
             if memory is not None and depth >= gated_from:
-                hidden = gated[depth - gated_from](hidden, memory, batch.context_rows, has_context)
+                hidden = gated[depth - gated_from](hidden, memory, context_rows, has_context)
         return hidden
 
     def forward(self, batch: Batch) -> RouteAOutput:
@@ -676,7 +699,12 @@ class RouteAModel(nn.Module):
         best = logits.masked_fill(~candidates, floor).argmax(dim=-1)
         return best.masked_fill(batch.targets == IGNORE_INDEX, IGNORE_INDEX)
 
-    def load_resumed(self, weights: Mapping[str, torch.Tensor], path: Path | str) -> None:
+    def load_resumed(
+        self,
+        weights: Mapping[str, torch.Tensor],
+        path: Path | str,
+        fresh: tuple[str, ...] = (),
+    ) -> None:
         """Load a checkpoint that may predate the typo inputs, tolerantly.
 
         A run checkpointed before this stage lacks ``letter_encoder.*`` (the
@@ -684,6 +712,8 @@ class RouteAModel(nn.Module):
         ``span_embeddings`` and ``candidate_mask`` -- the ``<unk>`` tail is
         appended, so the old rows prefix the new. The decoder's derived
         ``span_candidates`` buffers are gone now that the batch carries them.
+        *fresh* names the prefixes of parts new to this architecture, which a
+        parent checkpoint cannot hold and which keep their initialisation.
         Anything else missing or unexpected is still a refusal, not a fold.
         """
         own = self.state_dict()
@@ -723,7 +753,7 @@ class RouteAModel(nn.Module):
         missing = [
             name
             for name in result.missing_keys
-            if name not in popped and not name.startswith(("decoder.", "letter_encoder."))
+            if name not in popped and not name.startswith(("decoder.", "letter_encoder.", *fresh))
         ]
         if missing or result.unexpected_keys:
             raise ValueError(
