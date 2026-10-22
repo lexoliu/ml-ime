@@ -548,14 +548,15 @@ class RouteAModel(nn.Module):
             names.update(f"cross_attention.{index}.{name}" for name in layer.new_parameters())
         return frozenset(names)
 
-    def _fill_inputs(self, batch: Batch) -> torch.Tensor:
+    def _fill_inputs(self, batch: Batch, tower: BertModel) -> torch.Tensor:
         """``[MASK]`` everywhere a span was typed, plus that span's embedding and letters.
 
         The letter term is gated by the same ``span_positions`` the table row
         is, and its projection is zero-initialised, so at init this is exactly
-        the old sum.
+        the old sum. The word rows are *tower*'s, the fill tower the inputs
+        are for.
         """
-        words: torch.Tensor = self.fill.embeddings.word_embeddings(batch.input_ids)
+        words: torch.Tensor = tower.embeddings.word_embeddings(batch.input_ids)
         spans: torch.Tensor = self.span_embeddings(batch.span_ids) + self.letter_encoder(
             batch.span_letters
         )
@@ -587,7 +588,8 @@ class RouteAModel(nn.Module):
     def encode_fill(self, batch: Batch, memory: ContextMemory | None) -> torch.Tensor:
         """The fill tower over the typed spans, its top layers reading *memory*."""
         return self.fill_pass(
-            self._fill_inputs(batch),
+            self.fill,
+            self._fill_inputs(batch, self.fill),
             batch.attention_mask,
             memory,
             batch.context_rows,
@@ -596,27 +598,30 @@ class RouteAModel(nn.Module):
 
     def fill_pass(
         self,
+        tower: BertModel,
         inputs: torch.Tensor,
         attention_mask: torch.Tensor,
         memory: ContextMemory | None,
         context_rows: torch.Tensor,
         context_kept: torch.Tensor,
     ) -> torch.Tensor:
-        """The fill tower over input embeddings ``[B, W, H]``, its top layers reading *memory*.
+        """The fill *tower* over input embeddings ``[B, W, H]``, its top layers reading *memory*.
 
         *attention_mask* ``[B, W]`` marks the real positions, fill row *i*
         reads context row ``context_rows[i]``, and *context_kept* ``[C]`` says
         which contexts survived the dropout. What fills the positions is the
         caller's: the typed spans (:meth:`encode_fill`), or a key-level front.
+        *tower* is the model's own ``fill``, or a frozen copy of it that a
+        key-level warm-up keeps as its teacher while ``fill`` trains.
         """
-        embeddings: torch.Tensor = self.fill.embeddings(inputs_embeds=inputs)
+        embeddings: torch.Tensor = tower.embeddings(inputs_embeds=inputs)
         # A 4D mask early-exits ``_create_attention_masks`` before its padding
         # check -- ``padding_mask.all()`` is a device-to-host sync the step
         # cannot afford. The ``[B, 1, 1, W]`` boolean is what the built mask
         # becomes anyway under sdpa (True attends), so the towers see the same
         # values; eager attention would add it to the scores instead, which is
         # why the constructor refuses anything but sdpa.
-        mask, _ = self.fill._create_attention_masks(
+        mask, _ = tower._create_attention_masks(
             attention_mask=attention_mask[:, None, None, :].bool(),
             encoder_attention_mask=None,
             embedding_output=embeddings,
@@ -625,9 +630,9 @@ class RouteAModel(nn.Module):
         )
         gated = self.gated_layers()
         has_context = context_kept[context_rows]
-        gated_from = len(self.fill.encoder.layer) - len(gated)
+        gated_from = len(tower.encoder.layer) - len(gated)
         hidden = embeddings
-        for depth, layer in enumerate(self.fill.encoder.layer):
+        for depth, layer in enumerate(tower.encoder.layer):
             if self.checkpoint_encoder:
                 hidden = torch.as_tensor(
                     torch.utils.checkpoint.checkpoint(

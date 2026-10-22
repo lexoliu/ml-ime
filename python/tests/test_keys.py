@@ -14,6 +14,7 @@ compiles once.
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from collections import Counter
@@ -98,14 +99,34 @@ def reader_vocab_fixture(lexicon: Lexicon) -> CharVocab:
     return CharVocab(chars=SPECIALS + tuple(lexicon.characters))
 
 
-def key_config() -> E2EConfig:
-    return E2EConfig(cross_attention_layers=1, decoder=READER_TINY, keys=KEYS, key_warm_up=True)
+def key_config(train_fill_tower: bool = False) -> E2EConfig:
+    return E2EConfig(
+        cross_attention_layers=1,
+        decoder=READER_TINY,
+        keys=KEYS,
+        key_warm_up=True,
+        train_fill_tower=train_fill_tower,
+    )
 
 
-def tiny_key_model(lexicon: Lexicon, vocab: CharVocab) -> KeyE2EModel:
+def tiny_key_model(
+    lexicon: Lexicon, vocab: CharVocab, train_fill_tower: bool = False, tower: BertConfig = TINY
+) -> KeyE2EModel:
     torch.manual_seed(0)
     return KeyE2EModel.compose(
-        TINY, lexicon, key_config(), len(vocab), emittable_ids(lexicon, vocab)
+        tower, lexicon, key_config(train_fill_tower), len(vocab), emittable_ids(lexicon, vocab)
+    )
+
+
+def tiny_parent(lexicon: Lexicon, vocab: CharVocab, seed: int) -> E2EModel:
+    """A span model to warm a key front up over, its weights apart from the key model's."""
+    torch.manual_seed(seed)
+    return E2EModel.compose(
+        TINY,
+        lexicon,
+        E2EConfig(cross_attention_layers=1, decoder=READER_TINY),
+        len(vocab),
+        emittable_ids(lexicon, vocab),
     )
 
 
@@ -346,19 +367,31 @@ def test_the_parent_loads_whole_and_seeds_the_letters(
         letter_token_ids({"a": 1})
 
 
-def test_s1_trains_only_the_front_and_the_head_and_keeps_the_rest_in_eval(
-    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon, reader_vocab: CharVocab
+@pytest.mark.parametrize("train_fill_tower", [False, True])
+def test_s1_trains_only_the_front_the_head_and_the_tower_it_names_and_keeps_the_rest_in_eval(
+    vocabularies: Vocabularies,
+    spans: SpanVocab,
+    lexicon: Lexicon,
+    reader_vocab: CharVocab,
+    train_fill_tower: bool,
 ) -> None:
-    model = tiny_key_model(lexicon, reader_vocab)
+    model = tiny_key_model(lexicon, reader_vocab, train_fill_tower)
     model.freeze_for_key_warm_up()
+    trained = (*KEY_PARAMETER_PREFIXES, "head.", *(("fill.",) if train_fill_tower else ()))
     trainable = {name for name, p in model.named_parameters() if p.requires_grad}
-    assert trainable and all(
-        name.startswith((*KEY_PARAMETER_PREFIXES, "head.")) for name in trainable
-    )
+    assert trainable == {name for name, _ in model.named_parameters() if name.startswith(trained)}
     assert any(name.startswith("key_front.blocks.") for name in trainable)
     assert "blank.weight" in trainable
+    assert any(name.startswith("fill.encoder.") for name in trainable) == train_fill_tower
+    assert (model.teacher_fill is not None) == train_fill_tower
     model.train()
-    for name in ("fill", "context", "cross_attention", "decoder", "letter_encoder"):
+    frozen = ["context", "cross_attention", "decoder", "letter_encoder"]
+    if train_fill_tower:
+        frozen.append("teacher_fill")
+        assert all(module.training for module in model.fill.modules())
+    else:
+        frozen.append("fill")
+    for name in frozen:
         assert not any(module.training for module in getattr(model, name).modules()), name
     assert model.key_front.training
 
@@ -383,21 +416,30 @@ def test_s1_trains_only_the_front_and_the_head_and_keeps_the_rest_in_eval(
     total = output.extras["ctc_loss"] + KEYS.distill_weight * output.extras["distill_loss"]
     torch.testing.assert_close(output.loss.detach(), total)
 
+    # The tower trains in the pretrained group, at the head's rate.
     groups = model.parameter_groups(1e-4, 1e-3)
-    assert {id(p) for p in groups[0]["params"]} | {id(p) for p in groups[1]["params"]} == {  # type: ignore[attr-defined]
-        id(p) for p in model.parameters() if p.requires_grad
-    }
+    base = {id(p) for p in groups[0]["params"]}  # type: ignore[attr-defined]
+    new = {id(p) for p in groups[1]["params"]}  # type: ignore[attr-defined]
+    named = dict(model.named_parameters())
+    assert base == {id(named[name]) for name in trainable if name.startswith(("head.", "fill."))}
+    assert new == {id(named[name]) for name in trainable if name.startswith(KEY_PARAMETER_PREFIXES)}
 
 
+@pytest.mark.parametrize("train_fill_tower", [False, True])
 def test_the_s1_loss_falls_on_a_fixed_batch(
-    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon, reader_vocab: CharVocab
+    vocabularies: Vocabularies,
+    spans: SpanVocab,
+    lexicon: Lexicon,
+    reader_vocab: CharVocab,
+    train_fill_tower: bool,
 ) -> None:
-    model = tiny_key_model(lexicon, reader_vocab)
+    model = tiny_key_model(lexicon, reader_vocab, train_fill_tower)
     model.freeze_for_key_warm_up()
     model.train()
     batch = key_collator(spans, lexicon)(build_examples(vocabularies)[:8])
     optimiser = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=3e-3)
     losses = []
+    totals = []
     for _ in range(40):
         optimiser.zero_grad()
         output = model(batch)
@@ -405,7 +447,104 @@ def test_the_s1_loss_falls_on_a_fixed_batch(
         output.loss.backward()
         optimiser.step()
         losses.append(float(output.extras["ctc_loss"]))
+        totals.append(float(output.loss.detach()))
     assert losses[-1] < 0.5 * losses[0]
+    assert totals[-1] < 0.5 * totals[0]
+
+
+def test_the_teacher_stays_the_parents_tower_while_the_trained_tower_moves(
+    vocabularies: Vocabularies,
+    spans: SpanVocab,
+    lexicon: Lexicon,
+    reader_vocab: CharVocab,
+    tmp_path: Path,
+) -> None:
+    """The copy is seeded from the parent, gets no gradient and no update, and its states hold.
+
+    Its states are the parent's own encoder pass over the spans before any
+    step and after many, while the tower the front feeds has moved, and the
+    gate's parent frame is the parent's frame throughout.
+    """
+    parent = tiny_parent(lexicon, reader_vocab, seed=1).eval()
+    model = tiny_key_model(lexicon, reader_vocab, train_fill_tower=True)
+    model.load_parent(
+        parent.state_dict(), tmp_path / "parent.pt", letter_token_ids(KeyTokenizer().get_vocab())
+    )
+    teacher = model.teacher_fill
+    assert teacher is not None
+    for name, tensor in parent.fill.state_dict().items():
+        assert torch.equal(teacher.state_dict()[name], tensor), name
+    model.freeze_for_key_warm_up()
+    batch = key_collator(spans, lexicon)(build_examples(vocabularies)[:8])
+    with torch.no_grad():
+        expected = parent.encode(batch.spans)
+        frame = parent.scores(batch.spans)
+
+    def teacher_states() -> torch.Tensor:
+        with torch.no_grad():
+            return model.span_states(batch, model.encode_context(batch.spans))
+
+    model.train()
+    torch.testing.assert_close(teacher_states(), expected, rtol=0, atol=0)
+    before = {name: tensor.clone() for name, tensor in model.fill.state_dict().items()}
+    optimiser = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=3e-3)
+    for _ in range(10):
+        optimiser.zero_grad()
+        output = model(batch)
+        assert output.loss is not None
+        output.loss.backward()
+        assert all(parameter.grad is None for parameter in teacher.parameters())
+        optimiser.step()
+    assert teacher.training is False
+    for name, tensor in teacher.state_dict().items():
+        assert torch.equal(tensor, parent.fill.state_dict()[name]), name
+    moved = model.fill.state_dict()
+    assert not torch.equal(
+        moved["encoder.layer.0.attention.self.query.weight"],
+        before["encoder.layer.0.attention.self.query.weight"],
+    )
+    torch.testing.assert_close(teacher_states(), expected, rtol=0, atol=0)
+    model.eval()
+    torch.testing.assert_close(teacher_states(), expected, rtol=0, atol=0)
+    with torch.no_grad():
+        torch.testing.assert_close(model.parent_frame(batch), frame, rtol=0, atol=0)
+
+
+def test_the_teacher_loads_as_saved_or_from_a_tower_that_never_trained(
+    lexicon: Lexicon, reader_vocab: CharVocab, tmp_path: Path
+) -> None:
+    """A key checkpoint without a teacher seeds it from its tower; one with a teacher keeps it."""
+    frozen = tiny_key_model(lexicon, reader_vocab)
+    frozen.load_parent(
+        tiny_parent(lexicon, reader_vocab, seed=1).state_dict(),
+        tmp_path / "parent.pt",
+        letter_token_ids(KeyTokenizer().get_vocab()),
+    )
+    tower = tiny_key_model(lexicon, reader_vocab, train_fill_tower=True)
+    tower.load_resumed(frozen.state_dict(), tmp_path / "frozen.pt")
+    assert tower.teacher_fill is not None
+    for name, tensor in frozen.fill.state_dict().items():
+        assert torch.equal(tower.teacher_fill.state_dict()[name], tensor), name
+
+    # A run that trained its tower saved the teacher beside it, and resumes it as saved.
+    saved = tower.state_dict()
+    with torch.no_grad():
+        for name in saved:
+            if name.startswith("fill.encoder."):
+                saved[name] = saved[name] + 1.0
+    resumed = tiny_key_model(lexicon, reader_vocab, train_fill_tower=True)
+    resumed.load_resumed(saved, tmp_path / "tower.pt")
+    assert resumed.teacher_fill is not None
+    for name, tensor in frozen.fill.state_dict().items():
+        assert torch.equal(resumed.teacher_fill.state_dict()[name], tensor), name
+    assert not torch.equal(
+        resumed.fill.encoder.layer[0].output.dense.weight,
+        frozen.fill.encoder.layer[0].output.dense.weight,
+    )
+    with pytest.raises(ValueError, match="unexpected"):
+        tiny_key_model(lexicon, reader_vocab).load_resumed(saved, tmp_path / "tower.pt")
+    with pytest.raises(ValueError, match="fill tower trains"):
+        E2EConfig(cross_attention_layers=1, decoder=READER_TINY, train_fill_tower=True)
 
 
 def test_the_gates_frame_is_the_parents_when_the_student_matches_the_teacher(
@@ -458,6 +597,7 @@ def run_records(path: Path) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines()]
 
 
+@pytest.mark.parametrize("train_fill_tower", [False, True])
 def test_an_s1_run_logs_every_component_resumes_exactly_and_is_scored_against_its_parent(
     corpus: tuple[Path, Path],
     vocabularies: Vocabularies,
@@ -465,6 +605,7 @@ def test_an_s1_run_logs_every_component_resumes_exactly_and_is_scored_against_it
     reader_vocab: CharVocab,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    train_fill_tower: bool,
 ) -> None:
     monkeypatch.setattr(Vocabularies, "load", classmethod(lambda cls, *_: vocabularies))
     monkeypatch.setattr(BertConfig, "from_pretrained", classmethod(lambda cls, *_: TINY))
@@ -485,7 +626,15 @@ def test_an_s1_run_logs_every_component_resumes_exactly_and_is_scored_against_it
             out=tmp_path / name,
         )
 
-    whole = e2e(paths("whole"), slices, training, init_e2e=parent, keys=KEYS, key_warm_up=True)
+    whole = e2e(
+        paths("whole"),
+        slices,
+        training,
+        init_e2e=parent,
+        keys=KEYS,
+        key_warm_up=True,
+        train_fill_tower=train_fill_tower,
+    )
     records = run_records(whole.metrics)
     steps = [record for record in records if record.get("event") == "step"]
     assert len(steps) == 4
@@ -505,6 +654,7 @@ def test_an_s1_run_logs_every_component_resumes_exactly_and_is_scored_against_it
     assert summary["build_counts"]["illegal_gold"] == 0
     provenance = next(record for record in records if record.get("event") == "provenance")
     assert provenance["e2e"]["keys"] == asdict(KEYS)
+    assert provenance["e2e"]["train_fill_tower"] is train_fill_tower
 
     resumed = e2e(
         paths("resumed"),
@@ -513,11 +663,23 @@ def test_an_s1_run_logs_every_component_resumes_exactly_and_is_scored_against_it
         resume=tmp_path / "whole" / "checkpoint-000002.pt",
         keys=KEYS,
         key_warm_up=True,
+        train_fill_tower=train_fill_tower,
     )
     resumed_losses = [
         record["loss"] for record in run_records(resumed.metrics) if record.get("event") == "step"
     ]
     assert resumed_losses == [record["loss"] for record in steps[2:]]
+    # The resumed run is this one: the tower switch is part of its record.
+    with pytest.raises(ValueError, match="train_fill_tower"):
+        e2e(
+            paths("switched"),
+            slices,
+            training,
+            resume=tmp_path / "whole" / "checkpoint-000002.pt",
+            keys=KEYS,
+            key_warm_up=True,
+            train_fill_tower=not train_fill_tower,
+        )
 
     # A key checkpoint is not a span model the lattice search can decode.
     with pytest.raises(ValueError, match="key-level model"):
@@ -578,8 +740,13 @@ def test_the_count_is_the_key_loops_own(
     assert plain.ranks[0].epochs[0] < taken
 
 
+@pytest.mark.parametrize("train_fill_tower", [False, True])
 def test_the_s1_forward_compiles_once_across_key_lengths(
-    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon, reader_vocab: CharVocab
+    vocabularies: Vocabularies,
+    spans: SpanVocab,
+    lexicon: Lexicon,
+    reader_vocab: CharVocab,
+    train_fill_tower: bool,
 ) -> None:
     """Marked dims make every compiled callable dynamic from its first call.
 
@@ -588,7 +755,7 @@ def test_the_s1_forward_compiles_once_across_key_lengths(
     """
     from torch._dynamo.utils import counters
 
-    model = tiny_key_model(lexicon, reader_vocab)
+    model = tiny_key_model(lexicon, reader_vocab, train_fill_tower)
     model.freeze_for_key_warm_up()
     model.fill_pass = torch.compile(  # type: ignore[method-assign]
         model.fill_pass, dynamic=True, backend="eager"
@@ -673,3 +840,80 @@ def test_the_compiled_s1_step_matches_the_eager_one_on_cuda(
         output.loss.backward()
         losses.append(output.loss.detach().cpu())
     torch.testing.assert_close(losses[1], losses[0], rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="sync detection needs CUDA")
+def test_a_compiled_s1_step_training_the_tower_issues_no_host_syncs(
+    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon, reader_vocab: CharVocab
+) -> None:
+    """Forward, backward and the loop's fused AdamW step, compiled as a run compiles them."""
+    from mlime.train.e2e import compile_modules
+
+    model = tiny_key_model(lexicon, reader_vocab, train_fill_tower=True).cuda()
+    compile_modules(model, "default")
+    model.freeze_for_key_warm_up()
+    model.train()
+    optimiser = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=2e-5, fused=True
+    )
+    batch = key_collator(spans, lexicon, dropout=0.3)(build_examples(vocabularies)[:8]).to(
+        torch.device("cuda")
+    )
+
+    def step() -> None:
+        optimiser.zero_grad()
+        loss = model(batch).loss
+        assert loss is not None
+        loss.backward()
+        optimiser.step()
+
+    for _ in range(2):
+        step()
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        step()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="inductor's CUDA graphs need CUDA")
+def test_the_compiled_s1_step_training_the_tower_matches_the_eager_one_on_cuda(
+    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon, reader_vocab: CharVocab
+) -> None:
+    """The loss and every trained gradient agree; the towers drop nothing, so both draw alike.
+
+    The trained tower runs in training mode, and eager and inductor draw
+    their dropout masks from different generators, so the comparison is made
+    on a tower whose dropout is zero.
+    """
+    from mlime.train.e2e import compile_modules
+
+    tower = copy.deepcopy(TINY)
+    tower.hidden_dropout_prob = 0.0
+    tower.attention_probs_dropout_prob = 0.0
+    batch = key_collator(spans, lexicon)(build_examples(vocabularies)[:8]).to(torch.device("cuda"))
+    losses = []
+    gradients = []
+    for compiled in (False, True):
+        model = tiny_key_model(lexicon, reader_vocab, train_fill_tower=True, tower=tower).cuda()
+        if compiled:
+            compile_modules(model, "default")
+        model.freeze_for_key_warm_up()
+        model.train()
+        output = model(batch)
+        assert output.loss is not None
+        output.loss.backward()
+        losses.append(output.loss.detach().cpu())
+        gradients.append(
+            {
+                name: parameter.grad.detach().cpu()
+                for name, parameter in model.named_parameters()
+                if parameter.grad is not None
+            }
+        )
+    torch.testing.assert_close(losses[1], losses[0], rtol=1e-3, atol=1e-3)
+    assert gradients[1].keys() == gradients[0].keys()
+    assert any(name.startswith("fill.encoder.") for name in gradients[0])
+    for name, gradient in gradients[0].items():
+        torch.testing.assert_close(gradients[1][name], gradient, rtol=1e-3, atol=1e-4, msg=name)

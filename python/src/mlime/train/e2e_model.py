@@ -132,6 +132,10 @@ class E2EConfig(RouteAConfig):
     #: encoder states, with everything else frozen: the warm-up the key front
     #: enters through (S1).
     key_warm_up: bool = False
+    #: In the key warm-up, train the fill tower too, beside the front and the
+    #: head and at the head's rate; the distillation's targets stay those of
+    #: the parent's tower, which the model keeps a frozen copy of (#241).
+    train_fill_tower: bool = False
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -155,6 +159,8 @@ class E2EConfig(RouteAConfig):
                 )
         elif self.key_warm_up:
             raise ValueError("the key warm-up trains a key front; name one with keys")
+        if self.train_fill_tower and not self.key_warm_up:
+            raise ValueError("the fill tower trains beside a key front in its warm-up (S1)")
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> E2EConfig:

@@ -334,3 +334,34 @@ def test_a_key_warm_up_stamps_its_front_over_the_parent_a_flag_names(tmp_path: P
     )
     assert refused.exit_code == 2, refused.output
     assert "pass --init-from" in error(refused.output)
+
+
+def test_a_key_warm_up_that_trains_the_tower_stamps_one_switch_more(tmp_path: Path) -> None:
+    """#241: the tower switch is the only line it changes beside S1's own."""
+    out = tmp_path / "tower"
+    argv = ["e2e", "stamp", "mlime-e2e-keys-s1-tower", "--out", str(out)]
+    stage = ["--init-from", "mlime-e2e-v2-rank-g4", "--keys", "--key-warm-up"]
+    result = CliRunner().invoke(app, [*argv, *stage, "--train-fill-tower"])
+    assert result.exit_code == 0, result.output
+    template = (TEMPLATE / "kernel.py").read_text()
+    kernel = (out / "kernel.py").read_text()
+    keys = {"layers": 2, "distill_weight": 1.0, "correct_syllables": True}
+    assert sorted(changed_lines(template, kernel)) == sorted(
+        f"{name} = {value!r}"
+        for name, value in {
+            "INIT_FROM": "mlime-e2e-v2-rank-g4",
+            "KEYS": keys,
+            "KEY_WARM_UP": True,
+            "TRAIN_FILL_TOWER": True,
+            "PROFILE_STEPS": 30,
+            "TRACE_STEPS": 3,
+        }.items()
+    )
+    with pytest.raises(ValueError, match="stamp KEY_WARM_UP"):
+        E2EV2Stage(init_from="mlime-e2e-v2-rank-g4", keys=keys, train_fill_tower=True)
+    refused = CliRunner().invoke(
+        app,
+        ["e2e", "stamp", "mlime-e2e-v2-tower", "--out", str(tmp_path / "x"), "--train-fill-tower"],
+    )
+    assert refused.exit_code == 2, refused.output
+    assert "pass --init-from" in error(refused.output)
