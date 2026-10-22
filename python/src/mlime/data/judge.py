@@ -701,9 +701,7 @@ class CandidateSet(Candidates):
 
     def ordinals(self) -> list[int]:
         """The files with entry rows."""
-        return sorted(
-            int(path.stem) for path in self.candidates.glob("[0-9][0-9][0-9][0-9].tsv")
-        )
+        return sorted(int(path.stem) for path in self.candidates.glob("[0-9][0-9][0-9][0-9].tsv"))
 
     def shards(self, ordinal: int) -> list[Path]:
         """The record shards of one file."""
@@ -734,23 +732,43 @@ class CandidateSet(Candidates):
 
 
 def write_candidates(root: Path, units: pl.DataFrame) -> CandidateSet:
-    """Write *units* under *root* as a candidate set, one file per source.
+    """Write *units* under *root* as candidate files, one per source, after those already there.
 
     *units* has a row for each record and entry to judge: the record's ``id``,
     ``source``, ``text`` and ``context``, and the ``entry``. A record judged on
-    two entries has two rows. A set is written once, into a fresh root.
+    two entries has two rows. The files are numbered after the set's existing
+    ones, so a later round adds files that the judge takes up while it passes
+    over the files it has finished; no record of an earlier round may come again.
     """
     candidates = CandidateSet(root)
-    if candidates.candidates.exists() and any(candidates.candidates.iterdir()):
-        raise JudgeError(f"{candidates.candidates} is not empty; a set is written once")
+    if units.height == 0:
+        raise JudgeError("no unit to write")
     if units.select("id", "entry").is_duplicated().any():
         raise JudgeError("a record is listed twice for one entry")
     records = units.select(RECORD_SCHEMA.names()).unique(maintain_order=True)
     if records.get_column("id").is_duplicated().any():
         raise JudgeError("an id names two different records")
+    existing = candidates.ordinals()
+    sharded = sorted(
+        {
+            int(path.stem[-len("NNNNppp") : -len("ppp")])
+            for path in candidates.candidates.glob("*.parquet")
+        }
+    )
+    if sharded != existing:
+        raise JudgeError(
+            f"{candidates.candidates} holds record shards of files {sharded} but entry rows of "
+            f"files {existing}; a round was cut short"
+        )
+    if existing:
+        earlier = pl.concat([candidates.read_entry_rows(ordinal) for ordinal in existing])
+        again = set(records.get_column("id").to_list()) & set(earlier.get_column("id").to_list())
+        if again:
+            raise JudgeError(f"records of an earlier round come again: {sorted(again)[:10]}")
+    first = existing[-1] + 1 if existing else 0
     candidates.candidates.mkdir(parents=True, exist_ok=True)
     sources = sorted(records.get_column("source").unique().to_list())
-    for ordinal, source in enumerate(sources):
+    for ordinal, source in enumerate(sources, start=first):
         shard = records.filter(pl.col("source") == source).cast(RECORD_SCHEMA)
         rows = units.filter(pl.col("source") == source).select(ENTRY_ROW_SCHEMA.names())
         write_aside(
