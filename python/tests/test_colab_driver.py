@@ -78,7 +78,9 @@ class Driver:
         git(self.repo, "init", "--quiet", "-b", "dev")
         git(self.repo, "config", "user.email", "test@invalid")
         git(self.repo, "config", "user.name", "test")
-        shutil.copytree(ROOT / "colab", self.repo / "colab")
+        shutil.copytree(
+            ROOT / "colab", self.repo / "colab", ignore=shutil.ignore_patterns("__pycache__")
+        )
         git(self.repo, "add", ".")
         git(self.repo, "commit", "--quiet", "-m", "driver")
         git(self.repo, "remote", "add", "origin", str(self.origin))
