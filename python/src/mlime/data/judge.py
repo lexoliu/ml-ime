@@ -43,6 +43,13 @@ file's verdict log as it arrives, so a run stopped at any moment resumes with
 only the unjudged records. Once every record of a mined file has its verdict,
 the records it keeps are written to the samples directory under the shard's
 own name, and the file's census is written last, marking it judged.
+
+The judge reads its records through :class:`Candidates`: numbered files of
+record shards, each with the entries its records are judged on. Mining's run
+state is one (:class:`MinedLayout`); :class:`CandidateSet` is the same thing
+for records drawn from anywhere else, written by :func:`write_candidates`, so
+that a sample of already-ingested sentences faces exactly the rules a mined
+sentence does.
 """
 
 from __future__ import annotations
@@ -52,6 +59,8 @@ import email.utils
 import json
 import random
 import time
+from functools import partial
+from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
@@ -127,6 +136,11 @@ PROGRESS_EVERY = 1000
 
 #: A mined file's entry rows, as mining writes them and the judge writes its kept ones.
 ENTRY_ROW_SCHEMA = pl.Schema({"id": pl.String, "entry": pl.String})
+
+#: The columns of a record shard, as every samples shard holds them.
+RECORD_SCHEMA = pl.Schema(
+    {"id": pl.String, "source": pl.String, "text": pl.String, "context": pl.String}
+)
 
 Stage = Literal["boundary", "jev", "review"]
 STAGES: tuple[Stage, ...] = ("boundary", "jev", "review")
@@ -235,7 +249,7 @@ class BoundaryLexicon:
         crossings: list[str] = []
         start = text.find(entry)
         if start < 0:
-            raise JudgeError(f"the mined sentence {text!r} does not hold its entry {entry!r}")
+            raise JudgeError(f"the sentence {text!r} does not hold its entry {entry!r}")
         while start >= 0:
             words = self.crossing(text, start, start + len(entry))
             if not words:
@@ -251,7 +265,7 @@ class BoundaryLexicon:
 
 @dataclass(frozen=True)
 class Unit:
-    """One entry of one mined record: the thing every rule gives its verdict on."""
+    """One entry of one record: the thing every rule gives its verdict on."""
 
     ordinal: int
     id: str
@@ -490,11 +504,85 @@ class Review:
 
 
 # ---------------------------------------------------------------------------
-# The mined source on disk.
+# What the judge reads, and where it writes.
+
+
+def write_aside(path: Path, write: Callable[[Path], object]) -> None:
+    """Write *path* through a sibling and rename it into place."""
+    staged = path.with_name(path.name + ".part")
+    write(staged)
+    staged.replace(path)
+
+
+def read_entry_rows(path: Path) -> pl.DataFrame:
+    """A file's entry rows, ``id<TAB>entry`` without a header."""
+    return pl.read_csv(path, separator="\t", has_header=False, schema=ENTRY_ROW_SCHEMA)
+
+
+class Candidates(ABC):
+    """Numbered files of records waiting for the judge, and where its verdicts go.
+
+    A file is one or more record shards and its entry rows, one ``id<TAB>entry``
+    line for each entry a record is judged on. The judge keeps a verdict log, a
+    census and the kept entry rows of each file under :attr:`judge`, and writes
+    a judged file's kept records to :attr:`samples` under each shard's own name.
+    """
+
+    @property
+    @abstractmethod
+    def judge(self) -> Path:
+        """The verdict logs, the kept entry rows and the judged files' censuses."""
+
+    @property
+    @abstractmethod
+    def samples(self) -> Path:
+        """Where the kept records go."""
+
+    @property
+    @abstractmethod
+    def judged_entries(self) -> Path:
+        """Every entry with how many units name it and how many the judge kept."""
+
+    @abstractmethod
+    def ordinals(self) -> list[int]:
+        """The files ready to be judged."""
+
+    @abstractmethod
+    def shards(self, ordinal: int) -> list[Path]:
+        """The record shards of one file."""
+
+    @abstractmethod
+    def read_records(self, ordinal: int) -> pl.DataFrame:
+        """One file's records, checked against what wrote them."""
+
+    @abstractmethod
+    def read_entry_rows(self, ordinal: int) -> pl.DataFrame:
+        """One file's entry rows."""
+
+    @abstractmethod
+    def entry_table(self) -> pl.DataFrame:
+        """Every entry records were drawn for: ``entry``, ``mined`` (records drawn), and more."""
+
+    @property
+    def census(self) -> Path:
+        """The judge's census summed over the judged files."""
+        return self.judge / "census.json"
+
+    def verdicts(self, ordinal: int) -> Path:
+        """The verdict log of one file."""
+        return self.judge / f"{ordinal:04d}.jsonl"
+
+    def judged(self, ordinal: int) -> Path:
+        """The census of one judged file, written last."""
+        return self.judge / f"{ordinal:04d}.json"
+
+    def kept_rows(self, ordinal: int) -> Path:
+        """The entries the judge kept for each kept record of one file."""
+        return self.judge / f"{ordinal:04d}-entries.tsv"
 
 
 @dataclass(frozen=True)
-class MinedLayout:
+class MinedLayout(Candidates):
     """Where the mining run left a source's state, and where the judge writes."""
 
     root: Path
@@ -539,37 +627,147 @@ class MinedLayout:
         """Every target with what mining kept of it and what the judge kept."""
         return self.state / "judged-entries.tsv"
 
-    @property
-    def census(self) -> Path:
-        """The judge's census summed over the judged files."""
-        return self.judge / "census.json"
-
-    def verdicts(self, ordinal: int) -> Path:
-        """The verdict log of one mined file."""
-        return self.judge / f"{ordinal:04d}.jsonl"
-
-    def judged(self, ordinal: int) -> Path:
-        """The census of one judged file, written last."""
-        return self.judge / f"{ordinal:04d}.json"
-
-    def kept_rows(self, ordinal: int) -> Path:
-        """The entries the judge kept for each kept record of one file."""
-        return self.judge / f"{ordinal:04d}-entries.tsv"
-
     def shards(self, ordinal: int) -> list[Path]:
         """The unjudged shards of one mined file."""
         return sorted(self.unjudged.glob(f"{SOURCE}-{ordinal:04d}???.parquet"))
 
-    def mined_ordinals(self) -> list[int]:
+    def ordinals(self) -> list[int]:
         """The upstream files mining has finished."""
         return sorted(int(path.stem) for path in self.records.glob("*.json"))
+
+    def read_records(self, ordinal: int) -> pl.DataFrame:
+        """One mined file's records, as many as its mining record says it wrote."""
+        record = json.loads(self.records.joinpath(f"{ordinal:04d}.json").read_text("utf-8"))
+        written = int(record["census"]["written"])
+        shards = self.shards(ordinal)
+        frame = (
+            pl.concat([pl.read_parquet(path) for path in shards])
+            if shards
+            else pl.DataFrame(schema=RECORD_SCHEMA)
+        )
+        if frame.height != written:
+            raise JudgeError(
+                f"mined file {ordinal:04d} wrote {written} records, but {self.unjudged} holds "
+                f"{frame.height} of them; were its shards moved out of the unjudged directory?"
+            )
+        if written and set(frame.get_column("source").unique().to_list()) != {SOURCE}:
+            raise JudgeError(f"mined file {ordinal:04d} holds records of another source")
+        return frame
+
+    def read_entry_rows(self, ordinal: int) -> pl.DataFrame:
+        """One mined file's entry rows."""
+        return read_entry_rows(self.entry_rows / f"{ordinal:04d}.tsv")
+
+    def entry_table(self) -> pl.DataFrame:
+        """Every target with its category and how many sentences mining kept of it."""
+        return pl.read_csv(
+            self.mined_entries,
+            separator="\t",
+            schema_overrides={"entry": pl.String, "category": pl.String, "kept": pl.Int64},
+        ).rename({"kept": "mined"})
+
+
+@dataclass(frozen=True)
+class CandidateSet(Candidates):
+    """Records drawn from anywhere, laid out for the judge under one root.
+
+    ``candidates/`` holds each file's record shards, named as samples shards
+    are (``<source>-NNNNppp.parquet``: the source, the file's ordinal, the part),
+    and its entry rows, ``NNNN.tsv``. The judge writes under ``judge/`` and the
+    kept records under ``samples/``.
+    """
+
+    root: Path
+
+    @property
+    def candidates(self) -> Path:
+        """The record shards and entry rows."""
+        return self.root / "candidates"
+
+    @property
+    def judge(self) -> Path:
+        """The verdict logs, the kept entry rows and the judged files' censuses."""
+        return self.root / "judge"
+
+    @property
+    def samples(self) -> Path:
+        """The kept records."""
+        return self.root / "samples"
+
+    @property
+    def judged_entries(self) -> Path:
+        """Every entry with how many records were drawn for it and how many were kept."""
+        return self.judge / "judged-entries.tsv"
+
+    def ordinals(self) -> list[int]:
+        """The files with entry rows."""
+        return sorted(
+            int(path.stem) for path in self.candidates.glob("[0-9][0-9][0-9][0-9].tsv")
+        )
+
+    def shards(self, ordinal: int) -> list[Path]:
+        """The record shards of one file."""
+        return sorted(self.candidates.glob(f"*-{ordinal:04d}[0-9][0-9][0-9].parquet"))
+
+    def read_records(self, ordinal: int) -> pl.DataFrame:
+        """One file's records; every shard holds one source, the one its name gives."""
+        shards = self.shards(ordinal)
+        if not shards:
+            raise JudgeError(f"candidate file {ordinal:04d} has entry rows but no record shard")
+        frames = []
+        for path in shards:
+            frame = pl.read_parquet(path)
+            sources = frame.get_column("source").unique().to_list()
+            if sources != [path.stem[: -len("-NNNNppp")]]:
+                raise JudgeError(f"{path} holds records of {sorted(sources)}, not its own source")
+            frames.append(frame)
+        return pl.concat(frames)
+
+    def read_entry_rows(self, ordinal: int) -> pl.DataFrame:
+        """One file's entry rows."""
+        return read_entry_rows(self.candidates / f"{ordinal:04d}.tsv")
+
+    def entry_table(self) -> pl.DataFrame:
+        """Every entry with how many records were drawn for it."""
+        rows = pl.concat([self.read_entry_rows(ordinal) for ordinal in self.ordinals()])
+        return rows.group_by("entry").agg(pl.len().cast(pl.Int64).alias("mined")).sort("entry")
+
+
+def write_candidates(root: Path, units: pl.DataFrame) -> CandidateSet:
+    """Write *units* under *root* as a candidate set, one file per source.
+
+    *units* has a row for each record and entry to judge: the record's ``id``,
+    ``source``, ``text`` and ``context``, and the ``entry``. A record judged on
+    two entries has two rows. A set is written once, into a fresh root.
+    """
+    candidates = CandidateSet(root)
+    if candidates.candidates.exists() and any(candidates.candidates.iterdir()):
+        raise JudgeError(f"{candidates.candidates} is not empty; a set is written once")
+    if units.select("id", "entry").is_duplicated().any():
+        raise JudgeError("a record is listed twice for one entry")
+    records = units.select(RECORD_SCHEMA.names()).unique(maintain_order=True)
+    if records.get_column("id").is_duplicated().any():
+        raise JudgeError("an id names two different records")
+    candidates.candidates.mkdir(parents=True, exist_ok=True)
+    sources = sorted(records.get_column("source").unique().to_list())
+    for ordinal, source in enumerate(sources):
+        shard = records.filter(pl.col("source") == source).cast(RECORD_SCHEMA)
+        rows = units.filter(pl.col("source") == source).select(ENTRY_ROW_SCHEMA.names())
+        write_aside(
+            candidates.candidates / f"{source}-{ordinal:04d}000.parquet", shard.write_parquet
+        )
+        write_aside(
+            candidates.candidates / f"{ordinal:04d}.tsv",
+            partial(rows.write_csv, separator="\t", include_header=False),
+        )
+    return candidates
 
 
 @dataclass
 class JudgeCensus:
-    """What the judge counted over one mined file, or summed over many."""
+    """What the judge counted over one file of records, or summed over many."""
 
-    #: Records mining wrote.
+    #: Records the file holds.
     records: int = 0
     #: Entries of those records, each judged on its own.
     units: int = 0
@@ -592,34 +790,17 @@ class JudgeCensus:
             setattr(self, name, getattr(self, name) + getattr(other, name))
 
 
-def load_units(layout: MinedLayout, ordinal: int) -> tuple[list[Unit], pl.DataFrame]:
-    """One mined file's units, and its unjudged rows, checked against its mining record."""
-    record = json.loads(layout.records.joinpath(f"{ordinal:04d}.json").read_text(encoding="utf-8"))
-    written = int(record["census"]["written"])
-    shards = layout.shards(ordinal)
-    frame = (
-        pl.concat([pl.read_parquet(path) for path in shards])
-        if shards
-        else pl.DataFrame(schema={"id": pl.String, "source": pl.String, "text": pl.String})
-    )
-    if frame.height != written:
-        raise JudgeError(
-            f"mined file {ordinal:04d} wrote {written} records, but {layout.unjudged} holds "
-            f"{frame.height} of them; were its shards moved out of the unjudged directory?"
-        )
-    if written == 0:
+def load_units(layout: Candidates, ordinal: int) -> tuple[list[Unit], pl.DataFrame]:
+    """One file's units, and its records, the two checked to name the same records."""
+    frame = layout.read_records(ordinal)
+    if frame.height == 0:
         return [], frame
-    if set(frame.get_column("source").unique().to_list()) != {SOURCE}:
-        raise JudgeError(f"mined file {ordinal:04d} holds records of another source")
-    rows = pl.read_csv(
-        layout.entry_rows / f"{ordinal:04d}.tsv",
-        separator="\t",
-        has_header=False,
-        schema=ENTRY_ROW_SCHEMA,
-    )
+    rows = layout.read_entry_rows(ordinal)
     ids = set(frame.get_column("id").to_list())
+    if len(ids) != frame.height:
+        raise JudgeError(f"file {ordinal:04d} holds two records under one id")
     if set(rows.get_column("id").to_list()) != ids:
-        raise JudgeError(f"mined file {ordinal:04d}'s entry rows and records name other records")
+        raise JudgeError(f"file {ordinal:04d}'s entry rows and records name other records")
     joined = rows.join(frame, on="id", how="left", maintain_order="left")
     units = [
         Unit(
@@ -678,15 +859,8 @@ def census_of(
     return census, kept
 
 
-def write_aside(path: Path, write: Callable[[Path], object]) -> None:
-    """Write *path* through a sibling and rename it into place."""
-    staged = path.with_name(path.name + ".part")
-    write(staged)
-    staged.replace(path)
-
-
 def finish_file(
-    layout: MinedLayout,
+    layout: Candidates,
     ordinal: int,
     units: list[Unit],
     verdicts: Mapping[tuple[str, str], list[dict[str, Any]]],
@@ -729,11 +903,11 @@ def finish_file(
             encoding="utf-8",
         ),
     )
-    log.info("mined file judged", ordinal=ordinal, **asdict(census))
+    log.info("file judged", ordinal=ordinal, **asdict(census))
     return census
 
 
-def write_summary(layout: MinedLayout) -> JudgeCensus:
+def write_summary(layout: Candidates) -> JudgeCensus:
     """Sum the judged files into the census and the per-entry table."""
     total = JudgeCensus()
     kept: dict[str, int] = {}
@@ -743,7 +917,7 @@ def write_summary(layout: MinedLayout) -> JudgeCensus:
         total.add(JudgeCensus(**record["census"]))
         for entry, count in record["entries"].items():
             kept[entry] = kept.get(entry, 0) + count
-    mined = layout.mined_ordinals()
+    mined = layout.ordinals()
     write_aside(
         layout.census,
         lambda path: path.write_text(
@@ -754,14 +928,10 @@ def write_summary(layout: MinedLayout) -> JudgeCensus:
             encoding="utf-8",
         ),
     )
-    table = pl.read_csv(
-        layout.mined_entries,
-        separator="\t",
-        schema_overrides={"entry": pl.String, "category": pl.String, "kept": pl.Int64},
-    ).rename({"kept": "mined"})
+    table = layout.entry_table()
     unknown = set(kept) - set(table.get_column("entry").to_list())
     if unknown:
-        raise JudgeError(f"the judge kept entries mining does not list: {sorted(unknown)[:10]}")
+        raise JudgeError(f"the judge kept entries its input does not list: {sorted(unknown)[:10]}")
     table = table.with_columns(
         pl.col("entry").replace_strict(kept, default=0, return_dtype=pl.Int64).alias("kept")
     )
@@ -796,7 +966,7 @@ class Progress:
 
 @dataclass
 class FileState:
-    """One mined file being judged: its units, their verdicts, and its open log."""
+    """One file being judged: its units, their verdicts, and its open log."""
 
     ordinal: int
     units: list[Unit]
@@ -812,8 +982,8 @@ class FileState:
         self.verdicts.setdefault((str(line["id"]), str(line["entry"])), []).append(dict(line))
 
 
-def finished_at_threshold(layout: MinedLayout, ordinal: int) -> bool:
-    """Whether a mined file was judged under the threshold in force now."""
+def finished_at_threshold(layout: Candidates, ordinal: int) -> bool:
+    """Whether a file was judged under the threshold in force now."""
     path = layout.judged(ordinal)
     if not path.exists():
         return False
@@ -830,26 +1000,26 @@ def finished_at_threshold(layout: MinedLayout, ordinal: int) -> bool:
 
 
 async def judge_source(
-    layout: MinedLayout,
+    layout: Candidates,
     lexicon: BoundaryLexicon,
     jev: Asker[JevAnswer],
     review: Asker[ReviewAnswer],
     jev_concurrency: int = JEV_CONCURRENCY,
     review_concurrency: int = REVIEW_CONCURRENCY,
 ) -> JudgeCensus:
-    """Judge every finished mined file not yet judged, resuming from the verdict logs."""
+    """Judge every file of *layout* not yet judged, resuming from the verdict logs."""
     if jev_concurrency < 1 or review_concurrency < 1:
         raise ValueError("each judge needs at least one request in flight")
     layout.judge.mkdir(parents=True, exist_ok=True)
     states: dict[int, FileState] = {}
     jev_queue: asyncio.Queue[Unit] = asyncio.Queue()
     review_queue: asyncio.Queue[Unit | None] = asyncio.Queue()
-    for ordinal in layout.mined_ordinals():
+    for ordinal in layout.ordinals():
         if finished_at_threshold(layout, ordinal):
             continue
         units, _ = load_units(layout, ordinal)
         if len({unit.key for unit in units}) != len(units):
-            raise JudgeError(f"mined file {ordinal:04d} lists an entry twice for one record")
+            raise JudgeError(f"file {ordinal:04d} lists an entry twice for one record")
         state = FileState(
             ordinal, units, read_verdicts(layout.verdicts(ordinal)), layout.verdicts(ordinal)
         )
@@ -941,7 +1111,7 @@ async def judge_source(
 
 
 async def judge_with_endpoints(
-    layout: MinedLayout,
+    layout: Candidates,
     lexicon: BoundaryLexicon,
     jev_concurrency: int = JEV_CONCURRENCY,
     review_concurrency: int = REVIEW_CONCURRENCY,

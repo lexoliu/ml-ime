@@ -366,7 +366,7 @@ def mined_root(root: Path, records: list[tuple[str, str]], ordinal: int = 0) -> 
     return layout
 
 
-def run(layout: MinedLayout, jev: FakeJev, review: FakeReview) -> judge.JudgeCensus:
+def run(layout: judge.Candidates, jev: FakeJev, review: FakeReview) -> judge.JudgeCensus:
     return asyncio.run(judge.judge_source(layout, LEXICON, jev, review, 3, 2))
 
 
@@ -469,6 +469,98 @@ def test_a_record_with_two_entries_keeps_the_one_that_passes(tmp_path: Path) -> 
     census = asyncio.run(judge.judge_source(layout, LEXICON, Natural(), Fine(), 1, 1))
     assert (census.units, census.boundary, census.kept_units, census.kept_records) == (2, 1, 1, 1)
     assert layout.kept_rows(0).read_text(encoding="utf-8") == "000000000000\t画蛇添足\n"
+
+
+# --- a candidate set ----------------------------------------------------------
+
+
+def candidate_units(sources: list[str]) -> pl.DataFrame:
+    """RECORDS as units of a candidate set, each record tagged with the given source."""
+    return pl.DataFrame(
+        {
+            "id": [f"c{index:03d}" for index in range(len(RECORDS))],
+            "source": sources,
+            "text": [text for text, _, _, _ in RECORDS],
+            "context": ["前文" * 100 if index == 0 else None for index in range(len(RECORDS))],
+            "entry": [entry for _, entry, _, _ in RECORDS],
+        }
+    )
+
+
+TWO_SOURCES = ["web", "forum", "web", "forum", "web", "forum"]
+
+
+def test_a_candidate_set_faces_the_same_rules_and_keeps_each_source_apart(
+    tmp_path: Path,
+) -> None:
+    candidates = judge.write_candidates(tmp_path, candidate_units(TWO_SOURCES))
+    assert sorted(path.name for path in candidates.candidates.iterdir()) == [
+        "0000.tsv",
+        "0001.tsv",
+        "forum-0000000.parquet",
+        "web-0001000.parquet",
+    ]
+    jev, review = FakeJev(), FakeReview()
+    census = run(candidates, jev, review)
+
+    assert census == judge.JudgeCensus(
+        records=6,
+        units=6,
+        boundary=1,
+        jev=1,
+        review_spun=1,
+        review_unnatural=1,
+        kept_units=2,
+        kept_records=2,
+    )
+    assert "他小时候一丁不识字" not in jev.asked
+    web = pl.read_parquet(candidates.samples / "web-0001000.parquet")
+    assert web.get_column("text").to_list() == [RECORDS[0][0]]
+    assert web.get_column("source").to_list() == ["web"]
+    forum = pl.read_parquet(candidates.samples / "forum-0000000.parquet")
+    assert forum.get_column("text").to_list() == [RECORDS[5][0]]
+    assert candidates.kept_rows(1).read_text(encoding="utf-8") == "c000\t一丁不识\n"
+    entries = pl.read_csv(candidates.judged_entries, separator="\t")
+    assert entries.rows() == [("一丁不识", 4, 2), ("花好月圆", 2, 0)]
+    units, _ = judge.load_units(candidates, 1)
+    assert units[0].context == "前文" * (judge.CONTEXT_CHARACTERS // 2)
+
+    again_jev, again_review = FakeJev(), FakeReview()
+    assert run(candidates, again_jev, again_review) == census
+    assert again_jev.asked == [] and again_review.asked == []
+
+
+def test_a_candidate_set_is_written_once(tmp_path: Path) -> None:
+    judge.write_candidates(tmp_path, candidate_units(TWO_SOURCES))
+    with pytest.raises(JudgeError, match="written once"):
+        judge.write_candidates(tmp_path, candidate_units(TWO_SOURCES))
+
+
+def test_a_unit_listed_twice_is_refused(tmp_path: Path) -> None:
+    units = candidate_units(TWO_SOURCES)
+    with pytest.raises(JudgeError, match="twice"):
+        judge.write_candidates(tmp_path, pl.concat([units, units.head(1)]))
+
+
+def test_one_id_for_two_records_is_refused(tmp_path: Path) -> None:
+    units = candidate_units(TWO_SOURCES)[[0, 2]].with_columns(pl.lit("same").alias("id"))
+    with pytest.raises(JudgeError, match="two different records"):
+        judge.write_candidates(tmp_path, units)
+
+
+def test_a_shard_holding_another_source_is_refused(tmp_path: Path) -> None:
+    candidates = judge.write_candidates(tmp_path, candidate_units(["web"] * len(RECORDS)))
+    shard = candidates.candidates / "web-0000000.parquet"
+    shard.rename(candidates.candidates / "forum-0000000.parquet")
+    with pytest.raises(JudgeError, match="not its own source"):
+        run(candidates, FakeJev(), FakeReview())
+
+
+def test_entry_rows_without_records_are_refused(tmp_path: Path) -> None:
+    candidates = judge.write_candidates(tmp_path, candidate_units(["web"] * len(RECORDS)))
+    (candidates.candidates / "web-0000000.parquet").unlink()
+    with pytest.raises(JudgeError, match="no record shard"):
+        run(candidates, FakeJev(), FakeReview())
 
 
 # --- the threshold, applied when verdicts are read ------------------------------
