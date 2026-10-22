@@ -24,6 +24,7 @@ from mlime.data import DataLayout
 from mlime.logging import configure
 
 if TYPE_CHECKING:  # the training modules pull in torch; --help must not
+    from mlime.data import idiom_set
     from mlime.train.e2e_model import E2EConfig, RankingConfig
     from mlime.train.keys import KeyFrontConfig
     from mlime.train.qwen_tower import QwenContextConfig
@@ -1698,12 +1699,30 @@ def eval_idiom_draw(
     Then `mlime corpus judge --input candidates --data-dir <out>` judges them.
     """
     configure(verbose)
+    from mlime.data import idiom_set
+
+    inputs = idiom_draw_inputs(entries, knowledge_path, emittable, ordinary_cache, eval3, against)
+    pool = idiom_set.read_pool(samples, sources)
+    frame, census = idiom_set.draw(pool, inputs, strata, size, seed)
+    idiom_set.write_draw(out, frame, census)
+    typer.echo(json.dumps(census.as_dict(), ensure_ascii=False, indent=2))
+
+
+def idiom_draw_inputs(
+    entries: Path,
+    knowledge_path: Path,
+    emittable: Path,
+    ordinary_cache: Path,
+    eval3: Path,
+    against: list[Path],
+) -> idiom_set.Inputs:
+    """What `idiom-draw` and `idiom-topup` read besides the pool."""
     from mlime.data import idiom_set, judge, knowledge
 
     ordinary = knowledge.read_ordinary_vocabulary(
         knowledge.fetch_ordinary_vocabulary(ordinary_cache)
     )
-    inputs = idiom_set.Inputs(
+    return idiom_set.Inputs(
         table=idiom_set.read_table(entries),
         knowledge_idioms=idiom_set.read_knowledge_idioms(knowledge_path),
         emittable=frozenset(emittable.read_text(encoding="utf-8").split()),
@@ -1711,9 +1730,48 @@ def eval_idiom_draw(
         collisions=idiom_set.collisions_of(against),
         lexicon=judge.BoundaryLexicon.load(entries, ordinary),
     )
-    pool = idiom_set.read_pool(samples, sources)
-    frame, census = idiom_set.draw(pool, inputs, strata, size, seed)
-    idiom_set.write_draw(out, frame, census)
+
+
+@eval_app.command("idiom-topup")
+def eval_idiom_topup(
+    samples: Path = typer.Option(..., "--samples", help="The ingested corpus's samples directory"),
+    sources: list[str] = typer.Option(
+        ..., "--source", help="A source whose samples shards make the pool; repeatable"
+    ),
+    entries: Path = typer.Option(..., "--entries", help="#215's entry table (entries-215.tsv)"),
+    knowledge_path: Path = typer.Option(
+        ..., "--knowledge", help="The knowledge lexicon (knowledge.tsv)"
+    ),
+    emittable: Path = typer.Option(..., "--emittable", help="The emittable characters"),
+    ordinary_cache: Path = typer.Option(
+        ..., "--ordinary-cache", help="Where jieba's pinned dictionary is kept"
+    ),
+    eval3: Path = typer.Option(..., "--eval3", help="eval3, whose idioms set the frequencies"),
+    against: list[Path] = typer.Option(
+        ...,
+        "--against",
+        help="An evaluation or held-out file the draw must not overlap; repeatable",
+    ),
+    strata: int = typer.Option(10, "--strata", help="Strata of eval3's idiom frequencies"),
+    pool_root: Path = typer.Option(
+        ..., "--pool", help="The draw's root, its first round wholly judged"
+    ),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Top up #243's draw for the strata the judge left short of eval3's proportions.
+
+    Takes the draw's own inputs; the seed and size come from its census. Then
+    `mlime corpus judge --input candidates --data-dir <pool>` judges the new files
+    only, and `mlime eval idiom-set` builds from both rounds.
+    """
+    configure(verbose)
+    from mlime.data import idiom_set
+
+    first = idiom_set.round_one(pool_root)
+    inputs = idiom_draw_inputs(entries, knowledge_path, emittable, ordinary_cache, eval3, against)
+    prepared = idiom_set.prepare(idiom_set.read_pool(samples, sources), inputs, strata, first.seed)
+    frame, census = idiom_set.top_up(prepared, first.size, first.judged)
+    idiom_set.write_top_up(pool_root, frame, census)
     typer.echo(json.dumps(census.as_dict(), ensure_ascii=False, indent=2))
 
 
