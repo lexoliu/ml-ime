@@ -28,6 +28,13 @@ from mlime.train.e2e_search import SearchGraphs
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import Distributed, MetricLog, TrainingConfig, evaluate, train
 from mlime.train.model import RouteAConfig
+from mlime.train.qwen_tower import (
+    QwenContextConfig,
+    QwenContextTower,
+    TowerGraphs,
+    carried_cross_attention,
+    load_pretrained,
+)
 from mlime.train.ranking import RankingE2EModel
 from mlime.train.run import (
     CorpusLane,
@@ -172,6 +179,78 @@ def load_model(
     return model, int(state["step"])
 
 
+#: What a :class:`~mlime.train.model.GatedCrossAttention` block stores, all of
+#: which a swap to Qwen's tower reads.
+GATED_BLOCK_WEIGHTS = (
+    "norm.weight",
+    "norm.bias",
+    "attention.in_proj_weight",
+    "attention.in_proj_bias",
+    "attention.out_proj.weight",
+    "attention.out_proj.bias",
+    "gate",
+)
+
+
+def swap_in_qwen(model: E2EModel, weights: dict[str, torch.Tensor], source: Path | str) -> None:
+    """Load a MacBERT-context run's weights into *model*, whose context tower is Qwen's.
+
+    Everything but the context path loads as it was trained. MacBERT's tower
+    (``context.*``) is dropped whole, Qwen's comes from its release, and each
+    gated block keeps its norm, query, output projection, gate and biases
+    (:func:`~mlime.train.qwen_tower.carried_cross_attention`). What is left at
+    its initialisation is exactly what the model names as new on its context
+    path -- the LayerNorm on the context rows and the blocks' key and value
+    weights -- and anything else missing or left over is refused.
+    """
+    tower = model.context
+    if not isinstance(tower, QwenContextTower):
+        raise TypeError(f"the model's context tower is a {type(tower).__name__}, not Qwen's")
+    hidden = int(model.fill.config.hidden_size)
+    blocks = len(model.gated_layers())
+    carried: dict[str, torch.Tensor] = {}
+    for index in range(blocks):
+        prefix = f"cross_attention.{index}."
+        carried.update(
+            {
+                prefix + name: value
+                for name, value in carried_cross_attention(weights, prefix, hidden).items()
+            }
+        )
+    packed = {
+        f"cross_attention.{index}.{name}" for index in range(blocks) for name in GATED_BLOCK_WEIGHTS
+    }
+    unread = sorted(
+        name for name in weights if name.startswith("cross_attention.") and name not in packed
+    )
+    if unread:
+        raise ValueError(f"{source}'s gated blocks hold weights the swap does not read: {unread}")
+    kept = {
+        name: value
+        for name, value in weights.items()
+        if not name.startswith(("context.", "cross_attention."))
+    }
+    result = model.load_state_dict({**kept, **carried}, strict=False)
+    fresh = model.new_context_parameters()
+    missing = sorted(
+        name
+        for name in result.missing_keys
+        if name not in fresh and not name.startswith("context.model.")
+    )
+    if missing or result.unexpected_keys:
+        raise ValueError(
+            f"{source} does not fit the model with Qwen's tower swapped in: "
+            f"missing {missing[:4]}, unexpected {result.unexpected_keys[:4]}"
+        )
+    load_pretrained(tower)
+    log.info(
+        "context tower swapped to qwen",
+        dropped=sum(name.startswith("context.") for name in weights),
+        carried_blocks=blocks,
+        fresh=sorted(fresh),
+    )
+
+
 def build_from(
     source: Path,
     char_table: Path,
@@ -180,24 +259,41 @@ def build_from(
     aux_weight: float,
     ranking: RankingConfig | None,
     whole_alphabet: bool,
+    context: QwenContextConfig | None,
+    context_warm_up: bool,
 ) -> tuple[E2EModel, Vocabularies]:
     """The model the e2e checkpoint at *source* describes, under this stage's losses.
 
     *with_weights* -- a stage starting from a finished run -- carries the
-    checkpoint's weights over; a resume takes them from the loop instead. The
-    checkpoint is gigabytes, and it lives only in this frame: nothing holds it
-    once the model is built.
+    checkpoint's weights over; a resume takes them from the loop instead. A
+    stage that names a Qwen *context* tower over a run that read its context
+    with MacBERT swaps the tower in (:func:`swap_in_qwen`); any other change
+    of tower is refused, and a resume under a different one is refused by the
+    loop. The checkpoint is gigabytes, and it lives only in this frame:
+    nothing holds it once the model is built.
     """
     state = torch.load(source, map_location="cpu", weights_only=False)
     recorded = E2EConfig.from_record(_record(state, "e2e", source))
-    vocabularies = Vocabularies.load(char_table, recorded.base_model)
-    model = from_checkpoint(
-        state,
-        vocabularies.lexicon,
-        replace(recorded, aux_weight=aux_weight, ranking=ranking, whole_alphabet=whole_alphabet),
+    wanted = replace(
+        recorded,
+        aux_weight=aux_weight,
+        ranking=ranking,
+        whole_alphabet=whole_alphabet,
+        context=context,
+        context_warm_up=context_warm_up,
     )
+    vocabularies = Vocabularies.load(char_table, recorded.base_model, context)
+    model = from_checkpoint(state, vocabularies.lexicon, wanted)
     if with_weights:
-        model.load_resumed(_weights(state, source), source)
+        if recorded.context == context:
+            model.load_resumed(_weights(state, source), source)
+        elif recorded.context is None:
+            swap_in_qwen(model, _weights(state, source), source)
+        else:
+            raise ValueError(
+                f"{source} reads its context with {recorded.context}; a stage swaps only "
+                "MacBERT's tower for Qwen's"
+            )
         log.info("e2e model initialised from a finished run", step=state.get("step"))
     return model, vocabularies
 
@@ -219,7 +315,7 @@ def build_fresh(
     """
     encoder_state = torch.load(init_encoder, map_location="cpu", weights_only=False)
     base_model = RouteAConfig(**_record(encoder_state, "route_a", init_encoder)).base_model
-    vocabularies = Vocabularies.load(char_table, base_model)
+    vocabularies = Vocabularies.load(char_table, base_model, None)
     reader_state = torch.load(init_decoder, map_location="cpu", weights_only=False)
     model = initialise(
         encoder_state,
@@ -263,9 +359,18 @@ def compile_modules(model: E2EModel, mode: str) -> None:
     them than the card took to run them: on two T4s the ranking step went from
     19 to 23.4 examples a second per rank and the cards from 70% to 93% busy.
     The C++ links against ``libcuda.so``, which the host must provide.
+
+    A context tower that runs apart from the fill pass (``separate``: Qwen's,
+    frozen or replayed from its own graphs) stays outside the compiled region,
+    and only the fill pass that reads its memory is compiled.
     """
     options = {**torch._inductor.list_mode_options(mode), "cpp_wrapper": True}
-    model.encode = torch.compile(model.encode, dynamic=True, options=options)  # type: ignore[method-assign]
+    if model.context.separate:
+        model.encode_fill = torch.compile(  # type: ignore[method-assign]
+            model.encode_fill, dynamic=True, options=options
+        )
+    else:
+        model.encode = torch.compile(model.encode, dynamic=True, options=options)  # type: ignore[method-assign]
     model.decoder.forward = torch.compile(  # type: ignore[method-assign]
         model.decoder.forward, dynamic=True, options=options
     )
@@ -299,6 +404,9 @@ def e2e(
     segmenter: Path | None = None,
     whole_alphabet: bool = False,
     search_graphs: bool = False,
+    context: QwenContextConfig | None = None,
+    context_warm_up: bool = False,
+    tower_graphs: bool = False,
 ) -> RunResult:
     """Train the end-to-end model over *slices.train*; score held-out both ways.
 
@@ -316,6 +424,11 @@ def e2e(
     ranking loss's search from captured CUDA graphs (#137). *run_config* is
     the kernel's own run-config file, copied into each interval trio
     verbatim; the loop refuses ``checkpoint_minutes`` without it.
+
+    *context* names the Qwen tower that reads the context (#222): a stage
+    from a MacBERT run swaps it in, and every segment after names it again.
+    *context_warm_up* trains only the context path (S0). *tower_graphs*
+    replays a frozen Qwen tower's forward from captured CUDA graphs.
     """
     world = Distributed.from_environment()
     starts = (
@@ -336,6 +449,15 @@ def e2e(
             "the ranking loss segments clean keystrokes; the typo noise model is not "
             "wired into ime-segment"
         )
+    if context_warm_up and augmented.typos:
+        raise ValueError(
+            "the context warm-up trains the context path alone; the typo inputs it would "
+            "corrupt belong to the frozen letter encoder"
+        )
+    if tower_graphs and (context is None or context.lora is not None):
+        raise ValueError("--tower-graphs replays a frozen Qwen tower; name one without LoRA")
+    if tower_graphs and not torch.cuda.is_available():
+        raise ValueError("--tower-graphs replays CUDA graphs and this run has no CUDA device")
     source = init_e2e if init_e2e is not None else resume
     if source is not None:
         model, vocabularies = build_from(
@@ -345,10 +467,17 @@ def e2e(
             aux_weight=aux_weight,
             ranking=ranking,
             whole_alphabet=whole_alphabet,
+            context=context,
+            context_warm_up=context_warm_up,
         )
     else:
         if init_encoder is None or init_decoder is None:
             raise ValueError("a new run needs both --init-encoder and --init-decoder")
+        if context is not None or context_warm_up:
+            raise ValueError(
+                "a Qwen tower is swapped into a finished run, and warmed up there; "
+                "start the stage with --init-e2e"
+            )
         model, vocabularies = build_fresh(
             init_encoder,
             init_decoder,
@@ -368,6 +497,11 @@ def e2e(
         if not torch.cuda.is_available():
             raise ValueError("--search-graphs replays CUDA graphs and this run has no CUDA device")
         model.search_graphs = SearchGraphs()
+    if tower_graphs:
+        tower = model.context
+        if not isinstance(tower, QwenContextTower):
+            raise TypeError(f"--tower-graphs replays Qwen's tower, not a {type(tower).__name__}")
+        tower.graphs = TowerGraphs()
     lexicon, tokenizer = vocabularies.lexicon, vocabularies.tokenizer
 
     # One lane per rank this process stands for: lane j of a process takes
@@ -391,12 +525,19 @@ def e2e(
             context_dropout=context_dropout,
             max_context_tokens=max_context_tokens,
             ranking=lane_ranking,
+            context=context,
         )
         for index in range(virtual)
     ]
     # Frozen while the noise model is off, so the fill tower stays exactly the
     # pre-letter one and the ONNX export's span_ids-only graph still describes it.
     model.letter_encoder.requires_grad_(augmented.typos)
+    if context_warm_up:
+        model.freeze_for_context_warm_up()
+        log.info(
+            "context warm-up: only the context path trains",
+            trainable=sum(p.numel() for p in model.parameters() if p.requires_grad),
+        )
 
     paths.out.mkdir(parents=True, exist_ok=True)
     with MetricLog(paths.out / "metrics.jsonl") as provenance:
@@ -429,11 +570,12 @@ def e2e(
     )
     device = world.device
     candidates = vocabularies.candidate_space(augmented.typos)
+    reading = vocabularies.context_tokenizer
     with_context = evaluate(
-        model, evaluation, tokenizer, device, training.token_budget, True, candidates
+        model, evaluation, tokenizer, reading, device, training.token_budget, True, candidates
     )
     without_context = evaluate(
-        model, evaluation, tokenizer, device, training.token_budget, False, candidates
+        model, evaluation, tokenizer, reading, device, training.token_budget, False, candidates
     )
     result = RunResult(
         metrics=segment.metrics,

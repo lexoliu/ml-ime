@@ -120,7 +120,7 @@ def test_the_loss_falls_and_the_run_leaves_its_evidence(
         seed=3,
     )
     out_dir = tmp_path / "run"
-    collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
+    collator = Collator(tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
     metrics_path = train(model, [BuiltLane(stream, collator)], config, out_dir).metrics
 
     records = [json.loads(line) for line in metrics_path.read_text().splitlines()]
@@ -147,7 +147,7 @@ def test_the_schedule_reaches_both_learning_rates(
     model = RouteAModel.from_config(TINY, lexicon, RouteAConfig(cross_attention_layers=1))
     stream = CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, arbitration))
     config = TrainingConfig(max_steps=25, token_budget=64, log_every=1, fp16=False)
-    collator = Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
+    collator = Collator(tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask))
     metrics_path = train(model, [BuiltLane(stream, collator)], config, tmp_path / "run").metrics
     steps = [
         json.loads(line)
@@ -176,6 +176,7 @@ def test_accuracy_is_reported_with_and_without_context(
         accuracy = evaluate(
             model,
             examples,
+            tokenizer,
             tokenizer,
             torch.device("cpu"),
             512,
@@ -221,7 +222,7 @@ def stream_and_collator(
     samples_dir, labels_dir = corpus
     return (
         CorpusStream(samples_dir, labels_dir, SampleBuilder(lexicon, spans, arbitration, seed=1)),
-        Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)),
+        Collator(tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask)),
     )
 
 
@@ -673,7 +674,7 @@ def test_a_ranking_batch_pins_its_rows_and_keeps_its_layout(
         context="北京",
     )
     collator = RankCollator(
-        Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)),
+        Collator(tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask)),
         lambda _: [("w",)],
         spans,
         RankingConfig(segmentations=8, beam=4, negatives=8, weight=1.0),
@@ -1169,7 +1170,7 @@ def _rank_lanes(
                 rank=first_rank + index,
                 world_size=2,
             ),
-            Collator(tokenizer, CandidateSpace(spans, lexicon.candidate_mask)),
+            Collator(tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask)),
         )
         for index in range(count)
     ]

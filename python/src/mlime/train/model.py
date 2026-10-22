@@ -23,7 +23,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import torch
 import torch.utils.checkpoint
@@ -89,8 +89,20 @@ class RouteAConfig:
             raise ValueError(f"label_smoothing must be in [0, 1), got {self.label_smoothing}")
 
 
-class GatedCrossAttention(nn.Module):
-    """Multi-head attention from the fill tower into the context, behind a zero gate.
+@dataclass(frozen=True)
+class ContextMemory:
+    """What the fill tower's cross-attention reads of the context: rows, and which are real.
+
+    ``states [C, S, width]`` and ``mask [C, S]`` (true where real) hold one row
+    per *context*; a batch's ``context_rows`` names the one each fill row reads.
+    """
+
+    states: torch.Tensor
+    mask: torch.Tensor
+
+
+class ContextCrossAttention(nn.Module):
+    """A fill layer's gated attention into the context memory.
 
     The gate is a single scalar rather than a vector so that "the context is off"
     is one number per layer, readable straight out of a checkpoint. At zero the
@@ -98,6 +110,59 @@ class GatedCrossAttention(nn.Module):
     what makes "does context help?" answerable by training rather than by
     argument.
     """
+
+    gate: nn.Parameter
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        memory: ContextMemory,
+        rows: torch.Tensor,
+        has_context: torch.Tensor,
+    ) -> torch.Tensor:
+        """*hidden_states* ``[B, W, H]`` plus the gated term read from *memory*.
+
+        Fill row *i* reads context row ``rows[i]``; ``has_context [B]`` switches
+        the term per fill row.
+        """
+        raise NotImplementedError
+
+    def new_parameters(self) -> tuple[str, ...]:
+        """Names of the block's parameters no earlier checkpoint of its model holds."""
+        return ()
+
+
+class ContextTower(nn.Module):
+    """What reads the context, and how the fill tower's blocks read it back.
+
+    ``separate`` says where the tower runs: inside the compiled encoder pass
+    (a tower that trains with it), or before it, outside the compiled region
+    (a frozen tower, which may run from captured graphs of its own).
+    """
+
+    separate: ClassVar[bool]
+
+    def memory(self, ids: torch.Tensor, mask: torch.Tensor) -> ContextMemory:
+        """The context rows of ``[C, T]`` token *ids* under their padding *mask*."""
+        raise NotImplementedError
+
+    def cross_attention(
+        self, hidden_size: int, num_heads: int, dropout: float
+    ) -> ContextCrossAttention:
+        """A fill-layer block that reads this tower's memory."""
+        raise NotImplementedError
+
+    def new_parameters(self) -> tuple[str, ...]:
+        """Names of the tower's parameters no earlier checkpoint of its model holds."""
+        return ()
+
+    def enable_checkpointing(self) -> None:
+        """Recompute the tower's layers in backward instead of storing them."""
+        raise NotImplementedError
+
+
+class GatedCrossAttention(ContextCrossAttention):
+    """Multi-head attention from the fill tower into same-width context rows."""
 
     def __init__(self, hidden_size: int, num_heads: int, dropout: float):
         super().__init__()
@@ -110,20 +175,60 @@ class GatedCrossAttention(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        context: torch.Tensor,
-        context_mask: torch.Tensor,
+        memory: ContextMemory,
+        rows: torch.Tensor,
         has_context: torch.Tensor,
     ) -> torch.Tensor:
         """Add the gated, per-example-switched context term to *hidden_states*."""
+        context = memory.states[rows]
         attended, _ = self.attention(
             self.norm(hidden_states),
             context,
             context,
-            key_padding_mask=context_mask == 0,
+            key_padding_mask=~memory.mask[rows],
             need_weights=False,
         )
         gated: torch.Tensor = hidden_states + self.gate * has_context[:, None, None] * attended
         return gated
+
+
+class BertContextTower(BertModel, ContextTower):  # type: ignore[misc]  # transformers is untyped
+    """MacBERT's context tower: a BERT encoder over the context's base-vocabulary tokens.
+
+    A subclass of :class:`BertModel` rather than a wrapper, so its parameters
+    keep the ``context.*`` names every route A and e2e checkpoint stores them
+    under. It trains with the fill tower, inside the same compiled pass.
+    """
+
+    separate: ClassVar[bool] = False
+
+    # BertModel's attributes, which nn.Module's typed __getattr__ would
+    # otherwise shadow with ``Tensor | Module``.
+    config: Any
+    embeddings: Any
+    encoder: Any
+    gradient_checkpointing_enable: Any
+
+    def memory(self, ids: torch.Tensor, mask: torch.Tensor) -> ContextMemory:
+        """The last hidden states, under the same host-check-free mask as the fill tower's."""
+        encoded: torch.Tensor = self(
+            input_ids=ids, attention_mask=mask[:, None, None, :].bool()
+        ).last_hidden_state
+        return ContextMemory(states=encoded, mask=mask.bool())
+
+    def cross_attention(
+        self, hidden_size: int, num_heads: int, dropout: float
+    ) -> ContextCrossAttention:
+        """MacBERT's own width is the fill tower's, so the block projects nothing across."""
+        if self.config.hidden_size != hidden_size:
+            raise ValueError(
+                f"the towers disagree on hidden size: {hidden_size} and {self.config.hidden_size}"
+            )
+        return GatedCrossAttention(hidden_size, num_heads, dropout)
+
+    def enable_checkpointing(self) -> None:
+        """transformers' own gradient checkpointing, which the tower's forward reads."""
+        self.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
 
 class RestrictedMlmHead(nn.Module):
@@ -263,7 +368,7 @@ class RouteAModel(nn.Module):
     config_key: ClassVar[str] = "route_a"
 
     fill: BertModel
-    context: BertModel
+    context: ContextTower
     head: RestrictedMlmHead
     span_embeddings: nn.Embedding
     cross_attention: nn.ModuleList
@@ -276,17 +381,12 @@ class RouteAModel(nn.Module):
     def __init__(
         self,
         fill: BertForMaskedLM,
-        context: BertModel,
+        context: ContextTower,
         lexicon: Lexicon,
         config: RouteAConfig,
     ):
         super().__init__()
         bert_config = fill.config
-        if context.config.hidden_size != bert_config.hidden_size:
-            raise ValueError(
-                f"the towers disagree on hidden size: {bert_config.hidden_size} and "
-                f"{context.config.hidden_size}"
-            )
         if config.cross_attention_layers > bert_config.num_hidden_layers:
             raise ValueError(
                 f"cannot gate {config.cross_attention_layers} of "
@@ -298,7 +398,8 @@ class RouteAModel(nn.Module):
                 "fill tower's layer-by-layer pass needs it to build the same masks the "
                 "model's own forward would"
             )
-        for tower in (fill.bert, context):
+        towers = (fill.bert, context) if isinstance(context, BertContextTower) else (fill.bert,)
+        for tower in towers:
             implementation = getattr(tower.config, "_attn_implementation", None)
             if implementation != "sdpa":
                 raise RuntimeError(
@@ -314,7 +415,7 @@ class RouteAModel(nn.Module):
         self.span_embeddings = nn.Embedding(lexicon.spans, bert_config.hidden_size)
         self.letter_encoder = LetterEncoder(bert_config.hidden_size)
         self.cross_attention = nn.ModuleList(
-            GatedCrossAttention(
+            context.cross_attention(
                 bert_config.hidden_size,
                 bert_config.num_attention_heads,
                 config.cross_attention_dropout,
@@ -331,7 +432,7 @@ class RouteAModel(nn.Module):
     ) -> RouteAModel:
         """Build route A on top of the base checkpoint, initialising the new tables."""
         fill = BertForMaskedLM.from_pretrained(config.base_model)
-        context = BertModel.from_pretrained(config.base_model, add_pooling_layer=False)
+        context = BertContextTower.from_pretrained(config.base_model, add_pooling_layer=False)
         model = cls(fill, context, lexicon, config)
         model.initialise_span_embeddings(letter_token_ids(spans, vocabulary))
         log.info(
@@ -351,7 +452,7 @@ class RouteAModel(nn.Module):
         """Build route A on randomly initialised towers, for tests."""
         return cls(
             BertForMaskedLM(bert_config),
-            BertModel(bert_config, add_pooling_layer=False),
+            BertContextTower(bert_config, add_pooling_layer=False),
             lexicon,
             config,
         )
@@ -405,11 +506,11 @@ class RouteAModel(nn.Module):
             raise ValueError("no new parameters found; the naming convention has drifted")
         return [{"params": base, "lr": base_lr}, {"params": new, "lr": new_lr}]
 
-    def gated_layers(self) -> list[GatedCrossAttention]:
+    def gated_layers(self) -> list[ContextCrossAttention]:
         """The cross-attention layers, narrowed out of the untyped module list."""
         layers = []
         for layer in self.cross_attention:
-            if not isinstance(layer, GatedCrossAttention):
+            if not isinstance(layer, ContextCrossAttention):
                 raise TypeError(f"the cross-attention list holds a {type(layer).__name__}")
             layers.append(layer)
         return layers
@@ -428,21 +529,24 @@ class RouteAModel(nn.Module):
         """Recompute each encoder layer in backward instead of storing it.
 
         The fill tower's layers run one at a time from :meth:`encode`, so the
-        checkpoint wraps each call there; the context tower's own forward reads
-        the same switch through transformers' gradient checkpointing.
+        checkpoint wraps each call there; the context tower takes the same
+        switch its own way.
         """
         self.checkpoint_encoder = True
-        self.context.gradient_checkpointing_enable(
-            gradient_checkpointing_kwargs={"use_reentrant": False}
-        )
+        self.context.enable_checkpointing()
 
-    def _encode_context(self, batch: Batch) -> torch.Tensor:
-        """Run the context tower, on the same host-check-free mask as the fill one."""
-        encoded: torch.Tensor = self.context(
-            input_ids=batch.context_ids,
-            attention_mask=batch.context_mask[:, None, None, :].bool(),
-        ).last_hidden_state
-        return encoded
+    def bert_context(self) -> BertContextTower:
+        """The context tower as MacBERT's, for the callers that read its BERT layers."""
+        if not isinstance(self.context, BertContextTower):
+            raise TypeError(f"this model's context tower is a {type(self.context).__name__}")
+        return self.context
+
+    def new_context_parameters(self) -> frozenset[str]:
+        """The full names of every parameter the context path adds over its parent model."""
+        names = {f"context.{name}" for name in self.context.new_parameters()}
+        for index, layer in enumerate(self.gated_layers()):
+            names.update(f"cross_attention.{index}.{name}" for name in layer.new_parameters())
+        return frozenset(names)
 
     def _fill_inputs(self, batch: Batch) -> torch.Tensor:
         """``[MASK]`` everywhere a span was typed, plus that span's embedding and letters.
@@ -462,7 +566,26 @@ class RouteAModel(nn.Module):
 
         Split out of :meth:`forward` because the end-to-end model's decoder
         attends to the per-span hidden states rather than to their logits.
+        The context tower runs once per context row (:meth:`encode_context`),
+        and each fill row then reads the one ``context_rows`` names
+        (:meth:`encode_fill`).
         """
+        memory = self.encode_context(batch)
+        if memory is not None and self.context.separate:
+            # A separate tower's memory enters the compiled fill pass as an
+            # input, so its varying dims are marked as the batch's are.
+            torch._dynamo.maybe_mark_dynamic(memory.states, (0, 1))
+            torch._dynamo.maybe_mark_dynamic(memory.mask, (0, 1))
+        return self.encode_fill(batch, memory)
+
+    def encode_context(self, batch: Batch) -> ContextMemory | None:
+        """The context tower's memory of the batch's contexts; None when no layer reads it."""
+        if not self.gated_layers():
+            return None
+        return self.context.memory(batch.context_ids, batch.context_mask)
+
+    def encode_fill(self, batch: Batch, memory: ContextMemory | None) -> torch.Tensor:
+        """The fill tower over the typed spans, its top layers reading *memory*."""
         embeddings: torch.Tensor = self.fill.embeddings(inputs_embeds=self._fill_inputs(batch))
         # A 4D mask early-exits ``_create_attention_masks`` before its padding
         # check -- ``padding_mask.all()`` is a device-to-host sync the step
@@ -478,10 +601,6 @@ class RouteAModel(nn.Module):
             past_key_values=None,
         )
         gated = self.gated_layers()
-        # The context tower runs once per context row; each fill row then
-        # reads the one ``context_rows`` names.
-        context = self._encode_context(batch)[batch.context_rows] if gated else None
-        context_mask = batch.context_mask[batch.context_rows]
         has_context = batch.has_context[batch.context_rows]
         gated_from = len(self.fill.encoder.layer) - len(gated)
         hidden = embeddings
@@ -494,8 +613,8 @@ class RouteAModel(nn.Module):
                 )
             else:
                 hidden = torch.as_tensor(layer(hidden, attention_mask=attention_mask))
-            if context is not None and depth >= gated_from:
-                hidden = gated[depth - gated_from](hidden, context, context_mask, has_context)
+            if memory is not None and depth >= gated_from:
+                hidden = gated[depth - gated_from](hidden, memory, batch.context_rows, has_context)
         return hidden
 
     def forward(self, batch: Batch) -> RouteAOutput:

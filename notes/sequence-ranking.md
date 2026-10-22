@@ -96,12 +96,7 @@ Top-1 answers over every record (dev and test), context on, sorted by whether th
 
 The loss removed 78% of the wrong-length answers on full pinyin and 37–39% on the other two styles. That is the segmentation ranking it was built for.
 
-On abbreviated and mixed input it also turned right answers into wrong sentences of the right length. Examples (truth → ranked top-1, both right length):
-
-- 晚上六点 → 挽手落地
-- 不是周杰伦 → 不食之精灵
-- 也会感动很多人 → 也会干掉很多人
-- 不了了之 → 埔里来着
+On abbreviated and mixed input it also turned right answers into wrong sentences of the right length, typically by trading common words for rarer ones that fit the same initials.
 
 The wrong characters it chooses are rarer than v1's. Character rarity here is ranked by frequency over the six local run3 sample shards (59,872 characters, 2,964 distinct). The table covers the characters that differ from the truth in same-length wrong answers, context on:
 

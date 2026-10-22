@@ -18,10 +18,16 @@ uses. `<out>/char_pinyin.tsv` is the character
 table the Rust `Lexicon` parses, and `<out>/emittable.txt` the set
 `Emittable::parse` reads.
 
+Written into `crates/ime-neural/tests/fixtures`, the text files are committed
+and the graphs and weights are published with `scripts/publish_fixtures.py`,
+which pins them in `crates/ime-fixtures/fixtures.json`.
+
 A change to the segmenter moves the lattice and not the model. With
 `--keep-exports` after the directory, the script re-emits `lattice.jsonl` and
 rewrites `expected.json` over the graphs already in `<out>` instead of
-exporting new ones, whose bytes differ from machine to machine.
+exporting new ones, whose bytes differ from machine to machine; since the
+graphs live off the tree, `<out>` is then a copy of the set `ime-fixtures`
+assembles, and the rewritten text files are copied back into the tree.
 """
 
 import json

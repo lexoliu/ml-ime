@@ -52,6 +52,7 @@ from mlime.train.producer import (
 from mlime.train.samples import (
     BaseTokenizer,
     Collator,
+    ContextTokenizer,
     TrainingExample,
     token_budget_batches,
 )
@@ -751,6 +752,7 @@ def evaluate(
     model: nn.Module,
     examples: Sequence[TrainingExample],
     tokenizer: BaseTokenizer,
+    context_tokenizer: ContextTokenizer,
     device: torch.device,
     token_budget: int,
     with_context: bool,
@@ -764,6 +766,7 @@ def evaluate(
     route = unwrap(model)
     collator = Collator(
         tokenizer,
+        context_tokenizer,
         candidates,
         context_dropout=0.0 if with_context else 1.0,
     )
