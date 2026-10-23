@@ -560,8 +560,7 @@ mod tests {
     }
 
     fn fixture(name: &str) -> std::path::PathBuf {
-        let directory =
-            std::env::temp_dir().join(format!("ime-g2p-{name}-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!("ime-g2p-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&directory);
         directory
     }
@@ -575,8 +574,11 @@ mod tests {
             .await
             .expect("the first run completes");
         // A shard the stopped run was still writing is not one of its outputs.
-        std::fs::write(directory.join("annotated-00001.parquet.partial"), b"cut off")
-            .expect("the fixture is writable");
+        std::fs::write(
+            directory.join("annotated-00001.parquet.partial"),
+            b"cut off",
+        )
+        .expect("the fixture is writable");
 
         let all = vec![
             sample("a", "中国"),
