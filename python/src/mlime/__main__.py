@@ -1815,6 +1815,27 @@ def eval_idiom_set(
     typer.echo(json.dumps(census.as_dict(), ensure_ascii=False, indent=2))
 
 
+@eval_app.command("idiom-trim")
+def eval_idiom_trim(
+    records: Path = typer.Option(..., "--eval", help="The evaluation set exported from the set"),
+    set_root: Path = typer.Option(..., "--set", help="The set's root, as `idiom-set` wrote it"),
+    draw: Path = typer.Option(..., "--draw", help="The draw's root, whose census holds the strata"),
+    entries: Path = typer.Option(..., "--entries", help="#215's entry table (entries-215.tsv)"),
+    out: Path = typer.Option(..., "--out", help="Where the trimmed evaluation set goes"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Trim an exported idiom evaluation set to the draw's strata proportions, by its seed.
+
+    The export keeps only the sentences both annotators read alike, which
+    leaves the strata uneven again.
+    """
+    configure(verbose)
+    from mlime.data.idiom_set import Proportions, trim_eval_set
+
+    census = trim_eval_set(records, set_root, entries, Proportions.of_draw(draw), out)
+    typer.echo(json.dumps(census.as_dict(), ensure_ascii=False, indent=2))
+
+
 @eval_app.command("gui")
 def eval_gui(
     engine: str = typer.Option(..., help="apple, sogou or baidu -- the engine ime-drive ran"),

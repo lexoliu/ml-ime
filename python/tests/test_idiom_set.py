@@ -32,6 +32,7 @@ from mlime.data.idiom_set import (
     select,
     top_up,
     trim,
+    trim_eval_set,
     write_draw,
     write_top_up,
 )
@@ -363,6 +364,52 @@ def test_the_trim_is_reproducible_from_its_seed() -> None:
     assert kept(243) == kept(243)
     assert len(kept(243)) == 8
     assert any(kept(seed) != kept(243) for seed in range(1, 20)), "the seed picks the records"
+
+
+def exported_set(root: Path) -> tuple[Path, Path, Path]:
+    """The set's root, an evaluation set exported from it in a shuffled order, and the table."""
+    frame = trim_frame()
+    (root / "samples").mkdir(parents=True)
+    frame.select("id", "source", "text", "context").write_parquet(
+        root / "samples" / "web-00000.parquet"
+    )
+    frame.select("id", "entry").write_csv(root / "idioms.tsv", separator="\t")
+    records = root / "eval.jsonl"
+    order = list(reversed(frame["text"].to_list()))
+    records.write_text(
+        "".join(
+            json.dumps({"pinyin": "x", "text": text, "context": "前文"}, ensure_ascii=False) + "\n"
+            for text in order
+        ),
+        encoding="utf-8",
+    )
+    table = root / "entries.tsv"
+    pl.DataFrame(
+        {"entry": list(TRIM_OCCURRENCES), "occurrences": list(TRIM_OCCURRENCES.values())}
+    ).write_csv(table, separator="\t")
+    return root, records, table
+
+
+def test_an_exported_set_is_trimmed_keeping_its_records_and_their_order(tmp_path: Path) -> None:
+    root, records, table = exported_set(tmp_path)
+    strata = Strata(lowers=(1, 100), targets=(1, 3))
+    out = tmp_path / "trimmed.jsonl"
+    census = trim_eval_set(records, root, table, Proportions(strata, 243), out)
+    written = out.read_text("utf-8").splitlines()
+    original = records.read_text("utf-8").splitlines()
+    assert census.records == len(written) == 11 and census.trimmed == 1
+    assert written == [line for line in original if line in written], "lines kept as they were"
+    with pytest.raises(SelectionError, match="written once"):
+        trim_eval_set(records, root, table, Proportions(strata, 243), out)
+
+
+def test_an_exported_record_the_set_does_not_hold_is_refused(tmp_path: Path) -> None:
+    root, records, table = exported_set(tmp_path)
+    with records.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"pinyin": "x", "text": "别的句子", "context": None}) + "\n")
+    strata = Strata(lowers=(1, 100), targets=(1, 3))
+    with pytest.raises(SelectionError, match="not sentences of the set"):
+        trim_eval_set(records, root, table, Proportions(strata, 243), tmp_path / "out.jsonl")
 
 
 # --- the top-up -------------------------------------------------------------------
