@@ -125,9 +125,10 @@ impl AnnotationCounts {
 ///
 /// # Errors
 ///
-/// If a shard cannot be written, if `out_dir` holds outputs a run cannot have
-/// left, or if the two annotators are not the g2pW/LLM pair the stored schema
-/// is named after.
+/// If an annotator cannot read a batch, after committing the batches before it
+/// so a run started again goes on from there; if a shard cannot be written; if
+/// `out_dir` holds outputs a run cannot have left; or if the two annotators are
+/// not the g2pW/LLM pair the stored schema is named after.
 pub async fn annotate<F: Annotator, S: Annotator>(
     samples: impl IntoIterator<Item = Sample>,
     first: &F,
@@ -144,13 +145,12 @@ pub async fn annotate<F: Annotator, S: Annotator>(
     }
     let mut counts = AnnotationCounts::default();
     let done = finished(out_dir)?;
-    let mut annotated = ShardWriter::resume(out_dir, ANNOTATED, ROWS_PER_SHARD)?;
-    let mut hard = ShardWriter::resume(out_dir, HARD, ROWS_PER_SHARD)?;
-    let mut refused = ShardWriter::resume(out_dir, REFUSED, ROWS_PER_SHARD)?;
+    let mut outputs = Outputs::resume(out_dir)?;
 
     let mut skipped = 0_usize;
     let mut committed = Instant::now();
     let mut batch: Vec<Sample> = Vec::with_capacity(batch_size.max(1));
+    let mut fed: Result<()> = Ok(());
     for sample in samples {
         if done.contains(&sample.id) {
             skipped += 1;
@@ -158,46 +158,53 @@ pub async fn annotate<F: Annotator, S: Annotator>(
         }
         batch.push(sample);
         if batch.len() >= batch_size.max(1) {
-            run_batch(
-                &batch,
-                first,
-                second,
-                &mut counts,
-                &mut annotated,
-                &mut hard,
-                &mut refused,
-            )
-            .await?;
+            fed = run_batch(&batch, first, second, &mut counts, &mut outputs).await;
+            if fed.is_err() {
+                break;
+            }
             batch.clear();
             if committed.elapsed() >= CHECKPOINT {
-                // `annotated` last: a sample counts as done once its row is there.
-                hard.flush()?;
-                refused.flush()?;
-                annotated.flush()?;
+                outputs.commit()?;
                 committed = Instant::now();
             }
         }
     }
-    if !batch.is_empty() {
-        run_batch(
-            &batch,
-            first,
-            second,
-            &mut counts,
-            &mut annotated,
-            &mut hard,
-            &mut refused,
-        )
-        .await?;
+    if fed.is_ok() && !batch.is_empty() {
+        fed = run_batch(&batch, first, second, &mut counts, &mut outputs).await;
     }
 
-    hard.finish()?;
-    refused.finish()?;
-    annotated.finish()?;
+    // What the finished batches wrote is kept whether or not the run stopped early.
+    outputs.commit()?;
     if skipped > 0 {
         info!(skipped, "samples annotated by an earlier run skipped");
     }
+    fed?;
     Ok(counts)
+}
+
+/// The three shard writers of a run.
+struct Outputs {
+    annotated: ShardWriter<AnnotatedRow>,
+    hard: ShardWriter<AnnotatedRow>,
+    refused: ShardWriter<RefusedRow>,
+}
+
+impl Outputs {
+    fn resume(out_dir: &Path) -> Result<Self> {
+        Ok(Self {
+            annotated: ShardWriter::resume(out_dir, ANNOTATED, ROWS_PER_SHARD)?,
+            hard: ShardWriter::resume(out_dir, HARD, ROWS_PER_SHARD)?,
+            refused: ShardWriter::resume(out_dir, REFUSED, ROWS_PER_SHARD)?,
+        })
+    }
+
+    /// Write out every buffered row, `annotated` last: a sample counts as done
+    /// once its row is there.
+    fn commit(&mut self) -> Result<()> {
+        self.hard.flush()?;
+        self.refused.flush()?;
+        self.annotated.flush()
+    }
 }
 
 /// The ids of the samples `out_dir` already holds an outcome for: an annotated
@@ -243,12 +250,11 @@ async fn run_batch<F: Annotator, S: Annotator>(
     first: &F,
     second: &S,
     counts: &mut AnnotationCounts,
-    annotated: &mut ShardWriter<AnnotatedRow>,
-    hard: &mut ShardWriter<AnnotatedRow>,
-    refused: &mut ShardWriter<RefusedRow>,
+    outputs: &mut Outputs,
 ) -> Result<()> {
     let texts: Vec<String> = batch.iter().map(|sample| sample.text.clone()).collect();
     let (firsts, seconds) = tokio::join!(first.annotate(&texts), second.annotate(&texts));
+    let (firsts, seconds) = (firsts?, seconds?);
     if firsts.len() != batch.len() || seconds.len() != batch.len() {
         return Err(Error::Invariant(format!(
             "an annotator returned {} and {} outcomes for {} sentences",
@@ -265,7 +271,7 @@ async fn run_batch<F: Annotator, S: Annotator>(
                 Ok(reading) => readings.push(reading),
                 Err(refusal) => {
                     counts.refused += 1;
-                    refused.write(RefusedRow {
+                    outputs.refused.write(RefusedRow {
                         id: sample.id.clone(),
                         text: sample.text.clone(),
                         annotator: name.to_owned(),
@@ -295,11 +301,11 @@ async fn run_batch<F: Annotator, S: Annotator>(
         };
         if row.agree_all {
             counts.agreed += 1;
-            annotated.write(row)?;
+            outputs.annotated.write(row)?;
         } else {
             counts.disagreed += 1;
-            hard.write(row.clone())?;
-            annotated.write(row)?;
+            outputs.hard.write(row.clone())?;
+            outputs.annotated.write(row)?;
         }
     }
     info!(
@@ -479,9 +485,65 @@ mod tests {
             self.name
         }
 
-        fn annotate(&self, texts: &[String]) -> impl Future<Output = Vec<Outcome>> {
-            std::future::ready(self.answers.iter().take(texts.len()).cloned().collect())
+        fn annotate(&self, texts: &[String]) -> impl Future<Output = Result<Vec<Outcome>>> {
+            std::future::ready(Ok(self.answers.iter().take(texts.len()).cloned().collect()))
         }
+    }
+
+    /// An LLM annotator whose endpoint answers the first batch and then goes down.
+    struct GoesDown {
+        batches: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Annotator for GoesDown {
+        fn name(&self) -> &'static str {
+            "llm"
+        }
+
+        fn annotate(&self, texts: &[String]) -> impl Future<Output = Result<Vec<Outcome>>> {
+            let batch = self
+                .batches
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            std::future::ready(if batch == 0 {
+                Ok(vec![Ok(reading(&["zhong1", "guo2"])); texts.len()])
+            } else {
+                Err(Error::Invariant("the endpoint is down".to_owned()))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn an_annotator_that_cannot_read_stops_the_run_keeping_what_was_done() {
+        let directory = fixture("down");
+        let samples = || vec![sample("a", "中国"), sample("b", "中国")];
+        let down = GoesDown {
+            batches: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let error = annotate(samples(), &agreeing("g2pw"), &down, &directory, 1)
+            .await
+            .expect_err("the second batch cannot be read");
+        assert!(matches!(error, Error::Invariant(_)));
+        assert!(
+            shard_paths(&directory, REFUSED)
+                .expect("the directory lists")
+                .is_empty(),
+            "a sentence never read is not refused"
+        );
+        let annotated: Vec<AnnotatedRow> =
+            read_shards(&directory, ANNOTATED).expect("the first batch was committed");
+        assert_eq!(annotated.len(), 1);
+
+        let counts = annotate(
+            samples(),
+            &agreeing("g2pw"),
+            &agreeing("llm"),
+            &directory,
+            1,
+        )
+        .await
+        .expect("the endpoint is back");
+        assert_eq!(counts.agreed, 1, "only the sentence left is annotated");
+        std::fs::remove_dir_all(&directory).expect("the fixture directory is removed");
     }
 
     fn reading(syllables: &[&str]) -> Reading {
