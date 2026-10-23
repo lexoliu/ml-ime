@@ -51,7 +51,16 @@ pub trait Annotator {
     fn name(&self) -> &'static str;
 
     /// One outcome per input sentence, in order.
-    fn annotate(&self, texts: &[String]) -> impl Future<Output = Vec<Outcome>> + Send;
+    ///
+    /// A refusal is the annotator's verdict on a sentence it read. Failing to
+    /// read at all -- an endpoint that is down, a model session that broke -- is
+    /// an error that stops the run, never a refusal: a refused sentence counts as
+    /// done, so a resumed run would skip it.
+    ///
+    /// # Errors
+    ///
+    /// When the annotator could not read the batch.
+    fn annotate(&self, texts: &[String]) -> impl Future<Output = Result<Vec<Outcome>>> + Send;
 }
 
 /// Two annotators' readings for one sentence, position by position.
