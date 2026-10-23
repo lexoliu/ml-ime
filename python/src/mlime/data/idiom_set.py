@@ -71,8 +71,15 @@ held-out file the ingestion was guarded with, each after ``--against``::
     mlime eval idiom-set --judged data/idiom-select-243/pool --match-strata \\
         --entries data/corpus-225/inputs/entries-215.tsv <against> --out <root>
     ime-cli g2p annotate --data-dir <root>
-    ime-cli export eval-set --data-dir <root> --out <root>/idioms-abbreviated.jsonl \\
+    ime-cli export eval-set --data-dir <root> --out <root>/idioms-abbreviated-agreed.jsonl \\
         --size <agreed> --seed 243 --typing abbreviated
+    mlime eval idiom-trim --eval <root>/idioms-abbreviated-agreed.jsonl --set <root> \\
+        --draw data/idiom-select-243/pool --entries data/corpus-225/inputs/entries-215.tsv \\
+        --out <root>/idioms-abbreviated.jsonl
+
+The export keeps only the sentences both annotators read alike, which leaves
+the strata uneven again, so the exported set is trimmed once more
+(:func:`trim_eval_set`).
 """
 
 from __future__ import annotations
@@ -1162,4 +1169,41 @@ def build(
         trimmed=census.trimmed,
         out=str(out),
     )
+    return census
+
+
+def trim_eval_set(
+    records: Path, set_root: Path, entry_table: Path, proportions: Proportions, out: Path
+) -> Census:
+    """Trim an evaluation set exported from the set under *set_root* to *proportions*.
+
+    The export keeps only the sentences both annotators read alike, and those
+    are not spread evenly over the strata, so the trim (:func:`trim`) runs again
+    on what was exported. Each record is matched to its idiom through the set's
+    samples by its sentence, which the set holds once; the kept records are
+    written as they were, in their order.
+    """
+    if out.exists():
+        raise SelectionError(f"{out} exists; a trimmed set is written once")
+    lines = records.read_text(encoding="utf-8").splitlines()
+    texts = [json.loads(line)["text"] for line in lines]
+    samples = pl.concat(
+        [pl.read_parquet(path) for path in sorted((set_root / "samples").glob("*.parquet"))]
+    ).select("id", "text")
+    idioms = pl.read_csv(set_root / "idioms.tsv", separator="\t", quote_char=None)
+    entry_of = dict(samples.join(idioms, on="id", how="inner").select("text", "entry").iter_rows())
+    unknown = [text for text in texts if text not in entry_of]
+    if unknown:
+        raise SelectionError(f"{len(unknown)} of {records}'s records are not sentences of the set")
+    if len(set(texts)) != len(texts):
+        raise SelectionError(f"{records} holds a sentence twice")
+    entries = pl.read_csv(entry_table, separator="\t", quote_char=None)
+    occurrences = dict(zip(entries["entry"], entries["occurrences"], strict=True))
+
+    frame = pl.DataFrame({"text": texts, "entry": [entry_of[text] for text in texts]})
+    census = Census(kept_units=len(lines))
+    kept = set(trim(frame, occurrences, proportions, census)["text"].to_list())
+    chosen = [line for line, text in zip(lines, texts, strict=True) if text in kept]
+    census.records = len(chosen)
+    out.write_text("".join(f"{line}\n" for line in chosen), encoding="utf-8")
     return census
