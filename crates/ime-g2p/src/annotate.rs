@@ -638,7 +638,7 @@ mod tests {
         let directory = fixture("orphan");
         let disagreeing = Fixed {
             name: "llm",
-            answers: vec![Ok(reading(&["zhong4", "guo2"]))],
+            answers: vec![Ok(reading(&["chong2", "guo2"]))],
         };
         annotate(
             vec![sample("a", "中国")],
