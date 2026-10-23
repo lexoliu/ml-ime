@@ -11,10 +11,13 @@ use crate::error::{Error, Result};
 use crate::outcome::{Annotator, compare};
 use crate::shards::{
     ShardWriter, Shardable, bool_lists, column_of_bool_lists, column_of_optional_strings,
-    column_of_string_lists, column_of_strings, read_shards, string_lists, strings,
+    column_of_string_lists, column_of_strings, read_frame, read_shards, shard_paths, string_lists,
+    strings,
 };
 use polars::prelude::{Column, DataFrame};
+use std::collections::HashSet;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tracing::info;
 
 /// Shard prefix for sentences both annotators handled, agreeing or not.
@@ -28,6 +31,10 @@ pub const REFUSED: &str = "refused";
 
 /// How many rows one shard holds before the next one is started.
 pub const ROWS_PER_SHARD: usize = 50_000;
+
+/// How much annotation a stopped run may lose: past this since the last commit,
+/// the next finished batch commits the shards written so far.
+pub const CHECKPOINT: Duration = Duration::from_secs(60);
 
 /// One training example: what to type, and what was on screen before it.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -111,10 +118,16 @@ impl AnnotationCounts {
 /// ONNX session and the other is a network round trip: running them in sequence
 /// would make every batch cost the sum rather than the maximum.
 ///
+/// The run resumes. Every [`CHECKPOINT`] the shards written so far are
+/// committed, and a run started again over the same `out_dir` skips each sample
+/// that already has an outcome there, so a stopped run loses at most the work
+/// since its last checkpoint. The counts are this run's.
+///
 /// # Errors
 ///
-/// If a shard cannot be written, or if the two annotators are not the g2pW/LLM
-/// pair the stored schema is named after.
+/// If a shard cannot be written, if `out_dir` holds outputs a run cannot have
+/// left, or if the two annotators are not the g2pW/LLM pair the stored schema
+/// is named after.
 pub async fn annotate<F: Annotator, S: Annotator>(
     samples: impl IntoIterator<Item = Sample>,
     first: &F,
@@ -130,12 +143,19 @@ pub async fn annotate<F: Annotator, S: Annotator>(
         )));
     }
     let mut counts = AnnotationCounts::default();
-    let mut annotated = ShardWriter::new(out_dir, ANNOTATED, ROWS_PER_SHARD)?;
-    let mut hard = ShardWriter::new(out_dir, HARD, ROWS_PER_SHARD)?;
-    let mut refused = ShardWriter::new(out_dir, REFUSED, ROWS_PER_SHARD)?;
+    let done = finished(out_dir)?;
+    let mut annotated = ShardWriter::resume(out_dir, ANNOTATED, ROWS_PER_SHARD)?;
+    let mut hard = ShardWriter::resume(out_dir, HARD, ROWS_PER_SHARD)?;
+    let mut refused = ShardWriter::resume(out_dir, REFUSED, ROWS_PER_SHARD)?;
 
+    let mut skipped = 0_usize;
+    let mut committed = Instant::now();
     let mut batch: Vec<Sample> = Vec::with_capacity(batch_size.max(1));
     for sample in samples {
+        if done.contains(&sample.id) {
+            skipped += 1;
+            continue;
+        }
         batch.push(sample);
         if batch.len() >= batch_size.max(1) {
             run_batch(
@@ -149,6 +169,13 @@ pub async fn annotate<F: Annotator, S: Annotator>(
             )
             .await?;
             batch.clear();
+            if committed.elapsed() >= CHECKPOINT {
+                // `annotated` last: a sample counts as done once its row is there.
+                hard.flush()?;
+                refused.flush()?;
+                annotated.flush()?;
+                committed = Instant::now();
+            }
         }
     }
     if !batch.is_empty() {
@@ -164,10 +191,51 @@ pub async fn annotate<F: Annotator, S: Annotator>(
         .await?;
     }
 
-    annotated.finish()?;
     hard.finish()?;
     refused.finish()?;
+    annotated.finish()?;
+    if skipped > 0 {
+        info!(skipped, "samples annotated by an earlier run skipped");
+    }
     Ok(counts)
+}
+
+/// The ids of the samples `out_dir` already holds an outcome for: an annotated
+/// row, or a refusal.
+///
+/// A hard row is written with its annotated row, so a hard id without one means
+/// the outputs were not left by a run of [`annotate`].
+fn finished(out_dir: &Path) -> Result<HashSet<String>> {
+    let annotated: HashSet<String> = existing::<AnnotatedRow>(out_dir, ANNOTATED)?
+        .into_iter()
+        .map(|row| row.id)
+        .collect();
+    if let Some(orphan) = existing::<AnnotatedRow>(out_dir, HARD)?
+        .into_iter()
+        .find(|row| !annotated.contains(&row.id))
+    {
+        return Err(Error::Invariant(format!(
+            "{} holds a hard row for {} with no annotated row; these are not one run's outputs",
+            out_dir.display(),
+            orphan.id
+        )));
+    }
+    let mut done = annotated;
+    done.extend(
+        existing::<RefusedRow>(out_dir, REFUSED)?
+            .into_iter()
+            .map(|row| row.id),
+    );
+    Ok(done)
+}
+
+/// Every row of the `<prefix>-*.parquet` shards in `directory`, none when there are none.
+fn existing<R: Shardable>(directory: &Path, prefix: &str) -> Result<Vec<R>> {
+    let mut rows = Vec::new();
+    for path in shard_paths(directory, prefix)? {
+        rows.extend(R::from_frame(&read_frame(&path)?)?);
+    }
+    Ok(rows)
 }
 
 async fn run_batch<F: Annotator, S: Annotator>(
@@ -481,6 +549,116 @@ mod tests {
         assert_eq!(refused[0].annotator, "g2pw");
         assert_eq!(refused[0].reason, "g2pw has no reading for '你'");
 
+        std::fs::remove_dir_all(&directory).expect("the fixture directory is removed");
+    }
+
+    fn agreeing(name: &'static str) -> Fixed {
+        Fixed {
+            name,
+            answers: vec![Ok(reading(&["zhong1", "guo2"])); 8],
+        }
+    }
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        let directory =
+            std::env::temp_dir().join(format!("ime-g2p-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        directory
+    }
+
+    #[tokio::test]
+    async fn a_run_started_again_annotates_only_what_is_left() {
+        let directory = fixture("resume");
+        let (first, second) = (agreeing("g2pw"), agreeing("llm"));
+        let earlier = vec![sample("a", "中国"), sample("b", "中国")];
+        annotate(earlier, &first, &second, &directory, 8)
+            .await
+            .expect("the first run completes");
+        // A shard the stopped run was still writing is not one of its outputs.
+        std::fs::write(directory.join("annotated-00001.parquet.partial"), b"cut off")
+            .expect("the fixture is writable");
+
+        let all = vec![
+            sample("a", "中国"),
+            sample("b", "中国"),
+            sample("c", "中国"),
+        ];
+        let counts = annotate(all, &first, &second, &directory, 8)
+            .await
+            .expect("the second run completes");
+        assert_eq!(counts.agreed, 1, "only the sample left is annotated");
+
+        let annotated: Vec<AnnotatedRow> =
+            read_shards(&directory, ANNOTATED).expect("both runs' shards read back");
+        let mut ids: Vec<&str> = annotated.iter().map(|row| row.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["a", "b", "c"]);
+        assert_eq!(
+            shard_paths(&directory, ANNOTATED)
+                .expect("the directory lists")
+                .len(),
+            2
+        );
+        std::fs::remove_dir_all(&directory).expect("the fixture directory is removed");
+    }
+
+    #[tokio::test]
+    async fn a_refused_sample_is_not_asked_again() {
+        let directory = fixture("refused");
+        let refusing = Fixed {
+            name: "g2pw",
+            answers: vec![Err(Refusal::new("no reading"))],
+        };
+        annotate(
+            vec![sample("a", "中国")],
+            &refusing,
+            &agreeing("llm"),
+            &directory,
+            8,
+        )
+        .await
+        .expect("the first run completes");
+        let counts = annotate(
+            vec![sample("a", "中国")],
+            &agreeing("g2pw"),
+            &agreeing("llm"),
+            &directory,
+            8,
+        )
+        .await
+        .expect("the second run completes");
+        assert_eq!(counts, AnnotationCounts::default());
+        std::fs::remove_dir_all(&directory).expect("the fixture directory is removed");
+    }
+
+    #[tokio::test]
+    async fn a_hard_row_without_its_annotated_row_is_refused() {
+        let directory = fixture("orphan");
+        let disagreeing = Fixed {
+            name: "llm",
+            answers: vec![Ok(reading(&["zhong4", "guo2"]))],
+        };
+        annotate(
+            vec![sample("a", "中国")],
+            &agreeing("g2pw"),
+            &disagreeing,
+            &directory,
+            8,
+        )
+        .await
+        .expect("the run completes");
+        std::fs::remove_file(directory.join("annotated-00000.parquet"))
+            .expect("the annotated shard exists");
+        let error = annotate(
+            vec![sample("a", "中国")],
+            &agreeing("g2pw"),
+            &agreeing("llm"),
+            &directory,
+            8,
+        )
+        .await
+        .expect_err("the outputs are not one run's");
+        assert!(matches!(error, Error::Invariant(_)));
         std::fs::remove_dir_all(&directory).expect("the fixture directory is removed");
     }
 
