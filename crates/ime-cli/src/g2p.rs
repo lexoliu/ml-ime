@@ -385,8 +385,8 @@ async fn probe(sentence: &str, model: &ModelArgs) -> Result<()> {
     let llm = LlmAnnotator::new(&settings, 1);
     let batch = [sentence.to_owned()];
     let (first, second) = tokio::join!(g2pw.annotate(&batch), llm.annotate(&batch));
-    let first = one(first, g2pw.name())?;
-    let second = one(second, llm.name())?;
+    let first = one(first?, g2pw.name())?;
+    let second = one(second?, llm.name())?;
     let comparison = compare(sentence, &first, &second)?;
 
     let table = ProbeTable {
