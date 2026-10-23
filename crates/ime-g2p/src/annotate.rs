@@ -486,12 +486,7 @@ mod tests {
         }
 
         fn annotate(&self, texts: &[String]) -> impl Future<Output = Result<Vec<Outcome>>> {
-            std::future::ready(Ok(self
-                .answers
-                .iter()
-                .take(texts.len())
-                .cloned()
-                .collect()))
+            std::future::ready(Ok(self.answers.iter().take(texts.len()).cloned().collect()))
         }
     }
 
@@ -538,9 +533,15 @@ mod tests {
             read_shards(&directory, ANNOTATED).expect("the first batch was committed");
         assert_eq!(annotated.len(), 1);
 
-        let counts = annotate(samples(), &agreeing("g2pw"), &agreeing("llm"), &directory, 1)
-            .await
-            .expect("the endpoint is back");
+        let counts = annotate(
+            samples(),
+            &agreeing("g2pw"),
+            &agreeing("llm"),
+            &directory,
+            1,
+        )
+        .await
+        .expect("the endpoint is back");
         assert_eq!(counts.agreed, 1, "only the sentence left is annotated");
         std::fs::remove_dir_all(&directory).expect("the fixture directory is removed");
     }

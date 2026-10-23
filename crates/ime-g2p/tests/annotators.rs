@@ -292,8 +292,5 @@ async fn an_endpoint_that_cannot_be_reached_stops_the_run_rather_than_refusing()
         .annotate(&["中国".to_owned()])
         .await
         .expect_err("no reply is no verdict");
-    assert!(
-        matches!(error, ime_g2p::Error::Endpoint(_)),
-        "{error}"
-    );
+    assert!(matches!(error, ime_g2p::Error::Endpoint(_)), "{error}");
 }
