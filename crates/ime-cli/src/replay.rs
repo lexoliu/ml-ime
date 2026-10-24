@@ -147,9 +147,9 @@ pub(crate) struct ReplayArgs {
     #[arg(long, value_name = "INDEX")]
     probe: Option<usize>,
     /// The lexicon prior, in nats, a word arc gains when it lands with at
-    /// least one character typed as an initial: the weight `fused-eval
-    /// --select-on-dev` chose for the typing style being replayed.
-    #[arg(long, value_parser = crate::neural::parse_weight, default_value = "0.0", requires = "arcs")]
+    /// least one character typed as an initial; 12 by default, the prior the
+    /// idiom selection set chose (#243).
+    #[arg(long, value_parser = crate::neural::parse_weight, default_value = "12.0", requires = "arcs")]
     arc_prior: f32,
     #[command(flatten)]
     arcs: crate::neural::ArcArgs,

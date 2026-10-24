@@ -191,7 +191,7 @@ enum Command {
         #[arg(
             long,
             value_parser = parse_weight,
-            default_values_t = [0.0f32],
+            default_values_t = [12.0f32],
             requires = "arcs"
         )]
         arc_prior: Vec<f32>,
