@@ -30,9 +30,11 @@ import torch
 
 from mlime.data.pinyin_tables import TYPO_MODEL_PATH
 from mlime.data.shards import shard_paths
+from mlime.legality import Legality
 from mlime.logging import log
 from mlime.train.arbitration import ReadingArbitration
 from mlime.train.e2e_model import RankingConfig
+from mlime.train.keys import KeyCollator, KeyFrontConfig, KeySampleBuilder
 from mlime.train.lexicon import CandidateSpace, Lexicon, build_lexicon, read_char_readings
 from mlime.train.loop import (
     Accuracy,
@@ -305,6 +307,50 @@ class Vocabularies:
             world_size=world_size,
         )
 
+    def legality(self) -> Legality:
+        """The legality automaton over the lexicon's emittable set, from the run's own tables.
+
+        Each character's readings are the lexicon's -- the char table the run
+        reads -- and the corrections are the shared noise model's over the
+        same syllables, which are ``syllables.txt``'s: the automaton the Rust
+        search builds from the committed tables (#221).
+        """
+        readings: dict[str, list[str]] = {character: [] for character in self.lexicon.characters}
+        for syllable, ids in self.lexicon.homophones.items():
+            for index in ids:
+                readings[self.lexicon.characters[index]].append(syllable)
+        table = CorrectionTable(NoiseModel.load(TYPO_MODEL_PATH), self.syllables)
+        return Legality(self.lexicon.characters, readings, table)
+
+    def key_builder(
+        self, augmentation: Augmentation | None, seed: int, keys: KeyFrontConfig
+    ) -> KeySampleBuilder:
+        """A builder that types sentences as keys, with the gold's legal alignments over them."""
+        augmented = augmentation or Augmentation()
+        return KeySampleBuilder(
+            self.lexicon,
+            self.spans,
+            self.arbitration,
+            self.legality(),
+            keys,
+            augmented,
+            seed=seed,
+            noise=self.noise_model(augmented.typos),
+        )
+
+    def key_collator(
+        self,
+        context_dropout: float = 0.3,
+        max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+        seed: int = 0,
+    ) -> KeyCollator:
+        """The collator a key-level run pads its batches with.
+
+        Its span half reads the spans the typist meant, which a typo never
+        touches, so it resolves candidates over the clean lexicon.
+        """
+        return KeyCollator(self.collator(context_dropout, max_context_tokens, seed))
+
     def collator(
         self,
         context_dropout: float = 0.3,
@@ -355,10 +401,20 @@ class CorpusLane:
     ranking: LaneRanking | None = None
     #: The Qwen tower the lane's contexts are tokenised for; None for MacBERT's.
     context: QwenContextConfig | None = None
+    #: The key front a key-level lane types its examples for (#223).
+    keys: KeyFrontConfig | None = None
 
     def open(self) -> tuple[CorpusStream, BatchCollator]:
         """Load the tables, then build this lane's stream and collator over them."""
         vocabularies = Vocabularies.load(self.paths.char_table, self.base_model, self.context)
+        if self.keys is not None:
+            if self.ranking is not None:
+                raise ValueError("a key-level lane has no lattice readings to rank")
+            keyed = vocabularies.key_builder(self.augmentation, self.seed, self.keys)
+            return (
+                vocabularies.stream(self.paths, self.shards, keyed, self.rank, self.world_size),
+                vocabularies.key_collator(self.context_dropout, self.max_context_tokens, self.seed),
+            )
         builder = vocabularies.builder(self.augmentation, self.seed)
         stream = vocabularies.stream(self.paths, self.shards, builder, self.rank, self.world_size)
         collator = vocabularies.collator(

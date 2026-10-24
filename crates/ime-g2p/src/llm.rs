@@ -13,7 +13,8 @@
 //!   instead of being aligned by guesswork.
 //! * A reply that will not parse, or comes back the wrong length, is retried once
 //!   and then recorded as a refusal. It is never patched up, because a repaired
-//!   label is indistinguishable from a correct one downstream.
+//!   label is indistinguishable from a correct one downstream. An endpoint that
+//!   fails both attempts stops the run instead: no reply is no verdict.
 
 use crate::error::{Error, Result};
 use crate::outcome::{Annotator, Outcome, Reading, Refusal};
@@ -116,6 +117,13 @@ enum ReplyError {
     NoContent,
 }
 
+/// Why an attempt at a sentence failed: a reply that is no reading, or no reply.
+#[derive(Debug)]
+enum Failure {
+    Reply(String),
+    Endpoint(async_openai::error::OpenAIError),
+}
+
 /// Strip a ```` ``` ````-fenced block, if the whole reply is one.
 fn unfence(reply: &str) -> Option<&str> {
     let rest = reply.strip_prefix("```")?;
@@ -208,35 +216,48 @@ impl LlmAnnotator {
     }
 
     /// Annotate one sentence, retrying once before giving up on it.
-    async fn one(&self, text: &str) -> Outcome {
+    ///
+    /// A reply that will not parse on the last attempt either is a refusal. An
+    /// endpoint that fails on the last attempt is an error: the sentence was
+    /// never read.
+    async fn one(&self, text: &str) -> Result<Outcome> {
         let characters = han_characters(text);
         if characters.is_empty() {
-            return Err(Refusal::new("no Han characters to read"));
+            return Ok(Err(Refusal::new("no Han characters to read")));
         }
-        let mut last = String::new();
+        let mut last = Failure::Reply(String::new());
         for attempt in 0..=self.retries {
-            {
-                let Ok(_permit) = self.gate.acquire().await else {
-                    return Err(Refusal::new("the concurrency gate was closed mid-run"));
-                };
-                match self.complete(text).await {
-                    Ok(content) => match parse_readings(&content, &characters) {
-                        Ok(reading) => return Ok(reading),
-                        Err(error) => last = format!("ValueError: {error}"),
-                    },
-                    Err(error) => last = format!("OpenAIError: {error}"),
-                }
-            }
-            debug!(text, attempt, reason = %last, "llm annotation retry");
+            let reply = {
+                let _permit = self.gate.acquire().await.map_err(|_| {
+                    Error::Invariant("the concurrency gate was closed mid-run".to_owned())
+                })?;
+                self.complete(text).await
+            };
+            last = match reply {
+                Ok(Ok(content)) => match parse_readings(&content, &characters) {
+                    Ok(reading) => return Ok(Ok(reading)),
+                    Err(error) => Failure::Reply(format!("ValueError: {error}")),
+                },
+                Ok(Err(error)) => Failure::Reply(format!("OpenAIError: {error}")),
+                Err(Error::Endpoint(error)) => Failure::Endpoint(error),
+                Err(error) => return Err(error),
+            };
+            debug!(text, attempt, reason = ?last, "llm annotation retry");
         }
-        Err(Refusal::new(last))
+        match last {
+            Failure::Reply(reason) => Ok(Err(Refusal::new(reason))),
+            Failure::Endpoint(error) => Err(Error::Endpoint(error)),
+        }
     }
 
-    /// One chat completion, at the pinned reasoning effort.
-    async fn complete(
-        &self,
-        text: &str,
-    ) -> std::result::Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    /// One chat completion, at the pinned reasoning effort: the reply's content,
+    /// or what is wrong with the reply.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Endpoint`] if the endpoint gives no reply or the request cannot
+    /// be built, and whatever [`prompt`](Self::prompt) fails with.
+    async fn complete(&self, text: &str) -> Result<std::result::Result<String, ReplyError>> {
         let message = ChatCompletionRequestUserMessageArgs::default()
             .content(self.prompt(text)?)
             .build()?;
@@ -246,14 +267,12 @@ impl LlmAnnotator {
             .reasoning_effort(self.effort.clone())
             .build()?;
         let response = self.client.chat().create(request).await?;
-        let content = response
+        Ok(response
             .choices
             .into_iter()
             .next()
-            .and_then(|choice| choice.message.content);
-        content.ok_or_else(|| {
-            Box::new(ReplyError::NoContent) as Box<dyn std::error::Error + Send + Sync>
-        })
+            .and_then(|choice| choice.message.content)
+            .ok_or(ReplyError::NoContent))
     }
 }
 
@@ -262,8 +281,8 @@ impl Annotator for LlmAnnotator {
         "llm"
     }
 
-    async fn annotate(&self, texts: &[String]) -> Vec<Outcome> {
-        futures::future::join_all(texts.iter().map(|text| self.one(text))).await
+    async fn annotate(&self, texts: &[String]) -> Result<Vec<Outcome>> {
+        futures::future::try_join_all(texts.iter().map(|text| self.one(text))).await
     }
 }
 

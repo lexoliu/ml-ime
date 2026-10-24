@@ -25,6 +25,8 @@ from mlime.train.charlm_model import CharLmConfig
 from mlime.train.charlm_vocab import CharVocab
 from mlime.train.e2e_model import E2EConfig, E2EModel, RankingConfig, emittable_ids
 from mlime.train.e2e_search import SearchGraphs
+from mlime.train.key_model import KeyE2EModel, key_evaluate, letter_token_ids
+from mlime.train.keys import KeyExample, KeyFrontConfig
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import Distributed, MetricLog, TrainingConfig, evaluate, train
 from mlime.train.model import RouteAConfig
@@ -68,7 +70,9 @@ def _weights(state: dict[str, Any], path: Path | str) -> dict[str, torch.Tensor]
 
 
 def model_class(config: E2EConfig) -> type[E2EModel]:
-    """The model a config trains: the ranking one when it carries ranking settings."""
+    """The model a config trains: the key-level one, the ranking one, or the plain one."""
+    if config.keys is not None:
+        return KeyE2EModel
     return E2EModel if config.ranking is None else RankingE2EModel
 
 
@@ -171,8 +175,19 @@ def from_checkpoint(
 def load_model(
     path: Path, lexicon: Lexicon, device: torch.device, bert_config: BertConfig | None = None
 ) -> tuple[E2EModel, int]:
-    """The e2e checkpoint at *path*: the model it describes, and the step it left at."""
+    """The e2e checkpoint at *path*: the model it describes, and the step it left at.
+
+    Its callers read lattices -- the beam search, the emission, the export --
+    which a key-level model does not: its search is the constrained one over
+    keys (#224), so its checkpoint is refused here rather than decoded as the
+    span model it carries inside.
+    """
     state = torch.load(path, map_location="cpu", weights_only=False)
+    recorded = E2EConfig.from_record(_record(state, "e2e", path))
+    if recorded.keys is not None:
+        raise ValueError(
+            f"{path} is a key-level model; the lattice search does not decode it (#224)"
+        )
     model = from_checkpoint(state, lexicon, bert_config=bert_config)
     model.load_resumed(_weights(state, path), path)
     model.to(device).eval()
@@ -261,6 +276,8 @@ def build_from(
     whole_alphabet: bool,
     context: QwenContextConfig | None,
     context_warm_up: bool,
+    keys: KeyFrontConfig | None = None,
+    key_warm_up: bool = False,
 ) -> tuple[E2EModel, Vocabularies]:
     """The model the e2e checkpoint at *source* describes, under this stage's losses.
 
@@ -269,7 +286,10 @@ def build_from(
     stage that names a Qwen *context* tower over a run that read its context
     with MacBERT swaps the tower in (:func:`swap_in_qwen`); any other change
     of tower is refused, and a resume under a different one is refused by the
-    loop. The checkpoint is gigabytes, and it lives only in this frame:
+    loop. A stage that names a key front over a span model's run warms the
+    front up over it (:meth:`~mlime.train.key_model.KeyE2EModel.load_parent`),
+    reading the context with the parent's own tower; a key run keeps its
+    front. The checkpoint is gigabytes, and it lives only in this frame:
     nothing holds it once the model is built.
     """
     state = torch.load(source, map_location="cpu", weights_only=False)
@@ -281,11 +301,26 @@ def build_from(
         whole_alphabet=whole_alphabet,
         context=context,
         context_warm_up=context_warm_up,
+        keys=keys,
+        key_warm_up=key_warm_up,
     )
     vocabularies = Vocabularies.load(char_table, recorded.base_model, context)
     model = from_checkpoint(state, vocabularies.lexicon, wanted)
+    if recorded.keys is not None and recorded.keys != keys:
+        raise ValueError(f"{source} has the key front {recorded.keys}; a stage keeps it as it is")
     if with_weights:
-        if recorded.context == context:
+        if recorded.keys is None and keys is not None:
+            if recorded.context != context:
+                raise ValueError(
+                    f"{source} reads its context with {recorded.context}; a key front warms "
+                    "up over its parent's own tower"
+                )
+            if not isinstance(model, KeyE2EModel):
+                raise TypeError(f"a key front config built a {type(model).__name__}")
+            model.load_parent(
+                _weights(state, source), source, letter_token_ids(vocabularies.vocabulary)
+            )
+        elif recorded.context == context:
             model.load_resumed(_weights(state, source), source)
         elif recorded.context is None:
             swap_in_qwen(model, _weights(state, source), source)
@@ -330,6 +365,14 @@ def build_fresh(
     return model, vocabularies
 
 
+def inductor_options(mode: str) -> dict[str, Any]:
+    """The Inductor options every compiled call of a run takes: *mode*'s, with a C++ wrapper.
+
+    :func:`compile_modules` says why the wrapper is C++.
+    """
+    return {**torch._inductor.list_mode_options(mode), "cpp_wrapper": True}
+
+
 def compile_modules(model: E2EModel, mode: str) -> None:
     """torch.compile the encoder pass and the decoder stack, in place.
 
@@ -360,12 +403,40 @@ def compile_modules(model: E2EModel, mode: str) -> None:
     19 to 23.4 examples a second per rank and the cards from 70% to 93% busy.
     The C++ links against ``libcuda.so``, which the host must provide.
 
-    A context tower that runs apart from the fill pass (``separate``: Qwen's,
-    frozen or replayed from its own graphs) stays outside the compiled region,
-    and only the fill pass that reads its memory is compiled.
+    A context tower that runs apart from the fill pass (``separate``: Qwen)
+    stays outside the compiled region, and only the fill pass that reads its
+    memory is compiled with ``encode_fill``; the tower compiles its own layers
+    with the same options (:meth:`ContextTower.compile_layers`). Qwen with
+    adapters compiles one decoder layer, called for each of its blocks
+    (#237): unrolled into ``encode``, its 28 blocks made a forward graph
+    whose C++ wrapper g++ had not built in over half an hour on an L4.
+
+    A key-level model runs the fill pass twice a step -- over the spans for
+    its teacher and over the keys -- and reads the context once for both, so
+    its units are the context tower, the fill pass and the key front, each
+    one graph whatever fills the fill pass's positions.
     """
-    options = {**torch._inductor.list_mode_options(mode), "cpp_wrapper": True}
+    options = inductor_options(mode)
+    if isinstance(model, KeyE2EModel):
+        if model.context.separate:
+            model.context.compile_layers(options)
+        else:
+            model.encode_context = torch.compile(  # type: ignore[method-assign]
+                model.encode_context, dynamic=True, options=options
+            )
+        model.fill_pass = torch.compile(  # type: ignore[method-assign]
+            model.fill_pass, dynamic=True, options=options
+        )
+        model.key_front.forward = torch.compile(  # type: ignore[method-assign]
+            model.key_front.forward, dynamic=True, options=options
+        )
+        model.decoder.forward = torch.compile(  # type: ignore[method-assign]
+            model.decoder.forward, dynamic=True, options=options
+        )
+        log.info("key front, towers and decoder compiled", mode=mode)
+        return
     if model.context.separate:
+        model.context.compile_layers(options)
         model.encode_fill = torch.compile(  # type: ignore[method-assign]
             model.encode_fill, dynamic=True, options=options
         )
@@ -407,6 +478,8 @@ def e2e(
     context: QwenContextConfig | None = None,
     context_warm_up: bool = False,
     tower_graphs: bool = False,
+    keys: KeyFrontConfig | None = None,
+    key_warm_up: bool = False,
 ) -> RunResult:
     """Train the end-to-end model over *slices.train*; score held-out both ways.
 
@@ -429,6 +502,13 @@ def e2e(
     from a MacBERT run swaps it in, and every segment after names it again.
     *context_warm_up* trains only the context path (S0). *tower_graphs*
     replays a frozen Qwen tower's forward from captured CUDA graphs.
+
+    *keys* reads keystrokes through a key front with a per-key CTC head
+    (#223), whose examples are typed as keys with their legal alignments;
+    *key_warm_up* trains only the front and the head, distilling the parent's
+    encoder states (S1). A finished key run is scored by the S1 gate's
+    measure -- the parent's decoder fed the front's states -- beside the
+    parent's own on the same examples.
     """
     world = Distributed.from_environment()
     starts = (
@@ -458,6 +538,10 @@ def e2e(
         raise ValueError("--tower-graphs replays a frozen Qwen tower; name one without LoRA")
     if tower_graphs and not torch.cuda.is_available():
         raise ValueError("--tower-graphs replays CUDA graphs and this run has no CUDA device")
+    if keys is not None and (init_encoder is not None or init_decoder is not None):
+        raise ValueError(
+            "a key front warms up over a finished run; start the stage with --init-e2e"
+        )
     source = init_e2e if init_e2e is not None else resume
     if source is not None:
         model, vocabularies = build_from(
@@ -469,6 +553,8 @@ def e2e(
             whole_alphabet=whole_alphabet,
             context=context,
             context_warm_up=context_warm_up,
+            keys=keys,
+            key_warm_up=key_warm_up,
         )
     else:
         if init_encoder is None or init_decoder is None:
@@ -526,6 +612,7 @@ def e2e(
             max_context_tokens=max_context_tokens,
             ranking=lane_ranking,
             context=context,
+            keys=keys,
         )
         for index in range(virtual)
     ]
@@ -536,6 +623,16 @@ def e2e(
         model.freeze_for_context_warm_up()
         log.info(
             "context warm-up: only the context path trains",
+            trainable=sum(p.numel() for p in model.parameters() if p.requires_grad),
+        )
+    if key_warm_up:
+        if not isinstance(model, KeyE2EModel):
+            raise TypeError(
+                f"the key warm-up needs a key-level model, not a {type(model).__name__}"
+            )
+        model.freeze_for_key_warm_up()
+        log.info(
+            "key warm-up: only the key front and the CTC head train",
             trainable=sum(p.numel() for p in model.parameters() if p.requires_grad),
         )
 
@@ -565,18 +662,51 @@ def e2e(
     losses = step_losses(segment.metrics)
     if not segment.finished:
         return paused_run(segment, losses, model.gates(), world)
-    evaluation = held_out_examples(
-        paths, vocabularies.builder(augmented, training.seed + 1), slices
-    )
     device = world.device
-    candidates = vocabularies.candidate_space(augmented.typos)
-    reading = vocabularies.context_tokenizer
-    with_context = evaluate(
-        model, evaluation, tokenizer, reading, device, training.token_budget, True, candidates
-    )
-    without_context = evaluate(
-        model, evaluation, tokenizer, reading, device, training.token_budget, False, candidates
-    )
+    parents: dict[str, float] = {}
+    if isinstance(model, KeyE2EModel):
+        if keys is None:
+            raise TypeError("a key-level model was built without its key front config")
+        key_held_out = held_out_examples(
+            paths, vocabularies.key_builder(augmented, training.seed + 1, keys), slices
+        )
+        held: list[KeyExample] = []
+        for example in key_held_out:
+            if not isinstance(example, KeyExample):
+                raise TypeError(f"the key builder built a {type(example).__name__}")
+            held.append(example)
+        with_context, parent_with = key_evaluate(
+            model,
+            held,
+            vocabularies.key_collator(0.0, max_context_tokens),
+            device,
+            training.token_budget,
+        )
+        without_context, parent_without = key_evaluate(
+            model,
+            held,
+            vocabularies.key_collator(1.0, max_context_tokens),
+            device,
+            training.token_budget,
+        )
+        parents = {
+            "parent_accuracy_with_context": parent_with.rate,
+            "parent_accuracy_without_context": parent_without.rate,
+        }
+        evaluated = len(held)
+    else:
+        evaluation = held_out_examples(
+            paths, vocabularies.builder(augmented, training.seed + 1), slices
+        )
+        candidates = vocabularies.candidate_space(augmented.typos)
+        reading = vocabularies.context_tokenizer
+        with_context = evaluate(
+            model, evaluation, tokenizer, reading, device, training.token_budget, True, candidates
+        )
+        without_context = evaluate(
+            model, evaluation, tokenizer, reading, device, training.token_budget, False, candidates
+        )
+        evaluated = len(evaluation)
     result = RunResult(
         metrics=segment.metrics,
         first_loss=losses[0],
@@ -597,9 +727,10 @@ def e2e(
                 first_loss=result.first_loss,
                 last_loss=result.last_loss,
                 logged_steps=result.steps,
-                held_out_examples=len(evaluation),
+                held_out_examples=evaluated,
                 accuracy_with_context=with_context.rate,
                 accuracy_without_context=without_context.rate,
+                **parents,
                 scored_characters=with_context.scored,
                 gates=result.gates,
                 build_counts=segment.build_counts,
@@ -610,7 +741,8 @@ def e2e(
         last_loss=round(result.last_loss, 4),
         accuracy_with_context=round(with_context.rate, 4),
         accuracy_without_context=round(without_context.rate, 4),
-        held_out=len(evaluation),
+        **{name: round(rate, 4) for name, rate in parents.items()},
+        held_out=evaluated,
         gates=[round(gate, 5) for gate in result.gates],
     )
     return result

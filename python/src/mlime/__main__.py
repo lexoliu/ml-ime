@@ -25,6 +25,7 @@ from mlime.logging import configure
 
 if TYPE_CHECKING:  # the training modules pull in torch; --help must not
     from mlime.train.e2e_model import E2EConfig, RankingConfig
+    from mlime.train.keys import KeyFrontConfig
     from mlime.train.qwen_tower import QwenContextConfig
     from mlime.train.run import RunPaths, Slices
 
@@ -109,10 +110,39 @@ CONTEXT_LORA_RANK = typer.Option(
 CONTEXT_LORA_ALPHA = typer.Option(
     16.0, "--context-lora-alpha", help="LoRA alpha, with --context-lora-rank"
 )
+CONTEXT_LAYERS = typer.Option(
+    None,
+    "--context-layers",
+    help="Keep only the Qwen tower's first N decoder blocks and read the context after "
+    "block N (#237); the blocks above are never built. Omitted, every block",
+)
 CONTEXT_WARM_UP = typer.Option(
     False,
     "--context-warm-up/--no-context-warm-up",
     help="Train only the context path -- the gated blocks and the tower's additions (S0)",
+)
+KEYS = typer.Option(
+    False,
+    "--keys/--no-keys",
+    help="Read keystrokes through a key front with a per-key CTC head (#223)",
+)
+KEY_FRONT_LAYERS = typer.Option(
+    None, "--key-front-layers", help="Causal layers in the key front, with --keys (default 2)"
+)
+DISTILL_WEIGHT = typer.Option(
+    None,
+    "--distill-weight",
+    help="Weight of the S1 distillation beside the constrained CTC, with --keys (default 1.0)",
+)
+CORRECT_SYLLABLES = typer.Option(
+    True,
+    "--correct-syllables/--no-correct-syllables",
+    help="Let corrections read spans that are themselves syllables, with --keys",
+)
+KEY_WARM_UP = typer.Option(
+    False,
+    "--key-warm-up/--no-key-warm-up",
+    help="Train only the key front and the CTC head, distilling the parent (S1)",
 )
 
 
@@ -460,22 +490,48 @@ def ranking_settings(
 
 
 def context_settings(
-    tower: str | None, revision: str | None, lora_rank: int, lora_alpha: float
+    tower: str | None,
+    revision: str | None,
+    lora_rank: int,
+    lora_alpha: float,
+    layers: int | None,
 ) -> QwenContextConfig | None:
     """The Qwen context tower's settings from ``--context-*``; None keeps MacBERT's."""
     from mlime.train.qwen_tower import QWEN_REVISION, LoraConfig, QwenContextConfig
 
     if tower is None:
-        if revision is not None or lora_rank:
+        if revision is not None or lora_rank or layers is not None:
             raise typer.BadParameter(
-                "--context-revision and --context-lora-rank set the Qwen tower; "
-                "pass --context-tower"
+                "--context-revision, --context-lora-rank and --context-layers set the Qwen "
+                "tower; pass --context-tower"
             )
         return None
     return QwenContextConfig(
         model=tower,
         revision=QWEN_REVISION if revision is None else revision,
         lora=LoraConfig(rank=lora_rank, alpha=lora_alpha) if lora_rank else None,
+        layers=layers,
+    )
+
+
+def key_settings(
+    keys: bool, layers: int | None, distill_weight: float | None, correct_syllables: bool
+) -> KeyFrontConfig | None:
+    """The key front's settings from ``--keys`` and its knobs; None is the span model."""
+    if not keys:
+        if layers is not None or distill_weight is not None or not correct_syllables:
+            raise typer.BadParameter(
+                "--key-front-layers, --distill-weight and --no-correct-syllables set the key "
+                "front; pass --keys"
+            )
+        return None
+    from mlime.train.keys import KeyFrontConfig
+
+    default = KeyFrontConfig()
+    return KeyFrontConfig(
+        layers=default.layers if layers is None else layers,
+        distill_weight=default.distill_weight if distill_weight is None else distill_weight,
+        correct_syllables=correct_syllables,
     )
 
 
@@ -607,12 +663,18 @@ def train_e2e(
     context_revision: str | None = CONTEXT_REVISION,
     context_lora_rank: int = CONTEXT_LORA_RANK,
     context_lora_alpha: float = CONTEXT_LORA_ALPHA,
+    context_layers: int | None = CONTEXT_LAYERS,
     context_warm_up: bool = CONTEXT_WARM_UP,
     tower_graphs: bool = typer.Option(
         False,
         "--tower-graphs/--no-tower-graphs",
         help="Replay a frozen Qwen context tower's forward from captured CUDA graphs",
     ),
+    keys: bool = KEYS,
+    key_front_layers: int | None = KEY_FRONT_LAYERS,
+    distill_weight: float | None = DISTILL_WEIGHT,
+    correct_syllables: bool = CORRECT_SYLLABLES,
+    key_warm_up: bool = KEY_WARM_UP,
     max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
     token_budget: int = TOKEN_BUDGET,
     base_lr: float = typer.Option(3e-5, help="Learning rate for the pretrained weights"),
@@ -747,10 +809,16 @@ def train_e2e(
             whole_alphabet=whole_alphabet,
             search_graphs=search_graphs,
             context=context_settings(
-                context_tower, context_revision, context_lora_rank, context_lora_alpha
+                context_tower,
+                context_revision,
+                context_lora_rank,
+                context_lora_alpha,
+                context_layers,
             ),
             context_warm_up=context_warm_up,
             tower_graphs=tower_graphs,
+            keys=key_settings(keys, key_front_layers, distill_weight, correct_syllables),
+            key_warm_up=key_warm_up,
         )
     except torch.cuda.OutOfMemoryError as error:
         # The peak is recorded even at the crash, and the cache freed before
@@ -829,6 +897,13 @@ def train_count_batches(
     rank_beam: int = RANK_BEAM,
     rank_negatives: int = RANK_NEGATIVES,
     rank_weight: float = RANK_WEIGHT,
+    typos: bool = typer.Option(
+        False,
+        "--typos/--no-typos",
+        help="Count the run that corrupts its keystrokes with the shared noise model",
+    ),
+    keys: bool = KEYS,
+    correct_syllables: bool = CORRECT_SYLLABLES,
     workers: int | None = typer.Option(
         None,
         "--workers",
@@ -843,11 +918,14 @@ def train_count_batches(
     the one the loop will actually reach. This replays the loop's own grouping
     over the same shards at the same epochs and counts the batches; it builds no
     model and collates nothing. A ranking run weighs each example by every
-    row it costs, so its count reads the segmenter the run will read.
+    row it costs, so its count reads the segmenter the run will read. A
+    typo run's corruption decides which examples survive, and a key-level
+    run's legality and key widths do, so both are counted as they train.
     """
     configure(verbose)
     from mlime.train.count import count_batches
     from mlime.train.run import Vocabularies
+    from mlime.train.samples import Augmentation
 
     if workers is None:
         workers = os.cpu_count()
@@ -871,6 +949,8 @@ def train_count_batches(
         ),
         segmenter=segmenter,
         workers=workers,
+        augmentation=Augmentation(typos=typos),
+        keys=key_settings(keys, None, None, correct_syllables),
     )
     census.write(out)
     typer.echo(
@@ -1140,12 +1220,18 @@ def e2e_stamp(
     context_revision: str | None = CONTEXT_REVISION,
     context_lora_rank: int = CONTEXT_LORA_RANK,
     context_lora_alpha: float = CONTEXT_LORA_ALPHA,
+    context_layers: int | None = CONTEXT_LAYERS,
     context_warm_up: bool = CONTEXT_WARM_UP,
     tower_graphs: bool = typer.Option(
         False,
         "--tower-graphs/--no-tower-graphs",
         help="Replay a frozen Qwen context tower from captured CUDA graphs (TOWER_GRAPHS)",
     ),
+    keys: bool = KEYS,
+    key_front_layers: int | None = KEY_FRONT_LAYERS,
+    distill_weight: float | None = DISTILL_WEIGHT,
+    correct_syllables: bool = CORRECT_SYLLABLES,
+    key_warm_up: bool = KEY_WARM_UP,
 ) -> None:
     """Write a v2 run's kernel directory: v1's recipe, the run's slug, the v2 sources.
 
@@ -1155,7 +1241,8 @@ def e2e_stamp(
     options -- the ranking loss, the learning rates, the token budget and the
     accumulation, the Qwen context tower and its warm-up -- are the only
     fields of v1's recipe it changes; without it they are refused, since a
-    plain v2 run is v1's recipe exactly.
+    plain v2 run is v1's recipe exactly. `--keys` with `--key-warm-up` makes the
+    stage S1 of the key-level model (#223), named mlime-e2e-keys-*.
     """
     from mlime.locate import find_upwards
     from mlime.stamp import E2E_V2_SOURCES, E2EV2Run, E2EV2Stage, stamp_e2e_v2
@@ -1174,8 +1261,13 @@ def e2e_stamp(
         "--accumulate": accumulate,
         "--context-tower": context_tower,
         "--context-warm-up": context_warm_up or None,
+        "--keys": keys or None,
+        "--key-warm-up": key_warm_up or None,
     }
-    tower = context_settings(context_tower, context_revision, context_lora_rank, context_lora_alpha)
+    tower = context_settings(
+        context_tower, context_revision, context_lora_rank, context_lora_alpha, context_layers
+    )
+    front = key_settings(keys, key_front_layers, distill_weight, correct_syllables)
     stage = None
     if init_from is None:
         given = [option for option, value in recipe_options.items() if value is not None]
@@ -1205,8 +1297,17 @@ def e2e_stamp(
                 "revision": tower.revision,
                 "lora_rank": context_lora_rank,
                 "lora_alpha": context_lora_alpha,
+                "layers": context_layers,
             },
             context_warm_up=context_warm_up,
+            keys=None
+            if front is None
+            else {
+                "layers": front.layers,
+                "distill_weight": front.distill_weight,
+                "correct_syllables": front.correct_syllables,
+            },
+            key_warm_up=key_warm_up,
             **overrides,
         )
     spec = E2EV2Run(

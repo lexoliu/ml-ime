@@ -35,8 +35,14 @@ character (#121). With `CONTEXT_TOWER` stamped, the stage reads the context
 with Qwen instead of MacBERT (#222): the first segment swaps the tower into
 the finished run's weights, from Qwen's release at the pinned revision, and
 `CONTEXT_WARM_UP` trains only the context path, which is S0. `TOWER_GRAPHS`
-replays the frozen tower from captured CUDA graphs. A finished run is told
-apart from the run it started from by the stage its run-config records.
+replays the frozen tower from captured CUDA graphs. With `KEYS` stamped the
+stage reads keystrokes through a key front with a per-key CTC head (#223):
+the first segment builds the front over the finished run's weights, and
+`KEY_WARM_UP` trains only the front and the head, distilling that run's
+encoder states, which is S1. A key-level run is scored by the trainer's
+held-out gate -- the parent's decoder fed the front's states -- not by the
+lattice search, which does not decode it. A finished run is told apart from
+the run it started from by the stage its run-config records.
 
 A leg measures itself while it trains: `GpuSampler` and `HostSampler` log the
 cards, and the trainers' threads and the host's memory, to `gpu.csv` and
@@ -219,7 +225,8 @@ TRAIN_SHARDS = None
 
 #: The Qwen model that reads the context in place of MacBERT (#222), as
 #: `mlime train e2e`'s `--context-*` options: a dict of `tower`, `revision`,
-#: `lora_rank` (0 keeps it frozen) and `lora_alpha`. A stage swaps it into
+#: `lora_rank` (0 keeps it frozen), `lora_alpha` and `layers` (the decoder
+#: blocks the tower keeps, None for all of them). A stage swaps it into
 #: `INIT_FROM`'s weights. None keeps MacBERT's. Stamped per push.
 CONTEXT_TOWER = None
 
@@ -230,6 +237,15 @@ CONTEXT_WARM_UP = False
 #: Replay a frozen Qwen tower's forward from captured CUDA graphs; how the
 #: stage runs, not what it trains. Stamped per push.
 TOWER_GRAPHS = False
+
+#: The key-level front of #223, as `mlime train e2e`'s key options: a dict of
+#: `layers`, `distill_weight` and `correct_syllables`. A stage builds it over
+#: `INIT_FROM`'s weights. None keeps the span model. Stamped per push.
+KEYS = None
+
+#: Train only the key front and the CTC head, distilling `INIT_FROM`'s encoder
+#: states, with the rest of its model frozen (S1).
+KEY_WARM_UP = False
 
 #: The (pretrained, new) learning rates; None keeps `mlime train e2e`'s.
 LEARNING_RATES = None
@@ -554,7 +570,10 @@ def count_argv(char_table, out, segmenter, census=None):
         "--out",
         str(out),
         *ranking_argv(segmenter),
+        *keys_argv(),
     ]
+    if TYPOS:
+        argv.append("--typos")
     if census is not None:
         argv += ["--reuse-census", str(census)]
     return argv
@@ -575,6 +594,8 @@ def stage():
         "init_from": INIT_FROM,
         "context_tower": CONTEXT_TOWER,
         "context_warm_up": CONTEXT_WARM_UP,
+        "keys": KEYS,
+        "key_warm_up": KEY_WARM_UP,
     }
 
 
@@ -583,7 +604,8 @@ def stage_of(config):
 
     v1's run-config predates the stage fields and records none of them; it is
     the plain run from route A and the reader. A run before #222 records no
-    context tower: it read its context with MacBERT.
+    context tower: it read its context with MacBERT. A run before #223 records
+    no key front: it is the span model.
     """
     return {
         "ranking": config.get("ranking"),
@@ -591,6 +613,8 @@ def stage_of(config):
         "init_from": config.get("init_from"),
         "context_tower": config.get("context_tower"),
         "context_warm_up": config.get("context_warm_up", False),
+        "keys": config.get("keys"),
+        "key_warm_up": config.get("key_warm_up", False),
     }
 
 
@@ -608,8 +632,35 @@ def context_argv():
             "--context-lora-alpha",
             str(CONTEXT_TOWER["lora_alpha"]),
         ]
+        if CONTEXT_TOWER["layers"] is not None:
+            argv += ["--context-layers", str(CONTEXT_TOWER["layers"])]
     if CONTEXT_WARM_UP:
         argv.append("--context-warm-up")
+    return argv
+
+
+def keys_argv():
+    """The key front's switches that decide the examples, shared by counting and training."""
+    if KEYS is None:
+        return []
+    argv = ["--keys"]
+    if not KEYS["correct_syllables"]:
+        argv.append("--no-correct-syllables")
+    return argv
+
+
+def key_training_argv():
+    """The key front's switches only the trainer reads: its shape and its losses."""
+    if KEYS is None:
+        return []
+    argv = [
+        "--key-front-layers",
+        str(KEYS["layers"]),
+        "--distill-weight",
+        str(KEYS["distill_weight"]),
+    ]
+    if KEY_WARM_UP:
+        argv.append("--key-warm-up")
     return argv
 
 
@@ -722,6 +773,7 @@ def train_argv(
         argv.append("--activation-checkpointing")
     if TYPOS:
         argv.append("--typos")
+    argv += keys_argv() + key_training_argv()
     return argv
 
 
@@ -1032,6 +1084,10 @@ def main():
         raise RuntimeError("a context tower is swapped into a finished run; stamp INIT_FROM")
     if TOWER_GRAPHS and (CONTEXT_TOWER is None or CONTEXT_TOWER["lora_rank"]):
         raise RuntimeError("only a frozen Qwen tower is replayed from graphs; stamp CONTEXT_TOWER")
+    if KEYS is not None and INIT_FROM is None:
+        raise RuntimeError("a key front is built over a finished run; stamp INIT_FROM")
+    if KEY_WARM_UP and KEYS is None:
+        raise RuntimeError("the key warm-up trains a key front; stamp KEYS")
     install()
     packages = package_root()
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)
@@ -1068,6 +1124,11 @@ def main():
         return start_argv((initials / INIT_ENCODER, initials / INIT_DECODER), None)
 
     final = finished_checkpoint()
+    if final is not None and KEYS is not None:
+        raise RuntimeError(
+            f"{final} is a finished key-level run; its gate is the trainer's held-out record, "
+            "and the lattice search does not decode it"
+        )
     if final is not None:
         print(f"evaluating the finished run at {final}; nothing to train", flush=True)
         summary = {
@@ -1190,8 +1251,10 @@ def main():
         if not checkpoint.is_file():
             raise RuntimeError("the run finished without writing a final checkpoint")
         drop_numbered_checkpoints(out)
-        evaluated = evaluate_lattices(checkpoint, assets, char_table, env)
-        summary["evaluated"] = evaluated
+        # A key-level run's gate is the trainer's held-out record; the
+        # lattice search decodes span models only.
+        if KEYS is None:
+            summary["evaluated"] = evaluate_lattices(checkpoint, assets, char_table, env)
         summary["held_out"] = trained
 
     write_summary(summary)

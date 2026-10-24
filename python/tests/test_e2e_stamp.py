@@ -258,6 +258,7 @@ def test_a_context_warm_up_stamps_its_tower_and_its_graphs(tmp_path: Path) -> No
         "revision": QWEN_REVISION,
         "lora_rank": 0,
         "lora_alpha": 16.0,
+        "layers": None,
     }
     assert literal(kernel, "CONTEXT_WARM_UP") is True
     assert literal(kernel, "TOWER_GRAPHS") is True
@@ -283,9 +284,99 @@ def test_a_context_warm_up_stamps_its_tower_and_its_graphs(tmp_path: Path) -> No
             "revision": QWEN_REVISION,
             "lora_rank": 8,
             "lora_alpha": 16.0,
+            "layers": None,
         },
     )
     with pytest.raises(ValueError, match="only a frozen Qwen context tower"):
         E2EV2Run(run="mlime-e2e-v2-qwen-lora", stage=adapted, tower_graphs=True)
     with pytest.raises(ValueError, match="a context tower names"):
         E2EV2Stage(init_from="mlime-e2e-v2-rank-g4", context_tower={"tower": "x"})
+
+
+@pytest.mark.parametrize(
+    ("options", "fields"),
+    [
+        (["--context-layers", "18"], {"lora_rank": 0, "lora_alpha": 16.0, "layers": 18}),
+        (
+            ["--context-lora-rank", "16", "--context-lora-alpha", "32"],
+            {"lora_rank": 16, "lora_alpha": 32.0, "layers": None},
+        ),
+    ],
+    ids=["layer-cut", "lora"],
+)
+def test_the_s0_variants_stamp_their_tower(
+    tmp_path: Path, options: list[str], fields: dict[str, object]
+) -> None:
+    """#237: the cut and the adapters are the tower's recipe, stamped beside its name."""
+    out = tmp_path / "variant"
+    stage = ["--init-from", "mlime-e2e-v2-rank-g4", "--context-tower", "Qwen/Qwen3-0.6B-Base"]
+    argv = ["e2e", "stamp", "mlime-e2e-v2-qwen-variant", "--out", str(out), *stage]
+    result = CliRunner().invoke(app, [*argv, *options, "--context-warm-up"])
+    assert result.exit_code == 0, result.output
+    assert literal((out / "kernel.py").read_text(), "CONTEXT_TOWER") == {
+        "tower": "Qwen/Qwen3-0.6B-Base",
+        "revision": QWEN_REVISION,
+        **fields,
+    }
+
+    refused = CliRunner().invoke(
+        app,
+        [
+            "e2e",
+            "stamp",
+            "mlime-e2e-v2-qwen-variant",
+            "--out",
+            str(tmp_path / "plain"),
+            "--init-from",
+            "mlime-e2e-v2-rank-g4",
+            "--context-layers",
+            "18",
+        ],
+    )
+    assert refused.exit_code == 2, refused.output
+    assert "pass --context-tower" in error(refused.output)
+
+
+def test_a_key_warm_up_stamps_its_front_over_the_parent_a_flag_names(tmp_path: Path) -> None:
+    """S1 (#223): the parent is whichever finished run --init-from names, not one hard-wired."""
+    out = tmp_path / "keys"
+    argv = ["e2e", "stamp", "mlime-e2e-keys-s1-check", "--out", str(out)]
+    stage = ["--init-from", "mlime-e2e-v2-rank-g4", "--keys", "--key-warm-up"]
+    result = CliRunner().invoke(
+        app, [*argv, *stage, "--key-front-layers", "3", "--distill-weight", "0.5"]
+    )
+    assert result.exit_code == 0, result.output
+    template = (TEMPLATE / "kernel.py").read_text()
+    kernel = (out / "kernel.py").read_text()
+    keys = {"layers": 3, "distill_weight": 0.5, "correct_syllables": True}
+    assert literal(kernel, "INIT_FROM") == "mlime-e2e-v2-rank-g4"
+    assert literal(kernel, "KEYS") == keys
+    assert literal(kernel, "KEY_WARM_UP") is True
+    assert sorted(changed_lines(template, kernel)) == sorted(
+        f"{name} = {value!r}"
+        for name, value in {
+            "INIT_FROM": "mlime-e2e-v2-rank-g4",
+            "KEYS": keys,
+            "KEY_WARM_UP": True,
+            "PROFILE_STEPS": 30,
+            "TRACE_STEPS": 3,
+        }.items()
+    )
+    metadata = json.loads((out / "kernel-metadata.json").read_text())
+    assert metadata["id"] == "lexoliu/mlime-e2e-keys-s1-check-s0"
+
+    # A key stage carries the keys namespace, and only a key stage does.
+    with pytest.raises(ValueError, match="a key-level run is named"):
+        E2EV2Run(
+            run="mlime-e2e-v2-keys",
+            stage=E2EV2Stage(init_from="mlime-e2e-v2-rank-g4", keys=keys, key_warm_up=True),
+        )
+    with pytest.raises(ValueError, match="a key-level run is named"):
+        E2EV2Run(run="mlime-e2e-keys-s1", stage=E2EV2Stage(init_from="mlime-e2e-v2-rank-g4"))
+    with pytest.raises(ValueError, match="the key warm-up trains a key front"):
+        E2EV2Stage(init_from="mlime-e2e-v2-rank-g4", key_warm_up=True)
+    refused = CliRunner().invoke(
+        app, ["e2e", "stamp", "mlime-e2e-keys-s1", "--out", str(tmp_path / "x"), "--keys"]
+    )
+    assert refused.exit_code == 2, refused.output
+    assert "pass --init-from" in error(refused.output)
