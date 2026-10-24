@@ -66,6 +66,31 @@ impl<R: Shardable> ShardWriter<R> {
         })
     }
 
+    /// Open a writer that continues after the `<prefix>-*.parquet` shards already in `directory`.
+    ///
+    /// # Errors
+    ///
+    /// If the directory cannot be created or listed, or an existing shard's name
+    /// does not end in its number.
+    pub fn resume(directory: &Path, prefix: &str, rows_per_shard: usize) -> Result<Self> {
+        let mut writer = Self::new(directory, prefix, rows_per_shard)?;
+        for path in shard_paths(directory, prefix)? {
+            let number = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .and_then(|stem| stem.strip_prefix(&format!("{prefix}-")))
+                .and_then(|number| number.parse::<usize>().ok())
+                .ok_or_else(|| {
+                    Error::Invariant(format!(
+                        "{} is not a numbered `{prefix}` shard",
+                        path.display()
+                    ))
+                })?;
+            writer.shards = writer.shards.max(number + 1);
+        }
+        Ok(writer)
+    }
+
     /// Queue one row, flushing a shard once the buffer is full.
     ///
     /// # Errors
@@ -81,6 +106,9 @@ impl<R: Shardable> ShardWriter<R> {
 
     /// Write the buffered rows out as one shard.
     ///
+    /// The shard is written under a `.partial` name and renamed into place, so a
+    /// run killed mid-write leaves no truncated shard for a reader to trip on.
+    ///
     /// # Errors
     ///
     /// If the frame cannot be built or the file cannot be written.
@@ -91,12 +119,17 @@ impl<R: Shardable> ShardWriter<R> {
         let path = self
             .directory
             .join(format!("{}-{:05}.parquet", self.prefix, self.shards));
+        let partial = path.with_extension("parquet.partial");
         let mut frame = R::frame(&self.buffer)?;
-        let file = std::fs::File::create(&path).map_err(|source| crate::Error::Read {
-            path: path.clone(),
+        let file = std::fs::File::create(&partial).map_err(|source| crate::Error::Read {
+            path: partial.clone(),
             source,
         })?;
         ParquetWriter::new(file).finish(&mut frame)?;
+        std::fs::rename(&partial, &path).map_err(|source| crate::Error::Read {
+            path: path.clone(),
+            source,
+        })?;
         self.rows_written += self.buffer.len();
         self.shards += 1;
         debug!(path = %path.display(), rows = self.buffer.len(), "shard written");

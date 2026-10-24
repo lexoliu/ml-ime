@@ -113,6 +113,8 @@ enum Command {
         emittable: PathBuf,
         #[command(flatten)]
         search: SearchArgs,
+        #[command(flatten)]
+        arcs: neural::ArcArgs,
     },
     /// Decode an evaluation set with the neural emissions fused into the beam.
     FusedEval {
@@ -183,6 +185,18 @@ enum Command {
             requires = "typos"
         )]
         typo_weight: Vec<f32>,
+        /// The lexicon prior, in nats, a word arc gains when it lands with at
+        /// least one character typed as an initial; repeatable, swept on the
+        /// dev slice alongside `--weight` in one pass.
+        #[arg(
+            long,
+            value_parser = parse_weight,
+            default_values_t = [12.0f32],
+            requires = "arcs"
+        )]
+        arc_prior: Vec<f32>,
+        #[command(flatten)]
+        arcs: neural::ArcArgs,
         /// A directory the beam is dumped to: for every section the run
         /// evaluates, one JSON Lines file named for the section, one record's
         /// hypotheses and their scores per line. The report is unchanged.
@@ -289,6 +303,9 @@ impl SearchArgs {
             // The noise model's own rate: the other decoders get no
             // `--typo-weight` flag, so the prior is priced as written.
             typo_weight: 1.0,
+            // The commands that propose arcs set these from their own
+            // arguments.
+            ..BeamOptions::default()
         }
     }
 }
@@ -354,6 +371,7 @@ async fn main() -> Result<()> {
             out,
             emittable,
             search,
+            arcs,
         } => {
             let (table, lexicon) = tables()?;
             let corrections = search.corrections(&table)?;
@@ -365,6 +383,7 @@ async fn main() -> Result<()> {
                 lexicon,
                 search.segment(),
                 corrections,
+                &arcs,
             )
         }
         Command::FusedEval {
@@ -380,6 +399,8 @@ async fn main() -> Result<()> {
             unscored,
             weight,
             typo_weight,
+            arc_prior,
+            arcs,
             no_transition,
             dump,
             progress,
@@ -405,6 +426,8 @@ async fn main() -> Result<()> {
                 unscored,
                 weights: &weight,
                 typo_weights: &typo_weight,
+                arc_priors: &arc_prior,
+                arcs: &arcs,
                 no_transition,
                 dump: dump.as_deref(),
                 progress: progress.as_deref(),
@@ -551,6 +574,10 @@ struct FusedRun<'a> {
     /// The correction-prior weights the sweep tries, one entry per
     /// `--typo-weight`.
     typo_weights: &'a [f32],
+    /// The lexicon priors the sweep tries, one entry per `--arc-prior`.
+    arc_priors: &'a [f32],
+    /// The word lexicon, when the run proposes arcs.
+    arcs: &'a neural::ArcArgs,
     /// Whether the run drops the transition, emissions alone.
     no_transition: bool,
     /// Where every evaluated section's beam lands, or `None` to report only.
@@ -685,6 +712,10 @@ fn fused_eval(run: &FusedRun<'_>) -> Result<()> {
         lexicon,
         run.search.segment(),
         corrections,
+        run.arcs.arcs.is_some().then_some(neural::ArcRun {
+            args: run.arcs,
+            priors: run.arc_priors,
+        }),
         &run.search.beam(),
         run.batch,
         transition,

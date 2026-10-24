@@ -35,6 +35,16 @@ pub struct BeamOptions {
     /// Zero prices a widened character like a span's own reading; one charges
     /// the noise model's own rate.
     pub typo_weight: f32,
+    /// Nats a word arc's lineage gains when it lands, when at least one of
+    /// its characters was typed as an initial: the lexicon prior. Zero
+    /// leaves arcs to the models alone; the default, 12, is the prior the
+    /// idiom selection set chose (#243).
+    pub arc_prior: f32,
+    /// How many word arcs in flight keep a slot each, per reading: the best
+    /// lineage of each, earliest arc first, survives until the arc lands.
+    /// These slots are on top of `beam_width`, so a step advances at most
+    /// `beam_width + arc_width` states per reading.
+    pub arc_width: usize,
 }
 
 impl Default for BeamOptions {
@@ -46,6 +56,8 @@ impl Default for BeamOptions {
             diversity_gap: 1.5,
             diversity_chars: 3,
             typo_weight: 1.0,
+            arc_prior: 12.0,
+            arc_width: 8,
         }
     }
 }
@@ -66,6 +78,14 @@ pub struct Breakdown {
     /// (beam, character) pairs scored during expansion — the candidate
     /// count the scores paid.
     pub expanded: u64,
+    /// Lineages started on a word arc: one per (beam, arc) at the arc's
+    /// first position.
+    pub arc_starts: u64,
+    /// Slots kept for arcs in flight, summed over steps.
+    pub arc_slots: u64,
+    /// Arcs in flight that found no slot at a step because `arc_width` was
+    /// full, summed over steps.
+    pub arcs_unprotected: u64,
 }
 
 /// One decoded sentence.
@@ -150,6 +170,22 @@ impl Marks {
     }
 }
 
+/// Where a lineage stands inside a word arc: which arc of the reading, and
+/// which of its characters comes next. A lineage carries one from the arc's
+/// first character until its last lands.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+struct Cursor {
+    /// Index into the reading's [`CandidatePath::arcs`].
+    arc: u32,
+    /// Index of the arc's next character.
+    next: u32,
+}
+
+/// What two candidates must share to merge: their truncated history, their
+/// marks at guarded positions, and the arc they are inside, if any -- a
+/// lineage bound to an arc never merges with one free to read anything.
+type MergeKey = (History, Marks, Option<u32>);
+
 /// A way of reaching a beam state, before the model has been advanced into it:
 /// the last few characters, the score of the best way there, and where it came
 /// from.
@@ -163,6 +199,8 @@ struct Candidate {
     parent: usize,
     /// What the lineage read at each guarded position.
     marks: Marks,
+    /// The word arc the lineage is inside, until the arc's last character.
+    arc: Option<Cursor>,
 }
 
 /// A surviving beam: a [`Candidate`] together with the transition model's state
@@ -239,12 +277,21 @@ impl<S> Worker<'_, S> {
     /// score-ordered beam silently collapses the sentence onto one reading.
     /// Reserved slots come out of `beam_width`; when more guards would fit
     /// than the beam has room for, the earliest positions keep theirs.
+    ///
+    /// Word arcs add two kinds of candidate: a free lineage starts every arc
+    /// whose first character sits here, and a lineage inside an arc reads
+    /// the arc's next character and nothing else. Per surviving beam the
+    /// expansion is the mask plus the arcs starting here, or one character.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one expansion pass: position zero from the start state, later positions from each beam, both with their arc starts"
+    )]
     fn survivors<E, T>(
         &mut self,
         emission: &E,
         transition: &T,
         options: &BeamOptions,
-        index: &mut HashMap<(History, Marks), usize>,
+        index: &mut HashMap<MergeKey, usize>,
         breakdown: &mut Breakdown,
     ) -> Vec<Candidate>
     where
@@ -254,6 +301,10 @@ impl<S> Worker<'_, S> {
         let position = self.history.len();
         let allowed = &self.reading.positions()[position];
         let typo_weight = options.typo_weight;
+        let arcs = self.reading.arcs();
+        // The arcs whose first character sits here, as indices into `arcs`.
+        let first = arcs.partition_point(|arc| arc.start() < position);
+        let starting = first..first + arcs[first..].partition_point(|arc| arc.start() == position);
         let mut next: Vec<Candidate> = Vec::with_capacity(allowed.len() * self.latest.len().max(1));
         index.clear();
         let tick = Instant::now();
@@ -266,6 +317,14 @@ impl<S> Worker<'_, S> {
             .map(|&ch| emission.score(self.path, position, ch))
             .collect();
         let mut scored = vec![0.0f32; allowed.len()];
+        let mut expanded = 0usize;
+        let step = |from: &Candidate, state: &S, cursor: Cursor| {
+            self.arc_step(emission, transition, options, position, from, state, cursor)
+        };
+        let opening = |arc: usize| Cursor {
+            arc: u32::try_from(arc).expect("a reading holds fewer than 2^32 arcs"),
+            next: 0,
+        };
         if position == 0 {
             transition.score_many(&self.start, 1.0, allowed, &mut scored);
             for (slot, ((&ch, &emit), &trans)) in
@@ -280,11 +339,37 @@ impl<S> Worker<'_, S> {
                         ch,
                         parent: 0,
                         marks: Marks::default(),
+                        arc: None,
                     },
                 );
             }
+            expanded += allowed.len();
+            // The empty prefix every position-zero lineage extends.
+            let root = Candidate {
+                history: History::START,
+                score: 0.0,
+                ch: allowed[0],
+                parent: 0,
+                marks: Marks::default(),
+                arc: None,
+            };
+            for arc in starting {
+                relax(&mut next, index, step(&root, &self.start, opening(arc)));
+                breakdown.arc_starts += 1;
+            }
         } else {
             for (parent, beam) in self.latest.iter().enumerate() {
+                let from = Candidate {
+                    parent,
+                    ..beam.candidate
+                };
+                if let Some(cursor) = beam.candidate.arc {
+                    // Inside an arc: the lineage reads the arc's next
+                    // character and nothing else.
+                    relax(&mut next, index, step(&from, &beam.state, cursor));
+                    expanded += 1;
+                    continue;
+                }
                 scored.fill(0.0);
                 transition.score_many(&beam.state, 1.0, allowed, &mut scored);
                 for (slot, ((&ch, &emit), &trans)) in
@@ -300,17 +385,21 @@ impl<S> Worker<'_, S> {
                             ch,
                             parent,
                             marks: beam.candidate.marks,
+                            arc: None,
                         },
                     );
+                }
+                expanded += allowed.len();
+                for arc in starting.clone() {
+                    relax(&mut next, index, step(&from, &beam.state, opening(arc)));
+                    breakdown.arc_starts += 1;
                 }
             }
         }
         breakdown.expand_ns += u64::try_from(tick.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        breakdown.expanded +=
-            u64::try_from(allowed.len() * if position == 0 { 1 } else { self.latest.len() })
-                .unwrap_or(u64::MAX);
+        breakdown.expanded += u64::try_from(expanded).unwrap_or(u64::MAX);
         let tick = Instant::now();
-        let (keep, guarded_here) = self.reserve(&next, options);
+        let (keep, guarded_here) = self.reserve(&next, options, breakdown);
         let mut chosen = Vec::with_capacity(keep.len());
         for index in keep {
             let mut candidate = next[index];
@@ -323,17 +412,69 @@ impl<S> Worker<'_, S> {
         chosen
     }
 
+    /// One arc character after *from*, whose model state is *state*: the
+    /// arc's start when *cursor* names its first character, a step inside it
+    /// otherwise. Scored by the same emission and transition as every other
+    /// character; the arc's reading cost is paid at its start and the
+    /// lexicon prior when it lands, after which the lineage is free again.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one arc step reads the models, the options, and the lineage it extends"
+    )]
+    fn arc_step<E, T>(
+        &self,
+        emission: &E,
+        transition: &T,
+        options: &BeamOptions,
+        position: usize,
+        from: &Candidate,
+        state: &S,
+        cursor: Cursor,
+    ) -> Candidate
+    where
+        E: Emission,
+        T: Transition<State = S>,
+    {
+        let arc = &self.reading.arcs()[cursor.arc as usize];
+        let ch = arc.chars()[cursor.next as usize];
+        let mut score =
+            from.score + emission.score(self.path, position, ch) + transition.score(state, ch);
+        let next = cursor.next + 1;
+        let landed = next as usize == arc.chars().len();
+        if landed && arc.abbreviated() {
+            score += options.arc_prior;
+        }
+        Candidate {
+            history: from.history.extended(ch).truncated(T::HISTORY),
+            score,
+            ch,
+            parent: from.parent,
+            marks: from.marks,
+            arc: (!landed).then_some(Cursor {
+                arc: cursor.arc,
+                next,
+            }),
+        }
+    }
+
     /// Which entries of *next* survive: each guarded position's covered
     /// characters first, then selection order (score, then relax order) to
-    /// the beam width. The order's few taken entries reach the head through
-    /// a partition, not a full sort of every relaxed pair. Returns the
-    /// chosen indices and whether this position declared its own guard, so
-    /// the caller can mark every survivor's lineage.
+    /// the beam width, and on top of the width the best lineage of each
+    /// word arc in flight, up to `arc_width` of them, earliest arc first.
+    /// The order's few taken entries reach the head through a partition, not
+    /// a full sort of every relaxed pair. Returns the chosen indices and
+    /// whether this position declared its own guard, so the caller can mark
+    /// every survivor's lineage.
     #[expect(
         clippy::too_many_lines,
-        reason = "one survivor selection is a straight-line sequence: guard picks, a declared guard, then the fill"
+        reason = "one survivor selection is a straight-line sequence: arc slots, guard picks, a declared guard, then the fill"
     )]
-    fn reserve(&mut self, next: &[Candidate], options: &BeamOptions) -> (Vec<usize>, bool) {
+    fn reserve(
+        &mut self,
+        next: &[Candidate],
+        options: &BeamOptions,
+        breakdown: &mut Breakdown,
+    ) -> (Vec<usize>, bool) {
         let width = options.beam_width.get();
         let gap = options.diversity_gap;
         let covered = options.diversity_chars;
@@ -378,6 +519,39 @@ impl<S> Worker<'_, S> {
         };
         let mut keep: Vec<usize> = Vec::new();
         let mut kept: Vec<bool> = vec![false; next.len()];
+        // Arcs in flight: the best lineage of each keeps a slot until the
+        // arc lands, however far it trails -- the first character of an
+        // idiom typed as initials is where the models know least. The slots
+        // sit beside the beam width, not inside it, so the lineages the
+        // width keeps are the ones it would keep without arcs. Arcs are
+        // indexed in start order, so the lowest index is the earliest arc.
+        let mut protected: Vec<usize> = Vec::new();
+        {
+            let mut best_of: HashMap<u32, usize> = HashMap::new();
+            for (index, candidate) in next.iter().enumerate() {
+                if let Some(cursor) = candidate.arc {
+                    match best_of.entry(cursor.arc) {
+                        Entry::Vacant(slot) => {
+                            slot.insert(index);
+                        }
+                        Entry::Occupied(mut slot) => {
+                            if before(index, *slot.get()) {
+                                slot.insert(index);
+                            }
+                        }
+                    }
+                }
+            }
+            let mut in_flight: Vec<(u32, usize)> = best_of.into_iter().collect();
+            in_flight.sort_unstable();
+            let unprotected = in_flight.len().saturating_sub(options.arc_width);
+            breakdown.arcs_unprotected += u64::try_from(unprotected).unwrap_or(u64::MAX);
+            for &(_, index) in in_flight.iter().take(options.arc_width) {
+                kept[index] = true;
+                protected.push(index);
+            }
+            breakdown.arc_slots += u64::try_from(protected.len()).unwrap_or(u64::MAX);
+        }
         // Existing guards: the best lineage of each covered character keeps
         // its slot, however far it has slipped in score order.
         for (guard, chars) in self.guarded.iter().enumerate() {
@@ -450,7 +624,7 @@ impl<S> Worker<'_, S> {
         if keep.len() < width && !next.is_empty() {
             // Fill in selection order: the kept entries inside the head make
             // the prefix the fill draws on `keep.len() + width` deep.
-            let head = (keep.len() + width).min(next.len());
+            let head = (keep.len() + protected.len() + width).min(next.len());
             let mut order: Vec<usize> = (0..next.len()).collect();
             order.select_nth_unstable_by(head - 1, |&a, &b| {
                 next[b].score.total_cmp(&next[a].score).then(a.cmp(&b))
@@ -467,6 +641,7 @@ impl<S> Worker<'_, S> {
                 }
             }
         }
+        keep.extend(protected);
         (keep, guarded_here)
     }
 
@@ -605,7 +780,7 @@ where
             });
         }
     }
-    let mut index: HashMap<(History, Marks), usize> = HashMap::new();
+    let mut index: HashMap<MergeKey, usize> = HashMap::new();
     while workers.iter().any(Worker::pending) {
         // Score: each live worker relaxes its candidates to the best way of
         // reaching each history and truncates to the beam width, the same
@@ -628,10 +803,14 @@ where
             // the reading ends there -- the worker's last step asks only for
             // <eos>.
             let after = worker.history.len() + 1;
-            let positions = worker.reading.positions().get(after);
+            let ends = after == worker.reading.len();
             let asked = Asked {
-                candidates: positions.map_or(&[][..], Vec::as_slice),
-                eos: positions.is_none(),
+                candidates: if ends {
+                    &[]
+                } else {
+                    &worker.reading.positions()[after]
+                },
+                eos: ends,
             };
             for candidate in &next {
                 let state = if worker.history.is_empty() {
@@ -687,6 +866,10 @@ fn finish<T: Transition>(
             continue;
         }
         let last = &worker.latest;
+        debug_assert!(
+            last.iter().all(|beam| beam.candidate.arc.is_none()),
+            "an arc lies within its reading, so every lineage has landed by its end"
+        );
         let penalty = options.segmentation_weight * worker.reading.cost();
         let mut finished: Vec<(usize, f32)> = last
             .iter()
@@ -812,13 +995,15 @@ fn priced(typo_weight: f32, prior: f64) -> f32 {
 /// Keep only the best way of reaching each beam state. Candidates whose
 /// marks disagree are different lineages at a guarded position and never
 /// merge, so a guarded runner-up survives a history its winner's lineage
-/// also reaches.
-fn relax(
-    next: &mut Vec<Candidate>,
-    index: &mut HashMap<(History, Marks), usize>,
-    candidate: Candidate,
-) {
-    match index.entry((candidate.history, candidate.marks)) {
+/// also reaches; nor do candidates inside different word arcs, or one inside
+/// an arc and one outside, so an arc's lineage is never traded for a free one
+/// before it lands.
+fn relax(next: &mut Vec<Candidate>, index: &mut HashMap<MergeKey, usize>, candidate: Candidate) {
+    match index.entry((
+        candidate.history,
+        candidate.marks,
+        candidate.arc.map(|cursor| cursor.arc),
+    )) {
         Entry::Occupied(slot) => {
             let incumbent = &mut next[*slot.get()];
             if candidate.score > incumbent.score {

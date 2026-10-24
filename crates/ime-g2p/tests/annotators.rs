@@ -136,7 +136,10 @@ async fn a_malformed_reply_is_retried_once_and_then_recorded_as_a_refusal() {
         "still not JSON".to_owned(),
     ]);
     let annotator = LlmAnnotator::new(&endpoint.settings(), 4);
-    let outcomes = annotator.annotate(&["中国".to_owned()]).await;
+    let outcomes = annotator
+        .annotate(&["中国".to_owned()])
+        .await
+        .expect("the endpoint answers");
 
     let refusal = outcomes
         .into_iter()
@@ -164,7 +167,10 @@ async fn a_retry_that_parses_is_kept_rather_than_refused() {
         "{\"readings\": [\"zhong1\", \"guo2\"]}".to_owned(),
     ]);
     let annotator = LlmAnnotator::new(&endpoint.settings(), 4);
-    let outcomes = annotator.annotate(&["中国".to_owned()]).await;
+    let outcomes = annotator
+        .annotate(&["中国".to_owned()])
+        .await
+        .expect("the endpoint answers");
 
     let reading = outcomes
         .into_iter()
@@ -179,7 +185,10 @@ async fn a_retry_that_parses_is_kept_rather_than_refused() {
 async fn a_sentence_with_no_han_never_reaches_the_endpoint() {
     let endpoint = FakeEndpoint::serving(Vec::new());
     let annotator = LlmAnnotator::new(&endpoint.settings(), 4);
-    let outcomes = annotator.annotate(&["hello, world".to_owned()]).await;
+    let outcomes = annotator
+        .annotate(&["hello, world".to_owned()])
+        .await
+        .expect("nothing is asked of the endpoint");
 
     let refusal = outcomes
         .into_iter()
@@ -265,4 +274,23 @@ fn the_simplified_corpus_is_converted_to_the_traditional_the_network_was_trained
     assert_eq!(tables.to_traditional('万'), '萬');
     assert_eq!(tables.to_traditional('与'), '與');
     assert_eq!(tables.to_traditional('中'), '中');
+}
+
+#[tokio::test]
+async fn an_endpoint_that_cannot_be_reached_stops_the_run_rather_than_refusing() {
+    let address = TcpListener::bind("127.0.0.1:0")
+        .expect("a loopback port is free")
+        .local_addr()
+        .expect("the socket has an address");
+    let settings = LlmSettings {
+        base_url: format!("http://{address}/v1"),
+        api_key: "canned".to_owned(),
+        model: "canned".to_owned(),
+    };
+    let annotator = LlmAnnotator::new(&settings, 4);
+    let error = annotator
+        .annotate(&["中国".to_owned()])
+        .await
+        .expect_err("no reply is no verdict");
+    assert!(matches!(error, ime_g2p::Error::Endpoint(_)), "{error}");
 }

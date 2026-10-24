@@ -398,18 +398,13 @@ impl Annotator for G2pwAnnotator {
         "g2pw"
     }
 
-    async fn annotate(&self, texts: &[String]) -> Vec<Outcome> {
-        match self.predict(texts).await {
-            Ok(predictions) => texts
-                .iter()
-                .zip(predictions)
-                .map(|(text, row)| outcome(text, &row))
-                .collect(),
-            Err(error) => {
-                let reason = format!("{error}");
-                texts.iter().map(|_| Err(Refusal::new(&reason))).collect()
-            }
-        }
+    async fn annotate(&self, texts: &[String]) -> Result<Vec<Outcome>> {
+        let predictions = self.predict(texts).await?;
+        Ok(texts
+            .iter()
+            .zip(predictions)
+            .map(|(text, row)| outcome(text, &row))
+            .collect())
     }
 }
 
