@@ -365,7 +365,9 @@ def eval_idioms(inputs: Inputs) -> dict[str, int]:
     return {entry: int(occurrences[entry]) for entry in sorted(found)}
 
 
-def eligible_idioms(inputs: Inputs, held_by_eval: Mapping[str, int]) -> tuple[dict[str, int], Counter[str]]:
+def eligible_idioms(
+    inputs: Inputs, held_by_eval: Mapping[str, int]
+) -> tuple[dict[str, int], Counter[str]]:
     """The idioms the draw may take, with their run3 occurrences, and why the rest may not."""
     excluded: Counter[str] = Counter()
     eligible: dict[str, int] = {}
@@ -461,7 +463,10 @@ class Prepared:
         return None
 
     def take(self, candidate: Candidate, taken: Taken, skipped: Counter[str]) -> Row | None:
-        """Draw :meth:`free`'s sentence for *candidate*, counting in *skipped* the drawn ones passed."""
+        """Draw :meth:`free`'s sentence for *candidate*.
+
+        Sentences already drawn that it passes over are counted in *skipped*.
+        """
         for position, row in enumerate(candidate.rows):
             if self.verdict(candidate, position) is not None:
                 continue
@@ -470,7 +475,9 @@ class Prepared:
                 taken.add(row, candidate.entry)
                 return row
             skipped[
-                "drawn for this idiom before" if owner == candidate.entry else "drawn for another idiom"
+                "drawn for this idiom before"
+                if owner == candidate.entry
+                else "drawn for another idiom"
             ] += 1
         return None
 
@@ -519,9 +526,7 @@ class Prepared:
         census.checks = record_checks(frame, self.inputs, self.eligible, self.in_eval)
         drawn_occurrences = sorted(self.eligible[entry] for entry in frame["entry"])
         census.quantiles = compare_quantiles(drawn_occurrences, self.in_eval.values())
-        census.ks_distance = round(
-            ks_distance(drawn_occurrences, sorted(self.in_eval.values())), 4
-        )
+        census.ks_distance = round(ks_distance(drawn_occurrences, sorted(self.in_eval.values())), 4)
         census.sources = Counter(frame["source"].to_list())
         census.entry_lengths = Counter(len(entry) for entry in frame["entry"])
         return frame, census
@@ -562,8 +567,7 @@ def prepare(pool: pl.DataFrame, inputs: Inputs, strata_count: int, seed: int) ->
     )
     for candidate in candidates:
         if any(
-            prepared.verdict(candidate, position) is None
-            for position in range(len(candidate.rows))
+            prepared.verdict(candidate, position) is None for position in range(len(candidate.rows))
         ):
             prepared.available[candidate.stratum].append(candidate)
         else:
@@ -689,7 +693,9 @@ def judged_round(layout: judge.CandidateSet) -> JudgedRound:
     ordinals = layout.ordinals()
     if not ordinals:
         raise SelectionError(f"{layout.candidates} holds no candidate file")
-    unfinished = [ordinal for ordinal in ordinals if not judge.finished_at_threshold(layout, ordinal)]
+    unfinished = [
+        ordinal for ordinal in ordinals if not judge.finished_at_threshold(layout, ordinal)
+    ]
     if unfinished:
         raise SelectionError(f"the judge has not finished files {unfinished}")
     units = []
@@ -816,9 +822,7 @@ class TopUpCensus:
         }
 
 
-def top_up(
-    prepared: Prepared, size: int, judged: JudgedRound
-) -> tuple[pl.DataFrame, TopUpCensus]:
+def top_up(prepared: Prepared, size: int, judged: JudgedRound) -> tuple[pl.DataFrame, TopUpCensus]:
     """The second round's draw, for the strata whose kept units fall short of eval3's proportions.
 
     *prepared* must read the pool the first round was drawn from, and *size* be
@@ -928,9 +932,7 @@ def top_up(
     return frame, census
 
 
-def write_top_up(
-    root: Path, frame: pl.DataFrame, census: TopUpCensus
-) -> judge.CandidateSet:
+def write_top_up(root: Path, frame: pl.DataFrame, census: TopUpCensus) -> judge.CandidateSet:
     """Add the top-up to *root*'s candidate set as files after round one's, its census beside."""
     if (root / TOP_UP_CENSUS).exists():
         raise SelectionError(f"{root} already holds a top-up; there is one top-up round")
@@ -942,7 +944,9 @@ def write_top_up(
         records=frame.height,
         target_size=census.target_size,
         expected_kept=census.expected_kept,
-        files=[ordinal for ordinal in candidates.ordinals() if ordinal not in census.round_one_files],
+        files=[
+            ordinal for ordinal in candidates.ordinals() if ordinal not in census.round_one_files
+        ],
         root=str(root),
     )
     return candidates
@@ -976,7 +980,9 @@ def kept_units(layout: judge.Candidates) -> pl.DataFrame:
     ordinals = layout.ordinals()
     if not ordinals:
         raise SelectionError("the judge's input holds no file")
-    unfinished = [ordinal for ordinal in ordinals if not judge.finished_at_threshold(layout, ordinal)]
+    unfinished = [
+        ordinal for ordinal in ordinals if not judge.finished_at_threshold(layout, ordinal)
+    ]
     if unfinished:
         raise SelectionError(f"the judge has not finished files {unfinished}")
     frames = []
