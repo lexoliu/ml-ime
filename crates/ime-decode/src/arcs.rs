@@ -11,16 +11,12 @@
 //! the entry's characters fixed, keeps it alive until it lands and scores it
 //! with the same emission and transition models as every other lineage.
 //!
-//! An arc is proposed from the keystrokes, not from the segment's mask. A
-//! reading that takes `m` as the syllable `m` admits only 呣 there, yet the
-//! typed letter is still 马's initial, so an idiom with 马 at that position is
-//! proposed on that reading too. The character is then outside the position's
-//! mask, which makes it part of what the emission and the transitions are
-//! asked for there ([`CandidatePath::asked`]), and the arc carries the
-//! segmentation cost that reading the segment as an abbreviation costs over
-//! reading it as the syllable.
-//!
-//! [`CandidatePath::asked`]: crate::CandidatePath::asked
+//! An arc is proposed from the keystrokes: a position spells a character
+//! when its letters are one of the character's syllables or, with
+//! abbreviations allowed, an initial one of them starts with. Either way the
+//! character lies in the position's mask, since the lattice reads an initial
+//! through its whole prefix range, so an arc asks the models about nothing
+//! the reading does not already ask.
 
 use crate::emissions::Emittable;
 use hashbrown::HashMap;
@@ -184,16 +180,16 @@ impl WordLexicon {
     /// its positions spell, one character a position, in start order.
     ///
     /// A character is spelled at a position when the segment's typed letters
-    /// are one of its syllables, or an initial (a single letter, `zh`, `ch`,
-    /// `sh`) one of its syllables starts with. A corrected segment spells
-    /// nothing: its letters are a typo, not a reading. *masks* are the
-    /// reading's per-position candidate sets, which decide which characters
-    /// sit outside them.
+    /// are one of its syllables, or, when *options* allow abbreviations, an
+    /// initial (a single letter, `zh`, `ch`, `sh`) one of its syllables starts
+    /// with. A corrected segment spells nothing: its letters are a typo, not a
+    /// reading. Every arc character therefore lies in its position's mask: a
+    /// full spelling is the segment's own syllable, and the lattice reads an
+    /// initial through its whole prefix range.
     #[must_use]
     pub(crate) fn arcs(
         &self,
         segmentation: &Segmentation,
-        masks: &[Vec<CharId>],
         pinyin: &str,
         lexicon: &Lexicon,
         table: &SyllableTable,
@@ -221,11 +217,10 @@ impl WordLexicon {
                         &self.words[entry as usize],
                         start,
                         run,
-                        &masks[start..=start + offset],
                         pinyin,
                         lexicon,
                         table,
-                        options,
+                        options.allow_abbreviation,
                     ) {
                         arcs.push(arc);
                     }
@@ -272,9 +267,16 @@ enum Spelled {
 }
 
 /// How *span* spells *ch*, if it does. A polyphone typed in full under one
-/// reading is full, whatever its other readings start with.
-fn spell(ch: CharId, span: &str, lexicon: &Lexicon, table: &SyllableTable) -> Option<Spelled> {
-    let abbreviation = SyllableTable::is_abbreviation(span);
+/// reading is full, whatever its other readings start with; an initial
+/// spells nothing unless abbreviations are allowed.
+fn spell(
+    ch: CharId,
+    span: &str,
+    lexicon: &Lexicon,
+    table: &SyllableTable,
+    allow_abbreviation: bool,
+) -> Option<Spelled> {
+    let abbreviation = allow_abbreviation && SyllableTable::is_abbreviation(span);
     let mut spelled = None;
     for &syllable in lexicon.readings(ch) {
         let spelling = table.spelling(syllable);
@@ -290,54 +292,31 @@ fn spell(ch: CharId, span: &str, lexicon: &Lexicon, table: &SyllableTable) -> Op
 
 /// The arc *word* makes over *run*, the segments from *start* on, or `None`
 /// when the keystrokes do not spell it.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "one match reads the word, the run and the tables that relate them"
-)]
 fn spelled(
     word: &[CharId],
     start: usize,
     run: &[Segment],
-    masks: &[Vec<CharId>],
     pinyin: &str,
     lexicon: &Lexicon,
     table: &SyllableTable,
-    options: &SegmentOptions,
+    allow_abbreviation: bool,
 ) -> Option<WordArc> {
     if word.len() != run.len() {
         return None;
     }
     let mut abbreviated = false;
-    let mut reread = 0.0f32;
-    for ((&ch, segment), mask) in word.iter().zip(run).zip(masks) {
+    for (&ch, segment) in word.iter().zip(run) {
         let span = &pinyin[segment.start()..segment.end()];
-        match spell(ch, span, lexicon, table)? {
+        match spell(ch, span, lexicon, table, allow_abbreviation)? {
             Spelled::Full => {}
             Spelled::Initial => abbreviated = true,
-        }
-        if mask.binary_search(&ch).is_err() {
-            // The segment was read as a syllable the character does not
-            // have; the arc reads it as the initial instead and pays what
-            // that reading of the segment costs over the one taken.
-            reread += options.ambiguity_weight
-                * (log_len(table.prefix_range(span).len()) - log_len(segment.ambiguity()));
         }
     }
     Some(WordArc {
         start,
         chars: word.into(),
         abbreviated,
-        reread,
     })
-}
-
-/// `ln(n)` of a segment's ambiguity.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "an ambiguity is at most the inventory size"
-)]
-fn log_len(n: usize) -> f32 {
-    (n as f32).ln()
 }
 
 /// One lexicon entry on one reading: the beam may emit its characters at
@@ -350,7 +329,6 @@ pub struct WordArc {
     start: usize,
     chars: Box<[CharId]>,
     abbreviated: bool,
-    reread: f32,
 }
 
 impl WordArc {
@@ -371,14 +349,6 @@ impl WordArc {
     #[must_use]
     pub const fn abbreviated(&self) -> bool {
         self.abbreviated
-    }
-
-    /// The segmentation cost of reading the arc's segments as the initials it
-    /// needs, over the reading's own: positive where the reading took a
-    /// segment as a syllable the arc's character does not have.
-    #[must_use]
-    pub const fn reread(&self) -> f32 {
-        self.reread
     }
 }
 
@@ -421,15 +391,6 @@ mod tests {
             .k_best(&options)
             .iter()
             .map(|segmentation| {
-                let masks: Vec<Vec<CharId>> = segmentation
-                    .segments()
-                    .iter()
-                    .map(|segment| {
-                        let mut mask = Vec::new();
-                        lexicon.mask_into(segment.syllables().expect("clean"), &mut mask);
-                        mask
-                    })
-                    .collect();
                 let spans = segmentation
                     .segments()
                     .iter()
@@ -437,7 +398,7 @@ mod tests {
                     .collect();
                 (
                     spans,
-                    words.arcs(segmentation, &masks, input, lexicon, table, &options),
+                    words.arcs(segmentation, input, lexicon, table, &options),
                 )
             })
             .collect()
@@ -516,10 +477,6 @@ mod tests {
         assert_eq!(text(&lexicon, &arcs[0]), "一帆风顺");
         assert_eq!(arcs[0].start(), 0);
         assert!(arcs[0].abbreviated());
-        assert!(
-            arcs[0].reread().abs() < f32::EPSILON,
-            "every character is in its mask"
-        );
     }
 
     #[test]
@@ -544,48 +501,44 @@ mod tests {
     }
 
     #[test]
-    fn a_segment_read_as_a_whole_syllable_still_spells_an_initial() {
+    fn an_initial_spells_nothing_when_abbreviations_are_off() {
         let (table, lexicon) = tables();
-        // 马马虎虎 typed `mmhh`: the readings take `m` as the syllable m (呣)
-        // as well as the initial; on a reading that took the syllable, the
-        // arc still matches and pays the reread.
+        // `m` is the syllable m (呣) as well as 马's initial: with
+        // abbreviations off the lattice reads it as the syllable alone, and
+        // the arc must not read it as the initial either.
         let (words, _) = WordLexicon::parse(
-            "马马虎虎\tidiom\n",
+            "马到成功\tidiom\n",
             &["idiom"],
             &lexicon,
             &table,
             &every_character(&lexicon),
         )
         .expect("the lexicon reads");
-        let options = offline();
-        let input = "mmhh";
-        let lattice = SegmentLattice::build(input, &table, &options).expect("input reads");
-        let mut saw_reread = false;
-        for segmentation in lattice.k_best(&options) {
-            if segmentation.len() != 4 {
-                continue;
-            }
-            let masks: Vec<Vec<CharId>> = segmentation
-                .segments()
+        let input = "mdaochenggong";
+        let abbreviated: Vec<_> = arcs_of(&words, input, &table, &lexicon)
+            .into_iter()
+            .flat_map(|(_, arcs)| arcs)
+            .collect();
+        assert!(!abbreviated.is_empty() && abbreviated.iter().all(WordArc::abbreviated));
+        let options = SegmentOptions {
+            allow_abbreviation: false,
+            ..offline()
+        };
+        for typed in [input, "madaochenggong"] {
+            let lattice = SegmentLattice::build(typed, &table, &options).expect("input reads");
+            let arcs: Vec<_> = lattice
+                .k_best(&options)
                 .iter()
-                .map(|segment| {
-                    let mut mask = Vec::new();
-                    lexicon.mask_into(segment.syllables().expect("clean"), &mut mask);
-                    mask
+                .flat_map(|segmentation| {
+                    words.arcs(segmentation, typed, &lexicon, &table, &options)
                 })
                 .collect();
-            let arcs = words.arcs(&segmentation, &masks, input, &lexicon, &table, &options);
-            assert_eq!(arcs.len(), 1, "every four-segment reading spells the idiom");
-            let exact = segmentation
-                .segments()
-                .iter()
-                .any(|segment| segment.ambiguity() == 1);
-            if exact {
-                assert!(arcs[0].reread() > 0.0);
-                saw_reread = true;
+            if typed == input {
+                assert_eq!(arcs, Vec::<WordArc>::new());
+            } else {
+                assert!(!arcs.is_empty() && !arcs.iter().any(WordArc::abbreviated));
             }
         }
-        assert!(saw_reread, "some reading takes `m` as the syllable");
     }
 
     #[test]

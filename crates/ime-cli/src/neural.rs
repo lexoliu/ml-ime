@@ -502,8 +502,6 @@ impl Reader {
 }
 
 /// Write the lattice an evaluation set decodes into, for the model to score.
-/// With word arcs, a position also asks about every arc character placed
-/// there outside its mask, so the score file answers what the arcs read.
 ///
 /// # Errors
 ///

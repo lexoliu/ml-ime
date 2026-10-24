@@ -218,7 +218,7 @@ fn a_session_with_word_arcs_answers_what_the_full_decode_does() {
         .expect("the fixture towers open");
     let table = SyllableTable::load();
     let lexicon = lexicon();
-    let emittable = emittable(&dir, &lexicon);
+    let emittable = emittable(dir, &lexicon);
     let (words, _) = WordLexicon::parse("北京\tidiom\n", &["idiom"], &lexicon, &table, &emittable)
         .expect("the lexicon reads");
     // A prior far above any emission gap: the arc must win, so the test
