@@ -1,6 +1,6 @@
 //! The n-gram baseline as a complete input method.
 
-use ime_decode::{BeamOptions, Candidates, Hypothesis, Record, Uniform, decode_many};
+use ime_decode::{BeamOptions, Candidates, Hypothesis, Record, Uniform, WordLexicon, decode_many};
 use ime_eval::{Hypothesize, Request};
 use ime_ngram::NgramModel;
 use ime_pinyin::{
@@ -94,6 +94,7 @@ impl Baseline {
             &self.segment,
             self.corrections.as_ref(),
             &self.lexicon,
+            None,
         )?;
         let options = BeamOptions {
             top_k,
@@ -124,6 +125,9 @@ impl Baseline {
 /// letters were typed at each position. Rebuilding one without the other is how
 /// a score file comes to answer a lattice nobody decoded.
 ///
+/// *words*, when given, attaches every word arc its entries make on the
+/// readings ([`Candidates::with_arcs`]).
+///
 /// # Errors
 ///
 /// If the keystrokes have no reading, or a position admits no character.
@@ -133,6 +137,7 @@ pub fn read(
     options: &SegmentOptions,
     corrections: Option<&CorrectionTable>,
     lexicon: &Lexicon,
+    words: Option<&WordLexicon>,
 ) -> Result<(Vec<Segmentation>, Candidates), BaselineError> {
     let lattice = match corrections {
         Some(model) => SegmentLattice::build_corrections(pinyin, table, options, model),
@@ -151,6 +156,10 @@ pub fn read(
         input: pinyin.to_owned(),
         source,
     })?;
+    let batch = match words {
+        Some(words) => batch.with_arcs(&readings, pinyin, words, lexicon, table, options),
+        None => batch,
+    };
     Ok((readings, batch))
 }
 
