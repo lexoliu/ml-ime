@@ -59,11 +59,11 @@ import email.utils
 import json
 import random
 import time
-from functools import partial
 from abc import ABC, abstractmethod
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import asdict, dataclass, field, fields
 from datetime import UTC, datetime
+from functools import partial
 from importlib import resources
 from pathlib import Path
 from typing import Any, Literal, Protocol
