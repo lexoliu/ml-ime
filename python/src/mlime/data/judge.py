@@ -127,6 +127,10 @@ MAX_ATTEMPTS = 8
 #: The longest pause between attempts when the server names none.
 MAX_BACKOFF_SECONDS = 60.0
 
+#: The longest pause a server may name and still be waited out. A longer one
+#: (a spent usage quota answers with days) means the endpoint has stopped.
+MAX_RETRY_AFTER_SECONDS = 600.0
+
 #: Seconds a request may take: Jev answers in about one, the review model in tens.
 JEV_TIMEOUT_SECONDS = 60.0
 REVIEW_TIMEOUT_SECONDS = 180.0
@@ -382,10 +386,11 @@ def retry_after_seconds(response: httpx.Response, now: datetime | None = None) -
 class Poster:
     """POSTs JSON, retrying a rate limit or a transient failure with backoff.
 
-    A ``Retry-After`` header is honoured; without one the pause doubles from a
-    second up to :data:`MAX_BACKOFF_SECONDS`, jittered so the requests in flight
-    do not come back together. Any other failure, and a transient one that
-    outlasts :data:`MAX_ATTEMPTS`, raises :class:`JudgeError`.
+    A ``Retry-After`` header up to :data:`MAX_RETRY_AFTER_SECONDS` is honoured;
+    without one the pause doubles from a second up to
+    :data:`MAX_BACKOFF_SECONDS`, jittered so the requests in flight do not come
+    back together. Any other failure, a longer ``Retry-After``, and a transient
+    failure that outlasts :data:`MAX_ATTEMPTS` raise :class:`JudgeError`.
     """
 
     client: httpx.AsyncClient
@@ -410,6 +415,12 @@ class Poster:
                     )
                 reason = f"status {response.status_code}"
                 pause = retry_after_seconds(response)
+                if pause is not None and pause > MAX_RETRY_AFTER_SECONDS:
+                    raise JudgeError(
+                        f"{url} answered {response.status_code} asking for a {pause:.0f} s pause, "
+                        f"more than the {MAX_RETRY_AFTER_SECONDS:.0f} s a run waits out: "
+                        f"{response.text[:500]}"
+                    )
             if attempt + 1 == self.max_attempts:
                 raise JudgeError(
                     f"{url} still failing after {self.max_attempts} attempts: {reason}"
