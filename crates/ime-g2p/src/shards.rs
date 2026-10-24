@@ -189,15 +189,20 @@ pub fn shard_paths(directory: &Path, prefix: &str) -> Result<Vec<PathBuf>> {
 
 /// Read one parquet file into a frame.
 ///
+/// The file is read whole rather than memory-mapped. A shard is a few
+/// megabytes, and a mapped read holds the file open past the frame's life:
+/// reading run3's 415 shards in parallel through mapped reads exhausted the
+/// default limit of 256 open files, on two threads as on twelve.
+///
 /// # Errors
 ///
-/// If the file cannot be opened or is not parquet.
+/// If the file cannot be read or is not parquet.
 pub fn read_frame(path: &Path) -> Result<DataFrame> {
-    let file = std::fs::File::open(path).map_err(|source| crate::Error::Read {
+    let bytes = std::fs::read(path).map_err(|source| crate::Error::Read {
         path: path.to_owned(),
         source,
     })?;
-    Ok(ParquetReader::new(file).finish()?)
+    Ok(ParquetReader::new(std::io::Cursor::new(bytes)).finish()?)
 }
 
 /// Read every `<prefix>-*.parquet` shard in `directory` as one list of rows.

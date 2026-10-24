@@ -100,6 +100,15 @@ impl<'a> SampleFilter<'a> {
         }
     }
 
+    /// Mark the targets an earlier run of the same source already accepted as seen.
+    ///
+    /// A run resumed from its last finished shard starts with the digests every
+    /// finished shard accepted, so it deduplicates exactly as an uninterrupted
+    /// run would have.
+    pub fn preload(&mut self, digests: impl IntoIterator<Item = [u8; DEDUPE_DIGEST_BYTES]>) {
+        self.seen.extend(digests);
+    }
+
     /// The verdicts recorded so far.
     #[must_use]
     pub fn counts(&self) -> FilterCounts {

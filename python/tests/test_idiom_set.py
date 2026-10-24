@@ -1,0 +1,633 @@
+"""The idiom selection: a draw at eval3's frequencies, then one judged record per idiom.
+
+Every sentence here is written for the test.
+"""
+
+import asyncio
+import json
+from dataclasses import dataclass
+from fractions import Fraction
+from pathlib import Path
+
+import polars as pl
+import pytest
+
+from mlime.data import judge
+from mlime.data.idiom_set import (
+    Census,
+    Collisions,
+    Inputs,
+    JudgedRound,
+    Proportions,
+    Record,
+    SelectionError,
+    Strata,
+    build,
+    draw,
+    ks_distance,
+    plan,
+    prepare,
+    quantile,
+    round_one,
+    select,
+    top_up,
+    trim,
+    trim_eval_set,
+    write_draw,
+    write_top_up,
+)
+
+# --- collisions ---------------------------------------------------------------
+
+
+def test_collisions_catch_the_record_the_sentence_and_shared_runs() -> None:
+    index = Collisions.of(
+        [Record("今天天气很好", "我们一起去公园散步吧好不好呀"), Record("你好", None)]
+    )
+    assert index.reason(Record("今天天气很好", "我们一起去公园散步吧好不好呀")) == "record"
+    assert index.reason(Record("你好", "别的")) == "text"
+    # Thirteen Han characters across the context and the text, punctuation skipped.
+    assert index.reason(Record("今天天气", "，去公园散步吧，好不好呀")) == "window"
+    assert index.reason(Record("完全不同", "公园散步吧好不好呀今天天")) is None, (
+        "twelve is not a copy"
+    )
+    assert index.reason(Record("完全不同的话", "前面的话也不同")) is None
+
+
+# --- the strata ---------------------------------------------------------------
+
+
+def test_strata_cut_at_the_quantiles_hold_eval3s_idioms_evenly() -> None:
+    strata = Strata.of([5, 8, 40, 50, 300, 900], 3)
+    assert strata.lowers == (1, 40, 300)
+    assert strata.targets == (2, 2, 2)
+    assert [strata.index(value) for value in (1, 39, 40, 299, 300, 10_000)] == [0, 0, 1, 1, 2, 2]
+    assert strata.upper(0) == 40 and strata.upper(2) is None
+    with pytest.raises(SelectionError, match="no stratum"):
+        strata.index(0)
+
+
+def test_an_eval3_idiom_absent_from_run3_cannot_be_stratified() -> None:
+    with pytest.raises(SelectionError, match="must occur in run3"):
+        Strata.of([0, 5], 2)
+
+
+def test_the_size_is_shared_in_eval3s_proportions() -> None:
+    strata = Strata(lowers=(1, 40, 300), targets=(1, 2, 1))
+    assert strata.allocate(8) == [2, 4, 2]
+    # 7 * (1, 2, 1) / 4 = (1.75, 3.5, 1.75): floors (1, 3, 1), then the largest fractions.
+    assert strata.allocate(7) == [2, 3, 2]
+    assert sum(strata.allocate(9)) == 9
+
+
+def test_the_largest_size_is_bound_by_the_scarcest_stratum() -> None:
+    strata = Strata(lowers=(1, 40), targets=(1, 1))
+    assert strata.largest_size([100, 3]) == 7
+    assert strata.largest_size([0, 3]) == 0
+
+
+def test_quantiles_and_the_distribution_gap() -> None:
+    assert quantile([1, 2, 3, 4], 0.5) == 3
+    assert quantile([1, 2, 3, 4], 0.0) == 1
+    assert ks_distance([1, 2, 3], [1, 2, 3]) == 0.0
+    assert ks_distance([1, 1], [5, 5]) == 1.0
+
+
+# --- the draw -------------------------------------------------------------------
+
+TABLE = pl.DataFrame(
+    {
+        "entry": [
+            "一帆风顺",
+            "画蛇添足",
+            "守株待兔",
+            "对牛弹琴",
+            "亡羊补牢",
+            "刻舟求剑",
+            "掩耳盗铃",
+            "井底之蛙",
+            "自相矛盾",
+            "叶公好龙",
+            "躺平",
+        ],
+        "category": ["idiom"] * 10 + ["internet"],
+        "occurrences": [10, 100, 5, 7, 300, 200, 0, 50, 50, 50, 50],
+        "blocked": [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
+    }
+)
+KNOWLEDGE = frozenset(TABLE["entry"].to_list()) - {"自相矛盾"}
+EMITTABLE = frozenset("".join(TABLE["entry"].to_list())) - {"叶"}
+EVAL_TEXTS = ["他做事一帆风顺", "这是画蛇添足"]
+LEXICON = judge.BoundaryLexicon(["剑客", "一帆风顺"])
+
+
+def inputs(collisions: Collisions | None = None) -> Inputs:
+    return Inputs(
+        table=TABLE,
+        knowledge_idioms=KNOWLEDGE,
+        emittable=EMITTABLE,
+        eval_texts=EVAL_TEXTS,
+        collisions=collisions or Collisions.of([Record("你这是对牛弹琴啊", None)]),
+        lexicon=LEXICON,
+    )
+
+
+def pool(*texts: str) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "id": [f"p{index}" for index in range(len(texts))],
+            "source": ["web" if index % 2 else "forum" for index in range(len(texts))],
+            "text": list(texts),
+            "context": ["前文"] * len(texts),
+        }
+    )
+
+
+POOL = pool(
+    "他总是守株待兔不肯努力",
+    "不要再守株待兔了",
+    "你这是对牛弹琴啊",  # collides with an evaluation sentence
+    "现在亡羊补牢还来得及",
+    "那个刻舟求剑客很怪",  # crossed at the word boundary by 剑客
+    "刻舟求剑的人真不少",
+    "掩耳盗铃的井底之蛙在自相矛盾",
+    "叶公好龙也是一帆风顺",
+)
+
+
+def test_the_draw_takes_eligible_idioms_at_eval3s_frequencies() -> None:
+    frame, census = draw(POOL, inputs(), 2, 2, seed=243)
+    assert census.eval3_idioms == 2
+    assert census.excluded_idioms == {
+        "absent from run3": 1,
+        "blocked": 1,
+        "not a knowledge-lexicon idiom": 1,
+        "a character not emittable": 1,
+        "held by eval3": 2,
+    }
+    assert census.eligible_idioms == 4
+    assert census.idioms_without_sentence == 1  # 对牛弹琴's one sentence collides
+    assert census.largest_size == 2
+    assert [(s["lower"], s["eval3"], s["available"], s["drawn"]) for s in census.strata] == [
+        (1, 1, 1, 1),
+        (100, 1, 2, 1),
+    ]
+    entries = frame["entry"].to_list()
+    assert len(entries) == 2 and "守株待兔" in entries
+    assert set(entries) - {"守株待兔"} <= {"亡羊补牢", "刻舟求剑"}
+    for entry, text in zip(entries, frame["text"], strict=True):
+        assert entry in text
+    assert "那个刻舟求剑客很怪" not in frame["text"].to_list()
+    assert census.rejected_sentences["collides by text"] == 1
+    assert census.checks["colliding with evaluation"] == 0
+    assert frame.columns == ["id", "source", "text", "context", "entry"]
+
+
+def test_the_draw_is_reproducible_from_its_seed() -> None:
+    first, _ = draw(POOL, inputs(), 2, 2, seed=7)
+    again, _ = draw(POOL, inputs(), 2, 2, seed=7)
+    assert first.equals(again)
+
+
+def test_a_size_past_what_the_strata_hold_fails_naming_the_largest() -> None:
+    with pytest.raises(SelectionError, match="the largest size that fits is 2"):
+        draw(POOL, inputs(), 2, 3, seed=243)
+
+
+def test_a_sentence_two_idioms_share_is_drawn_once() -> None:
+    shared = pool("守株待兔和刻舟求剑都是寓言", "现在亡羊补牢还来得及")
+    frame, census = draw(shared, inputs(), 2, 2, seed=243)
+    assert dict(zip(frame["entry"], frame["id"], strict=True)) == {
+        "守株待兔": "p0",
+        "亡羊补牢": "p1",
+    }
+    assert frame["id"].n_unique() == 2
+    assert census.rejected_sentences.get("drawn for another idiom", 0) <= 1
+
+
+# --- the set, from what the judge kept -------------------------------------------
+
+
+@dataclass
+class Keep:
+    async def ask(self, unit: judge.Unit) -> judge.JevAnswer:
+        return judge.JevAnswer(p=0.95, model="jev-fake")
+
+
+@dataclass
+class Natural:
+    async def ask(self, unit: judge.Unit) -> judge.ReviewAnswer:
+        return judge.ReviewAnswer(
+            context_spun=False, sentence_natural=unit.text != "不要再守株待兔了"
+        )
+
+
+def drawn_and_judged(root: Path) -> judge.CandidateSet:
+    frame, census = draw(POOL, inputs(), 2, 2, seed=243)
+    candidates = write_draw(root, frame, census)
+    asyncio.run(judge.judge_source(candidates, LEXICON, Keep(), Natural(), 1, 1))
+    return candidates
+
+
+def test_build_writes_the_judged_idioms_as_samples_the_annotator_reads(tmp_path: Path) -> None:
+    candidates = drawn_and_judged(tmp_path / "pool")
+    assert json.loads((tmp_path / "pool" / "draw.json").read_text("utf-8"))["seed"] == 243
+    eval_set = tmp_path / "eval.jsonl"
+    eval_set.write_text(json.dumps({"pinyin": "nh", "text": "你好", "context": None}) + "\n")
+    table = tmp_path / "entries.tsv"
+    TABLE.write_csv(table, separator="\t")
+    out = tmp_path / "set"
+    census = build(candidates, table, [eval_set], out, None)
+    assert census.records == 2
+    shards = sorted((out / "samples").iterdir())
+    frames = [pl.read_parquet(path) for path in shards]
+    assert all(frame.columns == ["id", "source", "text", "context"] for frame in frames)
+    assert [path.name for path in shards] == [
+        f"{frame['source'][0]}-00000.parquet" for frame in frames
+    ]
+    with pytest.raises(SelectionError, match="not empty"):
+        build(candidates, table, [eval_set], out, None)
+
+
+def test_build_waits_for_the_judge_to_finish(tmp_path: Path) -> None:
+    frame, census = draw(POOL, inputs(), 2, 2, seed=243)
+    candidates = write_draw(tmp_path / "pool", frame, census)
+    table = tmp_path / "entries.tsv"
+    TABLE.write_csv(table, separator="\t")
+    with pytest.raises(SelectionError, match="has not finished"):
+        build(candidates, table, [], tmp_path / "set", None)
+
+
+ENTRIES = pl.DataFrame(
+    {
+        "entry": ["一帆风顺", "画蛇添足", "躺平"],
+        "category": ["idiom", "idiom", "internet"],
+        "occurrences": [3, 4, 0],
+    }
+)
+
+
+def units(*records: tuple[str, str, str]) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "id": [record[0] for record in records],
+            "entry": [record[2] for record in records],
+            "source": ["web"] * len(records),
+            "text": [record[1] for record in records],
+            "context": ["前文"] * len(records),
+        }
+    )
+
+
+def test_each_idiom_gives_one_record_and_other_categories_none() -> None:
+    kept = units(
+        ("b", "祝你一帆风顺", "一帆风顺"),
+        ("a", "一路上一帆风顺", "一帆风顺"),
+        ("c", "这样写就是画蛇添足", "画蛇添足"),
+        ("d", "我想躺平了", "躺平"),
+    )
+    frame, census = select(kept, ENTRIES, Collisions())
+    assert frame.sort("id")["id"].to_list() == ["a", "c"]
+    assert census.idioms == 2
+    assert census.records_per_idiom_kept == {2: 1, 1: 1}
+
+
+def test_a_colliding_record_gives_way_to_the_idioms_next_record() -> None:
+    kept = units(("a", "一路上一帆风顺", "一帆风顺"), ("b", "祝你一帆风顺", "一帆风顺"))
+    frame, census = select(kept, ENTRIES, Collisions.of([Record("一路上一帆风顺", "别的")]))
+    assert frame["id"].to_list() == ["b"]
+    assert census.dropped == {"collides by text": 1}
+
+
+def test_a_kept_unit_that_does_not_hold_its_entry_is_an_error() -> None:
+    with pytest.raises(SelectionError, match="does not hold"):
+        select(units(("a", "别的句子", "一帆风顺")), ENTRIES, Collisions())
+
+
+# --- the trim to eval3's proportions ----------------------------------------------
+
+
+def test_strata_read_back_from_a_draw_census() -> None:
+    _, census = draw(POOL, inputs(), 2, 2, seed=243)
+    strata = Strata.of_census(census.strata)
+    assert strata == prepare(POOL, inputs(), 2, seed=243).strata
+    broken = [dict(stratum) for stratum in census.strata]
+    broken[0]["upper"] = 10**9
+    with pytest.raises(SelectionError, match="tile"):
+        Strata.of_census(broken)
+
+
+#: Twelve invented idiom-like entries: four rare (stratum 0), eight frequent (stratum 1).
+TRIM_OCCURRENCES = {f"成语{index:02d}": 5 if index < 4 else 500 for index in range(12)}
+
+
+def trim_frame() -> pl.DataFrame:
+    entries = sorted(TRIM_OCCURRENCES)
+    return pl.DataFrame(
+        {
+            "id": [f"r{index:02d}" for index in range(len(entries))],
+            "source": ["web"] * len(entries),
+            "text": [f"他说{entry}" for entry in entries],
+            "context": ["前文"] * len(entries),
+            "entry": entries,
+        }
+    )
+
+
+def test_the_trim_keeps_the_largest_set_in_eval3s_proportions() -> None:
+    # eval3 holds 1 rare to 3 frequent; the eight frequent records cap the set at 11,
+    # allocated (2.75, 8.25) -> [3, 8], so one rare record goes.
+    strata = Strata(lowers=(1, 100), targets=(1, 3))
+    census = Census()
+    trimmed = trim(trim_frame(), TRIM_OCCURRENCES, Proportions(strata, 243), census)
+    assert trimmed.height == strata.largest_size([4, 8]) == 11
+    rare = [entry for entry, occurrences in TRIM_OCCURRENCES.items() if occurrences == 5]
+    assert trimmed.filter(pl.col("entry").is_in(rare)).height == 3
+    assert census.trimmed == 1
+    assert [(s["selected"], s["kept"]) for s in census.strata] == [(4, 3), (8, 8)]
+
+
+def test_a_set_already_in_proportion_is_not_trimmed() -> None:
+    strata = Strata(lowers=(1, 100), targets=(1, 2))
+    census = Census()
+    trimmed = trim(trim_frame(), TRIM_OCCURRENCES, Proportions(strata, 243), census)
+    assert trimmed.height == 12 and census.trimmed == 0
+
+
+def test_the_trim_is_reproducible_from_its_seed() -> None:
+    strata = Strata(lowers=(1, 100), targets=(1, 1))
+
+    def kept(seed: int) -> list[str]:
+        frame = trim(trim_frame(), TRIM_OCCURRENCES, Proportions(strata, seed), Census())
+        return sorted(frame["entry"].to_list())
+
+    assert kept(243) == kept(243)
+    assert len(kept(243)) == 8
+    assert any(kept(seed) != kept(243) for seed in range(1, 20)), "the seed picks the records"
+
+
+def exported_set(root: Path) -> tuple[Path, Path, Path]:
+    """The set's root, an evaluation set exported from it in a shuffled order, and the table."""
+    frame = trim_frame()
+    (root / "samples").mkdir(parents=True)
+    frame.select("id", "source", "text", "context").write_parquet(
+        root / "samples" / "web-00000.parquet"
+    )
+    frame.select("id", "entry").write_csv(root / "idioms.tsv", separator="\t")
+    records = root / "eval.jsonl"
+    order = list(reversed(frame["text"].to_list()))
+    records.write_text(
+        "".join(
+            json.dumps({"pinyin": "x", "text": text, "context": "前文"}, ensure_ascii=False) + "\n"
+            for text in order
+        ),
+        encoding="utf-8",
+    )
+    table = root / "entries.tsv"
+    pl.DataFrame(
+        {"entry": list(TRIM_OCCURRENCES), "occurrences": list(TRIM_OCCURRENCES.values())}
+    ).write_csv(table, separator="\t")
+    return root, records, table
+
+
+def test_an_exported_set_is_trimmed_keeping_its_records_and_their_order(tmp_path: Path) -> None:
+    root, records, table = exported_set(tmp_path)
+    strata = Strata(lowers=(1, 100), targets=(1, 3))
+    out = tmp_path / "trimmed.jsonl"
+    census = trim_eval_set(records, root, table, Proportions(strata, 243), out)
+    written = out.read_text("utf-8").splitlines()
+    original = records.read_text("utf-8").splitlines()
+    assert census.records == len(written) == 11 and census.trimmed == 1
+    assert written == [line for line in original if line in written], "lines kept as they were"
+    with pytest.raises(SelectionError, match="written once"):
+        trim_eval_set(records, root, table, Proportions(strata, 243), out)
+
+
+def test_an_exported_record_the_set_does_not_hold_is_refused(tmp_path: Path) -> None:
+    root, records, table = exported_set(tmp_path)
+    with records.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"pinyin": "x", "text": "别的句子", "context": None}) + "\n")
+    strata = Strata(lowers=(1, 100), targets=(1, 3))
+    with pytest.raises(SelectionError, match="not sentences of the set"):
+        trim_eval_set(records, root, table, Proportions(strata, 243), tmp_path / "out.jsonl")
+
+
+# --- the top-up -------------------------------------------------------------------
+
+LOW = [
+    "守株待兔",
+    "亡羊补牢",
+    "刻舟求剑",
+    "掩耳盗铃",
+    "井底之蛙",
+    "自相矛盾",
+    "拔苗助长",
+    "画龙点睛",
+]
+HIGH = ["叶公好龙", "杯弓蛇影", "狐假虎威", "卧薪尝胆", "闻鸡起舞"]
+TOP_UP_TABLE = pl.DataFrame(
+    {
+        "entry": ["画蛇添足", "对牛弹琴", *LOW, *HIGH],
+        "category": ["idiom"] * (2 + len(LOW) + len(HIGH)),
+        "occurrences": [5, 500, *(10 * (n + 1) for n in range(len(LOW))), 600, 700, 800, 900, 1000],
+        "blocked": [0] * (2 + len(LOW) + len(HIGH)),
+    }
+)
+
+
+def top_up_inputs() -> Inputs:
+    return Inputs(
+        table=TOP_UP_TABLE,
+        knowledge_idioms=frozenset(TOP_UP_TABLE["entry"].to_list()),
+        emittable=frozenset("".join(TOP_UP_TABLE["entry"].to_list())),
+        eval_texts=["这真是画蛇添足", "简直对牛弹琴"],
+        collisions=Collisions.of([Record("这真是画蛇添足", None)]),
+        lexicon=judge.BoundaryLexicon(["无关词语"]),
+    )
+
+
+#: Each low idiom has one sentence; each high idiom three, two of them the same sentence.
+TOP_UP_POOL = pool(
+    *(f"他们讲起{idiom}的故事" for idiom in LOW),
+    *(f"老师讲了{idiom}的道理" for idiom in HIGH),
+    *(f"我们都知道{idiom}这个词" for idiom in HIGH),
+    *(f"老师讲了{idiom}的道理" for idiom in HIGH),
+)
+
+
+def judged_as(frame: pl.DataFrame, rejected: set[str]) -> JudgedRound:
+    """*frame* as a judged round in which the units of the *rejected* idioms were rejected."""
+    return JudgedRound(
+        units=frame,
+        kept=frozenset(
+            (identifier, entry)
+            for identifier, entry in frame.select("id", "entry").iter_rows()
+            if entry not in rejected
+        ),
+    )
+
+
+def test_the_shortfall_is_each_quota_at_the_reachable_size_less_what_was_kept() -> None:
+    strata = Strata(lowers=(1, 40, 300), targets=(1, 2, 1))
+    result = plan(strata, drawn=[10, 20, 10], kept=[5, 16, 9], supply=[100, 6, 1])
+    # Reach at the keep rates 1/2, 4/5, 9/10: 5 + 50, 16 + 4.8, 9 + 0.9, floored to 55, 20, 9.
+    # The largest size whose allocation fits under them is 38: (10, 19, 9).
+    assert result.size == 38
+    assert result.quotas == (10, 19, 9)
+    assert result.needs == (5, 3, 0)
+    # A need over its keep rate, rounded up: 5 / (1/2) and 3 / (4/5) = 3.75.
+    assert result.draws == (10, 4, 0)
+    assert result.expected == (Fraction(10), Fraction(96, 5), Fraction(9))
+
+
+def test_a_stratum_over_its_quota_draws_nothing_and_the_scarcest_draws_all_it_has() -> None:
+    strata = Strata(lowers=(1, 40), targets=(1, 1))
+    # The smoke run's ends: the second stratum reaches 38 + 0.76 * 12 = 47.12 at most, the
+    # first has plenty left. Size 95 is (48, 47), the largest share falling to the first.
+    result = plan(strata, drawn=[46, 50], kept=[22, 38], supply=[5000, 12])
+    assert result.size == 95 and result.quotas == (48, 47)
+    assert result.needs == (26, 9)
+    # 26 / (22/46) = 54.4 and 9 / 0.76 = 11.8: the scarce stratum draws all 12 it has left.
+    assert result.draws == (ceil_div(26 * 46, 22), 12) == (55, 12)
+    over = plan(strata, drawn=[50, 50], kept=[45, 30], supply=[10, 0])
+    assert over.needs == (0, 0) and over.draws == (0, 0)
+
+
+def ceil_div(numerator: int, denominator: int) -> int:
+    return -(-numerator // denominator)
+
+
+def test_a_stratum_round_one_drew_nothing_in_has_no_yield() -> None:
+    with pytest.raises(SelectionError, match="yield is unknown"):
+        plan(Strata(lowers=(1, 40), targets=(1, 1)), drawn=[0, 4], kept=[0, 2], supply=[5, 5])
+
+
+def test_the_top_up_takes_unused_idioms_first_then_a_rejected_idioms_next_sentence() -> None:
+    prepared = prepare(TOP_UP_POOL, top_up_inputs(), 2, seed=243)
+    round_one, _ = prepared.draw(8)
+    high_drawn = sorted(set(round_one["entry"]) & set(HIGH))
+    assert len(high_drawn) == 4
+    rejected = set(high_drawn[:2])
+    judged = judged_as(round_one, rejected)
+
+    frame, census = top_up(prepare(TOP_UP_POOL, top_up_inputs(), 2, seed=243), 8, judged)
+    low, high = census.strata
+    # Low kept 4 of 4 and has 4 idioms left: reach 8. High kept 2 of 4 and has one idiom
+    # left plus two rejected ones: reach 2 + 3/2. The target is 7, (4, 3).
+    assert census.target_size == 7
+    assert (low["quota"], low["need"], low["draw"]) == (4, 0, 0)
+    assert (high["quota"], high["need"], high["draw"], high["supply"]) == (3, 1, 2, 3)
+    assert (high["drawn_unused"], high["drawn_second"]) == (1, 1)
+
+    [unused] = set(HIGH) - set(round_one["entry"])
+    first_rejected = next(
+        candidate.entry for candidate in prepared.order(1) if candidate.entry in rejected
+    )
+    assert sorted(frame["entry"]) == sorted([unused, first_rejected])
+    # Low keeps its 4; high keeps 2 and half of the 2 it draws.
+    assert census.expected_kept == 7.0
+
+
+def test_no_record_or_sentence_is_drawn_twice_across_the_rounds() -> None:
+    for seed in range(30):
+        prepared = prepare(TOP_UP_POOL, top_up_inputs(), 2, seed=seed)
+        round_one, _ = prepared.draw(8)
+        rejected = set(sorted(set(round_one["entry"]) & set(HIGH))[:3])
+        frame, census = top_up(
+            prepare(TOP_UP_POOL, top_up_inputs(), 2, seed=seed), 8, judged_as(round_one, rejected)
+        )
+        both = pl.concat([round_one, frame])
+        assert both["id"].n_unique() == both.height, seed
+        assert both["text"].n_unique() == both.height, seed
+        assert set(frame["entry"]).isdisjoint(set(round_one["entry"]) - rejected), seed
+        for entry, text in zip(frame["entry"], frame["text"], strict=True):
+            assert entry in text
+        assert census.checks["a sentence of round one"] == 0
+
+
+def test_the_top_up_is_reproducible_from_its_seed() -> None:
+    def run(seed: int) -> pl.DataFrame:
+        prepared = prepare(TOP_UP_POOL, top_up_inputs(), 2, seed=seed)
+        round_one, _ = prepared.draw(8)
+        judged = judged_as(round_one, set(sorted(set(round_one["entry"]) & set(HIGH))[:2]))
+        frame, _ = top_up(prepare(TOP_UP_POOL, top_up_inputs(), 2, seed=seed), 8, judged)
+        return frame
+
+    assert run(243).equals(run(243))
+    assert any(not run(243).equals(run(seed)) for seed in range(10))
+
+
+def test_a_round_one_these_inputs_do_not_give_is_refused() -> None:
+    round_one, _ = draw(TOP_UP_POOL, top_up_inputs(), 2, 8, seed=243)
+    other = prepare(TOP_UP_POOL, top_up_inputs(), 2, seed=7)
+    with pytest.raises(SelectionError, match="not the draw these inputs give"):
+        top_up(other, 8, judged_as(round_one, set(HIGH)))
+
+
+@dataclass
+class Rejecting:
+    """Jev, refusing the given sentences; it remembers what it was asked."""
+
+    rejected: set[str]
+    asked: list[str]
+
+    async def ask(self, unit: judge.Unit) -> judge.JevAnswer:
+        self.asked.append(unit.text)
+        return judge.JevAnswer(p=0.1 if unit.text in self.rejected else 0.95, model="jev-fake")
+
+
+@dataclass
+class Reviewing:
+    asked: list[str]
+
+    async def ask(self, unit: judge.Unit) -> judge.ReviewAnswer:
+        self.asked.append(unit.text)
+        return judge.ReviewAnswer(context_spun=False, sentence_natural=True)
+
+
+def test_the_judge_resumes_over_both_rounds_and_the_set_builds_from_them(tmp_path: Path) -> None:
+    root = tmp_path / "pool"
+    frame, census = draw(TOP_UP_POOL, top_up_inputs(), 2, 8, seed=243)
+    candidates = write_draw(root, frame, census)
+    high = frame.filter(pl.col("entry").is_in(HIGH)).sort("entry")
+    jev = Rejecting(set(high["text"].head(2)), [])
+    asyncio.run(judge.judge_source(candidates, LEXICON, jev, Reviewing([]), 1, 1))
+
+    first = round_one(root)
+    assert (first.seed, first.size) == (243, 8)
+    assert len(first.judged.kept) == 6
+    added, top_up_census = top_up(
+        prepare(TOP_UP_POOL, top_up_inputs(), 2, seed=first.seed), first.size, first.judged
+    )
+    write_top_up(root, added, top_up_census)
+    assert candidates.ordinals()[: len(top_up_census.round_one_files)] == (
+        top_up_census.round_one_files
+    )
+    assert len(candidates.ordinals()) > len(top_up_census.round_one_files)
+
+    again_jev, review = Rejecting(set(), []), Reviewing([])
+    asyncio.run(judge.judge_source(candidates, LEXICON, again_jev, review, 1, 1))
+    assert sorted(again_jev.asked) == sorted(added["text"]), "only the top-up is asked"
+    assert set(review.asked) == set(added["text"])
+
+    with pytest.raises(SelectionError, match="already holds a top-up"):
+        round_one(root)
+    with pytest.raises(SelectionError, match="already holds a draw"):
+        write_draw(root, frame, census)
+
+    eval_set = tmp_path / "eval.jsonl"
+    eval_set.write_text(json.dumps({"pinyin": "nh", "text": "你好", "context": None}) + "\n")
+    table = tmp_path / "entries.tsv"
+    TOP_UP_TABLE.write_csv(table, separator="\t")
+    built = build(candidates, table, [eval_set], tmp_path / "set", None)
+    assert built.idioms == 6 + added.height
+    assert built.records == 6 + added.height
+
+    proportions = Proportions.of_draw(root)
+    assert proportions == Proportions(prepare(TOP_UP_POOL, top_up_inputs(), 2, 243).strata, 243)
+    matched = build(candidates, table, [eval_set], tmp_path / "matched", proportions)
+    kept = [stratum["kept"] for stratum in matched.strata]
+    assert kept == proportions.strata.allocate(matched.records)
+    assert matched.records + matched.trimmed == built.records
+    with pytest.raises(SelectionError, match="no draw census"):
+        Proportions.of_draw(tmp_path)
