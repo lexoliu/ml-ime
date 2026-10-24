@@ -119,6 +119,30 @@ def test_a_rate_limit_is_retried_after_the_pause_the_server_names() -> None:
     assert 0.5 <= sleeps.pauses[1] <= 2.0
 
 
+def test_a_pause_longer_than_a_run_waits_out_fails_at_once() -> None:
+    sleeps = Sleeps()
+    spent = httpx.Response(429, headers={"Retry-After": "544689"}, text="usage limit reached")
+    with pytest.raises(JudgeError, match=r"544689 s pause.*usage limit reached"):
+        asyncio.run(poster(lambda _: spent, sleeps).post("https://judge.test/", {}, {}))
+    assert sleeps.pauses == []
+
+
+def test_a_pause_at_the_bound_is_still_waited_out() -> None:
+    bound = str(int(judge.MAX_RETRY_AFTER_SECONDS))
+    answers = iter(
+        [
+            httpx.Response(429, headers={"Retry-After": bound}),
+            httpx.Response(200, json={"ok": True}),
+        ]
+    )
+    sleeps = Sleeps()
+    result = asyncio.run(
+        poster(lambda _: next(answers), sleeps).post("https://judge.test/", {}, {})
+    )
+    assert result == {"ok": True}
+    assert sleeps.pauses == [judge.MAX_RETRY_AFTER_SECONDS]
+
+
 def test_a_dropped_connection_is_retried() -> None:
     calls = 0
 
