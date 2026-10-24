@@ -37,7 +37,8 @@ pub struct BeamOptions {
     pub typo_weight: f32,
     /// Nats a word arc's lineage gains when it lands, when at least one of
     /// its characters was typed as an initial: the lexicon prior. Zero
-    /// leaves arcs to the models alone.
+    /// leaves arcs to the models alone; the default, 12, is the prior the
+    /// idiom selection set chose (#243).
     pub arc_prior: f32,
     /// How many word arcs in flight keep a slot each, per reading: the best
     /// lineage of each, earliest arc first, survives until the arc lands.
@@ -55,7 +56,7 @@ impl Default for BeamOptions {
             diversity_gap: 1.5,
             diversity_chars: 3,
             typo_weight: 1.0,
-            arc_prior: 0.0,
+            arc_prior: 12.0,
             arc_width: 8,
         }
     }

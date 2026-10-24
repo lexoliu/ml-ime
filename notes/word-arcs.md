@@ -1,12 +1,12 @@
-# Word arcs and the lexicon prior (2026-10-21, #212)
+# Word arcs and the lexicon prior (2026-10-24, #212)
 
 ## Verdict
 
-Partial: one of the six configurations is measured. Abbreviated input without context is the one where the gap to the commercial engines is widest.
+Done. Idioms typed by their initials now come out right more often than in any commercial engine measured, and no configuration loses more than one test record.
 
-- **Arcs lift the idioms and cost nothing elsewhere.** On the abbreviated twin without context, the knowledge slice's idiom rows go from 40.38% entity exact to 60.58% (21 gained, 0 lost, z 4.58). Whole-test top-1 is 17.31% (874 / 5,050), against 17.27% for today's fused decoder. Against a live baseline in the same build, over the 2,855 test records it has finished, arcs get 485 records right where the baseline gets 482 (4 gained, 1 lost).
-- **Dev cannot choose the prior.** Dev holds 15 idiom entities in 475 records. Dev top-1 is flat across the prior (92 / 91 / 91 / 91 / 90 at 0 / 4 / 8 / 12 / 16), while dev idiom exact rises from 66.67% to 80.00% at 12 and 93.33% at 16. `--select-on-dev` picks the largest top-1, so it chooses 0. The arcs alone account for the gain above. The prior's gain is visible only on the idiom rows, and dev is too small to show it. Choosing the prior on the idiom rows would change the protocol, and that needs its own issue.
-- Still to measure: the other five configurations (full and mixed without context, and all three twins with context), plus a test check at prior 12 and 16 on the abbreviated twin, reported as a sensitivity run and not as a dev choice. The commands are under Reproduce, and the queue resumes where it stopped.
+- **Idioms.** On the knowledge slice (abbreviated twin, context off, test, 104 idioms), entity exact goes from 42.31% to 82.69% at the chosen prior, above Apple Pinyin (78.85%) and RIME (77.88%).
+- **Whole test.** Against the same build without arcs, top-1 moves by −1, +8, +1, +1, +9 and +6 records across the six configurations, +24 in all. The −1 is abbreviated without context, 979 against 980 of 5,050.
+- **The prior is 12**, chosen on the idiom selection set (#243) by the rule set there: a prior is admissible when every configuration's dev top-1 is within one record of its best, and the admissible prior with the highest idiom exact on the set wins. Dev top-1 alone cannot choose it: it is nearly flat across priors, and dev holds 15 idioms. `BeamOptions`, `fused-eval` and `replay` default to it.
 
 ## The design
 
@@ -28,79 +28,71 @@ The interface changes with it:
 
 ## Tables
 
-Every number below is from live route A (the fp32 export of `route-a-v2-final.pt`, step 244797), the run3 trigram and the int8 char LM at weight 1. The emission weight is today's dev choice for each configuration. Score files cannot answer characters outside the masks, so arcs need the live towers. "Today" is the score-file dump behind `notes/knowledge-slice.md`.
+Every number below decodes #213's lattices with route A's score files for them (`fused-213`, the files the CI decode reads), the run3 trigram and the int8 char LM at weight 1, with each configuration's dev emission weight: full 1.5 / 0.75, abbreviated 1.5 / 0.75, mixed 0.75 / 1.0 (context on / off). A score file answers every arc character, since an arc's character always lies inside its position's mask, and a record whose scores do not match the asked set fails. All runs are on one Apple Silicon machine; the CI's x86 runners differ by a few records through platform drift, so only same-platform runs are compared.
 
-### Abbreviated, context off (emission weight 0.75)
+### Choosing the prior
 
-Dev sweep of the prior:
+Dev top-1 by prior:
 
-| prior | dev top-1 | dev idiom exact (15) |
-|---|---|---|
-| 0 | 92 / 475 | 66.67% |
-| 4 | 91 | 66.67% |
-| 8 | 91 | 66.67% |
-| 12 | 91 | 80.00% |
-| 16 | 90 | 93.33% |
+| configuration | 0 | 4 | 8 | 12 | 16 |
+|---|---|---|---|---|---|
+| abbreviated, off | 106 | 105 | 105 | 105 | 103 |
+| abbreviated, on | 155 | 155 | 155 | 155 | 154 |
+| full, off | 362 | 362 | 362 | 362 | 362 |
+| full, on | 395 | 395 | 395 | 395 | 395 |
+| mixed, off | 158 | 158 | 160 | 159 | 159 |
+| mixed, on | 214 | 214 | 215 | 215 | 214 |
 
-Test, at the dev choice (prior 0):
+0 and 4 are inadmissible on mixed without context (158 against 160), 16 on abbreviated without context (103 against 106), which leaves 8 and 12. On the selection set (306 idioms in sentences drawn to eval3's run3-frequency deciles, abbreviated, context off), idiom exact is 67.62 / 75.56 / 79.68 / 84.44 / 88.25% at 0 / 4 / 8 / 12 / 16, so the rule picks 12.
 
-| system | top-1 | idiom exact (104) | slice top-1 |
+### Test at prior 12
+
+| configuration | without arcs | arcs, prior 12 | Δ records |
 |---|---|---|---|
-| today (score files) | 17.27% | 40.38% | 13.28% |
-| arcs, prior 0 | 17.31% (874 / 5,050) | **60.58%** (21 / 0, z 4.58) | 14.26% |
-| Apple Pinyin | — | 78.85% | — |
-| RIME | — | 77.88% | — |
+| abbreviated, off | 19.41% (980 / 5,050) | 19.39% (979) | −1 |
+| abbreviated, on | 32.08% (1,620 / 5,050) | 32.24% (1,628) | +8 |
+| full, off | 71.87% (3,613 / 5,027) | 71.89% (3,614) | +1 |
+| full, on | 78.77% (3,960 / 5,027) | 78.79% (3,961) | +1 |
+| mixed, off | 32.28% (1,627 / 5,041) | 32.45% (1,636) | +9 |
+| mixed, on | 41.84% (2,109 / 5,041) | 41.96% (2,115) | +6 |
 
-The ambiguity slice on test with arcs: 16.67% top-1 (317 / 1,902), 74.47% character, 他/她/它 61.38%, 的/地/得 76.02%.
+### Idioms on the knowledge slice
 
-### Pending
+Abbreviated, context off, test, 104 idioms, entity exact:
 
-| twin | context | arcs (dev sweep + test) | live baseline (test) |
-|---|---|---|---|
-| abbreviated | off | done | 2,855 / 5,050 |
-| mixed | off | — | — |
-| full | off | — | — |
-| abbreviated | on | — | — |
-| mixed | on | — | — |
-| full | on | — | — |
+| system | idiom exact |
+|---|---|
+| without arcs | 42.31% |
+| arcs, prior 0 | 61.54% |
+| arcs, prior 12 | **82.69%** |
+| arcs, prior 16 | 84.62% (whole test −8 records) |
+| Apple Pinyin | 78.85% |
+| RIME | 77.88% |
 
 ## Reproduce
 
 ```
-uv run --project python mlime export route-a route-a-v2-final.pt --out data/route-a-export/fp32
 cargo build --release -p ime-cli
-# one configuration: the prior chosen on dev, reported on test
+cargo build --release -p ime-eval --features cli --bin ime-knowledge
+# one configuration, mixed with context shown; for context off add --no-context and read the context-off score file
 target/release/ime-cli fused-eval --model data/run3/ngram.bin \
   --lm data/char-lm-run/transformer-s1/char-lm-int8-pages --lm-weight 1 \
-  --eval-set data/run3_pool/eval3-abbreviated.jsonl \
+  --eval-set data/run3_pool/eval3-mixed.jsonl \
   --emittable data/route-a-assets-v2/emittable.txt \
-  --route-a data/route-a-export/fp32 --no-context --weight 0.75 \
-  --arcs data/lexicon/knowledge.tsv \
-  --arc-prior 0 --arc-prior 4 --arc-prior 8 --arc-prior 12 --arc-prior 16 \
-  --select-on-dev --progress data/arcs-212/arcs/abbreviated-context-off/progress \
-  --dump data/arcs-212/arcs/abbreviated-context-off/dump
-# the baseline: the same without --arcs/--arc-prior, with --slice test
+  --scores data/fused-eval-inputs/fused-213/scores-lattice-mixed-context-on.jsonl.gz \
+  --weight 0.75 --arcs data/lexicon/knowledge.tsv --slice test \
+  --progress data/arcs-212/p12/mixed-context-on/progress --dump data/arcs-212/p12/mixed-context-on/dump
+# the dev sweep: --arc-prior 0 --arc-prior 4 --arc-prior 8 --arc-prior 12 --arc-prior 16 --select-on-dev
+# without arcs: the same command without --arcs
 target/release/ime-knowledge --eval-set data/run3_pool/eval3-abbreviated.jsonl \
   --lexicon data/lexicon/knowledge.tsv --slice test \
-  --dump <baseline test dump> --dump <arcs test dump>
+  --dump <without-arcs test dump> --dump <arcs test dump>
 ```
 
-The emission weights are full 1.5 / 0.75, abbreviated 1.5 / 0.75 and mixed 0.75 / 1.0 (context on / off). Every run resumes from `--progress`. On a loaded MacBook Pro the decode runs at about 2.5–3.5 records a second, so one configuration (5 × 475 dev + 5,050 test with arcs, 5,050 without) is about an hour. The prior is re-chosen with the same command once the lattices are re-emitted (#213).
-
-**Latency** is measured on the M1 with the product configuration of `notes/keystroke-latency.md`. Run it with and without `--arcs`:
-
-```
-ime-cli replay --route-a <int8 export of route-a-v2-final.pt, --quantize int8> --route-a-threads 4 \
-  --lm data/char-lm-run/transformer-s1/char-lm-int8-pages --model <ngram.mmap from pack-ngram> \
-  --emittable data/route-a-assets-v2/emittable.txt --eval-set data/run3_pool/eval3-abbreviated.jsonl \
-  --slice dev --records 40 --incremental \
-  --arcs data/lexicon/knowledge.tsv --arc-prior 0 --out replay-arcs.json
-```
-
-The report gives `beam_arc_starts` and `beam_arc_slots` per keystroke, and `beam_arcs_unprotected` in the summary.
+`--arc-prior` defaults to 12. Every run resumes from `--progress`. With the char LM, the decode's working set grows with the thread count (#248); on a 32 GB machine already under load, run it at `RAYON_NUM_THREADS=1`. The selection set and how it is built are #243's.
 
 ## Next
 
-- Finish the five pending configurations and the sensitivity check at prior 12 and 16.
-- A protocol issue on how to choose the prior, since dev top-1 cannot see it.
-- #214: the idioms with a character outside the emittable set.
+- #248: the char LM's step graph gathers every layer's history at once, which bounds how many threads an evaluation can use.
+- #214: idioms with a character outside the emittable set.
+- Keystroke latency with arcs on the M1, through `ime-cli replay --arcs`, which reports `beam_arc_starts` and `beam_arc_slots` per keystroke.
