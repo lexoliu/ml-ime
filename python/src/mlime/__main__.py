@@ -24,6 +24,7 @@ from mlime.data import DataLayout
 from mlime.logging import configure
 
 if TYPE_CHECKING:  # the training modules pull in torch; --help must not
+    from mlime.data import idiom_set
     from mlime.train.e2e_model import E2EConfig, RankingConfig
     from mlime.train.keys import KeyFrontConfig
     from mlime.train.qwen_tower import QwenContextConfig
@@ -231,6 +232,50 @@ def corpus_prepare(
         max_characters=max_characters,
         min_han_ratio=min_han_ratio,
         limit=limit,
+    )
+
+
+@corpus_app.command("judge")
+def corpus_judge(
+    data_dir: Path = typer.Option(
+        ...,
+        "--data-dir",
+        help="The streamed corpus root holding ingest/fineweb2-mined, or a candidate set's root",
+    ),
+    layout: Literal["mined", "candidates"] = typer.Option(
+        "mined",
+        "--input",
+        help="mined: the mining run's state; candidates: a set written by write_candidates",
+    ),
+    entries: Path = typer.Option(
+        None, help="#215's entry table; defaults to <data-dir>/inputs/entries-215.tsv"
+    ),
+    ordinary_cache: Path = typer.Option(
+        None,
+        help="Where jieba's pinned dictionary is kept; defaults to <data-dir>/.knowledge-cache",
+    ),
+    jev_concurrency: int = typer.Option(32, help="Jev requests in flight at once"),
+    review_concurrency: int = typer.Option(32, help="Review-model requests in flight at once"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Keep only the sentences that are natural usage of their entry, resuming.
+
+    Reads JEV_API_KEY and MLIME_JUDGE_LLM_BASE_URL, _MODEL and _KEY_FILE.
+    """
+    configure(verbose)
+    from mlime.data import judge, knowledge
+
+    ordinary = knowledge.read_ordinary_vocabulary(
+        knowledge.fetch_ordinary_vocabulary(ordinary_cache or data_dir / ".knowledge-cache")
+    )
+    lexicon = judge.BoundaryLexicon.load(
+        entries or data_dir / "inputs" / "entries-215.tsv", ordinary
+    )
+    candidates: judge.Candidates = (
+        judge.MinedLayout(data_dir) if layout == "mined" else judge.CandidateSet(data_dir)
+    )
+    asyncio.run(
+        judge.judge_with_endpoints(candidates, lexicon, jev_concurrency, review_concurrency)
     )
 
 
@@ -1621,6 +1666,174 @@ def eval_typo_twin(
             "no syllables.txt found above the working directory; pass --syllables"
         )
     typer.echo(typo_twin(eval_set, out, seed, table, syllable_path, lattice))
+
+
+@eval_app.command("idiom-draw")
+def eval_idiom_draw(
+    samples: Path = typer.Option(..., "--samples", help="The ingested corpus's samples directory"),
+    sources: list[str] = typer.Option(
+        ..., "--source", help="A source whose samples shards make the pool; repeatable"
+    ),
+    entries: Path = typer.Option(..., "--entries", help="#215's entry table (entries-215.tsv)"),
+    knowledge_path: Path = typer.Option(
+        ..., "--knowledge", help="The knowledge lexicon (knowledge.tsv)"
+    ),
+    emittable: Path = typer.Option(..., "--emittable", help="The emittable characters"),
+    ordinary_cache: Path = typer.Option(
+        ..., "--ordinary-cache", help="Where jieba's pinned dictionary is kept"
+    ),
+    eval3: Path = typer.Option(..., "--eval3", help="eval3, whose idioms set the frequencies"),
+    against: list[Path] = typer.Option(
+        ...,
+        "--against",
+        help="An evaluation or held-out file the draw must not overlap; repeatable",
+    ),
+    strata: int = typer.Option(10, "--strata", help="Strata of eval3's idiom frequencies"),
+    size: int = typer.Option(..., "--size", help="Idioms to draw, one sentence each"),
+    seed: int = typer.Option(..., "--seed", help="Seed of the idiom and sentence orders"),
+    out: Path = typer.Option(..., "--out", help="A fresh root for the candidate set"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Draw #243's idioms at eval3's run3 frequencies, one sentence each, for the judge.
+
+    Then `mlime corpus judge --input candidates --data-dir <out>` judges them.
+    """
+    configure(verbose)
+    from mlime.data import idiom_set
+
+    inputs = idiom_draw_inputs(entries, knowledge_path, emittable, ordinary_cache, eval3, against)
+    pool = idiom_set.read_pool(samples, sources)
+    frame, census = idiom_set.draw(pool, inputs, strata, size, seed)
+    idiom_set.write_draw(out, frame, census)
+    typer.echo(json.dumps(census.as_dict(), ensure_ascii=False, indent=2))
+
+
+def idiom_draw_inputs(
+    entries: Path,
+    knowledge_path: Path,
+    emittable: Path,
+    ordinary_cache: Path,
+    eval3: Path,
+    against: list[Path],
+) -> idiom_set.Inputs:
+    """What `idiom-draw` and `idiom-topup` read besides the pool."""
+    from mlime.data import idiom_set, judge, knowledge
+
+    ordinary = knowledge.read_ordinary_vocabulary(
+        knowledge.fetch_ordinary_vocabulary(ordinary_cache)
+    )
+    return idiom_set.Inputs(
+        table=idiom_set.read_table(entries),
+        knowledge_idioms=idiom_set.read_knowledge_idioms(knowledge_path),
+        emittable=frozenset(emittable.read_text(encoding="utf-8").split()),
+        eval_texts=[record.text for record in idiom_set.read_records(eval3)],
+        collisions=idiom_set.collisions_of(against),
+        lexicon=judge.BoundaryLexicon.load(entries, ordinary),
+    )
+
+
+@eval_app.command("idiom-topup")
+def eval_idiom_topup(
+    samples: Path = typer.Option(..., "--samples", help="The ingested corpus's samples directory"),
+    sources: list[str] = typer.Option(
+        ..., "--source", help="A source whose samples shards make the pool; repeatable"
+    ),
+    entries: Path = typer.Option(..., "--entries", help="#215's entry table (entries-215.tsv)"),
+    knowledge_path: Path = typer.Option(
+        ..., "--knowledge", help="The knowledge lexicon (knowledge.tsv)"
+    ),
+    emittable: Path = typer.Option(..., "--emittable", help="The emittable characters"),
+    ordinary_cache: Path = typer.Option(
+        ..., "--ordinary-cache", help="Where jieba's pinned dictionary is kept"
+    ),
+    eval3: Path = typer.Option(..., "--eval3", help="eval3, whose idioms set the frequencies"),
+    against: list[Path] = typer.Option(
+        ...,
+        "--against",
+        help="An evaluation or held-out file the draw must not overlap; repeatable",
+    ),
+    strata: int = typer.Option(10, "--strata", help="Strata of eval3's idiom frequencies"),
+    pool_root: Path = typer.Option(
+        ..., "--pool", help="The draw's root, its first round wholly judged"
+    ),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Top up #243's draw for the strata the judge left short of eval3's proportions.
+
+    Takes the draw's own inputs; the seed and size come from its census. Then
+    `mlime corpus judge --input candidates --data-dir <pool>` judges the new files
+    only, and `mlime eval idiom-set` builds from both rounds.
+    """
+    configure(verbose)
+    from mlime.data import idiom_set
+
+    first = idiom_set.round_one(pool_root)
+    inputs = idiom_draw_inputs(entries, knowledge_path, emittable, ordinary_cache, eval3, against)
+    prepared = idiom_set.prepare(idiom_set.read_pool(samples, sources), inputs, strata, first.seed)
+    frame, census = idiom_set.top_up(prepared, first.size, first.judged)
+    idiom_set.write_top_up(pool_root, frame, census)
+    typer.echo(json.dumps(census.as_dict(), ensure_ascii=False, indent=2))
+
+
+@eval_app.command("idiom-set")
+def eval_idiom_set(
+    judged: Path = typer.Option(
+        ..., "--judged", help="The root the judge read, every file of it judged"
+    ),
+    layout: Literal["mined", "candidates"] = typer.Option(
+        "candidates", "--input", help="How the judge read it, as `mlime corpus judge --input`"
+    ),
+    entries: Path = typer.Option(..., "--entries", help="#215's entry table (entries-215.tsv)"),
+    against: list[Path] = typer.Option(
+        ...,
+        "--against",
+        help="An evaluation set or pool the selection must not overlap; repeatable",
+    ),
+    out: Path = typer.Option(..., "--out", help="A fresh data root for the selection"),
+    match_strata: bool = typer.Option(
+        False,
+        "--match-strata",
+        help="Trim to the largest size in the draw's strata proportions, by the draw's seed",
+    ),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Build #243's idiom selection from what the judge kept, as samples to annotate.
+
+    Then `ime-cli g2p annotate --data-dir <out>` and `ime-cli export eval-set
+    --data-dir <out> --typing abbreviated` make it an evaluation set, the way
+    eval3's abbreviated twin was made.
+    """
+    configure(verbose)
+    from mlime.data import judge
+    from mlime.data.idiom_set import Proportions, build
+
+    candidates: judge.Candidates = (
+        judge.MinedLayout(judged) if layout == "mined" else judge.CandidateSet(judged)
+    )
+    proportions = Proportions.of_draw(judged) if match_strata else None
+    census = build(candidates, entries, against, out, proportions)
+    typer.echo(json.dumps(census.as_dict(), ensure_ascii=False, indent=2))
+
+
+@eval_app.command("idiom-trim")
+def eval_idiom_trim(
+    records: Path = typer.Option(..., "--eval", help="The evaluation set exported from the set"),
+    set_root: Path = typer.Option(..., "--set", help="The set's root, as `idiom-set` wrote it"),
+    draw: Path = typer.Option(..., "--draw", help="The draw's root, whose census holds the strata"),
+    entries: Path = typer.Option(..., "--entries", help="#215's entry table (entries-215.tsv)"),
+    out: Path = typer.Option(..., "--out", help="Where the trimmed evaluation set goes"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Trim an exported idiom evaluation set to the draw's strata proportions, by its seed.
+
+    The export keeps only the sentences both annotators read alike, which
+    leaves the strata uneven again.
+    """
+    configure(verbose)
+    from mlime.data.idiom_set import Proportions, trim_eval_set
+
+    census = trim_eval_set(records, set_root, entries, Proportions.of_draw(draw), out)
+    typer.echo(json.dumps(census.as_dict(), ensure_ascii=False, indent=2))
 
 
 @eval_app.command("gui")
