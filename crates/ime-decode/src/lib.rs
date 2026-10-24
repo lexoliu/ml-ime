@@ -473,6 +473,7 @@ mod tests {
         BeamOptions {
             beam_width: std::num::NonZeroUsize::new(1).expect("1 is not zero"),
             diversity_gap: 0.0,
+            arc_prior: 0.0,
             ..BeamOptions::default()
         }
     }
@@ -577,7 +578,7 @@ mod tests {
     }
 
     #[test]
-    fn an_arc_outside_a_mask_is_asked_for_where_it_is_scored() {
+    fn an_arc_scores_only_what_its_positions_ask() {
         /// A bigram preference that, like the character LM, answers only
         /// what the step producing the state was asked for.
         struct Strict(Preference);
@@ -616,21 +617,21 @@ mod tests {
             }
         }
         let (table, lexicon) = fixture();
-        let ma = lexicon.id_of('马').expect("马");
+        // `m` is the syllable m (呣) as well as 马's initial; the lattice reads
+        // it through the whole prefix range, so 马 is in the mask.
         let batch = with_idiom("mmhh", "马马虎虎", &table, &lexicon);
-        // Some reading takes `m` as the syllable m, whose mask lacks 马; the
-        // arc still runs there, and asks for 马.
-        let outside = batch
-            .paths()
-            .iter()
-            .find(|path| {
-                path.len() == 4
-                    && !path.arcs().is_empty()
-                    && path.positions()[0].binary_search(&ma).is_err()
-            })
-            .expect("a reading reads `m` as the syllable and still spells the idiom");
-        assert!(outside.asked(0).binary_search(&ma).is_ok());
-        assert!(outside.arcs()[0].reread() > 0.0);
+        assert!(batch.paths().iter().any(|path| !path.arcs().is_empty()));
+        for path in batch.paths() {
+            for arc in path.arcs() {
+                for (offset, ch) in arc.chars().iter().enumerate() {
+                    assert!(
+                        path.positions()[arc.start() + offset]
+                            .binary_search(ch)
+                            .is_ok()
+                    );
+                }
+            }
+        }
         let best = decode(
             &batch,
             Uniform,

@@ -439,9 +439,6 @@ impl<S> Worker<'_, S> {
         let ch = arc.chars()[cursor.next as usize];
         let mut score =
             from.score + emission.score(self.path, position, ch) + transition.score(state, ch);
-        if cursor.next == 0 {
-            score -= options.segmentation_weight * arc.reread();
-        }
         let next = cursor.next + 1;
         let landed = next as usize == arc.chars().len();
         if landed && arc.abbreviated() {
@@ -773,7 +770,7 @@ where
                 start: transition.start(
                     request.context,
                     &Asked {
-                        candidates: reading.asked(0),
+                        candidates: &reading.positions()[0],
                         eos: false,
                     },
                 ),
@@ -811,7 +808,7 @@ where
                 candidates: if ends {
                     &[]
                 } else {
-                    worker.reading.asked(after)
+                    &worker.reading.positions()[after]
                 },
                 eos: ends,
             };
