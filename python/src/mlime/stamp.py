@@ -78,8 +78,13 @@ E2E_KEYS_RUN = "mlime-e2e-keys-"
 #: What a stamped ``CONTEXT_TOWER`` holds: the kernel's ``--context-*`` options.
 CONTEXT_TOWER_FIELDS = frozenset({"tower", "revision", "lora_rank", "lora_alpha", "layers"})
 
-#: What a stamped ``KEYS`` holds: the kernel's key front options (#223).
-KEYS_FIELDS = frozenset({"layers", "distill_weight", "frame_weight", "correct_syllables"})
+#: What a stamped ``KEYS`` holds: the kernel's key front options (#223), and
+#: the loss weights of the stage it trains -- the warm-up's two (S1), or the
+#: joint stage's transition weight (S2, #257). A weight of the other stage is
+#: no part of the stamp, so it can never be stamped and left unread.
+KEYS_FIELDS = frozenset({"layers", "correct_syllables"})
+WARM_UP_WEIGHTS = frozenset({"distill_weight", "frame_weight"})
+JOINT_WEIGHTS = frozenset({"transition_weight"})
 
 #: What a stamped ``TRAIN_FILL_TOWER`` holds: what S1 trains of the fill path
 #: beside the tower itself (#241).
@@ -154,10 +159,13 @@ class E2EV2Stage:
     the tower keeps from the bottom, None for all of them (#237). *context_warm_up*
     (``CONTEXT_WARM_UP``) trains only the context path, which is S0.
     *keys* (``KEYS``) reads keystrokes through a key front with a per-key CTC
-    head (#223): its ``layers``, ``distill_weight``, ``frame_weight`` and
-    ``correct_syllables``.
+    head (#223): its ``layers`` and ``correct_syllables``, and its stage's
+    loss weights -- ``distill_weight`` and ``frame_weight`` in S1,
+    ``transition_weight`` in S2.
     *key_warm_up* (``KEY_WARM_UP``) trains only the front and the head,
-    distilling *init_from*'s encoder states, which is S1. *train_fill_tower*
+    distilling *init_from*'s encoder states, which is S1; without it a key
+    front is the joint stage (S2, #257) over *init_from*, a finished S1,
+    where everything trains on the CTC and the transition. *train_fill_tower*
     (``TRAIN_FILL_TOWER``) trains the fill tower in S1 as well, and with
     ``cross_attention`` its gated context blocks, against frozen copies of
     *init_from*'s (#241).
@@ -181,19 +189,6 @@ class E2EV2Stage:
                 f"a context tower names {sorted(CONTEXT_TOWER_FIELDS)}, "
                 f"got {sorted(self.context_tower)}"
             )
-        if self.keys is not None:
-            if set(self.keys) != KEYS_FIELDS:
-                raise ValueError(
-                    f"a key front names {sorted(KEYS_FIELDS)}, got {sorted(self.keys)}"
-                )
-            if self.ranking is not None or self.context_warm_up:
-                raise ValueError(
-                    "a key-level stage ranks no lattice readings and warms up only its key front"
-                )
-            if not self.key_warm_up:
-                raise ValueError("a key front enters through its warm-up (S1); stamp KEY_WARM_UP")
-        elif self.key_warm_up:
-            raise ValueError("the key warm-up trains a key front; name one with keys")
         if self.train_fill_tower is not None:
             if set(self.train_fill_tower) != FILL_TOWER_FIELDS:
                 raise ValueError(
@@ -202,6 +197,19 @@ class E2EV2Stage:
                 )
             if not self.key_warm_up:
                 raise ValueError("the fill tower trains in the key warm-up; stamp KEY_WARM_UP")
+        if self.keys is not None:
+            fields = KEYS_FIELDS | (WARM_UP_WEIGHTS if self.key_warm_up else JOINT_WEIGHTS)
+            if set(self.keys) != fields:
+                stage = "warm-up (S1)" if self.key_warm_up else "joint stage (S2)"
+                raise ValueError(
+                    f"a key front of the {stage} names {sorted(fields)}, got {sorted(self.keys)}"
+                )
+            if self.ranking is not None or self.context_warm_up:
+                raise ValueError(
+                    "a key-level stage ranks no lattice readings and warms up only its key front"
+                )
+        elif self.key_warm_up:
+            raise ValueError("the key warm-up trains a key front; name one with keys")
 
     def fields(self) -> dict[str, Any]:
         """The recipe fields this stage stamps over v1's."""

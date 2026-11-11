@@ -1233,10 +1233,7 @@ where
                 hypotheses: hypotheses
                     .iter()
                     .zip(texts)
-                    .map(|(hypothesis, text)| DumpedHypothesis {
-                        text,
-                        score: hypothesis.score(),
-                    })
+                    .map(|(hypothesis, text)| DumpedHypothesis::scored(text, hypothesis.score()))
                     .collect(),
             });
             Ok((report, row.into_iter().collect::<Vec<_>>()))
@@ -1399,9 +1396,8 @@ where
                     hypotheses: hypotheses
                         .iter()
                         .zip(texts)
-                        .map(|(hypothesis, text)| DumpedHypothesis {
-                            text,
-                            score: hypothesis.score(),
+                        .map(|(hypothesis, text)| {
+                            DumpedHypothesis::scored(text, hypothesis.score())
                         })
                         .collect(),
                 });
@@ -1883,9 +1879,8 @@ where
                     hypotheses: hypotheses
                         .iter()
                         .zip(texts)
-                        .map(|(hypothesis, text)| DumpedHypothesis {
-                            text,
-                            score: hypothesis.score(),
+                        .map(|(hypothesis, text)| {
+                            DumpedHypothesis::scored(text, hypothesis.score())
                         })
                         .collect(),
                 })?;
@@ -1906,10 +1901,7 @@ where
                 hypotheses: hypotheses
                     .iter()
                     .zip(texts)
-                    .map(|(hypothesis, text)| DumpedHypothesis {
-                        text,
-                        score: hypothesis.score(),
-                    })
+                    .map(|(hypothesis, text)| DumpedHypothesis::scored(text, hypothesis.score()))
                     .collect(),
             })
         })

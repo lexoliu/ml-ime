@@ -294,34 +294,9 @@ def evaluate(
     index = CandidateIndex(lexicon)
 
     eval_rows = read_eval_records(eval_set)
-    rows = [
-        {"pinyin": pinyin, "text": text, "context": context} for pinyin, text, context in eval_rows
-    ]
-    u64_max = float(2**64 - 1)
-    is_dev = [
-        digest(pinyin, text, context) / u64_max < dev_share for pinyin, text, context in eval_rows
-    ]
-    chosen = set(slice_indices(rows, slice_, dev_share))
-
-    names = ("dev", "test", "all") if slice_ == "all" else (slice_,)
-    reports = {name: Report(top_k) for name in names}
-
-    def fold(record: int, hypotheses: Sequence[str]) -> None:
-        observation = Observation.new(eval_rows[record][1], hypotheses, top_k)
-        if "all" in reports:
-            reports["all"].fold(observation)
-            reports["dev" if is_dev[record] else "test"].fold(observation)
-        else:
-            reports[slice_].fold(observation)
-
-    done = resume_dump(dump)
-    for record, hypotheses in done.items():
-        if record not in chosen:
-            raise ValueError(
-                f"{dump} holds record {record}, which slice {slice_!r} does not; "
-                "it was written by a different evaluation"
-            )
-        fold(record, hypotheses)
+    sliced = SliceReports(eval_rows, slice_, dev_share, top_k)
+    chosen = sliced.chosen
+    done = sliced.resume(dump)
 
     def pending() -> Iterator[LatticeRecord]:
         for record in read_lattice(lattice):
@@ -354,7 +329,7 @@ def evaluate(
                 row_positions,
             )
             for decoded_record, found in zip(chunk, results, strict=True):
-                fold(decoded_record.record, [text for text, _ in found])
+                sliced.fold(decoded_record.record, [text for text, _ in found])
                 sink.write(
                     json.dumps(
                         {
@@ -386,7 +361,72 @@ def evaluate(
         with_context=with_context,
         beam_width=beam_width,
     )
-    return [(name, reports[name]) for name in names]
+    return sliced.results()
+
+
+class SliceReports:
+    """The records one slice of an eval set holds, and the reports their decodes fold into.
+
+    *slice_* ``"all"`` reports dev, test and all, since the three cost one
+    decode; any other reports that slice alone. Membership is the record
+    digest's (:func:`~mlime.gui.slice_indices`), so it survives reordering.
+    """
+
+    def __init__(
+        self,
+        eval_rows: Sequence[tuple[str, str, str | None]],
+        slice_: str,
+        dev_share: float,
+        top_k: int,
+    ) -> None:
+        if slice_ not in ("dev", "test", "all"):
+            raise ValueError(f"slice {slice_!r} is not one of 'dev', 'test', 'all'")
+        self.slice = slice_
+        self.top_k = top_k
+        self._texts = [text for _, text, _ in eval_rows]
+        rows = [
+            {"pinyin": pinyin, "text": text, "context": context}
+            for pinyin, text, context in eval_rows
+        ]
+        u64_max = float(2**64 - 1)
+        self._is_dev = [
+            digest(pinyin, text, context) / u64_max < dev_share
+            for pinyin, text, context in eval_rows
+        ]
+        #: The eval-set indices the slice holds, in file order.
+        self.indices = slice_indices(rows, slice_, dev_share)
+        self.chosen = frozenset(self.indices)
+        self.names = ("dev", "test", "all") if slice_ == "all" else (slice_,)
+        self.reports = {name: Report(top_k) for name in self.names}
+
+    def fold(self, record: int, hypotheses: Sequence[str]) -> None:
+        """Fold record *record*'s hypotheses, best first, into every report it belongs to."""
+        observation = Observation.new(self._texts[record], hypotheses, self.top_k)
+        if "all" in self.reports:
+            self.reports["all"].fold(observation)
+            self.reports["dev" if self._is_dev[record] else "test"].fold(observation)
+        else:
+            self.reports[self.slice].fold(observation)
+
+    def resume(self, dump: Path) -> dict[int, list[str]]:
+        """Fold what an earlier run already wrote to *dump*, and return it.
+
+        A record outside the slice means the dump was written by a different
+        evaluation, and is refused.
+        """
+        done = resume_dump(dump)
+        for record, hypotheses in done.items():
+            if record not in self.chosen:
+                raise ValueError(
+                    f"{dump} holds record {record}, which slice {self.slice!r} does not; "
+                    "it was written by a different evaluation"
+                )
+            self.fold(record, hypotheses)
+        return done
+
+    def results(self) -> list[tuple[str, Report]]:
+        """``(name, report)`` for every slice reported, dev first."""
+        return [(name, self.reports[name]) for name in self.names]
 
 
 def ambiguity_report(

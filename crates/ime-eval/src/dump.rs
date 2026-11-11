@@ -30,6 +30,32 @@ pub struct DumpedHypothesis {
     pub text: String,
     /// The score it was ranked by; higher is better.
     pub score: f32,
+    /// The key-level search's terms of that score (#257): the CTC term of
+    /// the hypothesis's best cover, its summed transition log-probability,
+    /// and the best cover's correction cost. Absent from every other engine's
+    /// dump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ctc: Option<f32>,
+    /// See [`DumpedHypothesis::ctc`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transition: Option<f32>,
+    /// See [`DumpedHypothesis::ctc`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub correction: Option<f32>,
+}
+
+impl DumpedHypothesis {
+    /// A hypothesis with its score alone, as every engine but the key-level search dumps it.
+    #[must_use]
+    pub fn scored(text: String, score: f32) -> Self {
+        Self {
+            text,
+            score,
+            ctc: None,
+            transition: None,
+            correction: None,
+        }
+    }
 }
 
 /// Parse a dump file's JSON Lines. Blank lines are skipped.
@@ -60,4 +86,37 @@ pub fn parse_dump(source: &str) -> Result<Vec<DumpRow>, EvalError> {
         });
     }
     Ok(rows)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DumpedHypothesis, parse_dump};
+
+    #[test]
+    fn a_key_level_row_carries_its_terms_and_a_plain_one_writes_none() {
+        let rows = parse_dump(concat!(
+            "{\"record\": 2, \"text\": \"我爱北京\", \"hypotheses\": [{\"text\": \"我爱北京\", ",
+            "\"score\": -3.5, \"ctc\": -2.0, \"transition\": -1.25, \"correction\": 0.0}]}\n",
+            "{\"record\": 0, \"text\": \"他\", \"hypotheses\": [{\"text\": \"她\", \"score\": -1.5}]}\n",
+            "{\"record\": 1, \"text\": \"こんにちは\", \"hypotheses\": [{\"text\": \"안녕하세요\", ",
+            "\"score\": -9.0}]}\n",
+        ))
+        .expect("every row parses");
+        assert_eq!(rows[1].hypotheses[0].ctc, None);
+        let terms = &rows[2].hypotheses[0];
+        assert_eq!(
+            (terms.ctc, terms.transition, terms.correction),
+            (Some(-2.0), Some(-1.25), Some(0.0))
+        );
+        assert_eq!(
+            rows[0].hypotheses[0],
+            DumpedHypothesis::scored("她".to_owned(), -1.5)
+        );
+        let written = serde_json::to_string(&rows[0].hypotheses[0]).expect("serialises");
+        assert_eq!(written, "{\"text\":\"她\",\"score\":-1.5}");
+        assert!(
+            parse_dump("{\"record\": 0, \"text\": \"他\", \"hypotheses\": [{\"text\": \"她\", \"score\": 0.0, \"cost\": 1.0}]}\n")
+                .is_err()
+        );
+    }
 }

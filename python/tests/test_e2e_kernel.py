@@ -580,6 +580,44 @@ def test_a_key_stage_passes_its_front_to_the_count_and_the_trainer(
     assert getattr(augmentation, "typos", None) is True
 
 
+def test_a_joint_key_stage_passes_its_transition_weight_and_no_warm_up_weight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """S2 (#257): the trainer gets the transition weight and none of S1's switches, and parses."""
+    import typer
+    from typer.core import TyperGroup
+
+    import mlime.__main__ as cli
+
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-keys-s1-frame3-a100")
+    keys = {"layers": 2, "transition_weight": 0.5, "correct_syllables": True}
+    monkeypatch.setattr(kernel, "KEYS", keys)
+    assert kernel.stage()["keys"] == keys
+    assert kernel.stage()["key_warm_up"] is False
+    train_argv = kernel.train_argv(
+        tmp_path / "char_pinyin.tsv",
+        tmp_path / "run",
+        max_steps=100,
+        wall_budget=3600,
+        start=kernel.start_argv(None, tmp_path / "checkpoint-final.pt"),
+        resume=None,
+        token_budget=12288,
+        trace_steps=0,
+        segmenter=None,
+    )
+    command = train_argv.index("mlime")
+    tail = [str(arg) for arg in train_argv[command + 3 :]]
+    assert tail[tail.index("--transition-weight") + 1] == "0.5"
+    for switch in ("--distill-weight", "--frame-weight", "--key-warm-up", "--train-fill-tower"):
+        assert switch not in tail, switch
+    group = typer.main.get_command(cli.app)
+    assert isinstance(group, TyperGroup)
+    train = group.commands["train"]
+    assert isinstance(train, TyperGroup)
+    train.commands["e2e"].make_context("e2e", tail)
+
+
 def test_a_key_stage_needs_the_run_it_warms_up_over(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -599,3 +637,137 @@ def test_a_key_stage_needs_the_run_it_warms_up_over(
     monkeypatch.setattr(kernel, "TRAIN_FILL_TOWER", {"cross_attention": False})
     with pytest.raises(RuntimeError, match="stamp KEY_WARM_UP"):
         kernel.main()
+
+
+def test_the_key_evaluation_is_an_eval_keys_command_with_or_without_test(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A finished S2 run's sweep (#257) parses as `mlime eval keys` in both phases."""
+    import typer
+    from typer.core import TyperGroup
+
+    import mlime.__main__ as cli
+
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    group = typer.main.get_command(cli.app)
+    assert isinstance(group, TyperGroup)
+    evaluation = group.commands["eval"]
+    assert isinstance(evaluation, TyperGroup)
+    for test in (False, True):
+        argv = kernel.key_eval_argv(
+            tmp_path / "checkpoint-final.pt",
+            tmp_path / "eval3-mixed.jsonl",
+            tmp_path / "keys-eval3-mixed-context-off",
+            tmp_path / "report.txt",
+            tmp_path / "char_pinyin.tsv",
+            tmp_path / "ml-ime",
+            False,
+            test,
+        )
+        tail = argv[argv.index("keys") + 1 :]
+        assert tail[tail.index("--typo-table") + 1].endswith("crates/ime-pinyin/data/typo.json")
+        assert "--select-on-dev" in tail and "--no-context" in tail
+        assert ("--selection-only" in tail) is not test
+        betas = [float(tail[at + 1]) for at, item in enumerate(tail) if item == "--beta"]
+        assert betas == list(kernel.KEY_BETAS)
+        evaluation.commands["keys"].make_context("keys", tail)
+
+
+def key_assets(tmp_path: Path) -> Path:
+    assets = tmp_path / "inputs" / "assets"
+    assets.mkdir(parents=True)
+    for suffix in ("", "-abbreviated", "-mixed"):
+        (assets / f"eval3{suffix}.jsonl").write_text("{}\n")
+    return assets
+
+
+def stub_key_runs(
+    monkeypatch: pytest.MonkeyPatch, kernel: ModuleType, estimate: float | None
+) -> list[list[str]]:
+    """Stand in for `mlime eval keys`: write each section's selection, record the argv."""
+    calls: list[list[str]] = []
+
+    def run(argv: list[str], env: dict[str, str], log: str) -> tuple[int, float]:
+        calls.append([str(item) for item in argv])
+        directory = Path(argv[argv.index("--dump-dir") + 1])
+        directory.mkdir(parents=True, exist_ok=True)
+        point = {"beta": 1.0, "gamma": 0.5, "combination": "sum"}
+        (directory / "selection.json").write_text(
+            json.dumps(
+                {
+                    "grid": [{**point, "records": 500, "top1_hits": 300, "topk_hits": 400}],
+                    "chosen": point,
+                    "dev_records": 500,
+                    "test_records": 5000,
+                    "test_seconds_estimate": estimate,
+                }
+            )
+        )
+        return 0, 12.0
+
+    monkeypatch.setattr(kernel, "run", run)
+    monkeypatch.setattr(kernel, "gpu_count", lambda: 2)
+    return calls
+
+
+def test_the_key_test_slices_run_only_when_the_dev_rate_says_they_fit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kernel = load_kernel(monkeypatch, tmp_path / "inputs", segment=0)
+    monkeypatch.setattr(kernel, "WORKING", tmp_path / "working")
+    (tmp_path / "working").mkdir()
+    assets = key_assets(tmp_path)
+    started = kernel.time.monotonic()
+
+    calls = stub_key_runs(monkeypatch, kernel, estimate=4000.0)
+    monkeypatch.setattr(kernel, "SESSION_SECONDS", kernel.RESERVE_SECONDS + 10_000)
+    outcome = kernel.evaluate_keys(
+        "final.pt", assets, assets / "char_pinyin.tsv", tmp_path, {}, started
+    )
+    # Six sections of 4000s over two GPUs need 12000s; 10000s are left.
+    assert outcome["test"] == "deferred" and "12000s" in outcome["reason"]
+    assert len(calls) == 6 and all("--selection-only" in argv for argv in calls)
+    assert set(outcome["sections"]) == {
+        f"eval3{suffix}-context-{side}"
+        for suffix in ("", "-abbreviated", "-mixed")
+        for side in ("on", "off")
+    }
+    section = outcome["sections"]["eval3-mixed-context-off"]
+    assert section["chosen"] == {"beta": 1.0, "gamma": 0.5, "combination": "sum"}
+    assert section["dev"] == {"records": 500, "top1_hits": 300, "topk_hits": 400}
+
+    calls = stub_key_runs(monkeypatch, kernel, estimate=1000.0)
+    outcome = kernel.evaluate_keys(
+        "final.pt", assets, assets / "char_pinyin.tsv", tmp_path, {}, started
+    )
+    assert outcome["test"] == "decoded" and outcome["test_seconds_estimate"] == 3000.0
+    assert len(calls) == 12
+    assert sum("--selection-only" in argv for argv in calls) == 6
+    assert all("test_seconds" in entry for entry in outcome["sections"].values())
+
+    stub_key_runs(monkeypatch, kernel, estimate=None)
+    outcome = kernel.evaluate_keys(
+        "final.pt", assets, assets / "char_pinyin.tsv", tmp_path, {}, started
+    )
+    assert outcome["test"] == "deferred" and "nothing to measure" in outcome["reason"]
+
+
+def test_a_key_section_continues_from_a_mounted_earlier_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kernel = load_kernel(monkeypatch, tmp_path / "inputs", segment=1)
+    monkeypatch.setattr(kernel, "WORKING", tmp_path / "working")
+    (tmp_path / "working").mkdir()
+    mounted = tmp_path / "inputs" / "mlime-e2e-keys-s2" / "keys-eval3-context-on"
+    mounted.mkdir(parents=True)
+    (mounted / "dev-beta1-gamma1-sum.jsonl").write_text('{"record": 3}\n')
+    kernel.seed_key_section("eval3-context-on")
+    copied = tmp_path / "working" / "keys-eval3-context-on" / "dev-beta1-gamma1-sum.jsonl"
+    assert copied.read_text() == '{"record": 3}\n'
+    # Its own progress is never overwritten by a mount.
+    copied.write_text("")
+    kernel.seed_key_section("eval3-context-on")
+    assert copied.read_text() == ""
+    kernel.seed_key_section("eval3-mixed-context-off")
+    assert not (tmp_path / "working" / "keys-eval3-mixed-context-off").exists()
+    assert kernel.schedule_seconds([5.0, 4.0, 3.0, 3.0], 2) == 8.0

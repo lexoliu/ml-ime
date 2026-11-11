@@ -597,9 +597,15 @@ class RouteAModel(nn.Module):
 
     def encode_context(self, batch: Batch) -> ContextMemory | None:
         """The context tower's memory of the batch's contexts; None when no layer reads it."""
+        return self.context_memory(batch.context_ids, batch.context_mask)
+
+    def context_memory(
+        self, context_ids: torch.Tensor, context_mask: torch.Tensor
+    ) -> ContextMemory | None:
+        """The context tower's memory of ``[C, L]`` context rows; None when no layer reads it."""
         if not self.gated_layers():
             return None
-        return self.context.memory(batch.context_ids, batch.context_mask)
+        return self.context.memory(context_ids, context_mask)
 
     def encode_fill(self, batch: Batch, memory: ContextMemory | None) -> torch.Tensor:
         """The fill tower over the typed spans, its top layers reading *memory*."""

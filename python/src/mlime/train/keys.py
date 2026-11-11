@@ -77,7 +77,10 @@ class KeyFrontConfig:
     fill tower, at the tower's width. ``distill_weight`` weighs the S1
     warm-up's distillation term against the constrained CTC, and
     ``frame_weight`` the parent's per-position term on the student's states
-    (#255); 0 leaves that term out of the step.
+    (#255); 0 leaves that term out of the step. ``transition_weight`` weighs
+    the joint stage's transition term (S2, #257) against the same CTC. Each
+    weight belongs to one stage, and the config of the other stage refuses a
+    value but its default (:class:`~mlime.train.e2e_model.E2EConfig`).
     ``correct_syllables`` is the legality automaton's: whether a span that is
     itself a syllable may be read through a correction. ``max_keys`` is the
     longest key string an example may have; the fill tower's positions are
@@ -87,22 +90,27 @@ class KeyFrontConfig:
     layers: int = 2
     distill_weight: float = 1.0
     frame_weight: float = 0.0
+    transition_weight: float = 1.0
     correct_syllables: bool = True
     max_keys: int = 510
 
     def __post_init__(self) -> None:
         if self.layers < 1:
             raise ValueError(f"the key front needs at least one layer, got {self.layers}")
-        if self.distill_weight < 0.0:
-            raise ValueError(f"distill_weight must not be negative, got {self.distill_weight}")
-        if self.frame_weight < 0.0:
-            raise ValueError(f"frame_weight must not be negative, got {self.frame_weight}")
+        for name in ("distill_weight", "frame_weight", "transition_weight"):
+            if getattr(self, name) < 0.0:
+                raise ValueError(f"{name} must not be negative, got {getattr(self, name)}")
         if self.max_keys < 1:
             raise ValueError(f"max_keys must be positive, got {self.max_keys}")
 
     def weighed_as(self, other: KeyFrontConfig) -> KeyFrontConfig:
         """This front under *other*'s loss weights: what a stage over a key run may change."""
-        return replace(self, distill_weight=other.distill_weight, frame_weight=other.frame_weight)
+        return replace(
+            self,
+            distill_weight=other.distill_weight,
+            frame_weight=other.frame_weight,
+            transition_weight=other.transition_weight,
+        )
 
     @property
     def options(self) -> LegalityOptions:
@@ -317,6 +325,44 @@ class KeySampleBuilder(SampleBuilder):
 
 
 @dataclass(frozen=True)
+class KeyInputs:
+    """What the key path reads of a batch: the keys' fill row and the contexts, no gold.
+
+    ``key_input_ids``, ``key_attention`` and ``key_letters`` are the keys'
+    fill row ``[CLS] k1 .. kn [SEP]`` (:class:`KeyBatch` says how), and
+    ``key_mask [B, Wk]`` marks each row's real keys. The context fields are the
+    span batch's: one row per context, ``context_rows [B]`` naming the one each
+    fill row reads, ``has_context [C]`` which survived the dropout. A training
+    step reads these out of its :class:`KeyBatch` (:attr:`KeyBatch.inputs`); a
+    search over typed records has no gold and collates them alone
+    (:meth:`KeyCollator.inputs`).
+    """
+
+    key_input_ids: torch.Tensor
+    key_attention: torch.Tensor
+    key_letters: torch.Tensor
+    key_mask: torch.Tensor
+    context_ids: torch.Tensor
+    context_mask: torch.Tensor
+    has_context: torch.Tensor
+    context_rows: torch.Tensor
+
+    @property
+    def size(self) -> int:
+        """Fill rows."""
+        return int(self.key_input_ids.shape[0])
+
+    def to(self, device: torch.device) -> KeyInputs:
+        """The same inputs on *device*."""
+        return KeyInputs(
+            **{
+                item.name: getattr(self, item.name).to(device, non_blocking=True)
+                for item in fields(self)
+            }
+        )
+
+
+@dataclass(frozen=True)
 class KeyBatch:
     """One collated key-level step: the span model's batch, and the keys beside it.
 
@@ -357,9 +403,37 @@ class KeyBatch:
     key_mask: torch.Tensor
 
     @property
+    def inputs(self) -> KeyInputs:
+        """The keys and the contexts, as the key path reads them: the same tensors, no copy."""
+        spans = self.spans
+        return KeyInputs(
+            key_input_ids=self.key_input_ids,
+            key_attention=self.key_attention,
+            key_letters=self.key_letters,
+            key_mask=self.key_mask,
+            context_ids=spans.context_ids,
+            context_mask=spans.context_mask,
+            has_context=spans.has_context,
+            context_rows=spans.context_rows,
+        )
+
+    @property
     def scored(self) -> torch.Tensor:
         """The gold characters, as the span batch's scored positions: what the loss averages."""
         return self.spans.scored
+
+    @property
+    def gold_positions(self) -> torch.Tensor:
+        """``[P]``: each gold character as a flat index into ``[B, M]``, in ``scored``'s order.
+
+        The span batch's columns are the gold's positions framed by the two
+        sentinels (the collator's checked invariant), so the index is the
+        scored position less its row's sentinel pair and the leading one: index
+        arithmetic, with no mask read back from the device.
+        """
+        scored = self.spans.scored
+        width = self.spans.targets.shape[1]
+        return (scored // width) * (width - 2) + scored % width - 1
 
     @property
     def size(self) -> int:
@@ -428,26 +502,14 @@ class KeyCollator:
                 raise TypeError(f"the key collator got a {type(example).__name__}")
             keyed.append(example)
         span_batch = self.spans(keyed)
-        tokenizer = self.spans.tokenizer
         size = len(keyed)
-        counts = torch.tensor([len(example.keys) for example in keyed], dtype=torch.long)
+        rows = self._key_rows([example.keys for example in keyed])
+        counts, at_key, key_mask = rows.counts, rows.at_key, rows.key_mask
         lengths = torch.tensor([len(example.spans) for example in keyed], dtype=torch.long)
         width = int(counts.max())
         positions = int(lengths.max())
-        columns = torch.arange(width + 2)
-        at_key = (columns >= 1) & (columns <= counts[:, None])
-        key_input_ids = torch.full((size, width + 2), tokenizer.pad_token_id, dtype=torch.long)
-        key_input_ids[at_key] = tokenizer.mask_token_id
-        key_input_ids[:, 0] = tokenizer.cls_token_id
-        key_input_ids[torch.arange(size), counts + 1] = tokenizer.sep_token_id
-        key_attention = (columns < counts[:, None] + 2).long()
-        key_letters = torch.full((size, width + 2), LETTER_PAD, dtype=torch.long)
-        key_letters[at_key] = torch.tensor(
-            [letter_id(letter) for example in keyed for letter in example.keys], dtype=torch.long
-        )
         key_positions = at_key.reshape(-1).nonzero(as_tuple=True)[0]
         within = torch.arange(width)
-        key_mask = within < counts[:, None]
         starts = torch.cumsum(counts, 0) - counts
         key_index = torch.where(key_mask, starts[:, None] + within, starts[:, None])
 
@@ -468,11 +530,13 @@ class KeyCollator:
         position_mask = torch.arange(positions) < lengths[:, None]
         if len(end_positions) != span_batch.scored.numel():
             raise ValueError("the keys' span ends and the span batch's scored positions disagree")
+        if span_batch.targets.shape[1] != positions + 2:
+            raise ValueError("the span batch's columns are not the gold's and two sentinels")
         return KeyBatch(
             spans=span_batch,
-            key_input_ids=key_input_ids,
-            key_attention=key_attention,
-            key_letters=key_letters,
+            key_input_ids=rows.key_input_ids,
+            key_attention=rows.key_attention,
+            key_letters=rows.key_letters,
             key_positions=key_positions,
             key_index=key_index,
             gold=gold,
@@ -486,3 +550,68 @@ class KeyCollator:
             position_mask=position_mask,
             key_mask=key_mask,
         )
+
+    def inputs(self, keys: Sequence[str], contexts: Sequence[str | None]) -> KeyInputs:
+        """Typed records as the key path reads them: their keys and contexts, nothing else.
+
+        The search's collate: no gold, no segmentation, no span batch. The
+        keys' rows are the ones :meth:`__call__` builds for the same keys, and
+        the contexts go through the span collator's own encoding -- the same
+        tail, tokenizer and dropout coin -- so a record's states are the ones
+        a training batch holding it would give.
+        """
+        if not keys:
+            raise ValueError("cannot collate an empty batch")
+        if len(keys) != len(contexts):
+            raise ValueError(f"{len(keys)} key strings but {len(contexts)} contexts")
+        rows = self._key_rows(keys)
+        context_ids, context_mask, has_context = self.spans.encode_contexts(contexts)
+        return KeyInputs(
+            key_input_ids=rows.key_input_ids,
+            key_attention=rows.key_attention,
+            key_letters=rows.key_letters,
+            key_mask=rows.key_mask,
+            context_ids=context_ids,
+            context_mask=context_mask,
+            has_context=has_context,
+            context_rows=torch.arange(len(keys)),
+        )
+
+    def _key_rows(self, keys: Sequence[str]) -> _KeyRows:
+        """The keys' fill rows ``[CLS] k1 .. kn [SEP]``, padded to the longest."""
+        tokenizer = self.spans.tokenizer
+        size = len(keys)
+        counts = torch.tensor([len(typed) for typed in keys], dtype=torch.long)
+        if bool((counts == 0).any()):
+            raise ValueError("a record has no keys")
+        width = int(counts.max())
+        columns = torch.arange(width + 2)
+        at_key = (columns >= 1) & (columns <= counts[:, None])
+        key_input_ids = torch.full((size, width + 2), tokenizer.pad_token_id, dtype=torch.long)
+        key_input_ids[at_key] = tokenizer.mask_token_id
+        key_input_ids[:, 0] = tokenizer.cls_token_id
+        key_input_ids[torch.arange(size), counts + 1] = tokenizer.sep_token_id
+        key_letters = torch.full((size, width + 2), LETTER_PAD, dtype=torch.long)
+        key_letters[at_key] = torch.tensor(
+            [letter_id(letter) for typed in keys for letter in typed], dtype=torch.long
+        )
+        return _KeyRows(
+            counts=counts,
+            at_key=at_key,
+            key_input_ids=key_input_ids,
+            key_attention=(columns < counts[:, None] + 2).long(),
+            key_letters=key_letters,
+            key_mask=torch.arange(width) < counts[:, None],
+        )
+
+
+@dataclass(frozen=True)
+class _KeyRows:
+    """The keys' side of a collated batch, shared by the training and the search collate."""
+
+    counts: torch.Tensor
+    at_key: torch.Tensor
+    key_input_ids: torch.Tensor
+    key_attention: torch.Tensor
+    key_letters: torch.Tensor
+    key_mask: torch.Tensor
