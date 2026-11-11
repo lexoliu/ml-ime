@@ -130,7 +130,8 @@ class E2EConfig(RouteAConfig):
     keys: KeyFrontConfig | None = None
     #: Train only the key front and the CTC head, distilling the parent's
     #: encoder states, with everything else frozen: the warm-up the key front
-    #: enters through (S1).
+    #: enters through (S1). Off with a key front, the joint stage (S2, #257):
+    #: everything trains on the constrained CTC and the transition's term.
     key_warm_up: bool = False
     #: In the key warm-up, train the fill tower too -- and with
     #: ``cross_attention`` its gated context blocks -- beside the front and the
@@ -154,15 +155,41 @@ class E2EConfig(RouteAConfig):
                 )
             if self.context_warm_up:
                 raise ValueError("a run warms up one new part at a time: the context or the keys")
-            if not self.key_warm_up:
-                raise ValueError(
-                    "a key front enters through its warm-up (S1); the joint stage's "
-                    "transition term (S2) is not built yet"
-                )
+            default = KeyFrontConfig()
+            if self.key_warm_up:
+                if self.keys.transition_weight != default.transition_weight:
+                    raise ValueError(
+                        "transition_weight weighs the joint stage's term (S2); the warm-up "
+                        "trains no transition"
+                    )
+            else:
+                if (self.keys.distill_weight, self.keys.frame_weight) != (
+                    default.distill_weight,
+                    default.frame_weight,
+                ):
+                    raise ValueError(
+                        "distill_weight and frame_weight weigh the warm-up's terms (S1); the "
+                        "joint stage (S2) has no teacher to distil and no frame to fit"
+                    )
+                if self.keys.transition_weight <= 0.0:
+                    raise ValueError(
+                        "the joint stage trains the transition; its transition_weight must be "
+                        f"positive, got {self.keys.transition_weight}"
+                    )
         elif self.key_warm_up:
             raise ValueError("the key warm-up trains a key front; name one with keys")
         if self.train_fill_tower is not None and not self.key_warm_up:
             raise ValueError("the fill tower trains beside a key front in its warm-up (S1)")
+
+    @property
+    def reads_span_input(self) -> bool:
+        """Whether the decoder adds each step's span vector to its input.
+
+        The span model's does, and S1 keeps the parent's decoder as it is. The
+        joint stage's reads keys, which no step is aligned to, so it has no
+        span input at all (#216 §6).
+        """
+        return self.keys is None or self.key_warm_up
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> E2EConfig:
@@ -303,20 +330,24 @@ class Decoder(nn.Module):
     ``reader`` is the trained TransformerCharLm, held whole rather than copied:
     every distribution it learned over run3 is the e2e decoder's starting point.
     ``span_input`` is the zero-initialised projection that adds the current
-    span's encoder vector to the step's input, and ``cross_attention`` holds one
-    :class:`EncoderAttention` per block. ``emit_ids`` is the emission index of
-    every character the model may produce mapped onto the reader's alphabet;
-    persistent, so a checkpoint carries the mapping it was written with.
+    span's encoder vector to the step's input -- None for a decoder that
+    reads keys (*span_input* off), where no span is aligned to a step -- and
+    ``cross_attention`` holds one :class:`EncoderAttention` per block.
+    ``emit_ids`` is the emission index of every character the model may
+    produce mapped onto the reader's alphabet; persistent, so a checkpoint
+    carries the mapping it was written with.
     """
 
     reader: TransformerCharLm
     emit_ids: torch.Tensor
+    span_input: nn.Linear | None
 
     def __init__(
         self,
         reader: TransformerCharLm,
         encoder_width: int,
         emit_ids: torch.Tensor,
+        span_input: bool = True,
     ):
         super().__init__()
         if emit_ids.numel() == 0:
@@ -324,8 +355,11 @@ class Decoder(nn.Module):
         if int(emit_ids.max()) >= reader.embed.num_embeddings or int(emit_ids.min()) < 0:
             raise ValueError("emit_ids names ids outside the reader's alphabet")
         self.reader = reader
-        self.span_input = nn.Linear(encoder_width, reader.config.hidden, bias=False)
-        nn.init.zeros_(self.span_input.weight)
+        if span_input:
+            self.span_input = nn.Linear(encoder_width, reader.config.hidden, bias=False)
+            nn.init.zeros_(self.span_input.weight)
+        else:
+            self.span_input = None
         self.cross_attention = nn.ModuleList(
             EncoderAttention(reader.config, encoder_width) for _ in reader.layers()
         )
@@ -345,16 +379,22 @@ class Decoder(nn.Module):
         return layers
 
     def embed(
-        self, tokens: torch.Tensor, span_vectors: torch.Tensor, first: int | torch.Tensor
+        self, tokens: torch.Tensor, span_vectors: torch.Tensor | None, first: int | torch.Tensor
     ) -> torch.Tensor:
-        """``input(embed(token)) + span_input(span) + position``, ``[B, T] -> [B, T, H]``."""
+        """``input(embed(token)) + span_input(span) + position``, ``[B, T] -> [B, T, H]``.
+
+        A decoder without a span input takes no *span_vectors*, and one with
+        it always does: a caller that disagrees with the decoder is refused.
+        """
         positions = torch.arange(tokens.shape[1], device=tokens.device) + first
-        embedded = (
-            self.reader.input(self.reader.embed(tokens))
-            + self.span_input(span_vectors)
-            + self.reader.positions(positions)
-        )
-        dropped: torch.Tensor = self.reader.dropout(embedded)
+        embedded = self.reader.input(self.reader.embed(tokens))
+        if self.span_input is not None:
+            if span_vectors is None:
+                raise ValueError("this decoder adds each step's span vector; pass them")
+            embedded = embedded + self.span_input(span_vectors)
+        elif span_vectors is not None:
+            raise ValueError("this decoder reads keys and has no span input (#216 §6)")
+        dropped: torch.Tensor = self.reader.dropout(embedded + self.reader.positions(positions))
         return dropped
 
     def forward(
@@ -376,6 +416,42 @@ class Decoder(nn.Module):
             x = cross.attend(block(x), keys, values, span_mask)
         normed: torch.Tensor = self.reader.norm(x)
         return normed
+
+    def over_keys(
+        self,
+        tokens: torch.Tensor,
+        states: torch.Tensor,
+        mask: torch.Tensor,
+        rows: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Teacher-forced features of a decoder reading keys: ``[N, T] -> [N, T, hidden]``.
+
+        ``tokens [N, T]`` are reader ids, ``<bos>`` first; ``states [R, S,
+        enc]`` are the key states every gated block cross-attends to, real
+        where ``mask [R, S]`` (bool) is. Token row ``n`` reads state row
+        ``rows[n]``, or row ``n`` itself when *rows* is None. Each block's keys
+        and values are projected once per state row and gathered per token
+        row, so a beam's hypotheses share their record's projection. No step
+        gets a span input: the decoder must have none.
+        """
+        x = self.embed(tokens, None, 0)
+        kept = mask if rows is None else mask.index_select(0, rows)
+        for block, cross in zip(self.reader.layers(), self.gated_layers(), strict=True):
+            keys, values = cross.kv(states)
+            if rows is not None:
+                keys, values = keys.index_select(0, rows), values.index_select(0, rows)
+            x = cross.attend(block(x), keys, values, kept)
+        normed: torch.Tensor = self.reader.norm(x)
+        return normed
+
+    def emission_logits(self, features: torch.Tensor) -> torch.Tensor:
+        """``[..., hidden]`` features to logits over the whole emittable set, ``[..., E]``.
+
+        The tied reader head's rows at ``emit_ids``, in emission order.
+        """
+        emitted = self.reader.embed.weight.index_select(0, self.emit_ids)
+        scores: torch.Tensor = self.reader.project(self.reader.dropout(features)) @ emitted.T
+        return scores
 
     def logits_over(self, features: torch.Tensor, candidates: torch.Tensor) -> torch.Tensor:
         """Logits over *candidates* alone: ``[B, T, H] -> [B, T, K]`` (or ``[B, H] -> [B, K]``).
@@ -589,7 +665,9 @@ class E2EModel(RouteAModel):
     ):
         super().__init__(fill, context, lexicon, config)
         self.e2e_config = config
-        self.decoder = Decoder(reader, fill.config.hidden_size, emit_ids)
+        self.decoder = Decoder(
+            reader, fill.config.hidden_size, emit_ids, span_input=config.reads_span_input
+        )
 
     @classmethod
     def compose(

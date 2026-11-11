@@ -580,6 +580,44 @@ def test_a_key_stage_passes_its_front_to_the_count_and_the_trainer(
     assert getattr(augmentation, "typos", None) is True
 
 
+def test_a_joint_key_stage_passes_its_transition_weight_and_no_warm_up_weight(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """S2 (#257): the trainer gets the transition weight and none of S1's switches, and parses."""
+    import typer
+    from typer.core import TyperGroup
+
+    import mlime.__main__ as cli
+
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-keys-s1-frame3-a100")
+    keys = {"layers": 2, "transition_weight": 0.5, "correct_syllables": True}
+    monkeypatch.setattr(kernel, "KEYS", keys)
+    assert kernel.stage()["keys"] == keys
+    assert kernel.stage()["key_warm_up"] is False
+    train_argv = kernel.train_argv(
+        tmp_path / "char_pinyin.tsv",
+        tmp_path / "run",
+        max_steps=100,
+        wall_budget=3600,
+        start=kernel.start_argv(None, tmp_path / "checkpoint-final.pt"),
+        resume=None,
+        token_budget=12288,
+        trace_steps=0,
+        segmenter=None,
+    )
+    command = train_argv.index("mlime")
+    tail = [str(arg) for arg in train_argv[command + 3 :]]
+    assert tail[tail.index("--transition-weight") + 1] == "0.5"
+    for switch in ("--distill-weight", "--frame-weight", "--key-warm-up", "--train-fill-tower"):
+        assert switch not in tail, switch
+    group = typer.main.get_command(cli.app)
+    assert isinstance(group, TyperGroup)
+    train = group.commands["train"]
+    assert isinstance(train, TyperGroup)
+    train.commands["e2e"].make_context("e2e", tail)
+
+
 def test_a_key_stage_needs_the_run_it_warms_up_over(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

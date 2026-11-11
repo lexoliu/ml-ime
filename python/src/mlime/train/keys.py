@@ -77,7 +77,10 @@ class KeyFrontConfig:
     fill tower, at the tower's width. ``distill_weight`` weighs the S1
     warm-up's distillation term against the constrained CTC, and
     ``frame_weight`` the parent's per-position term on the student's states
-    (#255); 0 leaves that term out of the step.
+    (#255); 0 leaves that term out of the step. ``transition_weight`` weighs
+    the joint stage's transition term (S2, #257) against the same CTC. Each
+    weight belongs to one stage, and the config of the other stage refuses a
+    value but its default (:class:`~mlime.train.e2e_model.E2EConfig`).
     ``correct_syllables`` is the legality automaton's: whether a span that is
     itself a syllable may be read through a correction. ``max_keys`` is the
     longest key string an example may have; the fill tower's positions are
@@ -87,22 +90,27 @@ class KeyFrontConfig:
     layers: int = 2
     distill_weight: float = 1.0
     frame_weight: float = 0.0
+    transition_weight: float = 1.0
     correct_syllables: bool = True
     max_keys: int = 510
 
     def __post_init__(self) -> None:
         if self.layers < 1:
             raise ValueError(f"the key front needs at least one layer, got {self.layers}")
-        if self.distill_weight < 0.0:
-            raise ValueError(f"distill_weight must not be negative, got {self.distill_weight}")
-        if self.frame_weight < 0.0:
-            raise ValueError(f"frame_weight must not be negative, got {self.frame_weight}")
+        for name in ("distill_weight", "frame_weight", "transition_weight"):
+            if getattr(self, name) < 0.0:
+                raise ValueError(f"{name} must not be negative, got {getattr(self, name)}")
         if self.max_keys < 1:
             raise ValueError(f"max_keys must be positive, got {self.max_keys}")
 
     def weighed_as(self, other: KeyFrontConfig) -> KeyFrontConfig:
         """This front under *other*'s loss weights: what a stage over a key run may change."""
-        return replace(self, distill_weight=other.distill_weight, frame_weight=other.frame_weight)
+        return replace(
+            self,
+            distill_weight=other.distill_weight,
+            frame_weight=other.frame_weight,
+            transition_weight=other.transition_weight,
+        )
 
     @property
     def options(self) -> LegalityOptions:
@@ -362,6 +370,19 @@ class KeyBatch:
         return self.spans.scored
 
     @property
+    def gold_positions(self) -> torch.Tensor:
+        """``[P]``: each gold character as a flat index into ``[B, M]``, in ``scored``'s order.
+
+        The span batch's columns are the gold's positions framed by the two
+        sentinels (the collator's checked invariant), so the index is the
+        scored position less its row's sentinel pair and the leading one: index
+        arithmetic, with no mask read back from the device.
+        """
+        scored = self.spans.scored
+        width = self.spans.targets.shape[1]
+        return (scored // width) * (width - 2) + scored % width - 1
+
+    @property
     def size(self) -> int:
         """Examples in the step."""
         return self.spans.size
@@ -468,6 +489,8 @@ class KeyCollator:
         position_mask = torch.arange(positions) < lengths[:, None]
         if len(end_positions) != span_batch.scored.numel():
             raise ValueError("the keys' span ends and the span batch's scored positions disagree")
+        if span_batch.targets.shape[1] != positions + 2:
+            raise ValueError("the span batch's columns are not the gold's and two sentinels")
         return KeyBatch(
             spans=span_batch,
             key_input_ids=key_input_ids,

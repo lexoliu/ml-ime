@@ -141,6 +141,12 @@ FRAME_WEIGHT = typer.Option(
     help="Weight of the parent's per-position loss on the student's states in S1, with --keys "
     "(default 0: the term is left out)",
 )
+TRANSITION_WEIGHT = typer.Option(
+    None,
+    "--transition-weight",
+    help="Weight of the decoder's transition term beside the constrained CTC in the joint "
+    "stage (S2: --keys without --key-warm-up; default 1.0)",
+)
 CORRECT_SYLLABLES = typer.Option(
     True,
     "--correct-syllables/--no-correct-syllables",
@@ -580,17 +586,35 @@ def key_settings(
     layers: int | None,
     distill_weight: float | None,
     frame_weight: float | None,
+    transition_weight: float | None,
     correct_syllables: bool,
+    key_warm_up: bool,
 ) -> KeyFrontConfig | None:
-    """The key front's settings from ``--keys`` and its knobs; None is the span model."""
+    """The key front's settings from ``--keys`` and its knobs; None is the span model.
+
+    Each loss weight belongs to one stage: ``--distill-weight`` and
+    ``--frame-weight`` to the warm-up (``--key-warm-up``, S1),
+    ``--transition-weight`` to the joint stage (S2); the other stage refuses
+    them rather than leave them unread.
+    """
     if not keys:
-        knobs = (layers, distill_weight, frame_weight)
+        knobs = (layers, distill_weight, frame_weight, transition_weight)
         if any(knob is not None for knob in knobs) or not correct_syllables:
             raise typer.BadParameter(
-                "--key-front-layers, --distill-weight, --frame-weight and "
-                "--no-correct-syllables set the key front; pass --keys"
+                "--key-front-layers, --distill-weight, --frame-weight, --transition-weight "
+                "and --no-correct-syllables set the key front; pass --keys"
             )
         return None
+    if key_warm_up and transition_weight is not None:
+        raise typer.BadParameter(
+            "--transition-weight weighs the joint stage's term; the warm-up (--key-warm-up) "
+            "trains no transition"
+        )
+    if not key_warm_up and (distill_weight is not None or frame_weight is not None):
+        raise typer.BadParameter(
+            "--distill-weight and --frame-weight weigh the warm-up's terms; pass --key-warm-up, "
+            "or leave them out of the joint stage"
+        )
     from mlime.train.keys import KeyFrontConfig
 
     default = KeyFrontConfig()
@@ -598,6 +622,9 @@ def key_settings(
         layers=default.layers if layers is None else layers,
         distill_weight=default.distill_weight if distill_weight is None else distill_weight,
         frame_weight=default.frame_weight if frame_weight is None else frame_weight,
+        transition_weight=default.transition_weight
+        if transition_weight is None
+        else transition_weight,
         correct_syllables=correct_syllables,
     )
 
@@ -755,6 +782,7 @@ def train_e2e(
     key_front_layers: int | None = KEY_FRONT_LAYERS,
     distill_weight: float | None = DISTILL_WEIGHT,
     frame_weight: float | None = FRAME_WEIGHT,
+    transition_weight: float | None = TRANSITION_WEIGHT,
     correct_syllables: bool = CORRECT_SYLLABLES,
     key_warm_up: bool = KEY_WARM_UP,
     train_fill_tower: bool = TRAIN_FILL_TOWER,
@@ -902,7 +930,13 @@ def train_e2e(
             context_warm_up=context_warm_up,
             tower_graphs=tower_graphs,
             keys=key_settings(
-                keys, key_front_layers, distill_weight, frame_weight, correct_syllables
+                keys,
+                key_front_layers,
+                distill_weight,
+                frame_weight,
+                transition_weight,
+                correct_syllables,
+                key_warm_up,
             ),
             key_warm_up=key_warm_up,
             train_fill_tower=fill_tower_settings(train_fill_tower, train_cross_attention),
@@ -1037,7 +1071,8 @@ def train_count_batches(
         segmenter=segmenter,
         workers=workers,
         augmentation=Augmentation(typos=typos),
-        keys=key_settings(keys, None, None, None, correct_syllables),
+        # The count reads only the sampling fields, which no stage's weights touch.
+        keys=key_settings(keys, None, None, None, None, correct_syllables, key_warm_up=False),
     )
     census.write(out)
     typer.echo(
@@ -1318,6 +1353,7 @@ def e2e_stamp(
     key_front_layers: int | None = KEY_FRONT_LAYERS,
     distill_weight: float | None = DISTILL_WEIGHT,
     frame_weight: float | None = FRAME_WEIGHT,
+    transition_weight: float | None = TRANSITION_WEIGHT,
     correct_syllables: bool = CORRECT_SYLLABLES,
     key_warm_up: bool = KEY_WARM_UP,
     train_fill_tower: bool = TRAIN_FILL_TOWER,
@@ -1334,7 +1370,9 @@ def e2e_stamp(
     plain v2 run is v1's recipe exactly. `--keys` with `--key-warm-up` makes the
     stage S1 of the key-level model (#223), named mlime-e2e-keys-*;
     `--train-fill-tower` trains the fill tower in it, and with
-    `--train-cross-attention` its gated context blocks (#241).
+    `--train-cross-attention` its gated context blocks (#241). `--keys`
+    without `--key-warm-up`, over a finished S1 run, is the joint stage S2
+    (#257), weighed by `--transition-weight`.
     """
     from mlime.locate import find_upwards
     from mlime.stamp import E2E_V2_SOURCES, E2EV2Run, E2EV2Stage, stamp_e2e_v2
@@ -1360,7 +1398,15 @@ def e2e_stamp(
     tower = context_settings(
         context_tower, context_revision, context_lora_rank, context_lora_alpha, context_layers
     )
-    front = key_settings(keys, key_front_layers, distill_weight, frame_weight, correct_syllables)
+    front = key_settings(
+        keys,
+        key_front_layers,
+        distill_weight,
+        frame_weight,
+        transition_weight,
+        correct_syllables,
+        key_warm_up,
+    )
     fill_tower = fill_tower_settings(train_fill_tower, train_cross_attention)
     stage = None
     if init_from is None:
@@ -1398,8 +1444,11 @@ def e2e_stamp(
             if front is None
             else {
                 "layers": front.layers,
-                "distill_weight": front.distill_weight,
-                "frame_weight": front.frame_weight,
+                **(
+                    {"distill_weight": front.distill_weight, "frame_weight": front.frame_weight}
+                    if key_warm_up
+                    else {"transition_weight": front.transition_weight}
+                ),
                 "correct_syllables": front.correct_syllables,
             },
             key_warm_up=key_warm_up,

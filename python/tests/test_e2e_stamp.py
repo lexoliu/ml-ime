@@ -435,6 +435,48 @@ def test_a_key_warm_up_that_trains_the_tower_stamps_one_switch_more(
     assert "pass --init-from" in error(refused.output)
 
 
+def test_a_joint_key_stage_stamps_its_transition_weight_and_no_warm_up_weight(
+    tmp_path: Path,
+) -> None:
+    """S2 (#257): over a finished S1 run, KEYS holds the transition weight in place of S1's two."""
+    out = tmp_path / "joint"
+    argv = ["e2e", "stamp", "mlime-e2e-keys-s2-check", "--out", str(out)]
+    stage = ["--init-from", "mlime-e2e-keys-s1-frame3-a100", "--keys"]
+    result = CliRunner().invoke(app, [*argv, *stage, "--transition-weight", "0.5"])
+    assert result.exit_code == 0, result.output
+    template = (TEMPLATE / "kernel.py").read_text()
+    kernel = (out / "kernel.py").read_text()
+    keys = {"layers": 2, "transition_weight": 0.5, "correct_syllables": True}
+    assert sorted(changed_lines(template, kernel)) == sorted(
+        f"{name} = {value!r}"
+        for name, value in {
+            "INIT_FROM": "mlime-e2e-keys-s1-frame3-a100",
+            "KEYS": keys,
+            "PROFILE_STEPS": 30,
+            "TRACE_STEPS": 3,
+        }.items()
+    )
+    assert literal(kernel, "KEY_WARM_UP") is False
+
+    # Each stage's weights are its own: the other stage's are refused, stamped or passed.
+    s1_keys = {"layers": 2, "distill_weight": 1.0, "frame_weight": 0.0, "correct_syllables": True}
+    with pytest.raises(ValueError, match=r"joint stage \(S2\) names"):
+        E2EV2Stage(init_from="mlime-e2e-keys-s1-frame3-a100", keys=s1_keys)
+    with pytest.raises(ValueError, match=r"warm-up \(S1\) names"):
+        E2EV2Stage(init_from="mlime-e2e-v2-rank-g4", keys=keys, key_warm_up=True)
+    for option, wanted in (
+        (["--distill-weight", "1.0"], "pass --key-warm-up"),
+        (["--frame-weight", "0.5"], "pass --key-warm-up"),
+        (["--key-warm-up", "--transition-weight", "1.0"], "trains no transition"),
+    ):
+        refused = CliRunner().invoke(
+            app,
+            ["e2e", "stamp", "mlime-e2e-keys-s2-x", "--out", str(tmp_path / "x"), *stage, *option],
+        )
+        assert refused.exit_code == 2, refused.output
+        assert wanted in error(refused.output), option
+
+
 def test_the_context_blocks_train_only_with_the_tower(tmp_path: Path) -> None:
     """``--train-cross-attention`` names a part of the tower ``--train-fill-tower`` trains."""
     refused = CliRunner().invoke(

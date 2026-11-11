@@ -41,9 +41,11 @@ the first segment builds the front over the finished run's weights, and
 `KEY_WARM_UP` trains only the front and the head, distilling that run's
 encoder states, which is S1; `TRAIN_FILL_TOWER` trains the fill tower in S1
 as well, and with its `cross_attention` the tower's gated context blocks,
-against frozen copies of that run's (#241). A key-level run is scored by the
-trainer's held-out gate -- the parent's decoder fed the front's states -- not
-by the lattice search, which does not decode it. A finished run is told apart
+against frozen copies of that run's (#241). Without `KEY_WARM_UP` the stage is
+the joint one (S2, #257) over a finished S1 run. A key-level run is scored by the
+trainer's held-out record -- in S1 the parent's decoder fed the front's states,
+in S2 the decoder's teacher-forced accuracy and the CTC loss -- not by the
+lattice search, which does not decode it. A finished run is told apart
 from the run it started from by the stage its run-config records.
 
 A leg measures itself while it trains: `GpuSampler` and `HostSampler` log the
@@ -241,14 +243,16 @@ CONTEXT_WARM_UP = False
 TOWER_GRAPHS = False
 
 #: The key-level front of #223, as `mlime train e2e`'s key options: a dict of
-#: `layers`, `distill_weight`, `frame_weight` and `correct_syllables`. A stage
-#: builds it over `INIT_FROM`'s weights, or keeps the front of a key run it
-#: starts from under these loss weights. None keeps the span model. Stamped
+#: `layers`, `correct_syllables` and the stage's loss weights -- `distill_weight`
+#: and `frame_weight` in the warm-up, `transition_weight` in the joint stage. A
+#: stage builds it over `INIT_FROM`'s weights, or keeps the front of a key run
+#: it starts from under these loss weights. None keeps the span model. Stamped
 #: per push.
 KEYS = None
 
 #: Train only the key front and the CTC head, distilling `INIT_FROM`'s encoder
-#: states, with the rest of its model frozen (S1).
+#: states, with the rest of its model frozen (S1). Off with `KEYS` stamped, the
+#: stage is the joint one (S2, #257) over a finished S1 run: everything trains.
 KEY_WARM_UP = False
 
 #: Train the fill tower too in the key warm-up, at the pretrained rate, its
@@ -666,14 +670,12 @@ def key_training_argv():
     """The key front's switches only the trainer reads: its shape and its losses."""
     if KEYS is None:
         return []
-    argv = [
-        "--key-front-layers",
-        str(KEYS["layers"]),
-        "--distill-weight",
-        str(KEYS["distill_weight"]),
-        "--frame-weight",
-        str(KEYS["frame_weight"]),
-    ]
+    argv = ["--key-front-layers", str(KEYS["layers"])]
+    # Each stage stamps its own loss weights and only those: the warm-up's
+    # two, or the joint stage's transition weight.
+    for name in ("distill_weight", "frame_weight", "transition_weight"):
+        if name in KEYS:
+            argv += ["--" + name.replace("_", "-"), str(KEYS[name])]
     if KEY_WARM_UP:
         argv.append("--key-warm-up")
     if TRAIN_FILL_TOWER is not None:

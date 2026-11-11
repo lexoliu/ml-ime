@@ -9,7 +9,10 @@ dropped. Then the model: a fresh front hands the tower each key's letter, S1
 trains the front and the head only, the parent loads whole, the gate's frame
 is the parent's own when the student matches the teacher, and the run --
 through ``e2e()`` itself -- logs every loss component, resumes exactly and
-compiles once.
+compiles once. Last the joint stage (S2, #257): everything the keys reach
+trains on the CTC and the transition, the search's batched query scores what
+training scores, S1's checkpoint starts it with only S1's own parts dropped,
+and its run resumes exactly and compiles once.
 """
 
 from __future__ import annotations
@@ -39,7 +42,10 @@ from mlime.train.e2e import e2e, load_model
 from mlime.train.e2e_model import E2EConfig, E2EModel, emittable_ids
 from mlime.train.key_model import (
     KEY_PARAMETER_PREFIXES,
+    UNREAD_BY_KEYS,
+    WARM_UP_ONLY_PREFIXES,
     KeyE2EModel,
+    joint_evaluate,
     key_evaluate,
     letter_token_ids,
 )
@@ -64,6 +70,7 @@ from mlime.typo import MULTI_LETTER_INITIALS, NoiseModel, load_syllables
 
 ROOT = Path(__file__).parent.parent.parent
 DATA = ROOT / "crates/ime-pinyin/data"
+CPU = torch.device("cpu")
 
 #: The tiny tower has 64 positions; two are the sentinels.
 KEYS = KeyFrontConfig(layers=2, max_keys=62)
@@ -1222,3 +1229,451 @@ def test_the_compiled_s1_step_training_the_tower_matches_the_eager_one_on_cuda(
     assert not any(name.startswith(("teacher_", "decoder.")) for name in gradients[0])
     for name, gradient in gradients[0].items():
         torch.testing.assert_close(gradients[1][name], gradient, rtol=1e-3, atol=1e-4, msg=name)
+
+
+# --- the joint stage (S2) ----------------------------------------------------------
+
+#: S2's transition weight, away from its default so the total's arithmetic is checked.
+JOINT_KEYS = replace(KEYS, transition_weight=0.5)
+
+
+def joint_config(keys: KeyFrontConfig = JOINT_KEYS) -> E2EConfig:
+    return E2EConfig(cross_attention_layers=1, decoder=READER_TINY, keys=keys)
+
+
+def tiny_joint_model(lexicon: Lexicon, vocab: CharVocab) -> KeyE2EModel:
+    torch.manual_seed(0)
+    model = KeyE2EModel.compose(
+        TINY, lexicon, joint_config(), len(vocab), emittable_ids(lexicon, vocab)
+    )
+    # A trained run's gates are open; at zero the decoder would not read the
+    # keys at all and the context path would get an exactly zero gradient.
+    open_gates(model)
+    read_the_encoder(model)
+    return model
+
+
+def warmed_up_state(
+    lexicon: Lexicon, vocab: CharVocab, path: Path, train_fill_tower: FillTowerTraining | None
+) -> dict[str, torch.Tensor]:
+    """A finished S1 run's weights: a parent loaded into a warm-up, its front moved."""
+    warm = tiny_key_model(lexicon, vocab, train_fill_tower)
+    warm.load_parent(
+        tiny_parent(lexicon, vocab, seed=1).state_dict(),
+        path,
+        letter_token_ids(KeyTokenizer().get_vocab()),
+    )
+    with torch.no_grad():
+        for parameter in warm.key_front.parameters():
+            parameter.add_(0.01)
+    return warm.state_dict()
+
+
+def test_the_joint_config_round_trips_and_refuses_the_other_stages_weights() -> None:
+    config = joint_config()
+    assert E2EConfig.from_record(asdict(config)) == config
+    assert not config.reads_span_input
+    assert key_config().reads_span_input and E2EConfig().reads_span_input
+    # An S1 record written before the transition weight existed reads at its default.
+    record = asdict(key_config(keys=FRAMED))
+    del record["keys"]["transition_weight"]
+    assert E2EConfig.from_record(record) == key_config(keys=FRAMED)
+    for weights in ({"distill_weight": 0.5}, {"frame_weight": 3.0}):
+        with pytest.raises(ValueError, match="distill_weight and frame_weight weigh"):
+            joint_config(replace(JOINT_KEYS, **weights))
+    with pytest.raises(ValueError, match="transition_weight weighs"):
+        key_config(keys=JOINT_KEYS)
+    with pytest.raises(ValueError, match="must be positive"):
+        joint_config(replace(JOINT_KEYS, transition_weight=0.0))
+    with pytest.raises(ValueError, match="must not be negative"):
+        replace(KEYS, transition_weight=-1.0)
+    with pytest.raises(ValueError, match="fill tower trains"):
+        replace(joint_config(), train_fill_tower=TOWER)
+
+
+def test_s2_trains_everything_the_keys_reach_and_nothing_only_s1_reads(
+    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon, reader_vocab: CharVocab
+) -> None:
+    """Every part of the key path gets a nonzero gradient; the span table and letters none.
+
+    The decoder has no span input and the model keeps no teacher, and the loss
+    is the constrained CTC plus the weighted transition term.
+    """
+    model = tiny_joint_model(lexicon, reader_vocab)
+    assert model.decoder.span_input is None
+    assert model.teacher_fill is None and model.teacher_cross_attention is None
+    assert not any(name.startswith(WARM_UP_ONLY_PREFIXES) for name in model.state_dict())
+    model.freeze_for_joint()
+    model.train()
+    assert all(module.training for module in model.modules())
+    frozen = {name for name, p in model.named_parameters() if not p.requires_grad}
+    assert frozen == {
+        name for name, _ in model.named_parameters() if name.startswith(UNREAD_BY_KEYS)
+    }
+    assert frozen
+
+    batch = key_collator(spans, lexicon, dropout=0.3)(build_examples(vocabularies)[:8])
+    assert bool(batch.spans.has_context.any())
+    output = model(batch)
+    assert output.loss is not None and torch.isfinite(output.loss)
+    total = (
+        output.extras["ctc_loss"] + JOINT_KEYS.transition_weight * output.extras["transition_loss"]
+    )
+    torch.testing.assert_close(output.loss.detach(), total)
+    assert "distill_loss" not in output.extras and "frame_loss" not in output.extras
+    for component in ("segmentation_loss", "clean_span_loss", "typo_span_loss", "typo_share"):
+        assert torch.isfinite(output.extras[component]), component
+    output.loss.backward()
+    for name, parameter in model.named_parameters():
+        if name in frozen:
+            assert parameter.grad is None, name
+        else:
+            assert parameter.grad is not None, name
+    gradients = {
+        name: parameter.grad for name, parameter in model.named_parameters() if name not in frozen
+    }
+    for group in (
+        "decoder.reader.blocks.",
+        "decoder.reader.embed.",
+        "decoder.cross_attention.0.key.",
+        "decoder.cross_attention.0.value.",
+        "decoder.cross_attention.0.gate",
+        "fill.encoder.",
+        "fill.embeddings.",
+        "cross_attention.0.",
+        "context.",
+        "key_front.letters.",
+        "key_front.blocks.0.out.",
+        "head.",
+        "blank.",
+    ):
+        named = [name for name in gradients if name.startswith(group)]
+        assert named, group
+        assert any(bool(gradients[name].any()) for name in named), group
+
+    # S1's methods read the span input and the teacher, which S2 has not.
+    with pytest.raises(ValueError, match="no span input"):
+        model.decoder.embed(batch.gold, torch.zeros((*batch.gold.shape, TINY.hidden_size)), 0)
+    with pytest.raises(ValueError, match="freezes its own way"):
+        tiny_key_model(lexicon, reader_vocab).freeze_for_joint()
+
+
+def test_the_s2_loss_falls_on_a_fixed_batch(
+    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon, reader_vocab: CharVocab
+) -> None:
+    model = tiny_joint_model(lexicon, reader_vocab)
+    model.freeze_for_joint()
+    model.train()
+    batch = key_collator(spans, lexicon)(build_examples(vocabularies)[:8])
+    optimiser = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=3e-3)
+    records = []
+    for _ in range(40):
+        optimiser.zero_grad()
+        output = model(batch)
+        assert output.loss is not None
+        output.loss.backward()
+        optimiser.step()
+        records.append(
+            (
+                float(output.loss.detach()),
+                float(output.extras["ctc_loss"]),
+                float(output.extras["transition_loss"]),
+            )
+        )
+    for index, name in enumerate(("loss", "ctc", "transition")):
+        assert records[-1][index] < 0.5 * records[0][index], name
+
+
+def test_the_batched_query_reads_the_training_log_probs(
+    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon, reader_vocab: CharVocab
+) -> None:
+    """Every gold prefix, queried in any order and padding, scores what training scores there.
+
+    The query runs from the keys alone (:meth:`KeyE2EModel.key_states`), and
+    its hypotheses come shuffled across the records, each prefix padded with
+    an arbitrary character past its end.
+    """
+    model = tiny_joint_model(lexicon, reader_vocab).eval()
+    examples = build_examples(vocabularies)[:6]
+    batch = key_collator(spans, lexicon, dropout=0.3)(examples)
+    assert bool(batch.spans.has_context.any()) and not bool(batch.spans.has_context.all())
+    with torch.no_grad():
+        terms = model.joint_terms(batch)
+        trained = terms.transition.float().log_softmax(dim=-1)
+        keys = model.key_states(batch)
+        memory = model.encode_context(batch.spans)
+        torch.testing.assert_close(
+            keys.states, model.encode_keys(batch, memory)[:, 1 : keys.mask.shape[1] + 1]
+        )
+    assert torch.equal(keys.mask, batch.key_mask)
+
+    hypotheses = [
+        (row, step) for row, example in enumerate(examples) for step in range(len(example.targets))
+    ]
+    assert len(hypotheses) == trained.shape[0]
+    generator = torch.Generator().manual_seed(4)
+    order = torch.randperm(len(hypotheses), generator=generator).tolist()
+    longest = max(len(example.targets) for example in examples)
+    prefixes = torch.randint(0, lexicon.size, (len(order), longest), generator=generator)
+    rows, lengths = [], []
+    for slot, index in enumerate(order):
+        row, step = hypotheses[index]
+        prefixes[slot, :step] = torch.tensor(examples[row].targets[:step], dtype=torch.long)
+        rows.append(row)
+        lengths.append(step)
+    with torch.no_grad():
+        queried = model.transition_log_probs(
+            keys, torch.tensor(rows), prefixes, torch.tensor(lengths)
+        )
+    assert queried.dtype == torch.float32 and queried.shape == (len(order), lexicon.size)
+    torch.testing.assert_close(queried, trained[order], rtol=1e-5, atol=1e-5)
+
+    # An empty prefix is every record's first step.
+    firsts = [index for index, (_, step) in enumerate(hypotheses) if step == 0]
+    with torch.no_grad():
+        opening = model.transition_log_probs(
+            keys,
+            torch.arange(len(examples)),
+            torch.zeros((len(examples), 0), dtype=torch.long),
+            torch.zeros(len(examples), dtype=torch.long),
+        )
+    torch.testing.assert_close(opening, trained[firsts], rtol=1e-5, atol=1e-5)
+    # The record matters: another record's keys give another distribution.
+    with torch.no_grad():
+        swapped = model.transition_log_probs(
+            keys,
+            torch.arange(len(examples)).roll(1),
+            torch.zeros((len(examples), 0), dtype=torch.long),
+            torch.zeros(len(examples), dtype=torch.long),
+        )
+    assert not torch.allclose(swapped, opening)
+    # The held-out record is the argmax over that distribution, and the CTC per character.
+    accuracy, ctc = joint_evaluate(model, examples, key_collator(spans, lexicon, 0.3), CPU, 64)
+    assert accuracy.scored == len(hypotheses)
+    assert 0 <= accuracy.correct <= accuracy.scored
+    assert math.isfinite(ctc) and ctc > 0.0
+
+
+def test_an_s1_checkpoint_starts_s2_dropping_only_what_s1_alone_holds(
+    lexicon: Lexicon, reader_vocab: CharVocab, tmp_path: Path
+) -> None:
+    for trains in (None, CROSS_ATTENTION):
+        warm = warmed_up_state(lexicon, reader_vocab, tmp_path / "parent.pt", trains)
+        assert "decoder.span_input.weight" in warm
+        assert any(name.startswith("teacher_") for name in warm) == (trains is not None)
+        joint = tiny_joint_model(lexicon, reader_vocab)
+        joint.load_warmed_up(warm, tmp_path / "s1.pt")
+        own = joint.state_dict()
+        assert set(own) == {name for name in warm if not name.startswith(WARM_UP_ONLY_PREFIXES)}
+        for name, tensor in own.items():
+            assert torch.equal(tensor, warm[name]), name
+
+        # Anything else is refused: S1's weights loaded as a resume, a stray
+        # weight, a missing one.
+        with pytest.raises(ValueError, match="unexpected"):
+            tiny_joint_model(lexicon, reader_vocab).load_resumed(warm, tmp_path / "s1.pt")
+        with pytest.raises(ValueError, match="unexpected"):
+            tiny_joint_model(lexicon, reader_vocab).load_warmed_up(
+                {**warm, "garbage.weight": torch.zeros(1)}, tmp_path / "garbage.pt"
+            )
+        missing = {name: tensor for name, tensor in warm.items() if name != "blank.bias"}
+        with pytest.raises(ValueError, match="missing"):
+            tiny_joint_model(lexicon, reader_vocab).load_warmed_up(missing, tmp_path / "gap.pt")
+        decoderless = {
+            name: tensor
+            for name, tensor in warm.items()
+            if name != "decoder.cross_attention.0.gate"
+        }
+        with pytest.raises(ValueError, match="does not hold this model's decoder"):
+            tiny_joint_model(lexicon, reader_vocab).load_warmed_up(decoderless, tmp_path / "gap.pt")
+
+    # An S2 run resumes as saved, and no warm-up reads it: its decoder has no span input.
+    tiny_joint_model(lexicon, reader_vocab).load_resumed(own, tmp_path / "s2.pt")
+    with pytest.raises(ValueError, match="does not hold this model's decoder"):
+        tiny_key_model(lexicon, reader_vocab).load_resumed(own, tmp_path / "s2.pt")
+    with pytest.raises(ValueError, match="holds no key front"):
+        tiny_joint_model(lexicon, reader_vocab).load_warmed_up(
+            tiny_parent(lexicon, reader_vocab, seed=1).state_dict(), tmp_path / "parent.pt"
+        )
+    with pytest.raises(ValueError, match="resumes its own weights"):
+        tiny_key_model(lexicon, reader_vocab).load_warmed_up(warm, tmp_path / "s1.pt")
+
+
+def test_an_s2_run_starts_from_s1_resumes_exactly_and_reports_its_held_out_record(
+    corpus: tuple[Path, Path],
+    vocabularies: Vocabularies,
+    lexicon: Lexicon,
+    reader_vocab: CharVocab,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Through ``e2e()``: S1 over a span parent, S2 over S1, an S2 resume, and the refusals."""
+    monkeypatch.setattr(Vocabularies, "load", classmethod(lambda cls, *_: vocabularies))
+    monkeypatch.setattr(BertConfig, "from_pretrained", classmethod(lambda cls, *_: TINY))
+    parent = parent_checkpoint(lexicon, reader_vocab, tmp_path / "parent.pt")
+    samples_dir, labels_dir = corpus
+    slices = Slices(
+        train=("test-00000.parquet",), held_out=("test-00001.parquet",), max_held_out_examples=8
+    )
+    training = TrainingConfig(
+        max_steps=4, token_budget=96, log_every=1, checkpoint_every=2, fp16=False, seed=3
+    )
+
+    def paths(name: str) -> RunPaths:
+        return RunPaths(
+            samples=samples_dir,
+            labels=labels_dir,
+            char_table=tmp_path / "unread",
+            out=tmp_path / name,
+        )
+
+    e2e(
+        paths("s1"),
+        slices,
+        training,
+        init_e2e=parent,
+        keys=FRAMED,
+        key_warm_up=True,
+        train_fill_tower=CROSS_ATTENTION,
+    )
+    warmed = tmp_path / "s1" / "checkpoint-000004.pt"
+    joint = e2e(paths("s2"), slices, training, init_e2e=warmed, keys=JOINT_KEYS)
+    records = run_records(joint.metrics)
+    steps = [record for record in records if record.get("event") == "step"]
+    assert len(steps) == 4
+    for record in steps:
+        for component in ("ctc_loss", "transition_loss", "segmentation_loss", "typo_share"):
+            assert math.isfinite(record[component]), component
+        assert "distill_loss" not in record and "frame_loss" not in record
+    summary = next(record for record in records if record.get("event") == "summary")
+    for name in ("ctc_loss_with_context", "ctc_loss_without_context"):
+        assert math.isfinite(summary[name]) and summary[name] > 0.0, name
+    for name in ("accuracy_with_context", "accuracy_without_context"):
+        assert 0.0 <= summary[name] <= 1.0, name
+    assert summary["build_counts"]["illegal_gold"] == 0
+    provenance = next(record for record in records if record.get("event") == "provenance")
+    assert provenance["e2e"]["keys"] == asdict(JOINT_KEYS)
+    assert provenance["e2e"]["key_warm_up"] is False
+    finished = torch.load(
+        tmp_path / "s2" / "checkpoint-000004.pt", map_location="cpu", weights_only=False
+    )["model"]
+    assert not any(name.startswith(WARM_UP_ONLY_PREFIXES) for name in finished)
+    before = torch.load(warmed, map_location="cpu", weights_only=False)["model"]
+    for part in ("decoder.reader.blocks.0.", "fill.encoder.layer.0.", "key_front.", "blank."):
+        assert any(
+            not torch.equal(tensor, before[name])
+            for name, tensor in finished.items()
+            if name.startswith(part)
+        ), part
+
+    resumed = e2e(
+        paths("s2-resumed"),
+        slices,
+        training,
+        resume=tmp_path / "s2" / "checkpoint-000002.pt",
+        keys=JOINT_KEYS,
+    )
+    resumed_losses = [
+        record["loss"] for record in run_records(resumed.metrics) if record.get("event") == "step"
+    ]
+    assert resumed_losses == [record["loss"] for record in steps[2:]]
+
+    # S2 starts from a warm-up, never from the span model, and no warm-up follows it.
+    with pytest.raises(ValueError, match="enters through its warm-up"):
+        e2e(paths("skipped"), slices, training, init_e2e=parent, keys=JOINT_KEYS)
+    with pytest.raises(ValueError, match="never after"):
+        e2e(
+            paths("backwards"),
+            slices,
+            training,
+            init_e2e=tmp_path / "s2" / "checkpoint-000004.pt",
+            keys=FRAMED,
+            key_warm_up=True,
+        )
+
+
+def test_the_s2_forward_compiles_once_across_key_lengths(
+    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon, reader_vocab: CharVocab
+) -> None:
+    """The fill pass, the front and the decoder over the keys each stay one dynamic graph."""
+    from torch._dynamo.utils import counters
+
+    model = tiny_joint_model(lexicon, reader_vocab)
+    model.freeze_for_joint()
+    model.fill_pass = torch.compile(  # type: ignore[method-assign]
+        model.fill_pass, dynamic=True, backend="eager"
+    )
+    model.key_front.forward = torch.compile(  # type: ignore[method-assign]
+        model.key_front.forward, dynamic=True, backend="eager"
+    )
+    model.decoder.over_keys = torch.compile(  # type: ignore[method-assign]
+        model.decoder.over_keys, dynamic=True, backend="eager"
+    )
+    collator = key_collator(spans, lexicon)
+    examples = sorted(build_examples(vocabularies), key=lambda example: len(example.keys))
+    groups = [examples[:2], examples[-3:], examples[4:9], examples[::3]]
+    shapes = {(collator(group).key_input_ids.shape, collator(group).gold.shape) for group in groups}
+    assert len(shapes) == len(groups)
+    model.train()
+    breaks = sum(counters["graph_breaks"].values())
+    first = model(collator(groups[0])).loss
+    assert first is not None
+    first.backward()
+    graphs = int(counters["stats"].get("unique_graphs") or 0)
+    for group in groups[1:]:
+        loss = model(collator(group)).loss
+        assert loss is not None
+        loss.backward()
+    assert int(counters["stats"].get("unique_graphs") or 0) == graphs
+    assert int(sum(counters["graph_breaks"].values())) == breaks
+
+
+def test_compiling_the_joint_model_keeps_its_names(
+    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon, reader_vocab: CharVocab
+) -> None:
+    from mlime.train.e2e import compile_modules
+
+    model = tiny_joint_model(lexicon, reader_vocab)
+    names = list(model.state_dict())
+    compile_modules(model, "default")
+    assert list(model.state_dict()) == names
+    model.freeze_for_joint()
+    model.train()
+    loss = model(key_collator(spans, lexicon)(build_examples(vocabularies)[:4])).loss
+    assert loss is not None and torch.isfinite(loss)
+    loss.backward()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="sync detection needs CUDA")
+def test_a_compiled_s2_step_issues_no_host_syncs(
+    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon, reader_vocab: CharVocab
+) -> None:
+    """Forward, backward and the fused AdamW step of the joint stage, compiled as a run is."""
+    from mlime.train.e2e import compile_modules
+
+    model = tiny_joint_model(lexicon, reader_vocab).cuda()
+    compile_modules(model, "default")
+    model.freeze_for_joint()
+    model.train()
+    optimiser = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad], lr=2e-5, fused=True
+    )
+    batch = key_collator(spans, lexicon, dropout=0.3)(build_examples(vocabularies)[:8]).to(
+        torch.device("cuda")
+    )
+
+    def step() -> None:
+        optimiser.zero_grad()
+        loss = model(batch).loss
+        assert loss is not None
+        loss.backward()
+        optimiser.step()
+
+    for _ in range(2):
+        step()
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        step()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")

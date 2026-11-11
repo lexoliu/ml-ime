@@ -49,12 +49,30 @@ parent frame run through the copies; the span tables and the context tower
 they share with the student stay frozen, so the copies' states are the
 parent's exactly. Each copy is a parameter set the size of its part and is
 saved with the run, so a resume distils towards the same targets.
+
+**S2, the joint stage** (``key_warm_up`` off, #257) starts from a finished
+S1 and trains everything the key path reads: the front, the towers, their
+gated context, the CTC head and the decoder. There is no teacher, so no
+copies, no distillation and no frame term. The loss is the constrained CTC,
+exactly as S1 computes it, plus ``transition_weight`` times the transition's
+term (#216 §5a): the decoder runs teacher-forced over each row's gold
+characters, ``<bos>`` then the gold prefix, and every gated block
+cross-attends to all of the row's key states -- the fill tower's output at
+each real key, padding masked -- rather than to span-end states. No span is
+aligned to a step, so the decoder has no span input (#216 §6): an S2 model
+builds none, and starting from S1 drops the S1 decoder's
+(:meth:`KeyE2EModel.load_warmed_up`). The term is the cross-entropy of the
+gold character under a log-softmax over the whole emittable set. The search
+masks the characters a key cannot emit without renormalising, the rule #216
+§3 sets for the CTC head, so training and search read the same
+log-probabilities and no per-step legal set is built on the host.
 """
 
 from __future__ import annotations
 
 import copy
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -62,7 +80,9 @@ import torch
 from torch import nn
 from transformers import BertConfig, BertForMaskedLM, BertModel
 
+from mlime.logging import log
 from mlime.train.charlm_model import TransformerCharLm
+from mlime.train.charlm_vocab import BOS
 from mlime.train.ctc import alignment_components, alignment_scores, constrained_ctc
 from mlime.train.e2e_model import E2EConfig, E2EModel, context_tower
 from mlime.train.keys import KeyBatch, KeyCollator, KeyExample, KeyFrontConfig, key_coordinates
@@ -74,6 +94,11 @@ from mlime.train.samples import LETTER_PAD, token_budget_batches
 #: Parameter prefixes of the parts the key model adds: they train at the new rate.
 KEY_PARAMETER_PREFIXES = ("key_front.", "blank.")
 
+#: The decoder's gated cross-attention: it trains at the new rate too, since in
+#: the joint stage it reads every key's state where the parent's read span
+#: vectors, and has to relearn what it attends to (#216 §6). S1 freezes it.
+RELEARNED_PREFIXES = ("decoder.cross_attention.",)
+
 #: The submodules S1 leaves frozen and runs in evaluation mode.
 FROZEN_IN_WARM_UP = ("fill", "context", "cross_attention", "decoder", "letter_encoder")
 
@@ -81,6 +106,51 @@ FROZEN_IN_WARM_UP = ("fill", "context", "cross_attention", "decoder", "letter_en
 #: gated context blocks: the teacher of an S1 that trains them.
 TEACHER_FILL_PREFIX = "teacher_fill."
 TEACHER_CROSS_ATTENTION_PREFIX = "teacher_cross_attention."
+
+#: What only S1 holds: the teacher's copies and the parent decoder's span
+#: input, which the joint stage has no use for (#216 §6). Starting S2 from a
+#: finished S1 drops exactly these.
+WARM_UP_ONLY_PREFIXES = (
+    TEACHER_FILL_PREFIX,
+    TEACHER_CROSS_ATTENTION_PREFIX,
+    "decoder.span_input.",
+)
+
+#: The parent's parts the key path never reads -- the span table and the
+#: letters behind it, which only S1's teacher fed -- frozen in the joint stage.
+UNREAD_BY_KEYS = ("span_embeddings.", "letter_encoder.")
+
+
+@dataclass(frozen=True)
+class KeyStates:
+    """The fill tower's state at every key of a batch, the search's encoder output.
+
+    ``states [B, Wk, H]`` holds row ``b``'s key ``t`` at ``[b, t]`` -- the
+    sentinels' columns are cut away -- and ``mask [B, Wk]`` (bool) marks the
+    real keys; a padded key's state is whatever the tower computed there and
+    is read by nothing the mask excludes.
+    """
+
+    states: torch.Tensor
+    mask: torch.Tensor
+
+
+@dataclass(frozen=True)
+class _JointTerms:
+    """One joint pass: the constrained CTC's per-row terms and the transition's logits.
+
+    ``nll [B]`` is each row's constrained-CTC loss, ``blank`` and ``emit``
+    the alignment scores it was summed from, ``transition [P, E]`` the
+    decoder's teacher-forced logits at each gold character over the whole
+    emittable set, and ``targets [P]`` those characters, in the span batch's
+    ``scored`` order.
+    """
+
+    nll: torch.Tensor
+    blank: torch.Tensor
+    emit: torch.Tensor
+    transition: torch.Tensor
+    targets: torch.Tensor
 
 
 class KeyBlock(nn.Module):
@@ -274,7 +344,20 @@ class KeyE2EModel(E2EModel):
         parent's, and the copy starts as that. A copy the checkpoint holds
         loads as saved; one loaded by a model that keeps none is refused as
         unexpected weights.
+
+        The decoder must load whole. A key model is always built from an e2e
+        checkpoint, which holds its decoder, so a decoder weight the
+        checkpoint lacks is a different decoder -- an S1 model over an S2
+        run, whose decoder has no span input -- and is refused rather than
+        left at its initialisation.
         """
+        absent = sorted(
+            name
+            for name in self.state_dict()
+            if name.startswith("decoder.") and name not in weights
+        )
+        if absent:
+            raise ValueError(f"{path} does not hold this model's decoder: missing {absent[:4]}")
         seeded = [
             (prefix, teacher, part)
             for prefix, teacher, part in (
@@ -290,6 +373,31 @@ class KeyE2EModel(E2EModel):
         super().load_resumed(weights, path, (*fresh, *(prefix for prefix, _, _ in seeded)))
         for _, teacher, part in seeded:
             teacher.load_state_dict(part.state_dict())
+
+    def load_warmed_up(self, weights: Mapping[str, torch.Tensor], path: Path | str) -> None:
+        """Start the joint stage from a finished S1 run's weights.
+
+        What only S1 holds (:data:`WARM_UP_ONLY_PREFIXES`) -- the teacher's
+        copies, when that run trained its tower, and the parent decoder's
+        span input -- is dropped by name; everything else loads as it was
+        trained, and a weight this model does not hold, or one of its own
+        the checkpoint lacks, is still refused (:meth:`load_resumed`). A
+        checkpoint without a key front is not a warm-up, and S1 itself
+        resumes rather than starts from one.
+        """
+        if self.e2e_config.key_warm_up:
+            raise ValueError("the warm-up resumes its own weights; the joint stage starts from it")
+        if not any(name.startswith(KEY_PARAMETER_PREFIXES) for name in weights):
+            raise ValueError(f"{path} holds no key front; the joint stage starts from a warm-up")
+        dropped = {name for name in weights if name.startswith(WARM_UP_ONLY_PREFIXES)}
+        self.load_resumed(
+            {name: tensor for name, tensor in weights.items() if name not in dropped}, path
+        )
+        log.info(
+            "joint stage started from a warm-up",
+            dropped=len(dropped),
+            teacher_copies=sum(name.startswith("teacher_") for name in dropped),
+        )
 
     @property
     def teacher_tower(self) -> BertModel:
@@ -325,6 +433,19 @@ class KeyE2EModel(E2EModel):
         for name, parameter in self.named_parameters():
             parameter.requires_grad_(name.startswith(trained))
 
+    def freeze_for_joint(self) -> None:
+        """Leave everything the key path reads trainable: the joint stage (S2).
+
+        Only the span table and the letter encoder stay frozen
+        (:data:`UNREAD_BY_KEYS`): nothing in the stage reads them, and a
+        parameter that wants a gradient and never gets one is an error under
+        DDP's static bucketing.
+        """
+        if self.e2e_config.key_warm_up:
+            raise ValueError("the warm-up freezes its own way (freeze_for_key_warm_up)")
+        for name, parameter in self.named_parameters():
+            parameter.requires_grad_(not name.startswith(UNREAD_BY_KEYS))
+
     def train(self, mode: bool = True) -> KeyE2EModel:
         """Train mode for what trains; in the warm-up, the frozen parts stay in evaluation mode.
 
@@ -345,13 +466,15 @@ class KeyE2EModel(E2EModel):
         return self
 
     def parameter_groups(self, base_lr: float, new_lr: float) -> list[dict[str, object]]:
-        """Trainable parent parameters at the base rate, the front's and the blank's at the new."""
+        """Trainable parent parameters at the base rate; the front, the blank and the
+        decoder's cross-attention, where it trains, at the new."""
         base: list[nn.Parameter] = []
         new: list[nn.Parameter] = []
+        at_new_rate = (*KEY_PARAMETER_PREFIXES, *RELEARNED_PREFIXES)
         for name, parameter in self.named_parameters():
             if not parameter.requires_grad:
                 continue
-            (new if name.startswith(KEY_PARAMETER_PREFIXES) else base).append(parameter)
+            (new if name.startswith(at_new_rate) else base).append(parameter)
         if not new:
             raise ValueError("no key-level parameter trains; the naming convention has drifted")
         return [{"params": base, "lr": base_lr}, {"params": new, "lr": new_lr}]
@@ -416,12 +539,45 @@ class KeyE2EModel(E2EModel):
         return self.position_loss(scored.decoder, scored.targets, scored.candidates)
 
     def forward(self, batch: KeyBatch) -> RouteAOutput:  # type: ignore[override]
+        """The stage's loss: S1's in the warm-up (:meth:`warm_up_loss`), else S2's."""
+        if not isinstance(batch, KeyBatch):
+            raise TypeError(f"the key model trains on key batches, got a {type(batch).__name__}")
+        if self.e2e_config.key_warm_up:
+            return self.warm_up_loss(batch)
+        return self.joint_loss(batch)
+
+    def ctc_alignment(
+        self, batch: KeyBatch, student: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Each row's constrained-CTC loss ``[B]``, and the blank and emit scores behind it.
+
+        *student* is the fill tower over the keys, flat ``[B * (Wk + 2), H]``.
+        """
+        log_probs = self.ctc_log_probs(student.index_select(0, batch.key_positions))
+        blank, emit = alignment_scores(log_probs, batch.key_index, batch.gold)
+        nll = constrained_ctc(blank, emit, batch.cost, batch.keys, batch.lengths)
+        return nll, blank, emit
+
+    def components(
+        self, batch: KeyBatch, blank: torch.Tensor, emit: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """The CTC's per-component losses (#216 §7), detached: what every key stage logs."""
+        with torch.no_grad():
+            return alignment_components(
+                blank,
+                emit,
+                batch.span_end,
+                batch.ends,
+                batch.key_mask,
+                batch.position_mask,
+                batch.corrupted,
+            )
+
+    def warm_up_loss(self, batch: KeyBatch) -> RouteAOutput:
         """S1's loss: the constrained CTC, the distillation of the parent's states, the frame term.
 
         The last two are weighted, and a frame weight of 0 skips the decoder.
         """
-        if not isinstance(batch, KeyBatch):
-            raise TypeError(f"the key model trains on key batches, got a {type(batch).__name__}")
         spans = batch.spans
         mark_dynamic(spans)
         hidden = self.fill.config.hidden_size
@@ -432,9 +588,7 @@ class KeyE2EModel(E2EModel):
         student = self.encode_keys(batch, memory).reshape(-1, hidden)
         ends = student.index_select(0, batch.end_positions)
         distill = (ends.float() - target.float()).pow(2).mean()
-        log_probs = self.ctc_log_probs(student.index_select(0, batch.key_positions))
-        blank, emit = alignment_scores(log_probs, batch.key_index, batch.gold)
-        nll = constrained_ctc(blank, emit, batch.cost, batch.keys, batch.lengths)
+        nll, blank, emit = self.ctc_alignment(batch, student)
         ctc = nll.sum() / spans.scored.numel()
         loss = ctc + self.keys_config.distill_weight * distill
         extras = {"ctc_loss": ctc.detach(), "distill_loss": distill.detach()}
@@ -442,17 +596,127 @@ class KeyE2EModel(E2EModel):
             frame = self.frame_loss(batch, ends)
             loss = loss + self.keys_config.frame_weight * frame
             extras["frame_loss"] = frame.detach()
-        with torch.no_grad():
-            components = alignment_components(
-                blank,
-                emit,
-                batch.span_end,
-                batch.ends,
-                batch.key_mask,
-                batch.position_mask,
-                batch.corrupted,
-            )
-        return RouteAOutput(loss=loss, extras={**extras, **components})
+        return RouteAOutput(loss=loss, extras={**extras, **self.components(batch, blank, emit)})
+
+    def joint_loss(self, batch: KeyBatch) -> RouteAOutput:
+        """S2's loss: the constrained CTC plus ``transition_weight`` times the transition's term.
+
+        Both are normalised per gold character, the CTC exactly as S1's. The
+        transition's term is the cross-entropy of each gold character under
+        the decoder's log-softmax over the whole emittable set, teacher-forced
+        over the gold prefix and reading every key (:meth:`joint_terms`).
+        """
+        terms = self.joint_terms(batch)
+        scored = terms.targets.numel()
+        ctc = terms.nll.sum() / scored
+        log_probs = terms.transition.float().log_softmax(dim=-1)
+        transition = -log_probs.gather(1, terms.targets.unsqueeze(1)).sum() / scored
+        loss = ctc + self.keys_config.transition_weight * transition
+        extras = {"ctc_loss": ctc.detach(), "transition_loss": transition.detach()}
+        return RouteAOutput(
+            loss=loss, extras={**extras, **self.components(batch, terms.blank, terms.emit)}
+        )
+
+    def joint_terms(self, batch: KeyBatch) -> _JointTerms:
+        """One pass of the joint stage over *batch*: the CTC's terms and the transition's logits.
+
+        The context is read once and the fill tower runs once, over the keys;
+        the CTC head reads every key's state and the decoder cross-attends to
+        all of them. Every step is a batched tensor op over the whole batch.
+        """
+        spans = batch.spans
+        mark_dynamic(spans)
+        encoded = self.encode_keys(batch, self.encode_context(spans))
+        nll, blank, emit = self.ctc_alignment(batch, encoded.reshape(-1, encoded.shape[-1]))
+        at = batch.gold_positions
+        return _JointTerms(
+            nll=nll,
+            blank=blank,
+            emit=emit,
+            transition=self.transition_logits(self.states_at_keys(batch, encoded), batch.gold, at),
+            targets=batch.gold.reshape(-1).index_select(0, at),
+        )
+
+    def states_at_keys(self, batch: KeyBatch, encoded: torch.Tensor) -> KeyStates:
+        """*encoded* ``[B, Wk + 2, H]``, the fill tower over the keys, without its sentinels."""
+        width = batch.key_mask.shape[1]
+        return KeyStates(states=encoded[:, 1 : width + 1], mask=batch.key_mask)
+
+    def key_states(self, batch: KeyBatch) -> KeyStates:
+        """Encode *batch*'s keys once: the search's encoder pass (6a of #257).
+
+        Reads only the keys and the context -- ``key_input_ids``,
+        ``key_letters``, ``key_attention``, ``key_mask`` and the span batch's
+        context fields -- never the gold or its segmentation. Returns
+        :class:`KeyStates`: ``states [B, Wk, H]`` with ``[b, t]`` row ``b``'s
+        key ``t``, and ``mask [B, Wk]``. :meth:`ctc_log_probs` turns
+        ``states`` into each key's ``[B, Wk, E + 1]`` CTC log-probabilities
+        (the blank last), and :meth:`transition_log_probs` queries the
+        decoder over them. The caller sets the mode and the grad context: a
+        search runs this under ``eval()`` and ``torch.no_grad()``.
+        """
+        spans = batch.spans
+        mark_dynamic(spans)
+        return self.states_at_keys(batch, self.encode_keys(batch, self.encode_context(spans)))
+
+    def transition_logits(
+        self, keys: KeyStates, gold: torch.Tensor, at: torch.Tensor
+    ) -> torch.Tensor:
+        """The decoder's teacher-forced logits at the gold characters, ``[P, E]``.
+
+        *gold* ``[B, M]`` holds each row's sentence as emission indices, any
+        valid index past its end; step ``j`` reads ``<bos>`` and the gold's
+        first ``j`` characters, and every block cross-attends to *keys*. *at*
+        ``[P]`` picks the real steps as flat indices into ``[B, M]``
+        (:attr:`KeyBatch.gold_positions`), so only those rows meet the head.
+        """
+        decoder = self.decoder
+        ids = decoder.emit_ids[gold]
+        previous = torch.cat(
+            [torch.full((ids.shape[0], 1), BOS, dtype=torch.long, device=ids.device), ids[:, :-1]],
+            dim=1,
+        )
+        for tensor in (previous, keys.states, keys.mask):
+            torch._dynamo.maybe_mark_dynamic(tensor, (0, 1))
+        features = decoder.over_keys(previous, keys.states, keys.mask)
+        return decoder.emission_logits(features.reshape(-1, features.shape[-1]).index_select(0, at))
+
+    def transition_log_probs(
+        self,
+        keys: KeyStates,
+        rows: torch.Tensor,
+        prefixes: torch.Tensor,
+        lengths: torch.Tensor,
+    ) -> torch.Tensor:
+        """The next character's log-probabilities after each hypothesis, ``[N, E]`` float32.
+
+        The search's batched transition query (6c of #257). *keys* are
+        :meth:`key_states`' output for a set of records; hypothesis ``n``
+        belongs to record ``rows[n]`` (``[N]`` long, indices into
+        ``keys.states``' first dim) and has emitted ``prefixes[n, :lengths[n]]``
+        (``prefixes [N, L]`` long emission indices, any valid emission index
+        past ``lengths[n]``; ``lengths [N]`` long, each at most ``L``; ``L``
+        may be 0). Row ``n`` is the log-softmax over the whole emittable set,
+        emission order, of the character that follows the prefix: the
+        distribution the training term reads at that step, which the search
+        masks without renormalising. Each query re-runs the decoder over
+        ``<bos>`` and the whole prefix, batched over the hypotheses; the
+        decoder is causal, so what follows a prefix's end does not reach it.
+        Call under ``eval()`` and ``torch.no_grad()``.
+        """
+        decoder = self.decoder
+        tokens = torch.cat(
+            [
+                torch.full((prefixes.shape[0], 1), BOS, dtype=torch.long, device=prefixes.device),
+                decoder.emit_ids[prefixes],
+            ],
+            dim=1,
+        )
+        features = decoder.over_keys(tokens, keys.states, keys.mask, rows)
+        steps = tokens.shape[1]
+        at = torch.arange(tokens.shape[0], device=tokens.device) * steps + lengths
+        last = features.reshape(-1, features.shape[-1]).index_select(0, at)
+        return decoder.emission_logits(last).float().log_softmax(dim=-1)
 
     def student_frame(self, batch: KeyBatch) -> torch.Tensor:
         """The parent's decoder frame fed the key front's states at the span ends.
@@ -545,3 +809,39 @@ def key_evaluate(
     if was_training:
         model.train()
     return Accuracy(correct=student, scored=scored), Accuracy(correct=parent, scored=scored)
+
+
+def joint_evaluate(
+    model: KeyE2EModel,
+    examples: Sequence[KeyExample],
+    collator: KeyCollator,
+    device: torch.device,
+    token_budget: int,
+) -> tuple[Accuracy, float]:
+    """The joint stage's held-out record: teacher-forced transition accuracy, and the CTC loss.
+
+    The accuracy counts the gold characters at which the decoder's argmax
+    over the whole emittable set, teacher-forced over the gold prefix, is
+    the gold; the loss is the constrained CTC per gold character, as the
+    step reports it. A per-key greedy read means nothing here, and the
+    stage's gate is the constrained decode. *collator*'s context dropout of
+    0 or 1 is the context switch.
+    """
+    scored = 0
+    correct = torch.zeros((), dtype=torch.long, device=device)
+    nll = torch.zeros((), dtype=torch.float64, device=device)
+    was_training = model.training
+    model.eval()
+    with torch.no_grad():
+        for group in token_budget_batches(
+            iter(examples), token_budget, collator.max_context_tokens
+        ):
+            terms = model.joint_terms(collator(group).to(device))
+            correct += (terms.transition.argmax(dim=-1) == terms.targets).sum()
+            scored += terms.targets.numel()
+            nll += terms.nll.double().sum()
+    if was_training:
+        model.train()
+    if not scored:
+        raise ValueError("no held-out example scored a character")
+    return Accuracy(correct=int(correct), scored=scored), float(nll) / scored

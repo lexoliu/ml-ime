@@ -25,7 +25,7 @@ from mlime.train.charlm_model import CharLmConfig
 from mlime.train.charlm_vocab import CharVocab
 from mlime.train.e2e_model import E2EConfig, E2EModel, RankingConfig, emittable_ids
 from mlime.train.e2e_search import SearchGraphs
-from mlime.train.key_model import KeyE2EModel, key_evaluate, letter_token_ids
+from mlime.train.key_model import KeyE2EModel, joint_evaluate, key_evaluate, letter_token_ids
 from mlime.train.keys import FillTowerTraining, KeyExample, KeyFrontConfig
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import Distributed, MetricLog, TrainingConfig, evaluate, train
@@ -290,8 +290,11 @@ def build_from(
     loop. A stage that names a key front over a span model's run warms the
     front up over it (:meth:`~mlime.train.key_model.KeyE2EModel.load_parent`),
     reading the context with the parent's own tower; a key run keeps its
-    front, under this stage's loss weights. The checkpoint is gigabytes, and
-    it lives only in this frame: nothing holds it once the model is built.
+    front, under this stage's loss weights. The joint stage (S2) starts from
+    a finished warm-up (:meth:`~mlime.train.key_model.KeyE2EModel.load_warmed_up`),
+    dropping what only the warm-up holds, and a warm-up never starts from a
+    joint run, whose decoder has no span input. The checkpoint is gigabytes,
+    and it lives only in this frame: nothing holds it once the model is built.
     """
     state = torch.load(source, map_location="cpu", weights_only=False)
     recorded = E2EConfig.from_record(_record(state, "e2e", source))
@@ -313,8 +316,18 @@ def build_from(
             f"{source} has the key front {recorded.keys}; a stage keeps it and changes only "
             "its loss weights"
         )
+    joint = keys is not None and not key_warm_up
+    if recorded.keys is not None and not recorded.key_warm_up and key_warm_up:
+        raise ValueError(
+            f"{source} is a joint key run (S2); the warm-up (S1) comes before it, never after"
+        )
     if with_weights:
         if recorded.keys is None and keys is not None:
+            if joint:
+                raise ValueError(
+                    f"{source} is a span model; a key front enters through its warm-up (S1), "
+                    "and the joint stage starts from that"
+                )
             if recorded.context != context:
                 raise ValueError(
                     f"{source} reads its context with {recorded.context}; a key front warms "
@@ -325,6 +338,15 @@ def build_from(
             model.load_parent(
                 _weights(state, source), source, letter_token_ids(vocabularies.vocabulary)
             )
+        elif joint and recorded.key_warm_up:
+            if recorded.context != context:
+                raise ValueError(
+                    f"{source} reads its context with {recorded.context}; the joint stage "
+                    "keeps its warm-up's tower"
+                )
+            if not isinstance(model, KeyE2EModel):
+                raise TypeError(f"a key front config built a {type(model).__name__}")
+            model.load_warmed_up(_weights(state, source), source)
         elif recorded.context == context:
             model.load_resumed(_weights(state, source), source)
         elif recorded.context is None:
@@ -419,7 +441,9 @@ def compile_modules(model: E2EModel, mode: str) -> None:
     A key-level model runs the fill pass twice a step -- over the spans for
     its teacher and over the keys -- and reads the context once for both, so
     its units are the context tower, the fill pass and the key front, each
-    one graph whatever fills the fill pass's positions.
+    one graph whatever fills the fill pass's positions. Its decoder compiles
+    both ways it runs: over span-end states in S1 (``forward``) and over
+    every key in the joint stage (``over_keys``).
     """
     options = inductor_options(mode)
     if isinstance(model, KeyE2EModel):
@@ -437,6 +461,9 @@ def compile_modules(model: E2EModel, mode: str) -> None:
         )
         model.decoder.forward = torch.compile(  # type: ignore[method-assign]
             model.decoder.forward, dynamic=True, options=options
+        )
+        model.decoder.over_keys = torch.compile(  # type: ignore[method-assign]
+            model.decoder.over_keys, dynamic=True, options=options
         )
         log.info("key front, towers and decoder compiled", mode=mode)
         return
@@ -515,9 +542,13 @@ def e2e(
     encoder states (S1). *train_fill_tower* trains the fill tower beside
     them at the pretrained rate -- and with ``cross_attention`` its gated
     context blocks -- distilling towards frozen copies of the parent's
-    (#241). A finished key run is scored by the S1 gate's measure --
+    (#241). A finished warm-up is scored by the S1 gate's measure --
     the parent's decoder fed the front's states -- beside the parent's own on
-    the same examples.
+    the same examples. *keys* without *key_warm_up* is the joint stage (S2,
+    #257), started with *init_e2e* from a finished warm-up or resumed: all of
+    the key path trains on the constrained CTC and the transition's term,
+    and the finished run reports the decoder's teacher-forced accuracy over
+    the whole emittable set and the CTC loss, with context and without.
     """
     world = Distributed.from_environment()
     starts = (
@@ -650,6 +681,13 @@ def e2e(
             beside=list(model.trained_parts()),
             trainable=sum(p.numel() for p in model.parameters() if p.requires_grad),
         )
+    elif isinstance(model, KeyE2EModel):
+        model.freeze_for_joint()
+        log.info(
+            "joint key stage: everything the keys reach trains",
+            transition_weight=model.keys_config.transition_weight,
+            trainable=sum(p.numel() for p in model.parameters() if p.requires_grad),
+        )
 
     paths.out.mkdir(parents=True, exist_ok=True)
     with MetricLog(paths.out / "metrics.jsonl") as provenance:
@@ -678,7 +716,7 @@ def e2e(
     if not segment.finished:
         return paused_run(segment, losses, model.gates(), world)
     device = world.device
-    parents: dict[str, float] = {}
+    reported: dict[str, float] = {}
     if isinstance(model, KeyE2EModel):
         if keys is None:
             raise TypeError("a key-level model was built without its key front config")
@@ -690,24 +728,30 @@ def e2e(
             if not isinstance(example, KeyExample):
                 raise TypeError(f"the key builder built a {type(example).__name__}")
             held.append(example)
-        with_context, parent_with = key_evaluate(
-            model,
-            held,
-            vocabularies.key_collator(0.0, max_context_tokens),
-            device,
-            training.token_budget,
-        )
-        without_context, parent_without = key_evaluate(
-            model,
-            held,
-            vocabularies.key_collator(1.0, max_context_tokens),
-            device,
-            training.token_budget,
-        )
-        parents = {
-            "parent_accuracy_with_context": parent_with.rate,
-            "parent_accuracy_without_context": parent_without.rate,
-        }
+        with_collator = vocabularies.key_collator(0.0, max_context_tokens)
+        without_collator = vocabularies.key_collator(1.0, max_context_tokens)
+        if key_warm_up:
+            with_context, parent_with = key_evaluate(
+                model, held, with_collator, device, training.token_budget
+            )
+            without_context, parent_without = key_evaluate(
+                model, held, without_collator, device, training.token_budget
+            )
+            reported = {
+                "parent_accuracy_with_context": parent_with.rate,
+                "parent_accuracy_without_context": parent_without.rate,
+            }
+        else:
+            with_context, ctc_with = joint_evaluate(
+                model, held, with_collator, device, training.token_budget
+            )
+            without_context, ctc_without = joint_evaluate(
+                model, held, without_collator, device, training.token_budget
+            )
+            reported = {
+                "ctc_loss_with_context": ctc_with,
+                "ctc_loss_without_context": ctc_without,
+            }
         evaluated = len(held)
     else:
         evaluation = held_out_examples(
@@ -745,7 +789,7 @@ def e2e(
                 held_out_examples=evaluated,
                 accuracy_with_context=with_context.rate,
                 accuracy_without_context=without_context.rate,
-                **parents,
+                **reported,
                 scored_characters=with_context.scored,
                 gates=result.gates,
                 build_counts=segment.build_counts,
@@ -756,7 +800,7 @@ def e2e(
         last_loss=round(result.last_loss, 4),
         accuracy_with_context=round(with_context.rate, 4),
         accuracy_without_context=round(without_context.rate, 4),
-        **{name: round(rate, 4) for name, rate in parents.items()},
+        **{name: round(value, 4) for name, value in reported.items()},
         held_out=evaluated,
         gates=[round(gate, 5) for gate in result.gates],
     )
