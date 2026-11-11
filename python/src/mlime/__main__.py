@@ -1713,6 +1713,118 @@ def eval_e2e(
         out.write_text(rendered + "\n", encoding="utf-8")
 
 
+@eval_app.command("keys")
+def eval_keys(
+    checkpoint: Path = typer.Option(..., help="A joint-stage key-level checkpoint (S2, #257)"),
+    eval_set: Path = typer.Option(..., help="The eval set: each record's pinyin is its keys"),
+    char_table: Path = CHAR_TABLE,
+    typo_table: Path = typer.Option(
+        None, help="ime-pinyin's typo.json, which the verifier reads; found upwards when omitted"
+    ),
+    syllables: Path = typer.Option(
+        None, help="ime-pinyin's syllables.txt, which the verifier reads; found upwards"
+    ),
+    slice_: str = typer.Option(
+        None,
+        "--slice",
+        help="dev, test or all at one fixed weight point; replaced by --select-on-dev",
+    ),
+    select_on_dev: bool = typer.Option(
+        False,
+        "--select-on-dev",
+        help="Sweep the --beta x --gamma x combination grid on the dev slice, choose by dev "
+        "top-1 (ties: top-8, then the smaller beta, then the first given), then decode test "
+        "at the choice",
+    ),
+    selection_only: bool = typer.Option(
+        False, help="With --select-on-dev, stop after the choice: test is not decoded"
+    ),
+    beta: list[float] = typer.Option([1.0], help="The transition's weight; repeat to sweep"),
+    gamma: list[float] = typer.Option([1.0], help="The correction cost's weight; repeat to sweep"),
+    viterbi: bool = typer.Option(
+        None,
+        "--viterbi/--sum",
+        help="Combine a prefix's covers by max or by log-sum-exp; with --select-on-dev and "
+        "neither given, both are swept; at a fixed point the default is --sum",
+    ),
+    dev_share: float = typer.Option(0.0905, help="Share of the set that is development data"),
+    beam: int = typer.Option(8, help="Prefixes the search keeps after each key"),
+    top_k: int = typer.Option(8, help="Hypotheses kept per record"),
+    context: bool = typer.Option(True, help="Let the model read each record's context"),
+    token_budget: int = typer.Option(8192, help="Padded positions per encoder forward"),
+    dump_dir: Path = typer.Option(
+        ...,
+        help="Where each slice and weight point's dump goes, and the selection; "
+        "a run started again on the same directory continues where it stopped",
+    ),
+    records_per_chunk: int = typer.Option(
+        256, help="Records decoded between two writes of the dumps"
+    ),
+    ambiguity: Path = typer.Option(
+        None,
+        help="The ime-ambiguity binary (cargo build -p ime-eval --features cli); "
+        "given, each reported section adds the ambiguity slice of its dump (#150)",
+    ),
+    out: Path = typer.Option(None, help="Where the report text goes"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Decode a key-level checkpoint from each record's keys and report as `ime-eval` does."""
+    configure(verbose)
+    from mlime.data.corpus import default_char_table
+    from mlime.locate import find_upwards
+    from mlime.train.e2e_eval import ambiguity_report
+    from mlime.train.key_eval import load_key_run, report_keys, weight_grid
+    from mlime.typo import SYLLABLES_RELATIVE, default_typo_table
+
+    table = char_table or default_char_table()
+    if table is None:
+        raise typer.BadParameter("no char_pinyin.tsv found above the working directory")
+    typo = typo_table or default_typo_table()
+    if typo is None:
+        raise typer.BadParameter("no typo.json found above the working directory; pass it")
+    inventory = syllables or find_upwards(SYLLABLES_RELATIVE)
+    if inventory is None:
+        raise typer.BadParameter("no syllables.txt found above the working directory; pass it")
+    if select_on_dev == (slice_ is not None):
+        raise typer.BadParameter("name exactly one of --slice and --select-on-dev")
+    if slice_ is not None and slice_ not in ("dev", "test", "all"):
+        raise typer.BadParameter("--slice must be dev, test or all")
+    if selection_only and not select_on_dev:
+        raise typer.BadParameter("--selection-only stops a --select-on-dev sweep")
+    combinations = ([False, True] if select_on_dev else [False]) if viterbi is None else [viterbi]
+    grid = weight_grid(beta, gamma, combinations)
+    if not select_on_dev and len(grid) != 1:
+        raise typer.BadParameter("a fixed --slice decodes one --beta and one --gamma")
+    run, step = load_key_run(
+        checkpoint,
+        eval_set,
+        char_table=table,
+        typo_table=typo,
+        syllables=inventory,
+        with_context=context,
+        token_budget=token_budget,
+        dev_share=dev_share,
+        beam=beam,
+        top_k=top_k,
+        records_per_chunk=records_per_chunk,
+    )
+    report = report_keys(
+        run,
+        dump_dir,
+        grid,
+        slice_=slice_,
+        selection_only=selection_only,
+        ambiguity=None
+        if ambiguity is None
+        else lambda dump, name: ambiguity_report(ambiguity, eval_set, dump, name, dev_share),
+    )
+    heading = f"checkpoint: {checkpoint} (step {step}), context {'on' if context else 'off'}"
+    rendered = f"{heading}\n\n{report}"
+    typer.echo(rendered)
+    if out is not None:
+        out.write_text(rendered + "\n", encoding="utf-8")
+
+
 def _e2e_config(checkpoint: Path) -> E2EConfig:
     """The config an e2e model was built under, read out of its own file."""
     import torch

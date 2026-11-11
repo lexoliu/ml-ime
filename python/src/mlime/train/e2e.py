@@ -194,6 +194,38 @@ def load_model(
     return model, int(state["step"])
 
 
+def recorded_config(path: Path) -> E2EConfig:
+    """The config the e2e checkpoint at *path* was built under, read without its weights."""
+    state = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    return E2EConfig.from_record(_record(state, "e2e", path))
+
+
+def load_key_model(
+    path: Path, lexicon: Lexicon, device: torch.device, bert_config: BertConfig | None = None
+) -> tuple[KeyE2EModel, int]:
+    """The key-level checkpoint at *path* for the constrained search, and its step.
+
+    Only a joint-stage model (S2, #257) decodes from keys: an S1 model's
+    decoder reads span-end states, which a search without a segmentation
+    does not have, and a span model has no key front.
+    """
+    state = torch.load(path, map_location="cpu", weights_only=False)
+    recorded = E2EConfig.from_record(_record(state, "e2e", path))
+    if recorded.keys is None:
+        raise ValueError(f"{path} is a span model; the lattice evaluation decodes it")
+    if recorded.key_warm_up:
+        raise ValueError(
+            f"{path} is a key warm-up (S1); its decoder reads span ends, which the search "
+            "over keys has none of"
+        )
+    model = from_checkpoint(state, lexicon, bert_config=bert_config)
+    if not isinstance(model, KeyE2EModel):
+        raise TypeError(f"{path} built a {type(model).__name__}, not a key-level model")
+    model.load_resumed(_weights(state, path), path)
+    model.to(device).eval()
+    return model, int(state["step"])
+
+
 #: What a :class:`~mlime.train.model.GatedCrossAttention` block stores, all of
 #: which a swap to Qwen's tower reads.
 GATED_BLOCK_WEIGHTS = (

@@ -1400,7 +1400,7 @@ def test_the_batched_query_reads_the_training_log_probs(
     with torch.no_grad():
         terms = model.joint_terms(batch)
         trained = terms.transition.float().log_softmax(dim=-1)
-        keys = model.key_states(batch)
+        keys = model.key_states(batch.inputs)
         memory = model.encode_context(batch.spans)
         torch.testing.assert_close(
             keys.states, model.encode_keys(batch, memory)[:, 1 : keys.mask.shape[1] + 1]

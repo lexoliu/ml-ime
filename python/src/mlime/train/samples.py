@@ -827,18 +827,7 @@ class Collator:
             slot_index
         ]
 
-        kept: list[str] = []
-        has_context = torch.zeros(len(contexts), dtype=torch.float)
-        for index, context in enumerate(contexts):
-            keep = context is not None and self.rng.random() >= self.context_dropout
-            kept.append(context_tail(context, self.max_context_tokens) if keep and context else "")
-            has_context[index] = 1.0 if keep else 0.0
-        encoded = self.context_tokenizer(
-            kept,
-            padding=True,
-            truncation=True,
-            max_length=self.max_context_tokens,
-        )
+        context_ids, context_mask, has_context = self.encode_contexts(contexts)
         # The device code indexes the scored positions rather than finding
         # them: the nonzero and the check that they sit inside the span columns
         # run here, on the host, so the training step stays asynchronous.
@@ -853,14 +842,41 @@ class Collator:
             span_positions=span_positions,
             targets=targets,
             scored=scored_positions,
-            context_ids=torch.tensor(encoded["input_ids"], dtype=torch.long),
-            context_mask=torch.tensor(encoded["attention_mask"], dtype=torch.long),
+            context_ids=context_ids,
+            context_mask=context_mask,
             has_context=has_context,
             context_rows=torch.tensor(context_rows, dtype=torch.long),
             candidate_ids=candidate_ids,
             candidate_counts=candidate_counts,
             span_letters=span_letters,
             ids=tuple(example.id for example in examples),
+        )
+
+    def encode_contexts(
+        self, contexts: Sequence[str | None]
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """*contexts* as the context tower's rows: ``(context_ids, context_mask, has_context)``.
+
+        Each context is kept with probability ``1 - context_dropout``, a coin
+        thrown per context, and only its tail goes in (:func:`context_tail`);
+        a dropped or absent one is an empty row with ``has_context`` 0.
+        """
+        kept: list[str] = []
+        has_context = torch.zeros(len(contexts), dtype=torch.float)
+        for index, context in enumerate(contexts):
+            keep = context is not None and self.rng.random() >= self.context_dropout
+            kept.append(context_tail(context, self.max_context_tokens) if keep and context else "")
+            has_context[index] = 1.0 if keep else 0.0
+        encoded = self.context_tokenizer(
+            kept,
+            padding=True,
+            truncation=True,
+            max_length=self.max_context_tokens,
+        )
+        return (
+            torch.tensor(encoded["input_ids"], dtype=torch.long),
+            torch.tensor(encoded["attention_mask"], dtype=torch.long),
+            has_context,
         )
 
 
@@ -961,11 +977,11 @@ class BudgetPacker:
 
 def example_shape(example: TrainingExample, max_context_tokens: int) -> tuple[int, int]:
     """The fill and context widths *example* pads a batch to, sentinels included."""
-    return example.fill_width(), _context_width(example, max_context_tokens)
+    return example.fill_width(), context_width(example.context, max_context_tokens)
 
 
-def _context_width(example: TrainingExample, max_context_tokens: int) -> int:
-    """How many context-tower positions *example* would occupy on its own."""
+def context_width(context: str | None, max_context_tokens: int) -> int:
+    """How many context-tower positions *context* would occupy on its own."""
     if max_context_tokens <= 0:
         return 0
-    return min(len(example.context or ""), max_context_tokens - 2) + 2
+    return min(len(context or ""), max_context_tokens - 2) + 2

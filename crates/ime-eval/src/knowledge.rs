@@ -611,10 +611,7 @@ mod tests {
             text: text.to_owned(),
             hypotheses: top
                 .into_iter()
-                .map(|text| DumpedHypothesis {
-                    text: text.to_owned(),
-                    score: 0.0,
-                })
+                .map(|text| DumpedHypothesis::scored(text.to_owned(), 0.0))
                 .collect(),
         }
     }

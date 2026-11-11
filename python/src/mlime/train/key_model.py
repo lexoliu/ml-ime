@@ -85,7 +85,14 @@ from mlime.train.charlm_model import TransformerCharLm
 from mlime.train.charlm_vocab import BOS
 from mlime.train.ctc import alignment_components, alignment_scores, constrained_ctc
 from mlime.train.e2e_model import E2EConfig, E2EModel, context_tower
-from mlime.train.keys import KeyBatch, KeyCollator, KeyExample, KeyFrontConfig, key_coordinates
+from mlime.train.keys import (
+    KeyBatch,
+    KeyCollator,
+    KeyExample,
+    KeyFrontConfig,
+    KeyInputs,
+    key_coordinates,
+)
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import Accuracy
 from mlime.train.model import ContextTower, RouteAOutput, count_correct, mark_dynamic
@@ -480,21 +487,24 @@ class KeyE2EModel(E2EModel):
         return [{"params": base, "lr": base_lr}, {"params": new, "lr": new_lr}]
 
     def encode_keys(self, batch: KeyBatch, memory: Any) -> torch.Tensor:
+        """The fill tower over a training batch's keys (:meth:`encode_inputs`)."""
+        return self.encode_inputs(batch.inputs, memory)
+
+    def encode_inputs(self, keys: KeyInputs, memory: Any) -> torch.Tensor:
         """The fill tower over the keys, ``[B, Wk, H]``: ``[MASK]`` plus the front at each key."""
-        spans = batch.spans
-        words: torch.Tensor = self.fill.embeddings.word_embeddings(batch.key_input_ids)
-        at_key = (batch.key_letters != LETTER_PAD).unsqueeze(-1)
-        front = self.key_front(batch.key_letters)
+        words: torch.Tensor = self.fill.embeddings.word_embeddings(keys.key_input_ids)
+        at_key = (keys.key_letters != LETTER_PAD).unsqueeze(-1)
+        front = self.key_front(keys.key_letters)
         inputs = words + front * at_key
-        _mark_fill(inputs, batch.key_attention, memory, spans.context_rows, spans.has_context)
+        _mark_fill(inputs, keys.key_attention, memory, keys.context_rows, keys.has_context)
         return self.fill_pass(
             self.fill,
             self.cross_attention,
             inputs,
-            batch.key_attention,
+            keys.key_attention,
             memory,
-            spans.context_rows,
-            spans.has_context,
+            keys.context_rows,
+            keys.has_context,
         )
 
     def span_states(self, batch: KeyBatch, memory: Any) -> torch.Tensor:
@@ -633,21 +643,25 @@ class KeyE2EModel(E2EModel):
             nll=nll,
             blank=blank,
             emit=emit,
-            transition=self.transition_logits(self.states_at_keys(batch, encoded), batch.gold, at),
+            transition=self.transition_logits(
+                self.states_at_keys(batch.key_mask, encoded), batch.gold, at
+            ),
             targets=batch.gold.reshape(-1).index_select(0, at),
         )
 
-    def states_at_keys(self, batch: KeyBatch, encoded: torch.Tensor) -> KeyStates:
-        """*encoded* ``[B, Wk + 2, H]``, the fill tower over the keys, without its sentinels."""
-        width = batch.key_mask.shape[1]
-        return KeyStates(states=encoded[:, 1 : width + 1], mask=batch.key_mask)
+    def states_at_keys(self, mask: torch.Tensor, encoded: torch.Tensor) -> KeyStates:
+        """*encoded* ``[B, Wk + 2, H]``, the fill tower over the keys, without its sentinels.
 
-    def key_states(self, batch: KeyBatch) -> KeyStates:
-        """Encode *batch*'s keys once: the search's encoder pass (6a of #257).
+        *mask* ``[B, Wk]`` marks each row's real keys.
+        """
+        return KeyStates(states=encoded[:, 1 : mask.shape[1] + 1], mask=mask)
 
-        Reads only the keys and the context -- ``key_input_ids``,
-        ``key_letters``, ``key_attention``, ``key_mask`` and the span batch's
-        context fields -- never the gold or its segmentation. Returns
+    def key_states(self, keys: KeyInputs) -> KeyStates:
+        """Encode the keys once: the search's encoder pass (6a of #257).
+
+        Reads only the keys and the context (:class:`KeyInputs`), never a
+        gold or its segmentation: a training batch's :attr:`KeyBatch.inputs`,
+        or :meth:`KeyCollator.inputs` over typed records. Returns
         :class:`KeyStates`: ``states [B, Wk, H]`` with ``[b, t]`` row ``b``'s
         key ``t``, and ``mask [B, Wk]``. :meth:`ctc_log_probs` turns
         ``states`` into each key's ``[B, Wk, E + 1]`` CTC log-probabilities
@@ -655,9 +669,10 @@ class KeyE2EModel(E2EModel):
         decoder over them. The caller sets the mode and the grad context: a
         search runs this under ``eval()`` and ``torch.no_grad()``.
         """
-        spans = batch.spans
-        mark_dynamic(spans)
-        return self.states_at_keys(batch, self.encode_keys(batch, self.encode_context(spans)))
+        for tensor in (keys.context_ids, keys.context_mask):
+            torch._dynamo.maybe_mark_dynamic(tensor, (0, 1))
+        memory = self.context_memory(keys.context_ids, keys.context_mask)
+        return self.states_at_keys(keys.key_mask, self.encode_inputs(keys, memory))
 
     def transition_logits(
         self, keys: KeyStates, gold: torch.Tensor, at: torch.Tensor

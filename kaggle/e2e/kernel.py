@@ -45,8 +45,14 @@ against frozen copies of that run's (#241). Without `KEY_WARM_UP` the stage is
 the joint one (S2, #257) over a finished S1 run. A key-level run is scored by the
 trainer's held-out record -- in S1 the parent's decoder fed the front's states,
 in S2 the decoder's teacher-forced accuracy and the CTC loss -- not by the
-lattice search, which does not decode it. A finished run is told apart
-from the run it started from by the stage its run-config records.
+lattice search, which does not decode it. A finished S2 run is then decoded
+from the keys by `mlime eval keys`: each twin's dev slice, context on and off,
+sweeping the search's weights and choosing per section, and the test slices
+at the choices only when the sweeps' measured rate says they fit the session
+left; otherwise the summary says so, and the kernel pushed again with this
+one's output mounted continues every section from where it stopped. A finished
+run is told apart from the run it started from by the stage its run-config
+records.
 
 A leg measures itself while it trains: `GpuSampler` and `HostSampler` log the
 cards, and the trainers' threads and the host's memory, to `gpu.csv` and
@@ -263,6 +269,13 @@ TRAIN_FILL_TOWER = None
 
 #: The (pretrained, new) learning rates; None keeps `mlime train e2e`'s.
 LEARNING_RATES = None
+
+#: The twins a finished joint-stage key run (S2, #257) is decoded on, as
+#: `eval3<suffix>.jsonl` in the assets mount, and the dev sweep's grid: every
+#: beta x gamma, both combinations of a prefix's covers.
+KEY_TWINS = ("", "-abbreviated", "-mixed")
+KEY_BETAS = (0.5, 1.0, 2.0)
+KEY_GAMMAS = (0.5, 1.0, 2.0)
 
 #: The segmenter binary the ranking loss pipes keystrokes through, shipped
 #: inside the package dataset.
@@ -1012,6 +1025,190 @@ def evaluate_lattices(checkpoint, assets, char_table, env):
     return evaluated
 
 
+def key_eval_argv(checkpoint, eval_set, dump_dir, report, char_table, repository, context, test):
+    """The command that sweeps one twin's dev slice in one context setting (#257).
+
+    `--select-on-dev` decodes the dev slice at every point of the grid and
+    chooses there; with *test* it goes on to the test slice at the choice,
+    otherwise it stops after the choice (`--selection-only`). Both resume from
+    the section's dump directory, so the test pass decodes no dev record twice.
+    """
+    data = Path(repository) / "crates" / "ime-pinyin" / "data"
+    argv = [
+        sys.executable,
+        "-m",
+        "mlime",
+        "eval",
+        "keys",
+        "--checkpoint",
+        str(checkpoint),
+        "--eval-set",
+        str(eval_set),
+        "--char-table",
+        str(char_table),
+        "--typo-table",
+        str(data / "typo.json"),
+        "--syllables",
+        str(data / "syllables.txt"),
+        "--select-on-dev",
+        *(item for beta in KEY_BETAS for item in ("--beta", str(beta))),
+        *(item for gamma in KEY_GAMMAS for item in ("--gamma", str(gamma))),
+        "--context" if context else "--no-context",
+        "--dump-dir",
+        str(dump_dir),
+        "--out",
+        str(report),
+        "--verbose",
+    ]
+    if not test:
+        argv.append("--selection-only")
+    return argv
+
+
+def key_sections(assets):
+    """The key evaluation's sections: each twin of `KEY_TWINS`, context on and off."""
+    sections = []
+    for suffix in KEY_TWINS:
+        eval_set = assets / f"eval3{suffix}.jsonl"
+        if not eval_set.is_file():
+            raise FileNotFoundError(f"no eval set at {eval_set}; mounts hold {describe()}")
+        for context in (True, False):
+            sections.append(
+                (f"eval3{suffix}-context-{'on' if context else 'off'}", eval_set, context)
+            )
+    return sections
+
+
+def seed_key_section(name):
+    """Copy a mounted earlier kernel's dump directory for section *name* into the output.
+
+    A section's directory -- its dumps and its selection -- is its progress;
+    a later kernel over the same finished run mounts the earlier one's output
+    and continues each section from it rather than from nothing.
+    """
+    target = WORKING / f"keys-{name}"
+    if target.exists():
+        return
+    mounted = [
+        directory / target.name
+        for directory in directories(INPUTS)
+        if (directory / target.name).is_dir()
+    ]
+    if len(mounted) > 1:
+        raise RuntimeError(f"section {name} is mounted {len(mounted)} times: {mounted}")
+    if mounted:
+        shutil.copytree(mounted[0], target)
+        print(f"section {name} continues from {mounted[0]}", flush=True)
+
+
+def schedule_seconds(estimates, workers):
+    """The wall time of *estimates* spread over *workers*, longest first onto the least loaded."""
+    loads = [0.0] * workers
+    for estimate in sorted(estimates, reverse=True):
+        loads[loads.index(min(loads))] += estimate
+    return max(loads)
+
+
+def evaluate_keys(checkpoint, assets, char_table, repository, env, started):
+    """`mlime eval keys` over the twins' sections, dev first, test only if it fits.
+
+    Every section sweeps its own dev slice and chooses its own weights -- per
+    evaluation set and context setting, as the repository's selections are
+    made. The six dev sweeps run first, one per GPU at a time; each writes the
+    test decode's estimate from its measured rate. Test then runs only if
+    those estimates, scheduled over the GPUs, fit the session left after the
+    reserve; otherwise it is left for a later kernel over the same finished
+    run, which continues every section from this one's output.
+    """
+    sections = key_sections(assets)
+    for name, _, _ in sections:
+        seed_key_section(name)
+
+    def sweep(test):
+        queue = SimpleQueue()
+        for section in sections:
+            queue.put(section)
+
+        def worker(gpu):
+            worker_env = {**env, "CUDA_VISIBLE_DEVICES": str(gpu)}
+            measured = {}
+            while True:
+                try:
+                    name, eval_set, context = queue.get_nowait()
+                except Empty:
+                    return measured
+                dump_dir = WORKING / f"keys-{name}"
+                phase = "test" if test else "dev"
+                report = WORKING / f"keys-{name}-{phase}-report.txt"
+                code, elapsed = run(
+                    key_eval_argv(
+                        checkpoint,
+                        eval_set,
+                        dump_dir,
+                        report,
+                        char_table,
+                        repository,
+                        context,
+                        test,
+                    ),
+                    worker_env,
+                    str(WORKING / f"eval-keys-{name}-{phase}.log"),
+                )
+                if code != 0:
+                    raise RuntimeError(
+                        f"the key evaluation of {name} ({phase}) on GPU {gpu} failed"
+                    )
+                measured[name] = {"seconds": round(elapsed, 1), "gpu": gpu}
+
+        workers = gpu_count()
+        measured = {}
+        with ThreadPoolExecutor(workers) as pool:
+            for part in pool.map(worker, range(workers)):
+                measured.update(part)
+        return measured
+
+    dev = sweep(test=False)
+    evaluated = {}
+    for name, _, _ in sections:
+        selection = json.loads((WORKING / f"keys-{name}" / "selection.json").read_text())
+        chosen = next(
+            point
+            for point in selection["grid"]
+            if all(
+                point[key] == selection["chosen"][key] for key in ("beta", "gamma", "combination")
+            )
+        )
+        evaluated[name] = {
+            "dev_seconds": dev[name]["seconds"],
+            "gpu": dev[name]["gpu"],
+            "chosen": selection["chosen"],
+            "dev": {key: chosen[key] for key in ("records", "top1_hits", "topk_hits")},
+            "test_seconds_estimate": selection["test_seconds_estimate"],
+        }
+    estimates = [entry["test_seconds_estimate"] for entry in evaluated.values()]
+    left = SESSION_SECONDS - RESERVE_SECONDS - (time.monotonic() - started)
+    outcome = {"remaining_seconds": round(left, 1), "sections": evaluated}
+    if any(estimate is None for estimate in estimates):
+        outcome["test"] = "deferred"
+        outcome["reason"] = (
+            "a dev sweep decoded nothing to measure and no earlier sweep's rate is mounted"
+        )
+        return outcome
+    needed = schedule_seconds(estimates, gpu_count())
+    outcome["test_seconds_estimate"] = round(needed, 1)
+    if needed > left:
+        outcome["test"] = "deferred"
+        outcome["reason"] = (
+            f"the six test sections need about {needed:.0f}s against {left:.0f}s left; push this "
+            "kernel again with its output mounted, and it decodes test from where this one stopped"
+        )
+        return outcome
+    for name, measured in sweep(test=True).items():
+        evaluated[name]["test_seconds"] = measured["seconds"]
+    outcome["test"] = "decoded"
+    return outcome
+
+
 def previous_segment():
     """The newest resumable checkpoint mounted, or None for a run not started.
 
@@ -1147,10 +1344,10 @@ def main():
         return start_argv((initials / INIT_ENCODER, initials / INIT_DECODER), None)
 
     final = finished_checkpoint()
-    if final is not None and KEYS is not None:
+    if final is not None and KEY_WARM_UP:
         raise RuntimeError(
-            f"{final} is a finished key-level run; its gate is the trainer's held-out record, "
-            "and the lattice search does not decode it"
+            f"{final} is a finished key warm-up; its gate is the trainer's held-out record, "
+            "and no search decodes it"
         )
     if final is not None:
         print(f"evaluating the finished run at {final}; nothing to train", flush=True)
@@ -1158,8 +1355,13 @@ def main():
             "segment": SEGMENT,
             "evaluated_checkpoint": str(final),
             "finished": True,
-            "evaluated": evaluate_lattices(final, assets, char_table, env),
         }
+        if KEYS is None:
+            summary["evaluated"] = evaluate_lattices(final, assets, char_table, env)
+        else:
+            summary["key_evaluation"] = evaluate_keys(
+                final, assets, char_table, packages.parents[1], env, started
+            )
         write_summary(summary)
         return
 
@@ -1274,10 +1476,15 @@ def main():
         if not checkpoint.is_file():
             raise RuntimeError("the run finished without writing a final checkpoint")
         drop_numbered_checkpoints(out)
-        # A key-level run's gate is the trainer's held-out record; the
-        # lattice search decodes span models only.
+        # The lattice search decodes span models, the constrained search over
+        # keys a joint-stage key run; a warm-up's gate is the trainer's
+        # held-out record alone.
         if KEYS is None:
             summary["evaluated"] = evaluate_lattices(checkpoint, assets, char_table, env)
+        elif not KEY_WARM_UP:
+            summary["key_evaluation"] = evaluate_keys(
+                checkpoint, assets, char_table, packages.parents[1], env, started
+            )
         summary["held_out"] = trained
 
     write_summary(summary)
