@@ -1,7 +1,8 @@
 //! The decoder's input: what each output position is allowed to be.
 
 use crate::DecodeError;
-use ime_pinyin::{CharId, CorrectionTable, Lexicon, Segmentation, SyllableTable};
+use crate::arcs::{WordArc, WordLexicon};
+use ime_pinyin::{CharId, CorrectionTable, Lexicon, SegmentOptions, Segmentation, SyllableTable};
 
 /// One reading of the typed string, resolved down to characters.
 ///
@@ -17,6 +18,9 @@ pub struct CandidatePath {
     /// resolved without the noise model -- every candidate costs 0 there.
     priors: Option<Vec<Vec<f64>>>,
     cost: f32,
+    /// The lexicon entries this reading spells, in start order; empty when
+    /// the batch was built without a word lexicon.
+    arcs: Vec<WordArc>,
 }
 
 impl CandidatePath {
@@ -36,6 +40,12 @@ impl CandidatePath {
         self.priors
             .as_ref()
             .map_or(0.0, |priors| priors[position][slot])
+    }
+
+    /// The lexicon entries this reading spells, in start order.
+    #[must_use]
+    pub fn arcs(&self) -> &[WordArc] {
+        &self.arcs
     }
 
     /// How many characters this reading produces.
@@ -111,6 +121,7 @@ impl Candidates {
                 positions,
                 priors: None,
                 cost: segmentation.cost(),
+                arcs: Vec::new(),
             });
         }
         Ok(Self { paths })
@@ -181,9 +192,45 @@ impl Candidates {
                 positions,
                 priors: Some(priors),
                 cost: segmentation.cost(),
+                arcs: Vec::new(),
             });
         }
         Ok(Self { paths })
+    }
+
+    /// This batch with every arc of *words* its readings spell attached:
+    /// *segmentations* are the readings the batch was built from, in the
+    /// same order, and *pinyin* the keystrokes they span. Every arc
+    /// character lies in its position's mask, so the models are asked about
+    /// the masks alone, as without arcs.
+    ///
+    /// # Panics
+    ///
+    /// If *segmentations* is not the list the batch was built from.
+    #[must_use]
+    pub fn with_arcs(
+        mut self,
+        segmentations: &[Segmentation],
+        pinyin: &str,
+        words: &WordLexicon,
+        lexicon: &Lexicon,
+        table: &SyllableTable,
+        options: &SegmentOptions,
+    ) -> Self {
+        assert_eq!(
+            segmentations.len(),
+            self.paths.len(),
+            "arcs are proposed over the readings the batch was built from"
+        );
+        for (path, segmentation) in self.paths.iter_mut().zip(segmentations) {
+            assert_eq!(
+                segmentation.len(),
+                path.len(),
+                "arcs are proposed over the readings the batch was built from"
+            );
+            path.arcs = words.arcs(segmentation, pinyin, lexicon, table, options);
+        }
+        self
     }
 
     /// The readings, in the order [`SegmentLattice::k_best`] ranked them.

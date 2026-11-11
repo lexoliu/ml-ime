@@ -17,6 +17,12 @@
 //! [`typing_segments`], the length gate, the duplicate check -- so that changing
 //! one costs a local re-run rather than another pass over 9.7 GB.
 //!
+//! The web-scale sources -- FineWeb2-HQ, FineWeb-2 mined for absent lexicon
+//! entries, the MNBVC forums and the `YYeTs` subtitles -- are too large to fetch
+//! whole, so [`ingest`] streams them one upstream file at a time through the
+//! same rules, plus the [`leak`] guard against the evaluation sets and the
+//! [`privacy`] gate on personal data.
+//!
 //! What comes out is the same `{id, source, text, context}` sample schema the rest
 //! of the engine already reads, written into the same [`DataLayout`] directories,
 //! so `ime-cli export pool | eval-set | ngram-corpus` work on a run-2 data root
@@ -27,10 +33,15 @@ pub mod download;
 pub mod error;
 pub mod fetch;
 pub mod filter;
+pub mod ingest;
+pub mod leak;
+pub mod mine;
 pub mod prepare;
+pub mod privacy;
 pub mod segment;
 pub mod source;
 pub mod text;
+pub mod upstream;
 
 pub use error::{Error, Result};
 pub use fetch::fetch;
@@ -39,6 +50,7 @@ pub use ime_g2p::DataLayout;
 pub use prepare::{PrepareReport, prepare};
 pub use segment::{TypingSegment, is_typable_target, typing_segments};
 pub use source::{
-    BILIBILI, DIALOGUE, DOUYIN, MOEGIRL, NEWS, RawDocument, SOURCES, SegmentUnit, SourceSpec, WIKI,
+    BILIBILI, DIALOGUE, DOUYIN, FINEWEB2_HQ, FINEWEB2_MINED, MNBVC_FORUM, MOEGIRL, NEWS,
+    RawDocument, SOURCES, STREAMED, SegmentUnit, SourceSpec, WIKI, YYETS,
 };
 pub use text::Normalizer;
