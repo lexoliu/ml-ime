@@ -26,7 +26,7 @@ from mlime.train.charlm_vocab import CharVocab
 from mlime.train.e2e_model import E2EConfig, E2EModel, RankingConfig, emittable_ids
 from mlime.train.e2e_search import SearchGraphs
 from mlime.train.key_model import KeyE2EModel, key_evaluate, letter_token_ids
-from mlime.train.keys import KeyExample, KeyFrontConfig
+from mlime.train.keys import FillTowerTraining, KeyExample, KeyFrontConfig
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import Distributed, MetricLog, TrainingConfig, evaluate, train
 from mlime.train.model import RouteAConfig
@@ -278,6 +278,7 @@ def build_from(
     context_warm_up: bool,
     keys: KeyFrontConfig | None = None,
     key_warm_up: bool = False,
+    train_fill_tower: FillTowerTraining | None = None,
 ) -> tuple[E2EModel, Vocabularies]:
     """The model the e2e checkpoint at *source* describes, under this stage's losses.
 
@@ -289,8 +290,8 @@ def build_from(
     loop. A stage that names a key front over a span model's run warms the
     front up over it (:meth:`~mlime.train.key_model.KeyE2EModel.load_parent`),
     reading the context with the parent's own tower; a key run keeps its
-    front. The checkpoint is gigabytes, and it lives only in this frame:
-    nothing holds it once the model is built.
+    front, under this stage's loss weights. The checkpoint is gigabytes, and
+    it lives only in this frame: nothing holds it once the model is built.
     """
     state = torch.load(source, map_location="cpu", weights_only=False)
     recorded = E2EConfig.from_record(_record(state, "e2e", source))
@@ -303,11 +304,15 @@ def build_from(
         context_warm_up=context_warm_up,
         keys=keys,
         key_warm_up=key_warm_up,
+        train_fill_tower=train_fill_tower,
     )
     vocabularies = Vocabularies.load(char_table, recorded.base_model, context)
     model = from_checkpoint(state, vocabularies.lexicon, wanted)
-    if recorded.keys is not None and recorded.keys != keys:
-        raise ValueError(f"{source} has the key front {recorded.keys}; a stage keeps it as it is")
+    if recorded.keys is not None and (keys is None or recorded.keys.weighed_as(keys) != keys):
+        raise ValueError(
+            f"{source} has the key front {recorded.keys}; a stage keeps it and changes only "
+            "its loss weights"
+        )
     if with_weights:
         if recorded.keys is None and keys is not None:
             if recorded.context != context:
@@ -480,6 +485,7 @@ def e2e(
     tower_graphs: bool = False,
     keys: KeyFrontConfig | None = None,
     key_warm_up: bool = False,
+    train_fill_tower: FillTowerTraining | None = None,
 ) -> RunResult:
     """Train the end-to-end model over *slices.train*; score held-out both ways.
 
@@ -506,9 +512,12 @@ def e2e(
     *keys* reads keystrokes through a key front with a per-key CTC head
     (#223), whose examples are typed as keys with their legal alignments;
     *key_warm_up* trains only the front and the head, distilling the parent's
-    encoder states (S1). A finished key run is scored by the S1 gate's
-    measure -- the parent's decoder fed the front's states -- beside the
-    parent's own on the same examples.
+    encoder states (S1). *train_fill_tower* trains the fill tower beside
+    them at the pretrained rate -- and with ``cross_attention`` its gated
+    context blocks -- distilling towards frozen copies of the parent's
+    (#241). A finished key run is scored by the S1 gate's measure --
+    the parent's decoder fed the front's states -- beside the parent's own on
+    the same examples.
     """
     world = Distributed.from_environment()
     starts = (
@@ -542,6 +551,10 @@ def e2e(
         raise ValueError(
             "a key front warms up over a finished run; start the stage with --init-e2e"
         )
+    if train_fill_tower is not None and not key_warm_up:
+        raise ValueError(
+            "--train-fill-tower trains the tower in the key warm-up; add --key-warm-up"
+        )
     source = init_e2e if init_e2e is not None else resume
     if source is not None:
         model, vocabularies = build_from(
@@ -555,6 +568,7 @@ def e2e(
             context_warm_up=context_warm_up,
             keys=keys,
             key_warm_up=key_warm_up,
+            train_fill_tower=train_fill_tower,
         )
     else:
         if init_encoder is None or init_decoder is None:
@@ -632,7 +646,8 @@ def e2e(
             )
         model.freeze_for_key_warm_up()
         log.info(
-            "key warm-up: only the key front and the CTC head train",
+            "key warm-up: the key front and the CTC head train",
+            beside=list(model.trained_parts()),
             trainable=sum(p.numel() for p in model.parameters() if p.requires_grad),
         )
 

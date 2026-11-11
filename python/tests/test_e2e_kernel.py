@@ -503,13 +503,17 @@ def test_a_key_stage_passes_its_front_to_the_count_and_the_trainer(
     kernel = load_kernel(monkeypatch, tmp_path, segment=0)
     monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-v2-rank-g4")
     monkeypatch.setattr(
-        kernel, "KEYS", {"layers": 3, "distill_weight": 0.5, "correct_syllables": False}
+        kernel,
+        "KEYS",
+        {"layers": 3, "distill_weight": 0.5, "frame_weight": 0.25, "correct_syllables": False},
     )
     monkeypatch.setattr(kernel, "KEY_WARM_UP", True)
+    monkeypatch.setattr(kernel, "TRAIN_FILL_TOWER", {"cross_attention": True})
     monkeypatch.setattr(kernel, "TYPOS", True)
     assert kernel.stage()["keys"] == {
         "layers": 3,
         "distill_weight": 0.5,
+        "frame_weight": 0.25,
         "correct_syllables": False,
     }
 
@@ -526,10 +530,19 @@ def test_a_key_stage_passes_its_front_to_the_count_and_the_trainer(
     )
     command = train_argv.index("mlime")
     tail = [str(arg) for arg in train_argv[command + 3 :]]
-    for switch in ("--keys", "--no-correct-syllables", "--key-warm-up", "--typos"):
+    assert kernel.stage()["train_fill_tower"] == {"cross_attention": True}
+    for switch in (
+        "--keys",
+        "--no-correct-syllables",
+        "--key-warm-up",
+        "--train-fill-tower",
+        "--train-cross-attention",
+        "--typos",
+    ):
         assert switch in tail, switch
     assert tail[tail.index("--key-front-layers") + 1] == "3"
     assert tail[tail.index("--distill-weight") + 1] == "0.5"
+    assert tail[tail.index("--frame-weight") + 1] == "0.25"
     group = typer.main.get_command(cli.app)
     assert isinstance(group, TyperGroup)
     train = group.commands["train"]
@@ -537,7 +550,13 @@ def test_a_key_stage_passes_its_front_to_the_count_and_the_trainer(
     train.commands["e2e"].make_context("e2e", tail)
 
     count_argv = kernel.count_argv(tmp_path / "char_pinyin.tsv", tmp_path / "counts.json", None)
-    assert "--key-front-layers" not in count_argv and "--key-warm-up" not in count_argv
+    for switch in (
+        "--key-front-layers",
+        "--key-warm-up",
+        "--train-fill-tower",
+        "--train-cross-attention",
+    ):
+        assert switch not in count_argv, switch
     asked: dict[str, object] = {}
 
     class CountedError(Exception):
@@ -566,11 +585,17 @@ def test_a_key_stage_needs_the_run_it_warms_up_over(
 ) -> None:
     kernel = load_kernel(monkeypatch, tmp_path, segment=0)
     monkeypatch.setattr(
-        kernel, "KEYS", {"layers": 2, "distill_weight": 1.0, "correct_syllables": True}
+        kernel,
+        "KEYS",
+        {"layers": 2, "distill_weight": 1.0, "frame_weight": 0.0, "correct_syllables": True},
     )
     with pytest.raises(RuntimeError, match="stamp INIT_FROM"):
         kernel.main()
     monkeypatch.setattr(kernel, "KEYS", None)
     monkeypatch.setattr(kernel, "KEY_WARM_UP", True)
     with pytest.raises(RuntimeError, match="stamp KEYS"):
+        kernel.main()
+    monkeypatch.setattr(kernel, "KEY_WARM_UP", False)
+    monkeypatch.setattr(kernel, "TRAIN_FILL_TOWER", {"cross_attention": False})
+    with pytest.raises(RuntimeError, match="stamp KEY_WARM_UP"):
         kernel.main()

@@ -48,6 +48,7 @@ V1_RECIPE: dict[str, Any] = {
     "CONTEXT_WARM_UP": False,
     "KEYS": None,
     "KEY_WARM_UP": False,
+    "TRAIN_FILL_TOWER": None,
 }
 
 #: What a v2 leg mounts, each a Hugging Face dataset repo the stager downloads:
@@ -78,7 +79,11 @@ E2E_KEYS_RUN = "mlime-e2e-keys-"
 CONTEXT_TOWER_FIELDS = frozenset({"tower", "revision", "lora_rank", "lora_alpha", "layers"})
 
 #: What a stamped ``KEYS`` holds: the kernel's key front options (#223).
-KEYS_FIELDS = frozenset({"layers", "distill_weight", "correct_syllables"})
+KEYS_FIELDS = frozenset({"layers", "distill_weight", "frame_weight", "correct_syllables"})
+
+#: What a stamped ``TRAIN_FILL_TOWER`` holds: what S1 trains of the fill path
+#: beside the tower itself (#241).
+FILL_TOWER_FIELDS = frozenset({"cross_attention"})
 
 
 def literal(source: str, name: str) -> Any:
@@ -149,9 +154,13 @@ class E2EV2Stage:
     the tower keeps from the bottom, None for all of them (#237). *context_warm_up*
     (``CONTEXT_WARM_UP``) trains only the context path, which is S0.
     *keys* (``KEYS``) reads keystrokes through a key front with a per-key CTC
-    head (#223): its ``layers``, ``distill_weight`` and ``correct_syllables``.
+    head (#223): its ``layers``, ``distill_weight``, ``frame_weight`` and
+    ``correct_syllables``.
     *key_warm_up* (``KEY_WARM_UP``) trains only the front and the head,
-    distilling *init_from*'s encoder states, which is S1.
+    distilling *init_from*'s encoder states, which is S1. *train_fill_tower*
+    (``TRAIN_FILL_TOWER``) trains the fill tower in S1 as well, and with
+    ``cross_attention`` its gated context blocks, against frozen copies of
+    *init_from*'s (#241).
     """
 
     init_from: str
@@ -163,6 +172,7 @@ class E2EV2Stage:
     context_warm_up: bool = False
     keys: dict[str, Any] | None = None
     key_warm_up: bool = False
+    train_fill_tower: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         _v2_name(self.init_from)
@@ -184,6 +194,14 @@ class E2EV2Stage:
                 raise ValueError("a key front enters through its warm-up (S1); stamp KEY_WARM_UP")
         elif self.key_warm_up:
             raise ValueError("the key warm-up trains a key front; name one with keys")
+        if self.train_fill_tower is not None:
+            if set(self.train_fill_tower) != FILL_TOWER_FIELDS:
+                raise ValueError(
+                    f"a fill tower switch names {sorted(FILL_TOWER_FIELDS)}, "
+                    f"got {sorted(self.train_fill_tower)}"
+                )
+            if not self.key_warm_up:
+                raise ValueError("the fill tower trains in the key warm-up; stamp KEY_WARM_UP")
 
     def fields(self) -> dict[str, Any]:
         """The recipe fields this stage stamps over v1's."""
@@ -197,6 +215,7 @@ class E2EV2Stage:
             "CONTEXT_WARM_UP": self.context_warm_up,
             "KEYS": self.keys,
             "KEY_WARM_UP": self.key_warm_up,
+            "TRAIN_FILL_TOWER": self.train_fill_tower,
         }
 
 

@@ -863,7 +863,7 @@ def test_the_prefilled_masks_skip_the_builder(
     batch = Collator(tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask))(
         [example(spans, lexicon, "我爱北京", ("wo", "ai", "bei", "jing"))]
     )
-    embeddings = model.fill.embeddings(inputs_embeds=model._fill_inputs(batch))
+    embeddings = model.fill.embeddings(inputs_embeds=model._fill_inputs(batch, model.fill))
     fill_mask = batch.attention_mask[:, None, None, :].bool()
     returned, extra = model.fill._create_attention_masks(
         attention_mask=fill_mask,
@@ -881,7 +881,7 @@ def test_the_prefilled_masks_skip_the_builder(
         # ``embeddings`` is post-LayerNorm, so the reference re-derives it from
         # the raw fill inputs -- ``BertModel`` embeds ``inputs_embeds`` itself.
         reference: torch.Tensor = model.fill(
-            inputs_embeds=model._fill_inputs(batch), attention_mask=batch.attention_mask
+            inputs_embeds=model._fill_inputs(batch, model.fill), attention_mask=batch.attention_mask
         ).last_hidden_state
         context: torch.Tensor = model.context(
             input_ids=batch.context_ids, attention_mask=context_mask

@@ -31,17 +31,36 @@ evaluation mode, so the teacher's states are the parent's own and the tower
 the front feeds adds no dropout the front cannot see. The gate feeds the
 parent's frozen decoder the front's states at the span ends, in place of its
 encoder's (:meth:`KeyE2EModel.student_frame`).
+
+**The frame term** (``frame_weight``, #255) trains on what that gate reads.
+The squared error weighs every direction of a state alike and the decoder
+does not, so a run can fit the parent's states more closely and still decode
+worse. The term is the parent's own per-position loss, computed by its frozen
+decoder over the student's states at the span ends: the decoder's weights
+take no step, and its gradient reaches the front and the tower through them.
+
+**S1 with the tower** (``train_fill_tower``, #241) trains the fill tower too,
+beside the front and the head and at the head's rate, in training mode, and
+with ``cross_attention`` the tower's gated context blocks as well. The teacher
+must stay the parent, so the model keeps a frozen copy of each parent part
+that trains -- ``teacher_fill`` of the tower, ``teacher_cross_attention`` of
+the blocks, always in evaluation mode -- and the teacher's pass and the gate's
+parent frame run through the copies; the span tables and the context tower
+they share with the student stay frozen, so the copies' states are the
+parent's exactly. Each copy is a parameter set the size of its part and is
+saved with the run, so a resume distils towards the same targets.
 """
 
 from __future__ import annotations
 
+import copy
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, ClassVar
 
 import torch
 from torch import nn
-from transformers import BertConfig, BertForMaskedLM
+from transformers import BertConfig, BertForMaskedLM, BertModel
 
 from mlime.train.charlm_model import TransformerCharLm
 from mlime.train.ctc import alignment_components, alignment_scores, constrained_ctc
@@ -57,6 +76,11 @@ KEY_PARAMETER_PREFIXES = ("key_front.", "blank.")
 
 #: The submodules S1 leaves frozen and runs in evaluation mode.
 FROZEN_IN_WARM_UP = ("fill", "context", "cross_attention", "decoder", "letter_encoder")
+
+#: Parameter prefixes of the frozen copies of the parent's fill tower and of its
+#: gated context blocks: the teacher of an S1 that trains them.
+TEACHER_FILL_PREFIX = "teacher_fill."
+TEACHER_CROSS_ATTENTION_PREFIX = "teacher_cross_attention."
 
 
 class KeyBlock(nn.Module):
@@ -159,6 +183,8 @@ class KeyE2EModel(E2EModel):
 
     key_front: KeyFront
     blank: nn.Linear
+    teacher_fill: BertModel | None
+    teacher_cross_attention: nn.ModuleList | None
 
     def __init__(
         self,
@@ -185,6 +211,16 @@ class KeyE2EModel(E2EModel):
         self.blank = nn.Linear(width, 1)
         nn.init.zeros_(self.blank.weight)
         nn.init.zeros_(self.blank.bias)
+        # Seeded with the parent's parts when the weights load (load_resumed).
+        trains = config.train_fill_tower
+        self.teacher_fill = (
+            None if trains is None else copy.deepcopy(self.fill).requires_grad_(False)
+        )
+        self.teacher_cross_attention = (
+            copy.deepcopy(self.cross_attention).requires_grad_(False)
+            if trains is not None and trains.cross_attention
+            else None
+        )
 
     @classmethod
     def compose(
@@ -225,19 +261,87 @@ class KeyE2EModel(E2EModel):
         self.load_resumed(weights, path, fresh=KEY_PARAMETER_PREFIXES)
         self.key_front.initialise_letters(self.fill.embeddings.word_embeddings.weight, letter_ids)
 
+    def load_resumed(
+        self,
+        weights: Mapping[str, torch.Tensor],
+        path: Path | str,
+        fresh: tuple[str, ...] = (),
+    ) -> None:
+        """Load *weights*, seeding each teacher copy from its part when they hold none of it.
+
+        A checkpoint without a copy of a part never trained that part -- a run
+        that trains it keeps and saves the frozen copy -- so the part is its
+        parent's, and the copy starts as that. A copy the checkpoint holds
+        loads as saved; one loaded by a model that keeps none is refused as
+        unexpected weights.
+        """
+        seeded = [
+            (prefix, teacher, part)
+            for prefix, teacher, part in (
+                (TEACHER_FILL_PREFIX, self.teacher_fill, self.fill),
+                (
+                    TEACHER_CROSS_ATTENTION_PREFIX,
+                    self.teacher_cross_attention,
+                    self.cross_attention,
+                ),
+            )
+            if teacher is not None and not any(name.startswith(prefix) for name in weights)
+        ]
+        super().load_resumed(weights, path, (*fresh, *(prefix for prefix, _, _ in seeded)))
+        for _, teacher, part in seeded:
+            teacher.load_state_dict(part.state_dict())
+
+    @property
+    def teacher_tower(self) -> BertModel:
+        """The parent's fill tower: the frozen copy while ``fill`` trains, ``fill`` otherwise."""
+        return self.fill if self.teacher_fill is None else self.teacher_fill
+
+    @property
+    def teacher_blocks(self) -> nn.ModuleList:
+        """The parent's gated context blocks: the frozen copy while they train, else the blocks."""
+        if self.teacher_cross_attention is None:
+            return self.cross_attention
+        return self.teacher_cross_attention
+
+    def trained_parts(self) -> tuple[str, ...]:
+        """The parent's submodules S1 trains beside the front and the head."""
+        trains = self.e2e_config.train_fill_tower
+        if trains is None:
+            return ()
+        return ("fill", "cross_attention") if trains.cross_attention else ("fill",)
+
     def freeze_for_key_warm_up(self) -> None:
-        """Leave only the key front and the CTC head -- the MLM head and the blank -- trainable."""
+        """Leave only the key front and the CTC head -- the MLM head and the blank -- trainable.
+
+        With ``train_fill_tower`` the fill tower trains as well, and its gated
+        context blocks when it names them; their frozen copies, the teacher,
+        never do.
+        """
+        trained = (
+            *KEY_PARAMETER_PREFIXES,
+            "head.",
+            *(f"{part}." for part in self.trained_parts()),
+        )
         for name, parameter in self.named_parameters():
-            parameter.requires_grad_(name.startswith((*KEY_PARAMETER_PREFIXES, "head.")))
+            parameter.requires_grad_(name.startswith(trained))
 
     def train(self, mode: bool = True) -> KeyE2EModel:
-        """Train mode for what trains; in the warm-up, the frozen parts stay in evaluation mode."""
+        """Train mode for what trains; in the warm-up, the frozen parts stay in evaluation mode.
+
+        The fill tower and its gated context blocks run in training mode when
+        the warm-up trains them, and the teacher's copies of them always run in
+        evaluation mode.
+        """
         super().train(mode)
         if self.e2e_config.key_warm_up:
+            trained = self.trained_parts()
             for name in FROZEN_IN_WARM_UP:
                 module = getattr(self, name)
-                if isinstance(module, nn.Module):
+                if name not in trained and isinstance(module, nn.Module):
                     module.eval()
+        for teacher in (self.teacher_fill, self.teacher_cross_attention):
+            if teacher is not None:
+                teacher.eval()
         return self
 
     def parameter_groups(self, base_lr: float, new_lr: float) -> list[dict[str, object]]:
@@ -261,16 +365,29 @@ class KeyE2EModel(E2EModel):
         inputs = words + front * at_key
         _mark_fill(inputs, batch.key_attention, memory, spans.context_rows, spans.has_context)
         return self.fill_pass(
-            inputs, batch.key_attention, memory, spans.context_rows, spans.has_context
+            self.fill,
+            self.cross_attention,
+            inputs,
+            batch.key_attention,
+            memory,
+            spans.context_rows,
+            spans.has_context,
         )
 
     def span_states(self, batch: KeyBatch, memory: Any) -> torch.Tensor:
-        """The parent's fill tower over the spans the typist meant, ``[B, W, H]``."""
+        """The parent's fill path over the spans the typist meant, ``[B, W, H]``."""
         spans = batch.spans
-        inputs = self._fill_inputs(spans)
+        tower = self.teacher_tower
+        inputs = self._fill_inputs(spans, tower)
         _mark_fill(inputs, spans.attention_mask, memory, spans.context_rows, spans.has_context)
         return self.fill_pass(
-            inputs, spans.attention_mask, memory, spans.context_rows, spans.has_context
+            tower,
+            self.teacher_blocks,
+            inputs,
+            spans.attention_mask,
+            memory,
+            spans.context_rows,
+            spans.has_context,
         )
 
     def ctc_log_probs(self, states: torch.Tensor) -> torch.Tensor:
@@ -279,8 +396,30 @@ class KeyE2EModel(E2EModel):
         logits = torch.cat([self.head.decoder(transformed), self.blank(transformed)], dim=-1)
         return logits.float().log_softmax(dim=-1)
 
+    def at_span_ends(self, batch: KeyBatch, ends: torch.Tensor) -> torch.Tensor:
+        """The ``[P, H]`` span-end states in the span batch's columns, ``[B, W, H]``.
+
+        They land where the parent's encoder states would be, which is how its
+        decoder reads them.
+        """
+        spans = batch.spans
+        width = spans.targets.shape[1]
+        hidden = ends.shape[-1]
+        placed = ends.new_zeros((spans.size * width, hidden)).index_copy(0, spans.scored, ends)
+        return placed.view(spans.size, width, hidden)
+
+    def frame_loss(self, batch: KeyBatch, ends: torch.Tensor) -> torch.Tensor:
+        """The parent's per-position loss, its decoder reading the student's span-end states."""
+        scored = self._scored(batch.spans, self.at_span_ends(batch, ends))
+        if scored is None:
+            raise ValueError("a key batch scores at least one span")
+        return self.position_loss(scored.decoder, scored.targets, scored.candidates)
+
     def forward(self, batch: KeyBatch) -> RouteAOutput:  # type: ignore[override]
-        """S1's loss: the constrained CTC plus the weighted distillation of the parent's states."""
+        """S1's loss: the constrained CTC, the distillation of the parent's states, the frame term.
+
+        The last two are weighted, and a frame weight of 0 skips the decoder.
+        """
         if not isinstance(batch, KeyBatch):
             raise TypeError(f"the key model trains on key batches, got a {type(batch).__name__}")
         spans = batch.spans
@@ -298,6 +437,11 @@ class KeyE2EModel(E2EModel):
         nll = constrained_ctc(blank, emit, batch.cost, batch.keys, batch.lengths)
         ctc = nll.sum() / spans.scored.numel()
         loss = ctc + self.keys_config.distill_weight * distill
+        extras = {"ctc_loss": ctc.detach(), "distill_loss": distill.detach()}
+        if self.keys_config.frame_weight:
+            frame = self.frame_loss(batch, ends)
+            loss = loss + self.keys_config.frame_weight * frame
+            extras["frame_loss"] = frame.detach()
         with torch.no_grad():
             components = alignment_components(
                 blank,
@@ -308,35 +452,32 @@ class KeyE2EModel(E2EModel):
                 batch.position_mask,
                 batch.corrupted,
             )
-        return RouteAOutput(
-            loss=loss,
-            extras={
-                "ctc_loss": ctc.detach(),
-                "distill_loss": distill.detach(),
-                **components,
-            },
-        )
+        return RouteAOutput(loss=loss, extras={**extras, **components})
 
     def student_frame(self, batch: KeyBatch) -> torch.Tensor:
         """The parent's decoder frame fed the key front's states at the span ends.
 
-        The states land in the span columns of the span batch, where the
-        parent's encoder states would be, and the frame is the span model's
-        own (:meth:`~mlime.train.e2e_model.E2EModel.frame`): the S1 gate.
+        The states land in the span columns of the span batch
+        (:meth:`at_span_ends`), and the frame is the span model's own
+        (:meth:`~mlime.train.e2e_model.E2EModel.frame`): the S1 gate.
         """
         spans = batch.spans
         mark_dynamic(spans)
         memory = self.encode_context(spans)
         student = self.encode_keys(batch, memory)
-        hidden = student.shape[-1]
-        ends = student.reshape(-1, hidden).index_select(0, batch.end_positions)
-        width = spans.targets.shape[1]
-        placed = student.new_zeros((spans.size * width, hidden)).index_copy(0, spans.scored, ends)
-        return self.frame(spans, placed.view(spans.size, width, hidden))
+        ends = student.reshape(-1, student.shape[-1]).index_select(0, batch.end_positions)
+        return self.frame(spans, self.at_span_ends(batch, ends))
 
     def parent_frame(self, batch: KeyBatch) -> torch.Tensor:
-        """The parent's own frame over the spans: what the gate compares the student against."""
-        return self.frame(batch.spans, None)
+        """The parent's own frame over the spans: what the gate compares the student against.
+
+        Its encoder states are the teacher's (:meth:`span_states`), the span
+        model's own pass through the parent's tower and context blocks even
+        while the student's train.
+        """
+        spans = batch.spans
+        mark_dynamic(spans)
+        return self.frame(spans, self.span_states(batch, self.encode_context(spans)))
 
 
 def letter_token_ids(vocabulary: Mapping[str, int]) -> list[int]:

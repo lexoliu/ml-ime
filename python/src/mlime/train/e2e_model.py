@@ -38,7 +38,7 @@ from transformers import BertConfig, BertForMaskedLM
 
 from mlime.train.charlm_model import Block, CharLmConfig, TransformerCharLm
 from mlime.train.charlm_vocab import BOS, CharVocab
-from mlime.train.keys import KeyFrontConfig
+from mlime.train.keys import FillTowerTraining, KeyFrontConfig
 from mlime.train.lexicon import Lexicon
 from mlime.train.model import (
     BertContextTower,
@@ -132,6 +132,12 @@ class E2EConfig(RouteAConfig):
     #: encoder states, with everything else frozen: the warm-up the key front
     #: enters through (S1).
     key_warm_up: bool = False
+    #: In the key warm-up, train the fill tower too -- and with
+    #: ``cross_attention`` its gated context blocks -- beside the front and the
+    #: head and at the head's rate; None leaves it frozen. The distillation's
+    #: targets stay the parent's, through a frozen copy of each part that
+    #: trains (#241).
+    train_fill_tower: FillTowerTraining | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -155,6 +161,8 @@ class E2EConfig(RouteAConfig):
                 )
         elif self.key_warm_up:
             raise ValueError("the key warm-up trains a key front; name one with keys")
+        if self.train_fill_tower is not None and not self.key_warm_up:
+            raise ValueError("the fill tower trains beside a key front in its warm-up (S1)")
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> E2EConfig:
@@ -167,6 +175,8 @@ class E2EConfig(RouteAConfig):
             fields["context"] = QwenContextConfig.from_record(fields["context"])
         if fields.get("keys") is not None:
             fields["keys"] = KeyFrontConfig.from_record(fields["keys"])
+        if fields.get("train_fill_tower") is not None:
+            fields["train_fill_tower"] = FillTowerTraining.from_record(fields["train_fill_tower"])
         return cls(**fields)
 
 

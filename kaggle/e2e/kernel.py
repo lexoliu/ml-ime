@@ -39,10 +39,12 @@ replays the frozen tower from captured CUDA graphs. With `KEYS` stamped the
 stage reads keystrokes through a key front with a per-key CTC head (#223):
 the first segment builds the front over the finished run's weights, and
 `KEY_WARM_UP` trains only the front and the head, distilling that run's
-encoder states, which is S1. A key-level run is scored by the trainer's
-held-out gate -- the parent's decoder fed the front's states -- not by the
-lattice search, which does not decode it. A finished run is told apart from
-the run it started from by the stage its run-config records.
+encoder states, which is S1; `TRAIN_FILL_TOWER` trains the fill tower in S1
+as well, and with its `cross_attention` the tower's gated context blocks,
+against frozen copies of that run's (#241). A key-level run is scored by the
+trainer's held-out gate -- the parent's decoder fed the front's states -- not
+by the lattice search, which does not decode it. A finished run is told apart
+from the run it started from by the stage its run-config records.
 
 A leg measures itself while it trains: `GpuSampler` and `HostSampler` log the
 cards, and the trainers' threads and the host's memory, to `gpu.csv` and
@@ -239,13 +241,21 @@ CONTEXT_WARM_UP = False
 TOWER_GRAPHS = False
 
 #: The key-level front of #223, as `mlime train e2e`'s key options: a dict of
-#: `layers`, `distill_weight` and `correct_syllables`. A stage builds it over
-#: `INIT_FROM`'s weights. None keeps the span model. Stamped per push.
+#: `layers`, `distill_weight`, `frame_weight` and `correct_syllables`. A stage
+#: builds it over `INIT_FROM`'s weights, or keeps the front of a key run it
+#: starts from under these loss weights. None keeps the span model. Stamped
+#: per push.
 KEYS = None
 
 #: Train only the key front and the CTC head, distilling `INIT_FROM`'s encoder
 #: states, with the rest of its model frozen (S1).
 KEY_WARM_UP = False
+
+#: Train the fill tower too in the key warm-up, at the pretrained rate, its
+#: distillation targets those of a frozen copy of `INIT_FROM`'s tower (#241).
+#: None leaves it frozen; `{"cross_attention": True}` trains its gated context
+#: blocks beside it, against a frozen copy of those too.
+TRAIN_FILL_TOWER = None
 
 #: The (pretrained, new) learning rates; None keeps `mlime train e2e`'s.
 LEARNING_RATES = None
@@ -596,6 +606,7 @@ def stage():
         "context_warm_up": CONTEXT_WARM_UP,
         "keys": KEYS,
         "key_warm_up": KEY_WARM_UP,
+        "train_fill_tower": TRAIN_FILL_TOWER,
     }
 
 
@@ -605,7 +616,8 @@ def stage_of(config):
     v1's run-config predates the stage fields and records none of them; it is
     the plain run from route A and the reader. A run before #222 records no
     context tower: it read its context with MacBERT. A run before #223 records
-    no key front: it is the span model.
+    no key front: it is the span model. A run before #241 records no fill
+    tower switch: its tower was frozen.
     """
     return {
         "ranking": config.get("ranking"),
@@ -615,6 +627,7 @@ def stage_of(config):
         "context_warm_up": config.get("context_warm_up", False),
         "keys": config.get("keys"),
         "key_warm_up": config.get("key_warm_up", False),
+        "train_fill_tower": config.get("train_fill_tower"),
     }
 
 
@@ -658,9 +671,15 @@ def key_training_argv():
         str(KEYS["layers"]),
         "--distill-weight",
         str(KEYS["distill_weight"]),
+        "--frame-weight",
+        str(KEYS["frame_weight"]),
     ]
     if KEY_WARM_UP:
         argv.append("--key-warm-up")
+    if TRAIN_FILL_TOWER is not None:
+        argv.append("--train-fill-tower")
+        if TRAIN_FILL_TOWER["cross_attention"]:
+            argv.append("--train-cross-attention")
     return argv
 
 
@@ -1088,6 +1107,8 @@ def main():
         raise RuntimeError("a key front is built over a finished run; stamp INIT_FROM")
     if KEY_WARM_UP and KEYS is None:
         raise RuntimeError("the key warm-up trains a key front; stamp KEYS")
+    if TRAIN_FILL_TOWER is not None and not KEY_WARM_UP:
+        raise RuntimeError("the fill tower trains in the key warm-up; stamp KEY_WARM_UP")
     install()
     packages = package_root()
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)
