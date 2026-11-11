@@ -75,7 +75,9 @@ class KeyFrontConfig:
 
     ``layers`` is the thin causal stack between the key embeddings and the
     fill tower, at the tower's width. ``distill_weight`` weighs the S1
-    warm-up's distillation term against the constrained CTC.
+    warm-up's distillation term against the constrained CTC, and
+    ``frame_weight`` the parent's per-position term on the student's states
+    (#255); 0 leaves that term out of the step.
     ``correct_syllables`` is the legality automaton's: whether a span that is
     itself a syllable may be read through a correction. ``max_keys`` is the
     longest key string an example may have; the fill tower's positions are
@@ -84,6 +86,7 @@ class KeyFrontConfig:
 
     layers: int = 2
     distill_weight: float = 1.0
+    frame_weight: float = 0.0
     correct_syllables: bool = True
     max_keys: int = 510
 
@@ -92,8 +95,14 @@ class KeyFrontConfig:
             raise ValueError(f"the key front needs at least one layer, got {self.layers}")
         if self.distill_weight < 0.0:
             raise ValueError(f"distill_weight must not be negative, got {self.distill_weight}")
+        if self.frame_weight < 0.0:
+            raise ValueError(f"frame_weight must not be negative, got {self.frame_weight}")
         if self.max_keys < 1:
             raise ValueError(f"max_keys must be positive, got {self.max_keys}")
+
+    def weighed_as(self, other: KeyFrontConfig) -> KeyFrontConfig:
+        """This front under *other*'s loss weights: what a stage over a key run may change."""
+        return replace(self, distill_weight=other.distill_weight, frame_weight=other.frame_weight)
 
     @property
     def options(self) -> LegalityOptions:

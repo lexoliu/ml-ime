@@ -68,6 +68,11 @@ DATA = ROOT / "crates/ime-pinyin/data"
 #: The tiny tower has 64 positions; two are the sentinels.
 KEYS = KeyFrontConfig(layers=2, max_keys=62)
 
+#: The same front with the parent's per-position term on its states (#255).
+FRAMED = replace(KEYS, frame_weight=0.5)
+
+LOSS_WEIGHTS = [pytest.param(KEYS, id="distilled"), pytest.param(FRAMED, id="framed")]
+
 #: What S1 trains of the fill path beside the front and the head (#241).
 TOWER = FillTowerTraining()
 CROSS_ATTENTION = FillTowerTraining(cross_attention=True)
@@ -112,12 +117,14 @@ def reader_vocab_fixture(lexicon: Lexicon) -> CharVocab:
 
 
 def key_config(
-    train_fill_tower: FillTowerTraining | None = None, cross_attention_dropout: float | None = None
+    train_fill_tower: FillTowerTraining | None = None,
+    cross_attention_dropout: float | None = None,
+    keys: KeyFrontConfig = KEYS,
 ) -> E2EConfig:
     config = E2EConfig(
         cross_attention_layers=1,
         decoder=READER_TINY,
-        keys=KEYS,
+        keys=keys,
         key_warm_up=True,
         train_fill_tower=train_fill_tower,
     )
@@ -132,12 +139,13 @@ def tiny_key_model(
     train_fill_tower: FillTowerTraining | None = None,
     tower: BertConfig = TINY,
     cross_attention_dropout: float | None = None,
+    keys: KeyFrontConfig = KEYS,
 ) -> KeyE2EModel:
     torch.manual_seed(0)
     return KeyE2EModel.compose(
         tower,
         lexicon,
-        key_config(train_fill_tower, cross_attention_dropout),
+        key_config(train_fill_tower, cross_attention_dropout, keys),
         len(vocab),
         emittable_ids(lexicon, vocab),
     )
@@ -153,6 +161,17 @@ def open_gates(model: E2EModel, value: float = 0.5) -> None:
     """
     with torch.no_grad():
         for layer in model.gated_layers():
+            layer.gate.fill_(value)
+
+
+def read_the_encoder(model: E2EModel, value: float = 0.5) -> None:
+    """Open the decoder's cross gates, as a trained parent's are.
+
+    A fresh decoder's start at zero, so its loss would not depend on the
+    encoder states it is handed at all.
+    """
+    with torch.no_grad():
+        for layer in model.decoder.gated_layers():
             layer.gate.fill_(value)
 
 
@@ -718,6 +737,71 @@ def test_the_gates_frame_is_the_parents_when_the_student_matches_the_teacher(
     assert student.scored == sum(len(example.targets) for example in examples)
 
 
+def test_the_frame_term_is_the_parents_loss_when_the_student_matches_the_teacher(
+    vocabularies: Vocabularies,
+    spans: SpanVocab,
+    lexicon: Lexicon,
+    reader_vocab: CharVocab,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tiny_key_model(lexicon, reader_vocab, keys=FRAMED).eval()
+    read_the_encoder(model)
+    batch = key_collator(spans, lexicon)(build_examples(vocabularies)[:6])
+    hidden = TINY.hidden_size
+
+    def matching(batch_: KeyBatch, memory_: Any) -> torch.Tensor:
+        teacher = model.span_states(batch_, memory_).reshape(-1, hidden)
+        placed = teacher.new_zeros((batch_.key_input_ids.numel(), hidden)).index_copy(
+            0, batch_.end_positions, teacher.index_select(0, batch_.spans.scored)
+        )
+        return placed.view(*batch_.key_input_ids.shape, hidden)
+
+    monkeypatch.setattr(model, "encode_keys", matching)
+    with torch.no_grad():
+        framed = model(batch).extras["frame_loss"]
+        parent = E2EModel.forward(model, batch.spans).extras["decoder_loss"]
+    torch.testing.assert_close(framed, parent)
+
+
+def test_the_frame_term_trains_the_student_through_the_frozen_decoder(
+    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon, reader_vocab: CharVocab
+) -> None:
+    model = tiny_key_model(lexicon, reader_vocab, TOWER, keys=FRAMED)
+    open_gates(model)
+    read_the_encoder(model)
+    model.freeze_for_key_warm_up()
+    model.train()
+    assert not any(module.training for module in model.decoder.modules())
+    batch = key_collator(spans, lexicon, dropout=0.3)(build_examples(vocabularies)[:8])
+
+    output = model(batch)
+    assert output.loss is not None
+    total = (
+        output.extras["ctc_loss"]
+        + FRAMED.distill_weight * output.extras["distill_loss"]
+        + FRAMED.frame_weight * output.extras["frame_loss"]
+    )
+    torch.testing.assert_close(output.loss.detach(), total)
+    output.loss.backward()
+    assert all(parameter.grad is None for parameter in model.decoder.parameters())
+
+    # The term alone moves the tower and the front's letters, by way of the decoder.
+    memory = model.encode_context(batch.spans)
+    student = model.encode_keys(batch, memory).reshape(-1, TINY.hidden_size)
+    frame = model.frame_loss(batch, student.index_select(0, batch.end_positions))
+    tower = model.fill.encoder.layer[0].attention.self.query.weight
+    for gradient in torch.autograd.grad(frame, [tower, model.key_front.letters.weight]):
+        assert bool(gradient.any())
+
+    # Without the weight the decoder is not run at all.
+    plain = tiny_key_model(lexicon, reader_vocab, TOWER)
+    plain.freeze_for_key_warm_up()
+    plain.train()
+    assert "frame_loss" not in plain(batch).extras
+    with pytest.raises(ValueError, match="frame_weight"):
+        replace(KEYS, frame_weight=-0.1)
+
+
 # --- the run ---------------------------------------------------------------------
 
 
@@ -823,6 +907,42 @@ def test_an_s1_run_logs_every_component_resumes_exactly_and_is_scored_against_it
             keys=KEYS,
             key_warm_up=True,
             train_fill_tower=switched,
+        )
+
+    # A stage over the finished key run keeps its front and its teacher, and
+    # trains under its own loss weights (#255).
+    finished = tmp_path / "whole" / "checkpoint-000004.pt"
+    framed = e2e(
+        paths("framed"),
+        slices,
+        training,
+        init_e2e=finished,
+        keys=FRAMED,
+        key_warm_up=True,
+        train_fill_tower=train_fill_tower,
+    )
+    framed_steps = [
+        record for record in run_records(framed.metrics) if record.get("event") == "step"
+    ]
+    assert len(framed_steps) == 4
+    assert all(math.isfinite(record["frame_loss"]) for record in framed_steps)
+    before = torch.load(finished, map_location="cpu", weights_only=False)["model"]
+    after = torch.load(
+        tmp_path / "framed" / "checkpoint-000004.pt", map_location="cpu", weights_only=False
+    )["model"]
+    teachers = [name for name in before if name.startswith("teacher_")]
+    assert bool(teachers) == (train_fill_tower is not None)
+    for name in teachers:
+        torch.testing.assert_close(after[name], before[name], rtol=0, atol=0, msg=name)
+    with pytest.raises(ValueError, match="changes only its loss weights"):
+        e2e(
+            paths("reshaped"),
+            slices,
+            training,
+            init_e2e=finished,
+            keys=replace(FRAMED, layers=3),
+            key_warm_up=True,
+            train_fill_tower=train_fill_tower,
         )
 
     # A key checkpoint is not a span model the lattice search can decode.
@@ -987,6 +1107,7 @@ def test_the_compiled_s1_step_matches_the_eager_one_on_cuda(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="sync detection needs CUDA")
+@pytest.mark.parametrize("keys", LOSS_WEIGHTS)
 @pytest.mark.parametrize("train_fill_tower", TRAINED_TOWERS)
 def test_a_compiled_s1_step_training_the_tower_issues_no_host_syncs(
     vocabularies: Vocabularies,
@@ -994,6 +1115,7 @@ def test_a_compiled_s1_step_training_the_tower_issues_no_host_syncs(
     lexicon: Lexicon,
     reader_vocab: CharVocab,
     train_fill_tower: FillTowerTraining,
+    keys: KeyFrontConfig,
 ) -> None:
     """Forward, backward and the loop's fused AdamW step, compiled as a run compiles them.
 
@@ -1002,7 +1124,7 @@ def test_a_compiled_s1_step_training_the_tower_issues_no_host_syncs(
     """
     from mlime.train.e2e import compile_modules
 
-    model = tiny_key_model(lexicon, reader_vocab, train_fill_tower).cuda()
+    model = tiny_key_model(lexicon, reader_vocab, train_fill_tower, keys=keys).cuda()
     open_gates(model)
     compile_modules(model, "default")
     model.freeze_for_key_warm_up()
@@ -1032,6 +1154,7 @@ def test_a_compiled_s1_step_training_the_tower_issues_no_host_syncs(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="inductor's CUDA graphs need CUDA")
+@pytest.mark.parametrize("keys", LOSS_WEIGHTS)
 @pytest.mark.parametrize("train_fill_tower", TRAINED_TOWERS)
 def test_the_compiled_s1_step_training_the_tower_matches_the_eager_one_on_cuda(
     vocabularies: Vocabularies,
@@ -1039,6 +1162,7 @@ def test_the_compiled_s1_step_training_the_tower_matches_the_eager_one_on_cuda(
     lexicon: Lexicon,
     reader_vocab: CharVocab,
     train_fill_tower: FillTowerTraining,
+    keys: KeyFrontConfig,
 ) -> None:
     """The loss and every trained gradient agree; the towers drop nothing, so both draw alike.
 
@@ -1060,7 +1184,12 @@ def test_the_compiled_s1_step_training_the_tower_matches_the_eager_one_on_cuda(
     gradients = []
     for compiled in (False, True):
         model = tiny_key_model(
-            lexicon, reader_vocab, train_fill_tower, tower=tower, cross_attention_dropout=0.0
+            lexicon,
+            reader_vocab,
+            train_fill_tower,
+            tower=tower,
+            cross_attention_dropout=0.0,
+            keys=keys,
         ).cuda()
         open_gates(model)
         if compiled:

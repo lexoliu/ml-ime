@@ -79,7 +79,7 @@ E2E_KEYS_RUN = "mlime-e2e-keys-"
 CONTEXT_TOWER_FIELDS = frozenset({"tower", "revision", "lora_rank", "lora_alpha", "layers"})
 
 #: What a stamped ``KEYS`` holds: the kernel's key front options (#223).
-KEYS_FIELDS = frozenset({"layers", "distill_weight", "correct_syllables"})
+KEYS_FIELDS = frozenset({"layers", "distill_weight", "frame_weight", "correct_syllables"})
 
 #: What a stamped ``TRAIN_FILL_TOWER`` holds: what S1 trains of the fill path
 #: beside the tower itself (#241).
@@ -154,7 +154,8 @@ class E2EV2Stage:
     the tower keeps from the bottom, None for all of them (#237). *context_warm_up*
     (``CONTEXT_WARM_UP``) trains only the context path, which is S0.
     *keys* (``KEYS``) reads keystrokes through a key front with a per-key CTC
-    head (#223): its ``layers``, ``distill_weight`` and ``correct_syllables``.
+    head (#223): its ``layers``, ``distill_weight``, ``frame_weight`` and
+    ``correct_syllables``.
     *key_warm_up* (``KEY_WARM_UP``) trains only the front and the head,
     distilling *init_from*'s encoder states, which is S1. *train_fill_tower*
     (``TRAIN_FILL_TOWER``) trains the fill tower in S1 as well, and with

@@ -290,8 +290,8 @@ def build_from(
     loop. A stage that names a key front over a span model's run warms the
     front up over it (:meth:`~mlime.train.key_model.KeyE2EModel.load_parent`),
     reading the context with the parent's own tower; a key run keeps its
-    front. The checkpoint is gigabytes, and it lives only in this frame:
-    nothing holds it once the model is built.
+    front, under this stage's loss weights. The checkpoint is gigabytes, and
+    it lives only in this frame: nothing holds it once the model is built.
     """
     state = torch.load(source, map_location="cpu", weights_only=False)
     recorded = E2EConfig.from_record(_record(state, "e2e", source))
@@ -308,8 +308,11 @@ def build_from(
     )
     vocabularies = Vocabularies.load(char_table, recorded.base_model, context)
     model = from_checkpoint(state, vocabularies.lexicon, wanted)
-    if recorded.keys is not None and recorded.keys != keys:
-        raise ValueError(f"{source} has the key front {recorded.keys}; a stage keeps it as it is")
+    if recorded.keys is not None and (keys is None or recorded.keys.weighed_as(keys) != keys):
+        raise ValueError(
+            f"{source} has the key front {recorded.keys}; a stage keeps it and changes only "
+            "its loss weights"
+        )
     if with_weights:
         if recorded.keys is None and keys is not None:
             if recorded.context != context:

@@ -503,7 +503,9 @@ def test_a_key_stage_passes_its_front_to_the_count_and_the_trainer(
     kernel = load_kernel(monkeypatch, tmp_path, segment=0)
     monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-v2-rank-g4")
     monkeypatch.setattr(
-        kernel, "KEYS", {"layers": 3, "distill_weight": 0.5, "correct_syllables": False}
+        kernel,
+        "KEYS",
+        {"layers": 3, "distill_weight": 0.5, "frame_weight": 0.25, "correct_syllables": False},
     )
     monkeypatch.setattr(kernel, "KEY_WARM_UP", True)
     monkeypatch.setattr(kernel, "TRAIN_FILL_TOWER", {"cross_attention": True})
@@ -511,6 +513,7 @@ def test_a_key_stage_passes_its_front_to_the_count_and_the_trainer(
     assert kernel.stage()["keys"] == {
         "layers": 3,
         "distill_weight": 0.5,
+        "frame_weight": 0.25,
         "correct_syllables": False,
     }
 
@@ -539,6 +542,7 @@ def test_a_key_stage_passes_its_front_to_the_count_and_the_trainer(
         assert switch in tail, switch
     assert tail[tail.index("--key-front-layers") + 1] == "3"
     assert tail[tail.index("--distill-weight") + 1] == "0.5"
+    assert tail[tail.index("--frame-weight") + 1] == "0.25"
     group = typer.main.get_command(cli.app)
     assert isinstance(group, TyperGroup)
     train = group.commands["train"]
@@ -581,7 +585,9 @@ def test_a_key_stage_needs_the_run_it_warms_up_over(
 ) -> None:
     kernel = load_kernel(monkeypatch, tmp_path, segment=0)
     monkeypatch.setattr(
-        kernel, "KEYS", {"layers": 2, "distill_weight": 1.0, "correct_syllables": True}
+        kernel,
+        "KEYS",
+        {"layers": 2, "distill_weight": 1.0, "frame_weight": 0.0, "correct_syllables": True},
     )
     with pytest.raises(RuntimeError, match="stamp INIT_FROM"):
         kernel.main()

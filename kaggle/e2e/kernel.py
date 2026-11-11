@@ -241,8 +241,10 @@ CONTEXT_WARM_UP = False
 TOWER_GRAPHS = False
 
 #: The key-level front of #223, as `mlime train e2e`'s key options: a dict of
-#: `layers`, `distill_weight` and `correct_syllables`. A stage builds it over
-#: `INIT_FROM`'s weights. None keeps the span model. Stamped per push.
+#: `layers`, `distill_weight`, `frame_weight` and `correct_syllables`. A stage
+#: builds it over `INIT_FROM`'s weights, or keeps the front of a key run it
+#: starts from under these loss weights. None keeps the span model. Stamped
+#: per push.
 KEYS = None
 
 #: Train only the key front and the CTC head, distilling `INIT_FROM`'s encoder
@@ -669,6 +671,8 @@ def key_training_argv():
         str(KEYS["layers"]),
         "--distill-weight",
         str(KEYS["distill_weight"]),
+        "--frame-weight",
+        str(KEYS["frame_weight"]),
     ]
     if KEY_WARM_UP:
         argv.append("--key-warm-up")

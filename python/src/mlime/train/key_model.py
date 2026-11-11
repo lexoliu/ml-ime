@@ -32,6 +32,13 @@ the front feeds adds no dropout the front cannot see. The gate feeds the
 parent's frozen decoder the front's states at the span ends, in place of its
 encoder's (:meth:`KeyE2EModel.student_frame`).
 
+**The frame term** (``frame_weight``, #255) trains on what that gate reads.
+The squared error weighs every direction of a state alike and the decoder
+does not, so a run can fit the parent's states more closely and still decode
+worse. The term is the parent's own per-position loss, computed by its frozen
+decoder over the student's states at the span ends: the decoder's weights
+take no step, and its gradient reaches the front and the tower through them.
+
 **S1 with the tower** (``train_fill_tower``, #241) trains the fill tower too,
 beside the front and the head and at the head's rate, in training mode, and
 with ``cross_attention`` the tower's gated context blocks as well. The teacher
@@ -389,8 +396,30 @@ class KeyE2EModel(E2EModel):
         logits = torch.cat([self.head.decoder(transformed), self.blank(transformed)], dim=-1)
         return logits.float().log_softmax(dim=-1)
 
+    def at_span_ends(self, batch: KeyBatch, ends: torch.Tensor) -> torch.Tensor:
+        """The ``[P, H]`` span-end states in the span batch's columns, ``[B, W, H]``.
+
+        They land where the parent's encoder states would be, which is how its
+        decoder reads them.
+        """
+        spans = batch.spans
+        width = spans.targets.shape[1]
+        hidden = ends.shape[-1]
+        placed = ends.new_zeros((spans.size * width, hidden)).index_copy(0, spans.scored, ends)
+        return placed.view(spans.size, width, hidden)
+
+    def frame_loss(self, batch: KeyBatch, ends: torch.Tensor) -> torch.Tensor:
+        """The parent's per-position loss, its decoder reading the student's span-end states."""
+        scored = self._scored(batch.spans, self.at_span_ends(batch, ends))
+        if scored is None:
+            raise ValueError("a key batch scores at least one span")
+        return self.position_loss(scored.decoder, scored.targets, scored.candidates)
+
     def forward(self, batch: KeyBatch) -> RouteAOutput:  # type: ignore[override]
-        """S1's loss: the constrained CTC plus the weighted distillation of the parent's states."""
+        """S1's loss: the constrained CTC, the distillation of the parent's states, the frame term.
+
+        The last two are weighted, and a frame weight of 0 skips the decoder.
+        """
         if not isinstance(batch, KeyBatch):
             raise TypeError(f"the key model trains on key batches, got a {type(batch).__name__}")
         spans = batch.spans
@@ -408,6 +437,11 @@ class KeyE2EModel(E2EModel):
         nll = constrained_ctc(blank, emit, batch.cost, batch.keys, batch.lengths)
         ctc = nll.sum() / spans.scored.numel()
         loss = ctc + self.keys_config.distill_weight * distill
+        extras = {"ctc_loss": ctc.detach(), "distill_loss": distill.detach()}
+        if self.keys_config.frame_weight:
+            frame = self.frame_loss(batch, ends)
+            loss = loss + self.keys_config.frame_weight * frame
+            extras["frame_loss"] = frame.detach()
         with torch.no_grad():
             components = alignment_components(
                 blank,
@@ -418,31 +452,21 @@ class KeyE2EModel(E2EModel):
                 batch.position_mask,
                 batch.corrupted,
             )
-        return RouteAOutput(
-            loss=loss,
-            extras={
-                "ctc_loss": ctc.detach(),
-                "distill_loss": distill.detach(),
-                **components,
-            },
-        )
+        return RouteAOutput(loss=loss, extras={**extras, **components})
 
     def student_frame(self, batch: KeyBatch) -> torch.Tensor:
         """The parent's decoder frame fed the key front's states at the span ends.
 
-        The states land in the span columns of the span batch, where the
-        parent's encoder states would be, and the frame is the span model's
-        own (:meth:`~mlime.train.e2e_model.E2EModel.frame`): the S1 gate.
+        The states land in the span columns of the span batch
+        (:meth:`at_span_ends`), and the frame is the span model's own
+        (:meth:`~mlime.train.e2e_model.E2EModel.frame`): the S1 gate.
         """
         spans = batch.spans
         mark_dynamic(spans)
         memory = self.encode_context(spans)
         student = self.encode_keys(batch, memory)
-        hidden = student.shape[-1]
-        ends = student.reshape(-1, hidden).index_select(0, batch.end_positions)
-        width = spans.targets.shape[1]
-        placed = student.new_zeros((spans.size * width, hidden)).index_copy(0, spans.scored, ends)
-        return self.frame(spans, placed.view(spans.size, width, hidden))
+        ends = student.reshape(-1, student.shape[-1]).index_select(0, batch.end_positions)
+        return self.frame(spans, self.at_span_ends(batch, ends))
 
     def parent_frame(self, batch: KeyBatch) -> torch.Tensor:
         """The parent's own frame over the spans: what the gate compares the student against.

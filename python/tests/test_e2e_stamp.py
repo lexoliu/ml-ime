@@ -343,12 +343,22 @@ def test_a_key_warm_up_stamps_its_front_over_the_parent_a_flag_names(tmp_path: P
     argv = ["e2e", "stamp", "mlime-e2e-keys-s1-check", "--out", str(out)]
     stage = ["--init-from", "mlime-e2e-v2-rank-g4", "--keys", "--key-warm-up"]
     result = CliRunner().invoke(
-        app, [*argv, *stage, "--key-front-layers", "3", "--distill-weight", "0.5"]
+        app,
+        [
+            *argv,
+            *stage,
+            "--key-front-layers",
+            "3",
+            "--distill-weight",
+            "0.5",
+            "--frame-weight",
+            "0.25",
+        ],
     )
     assert result.exit_code == 0, result.output
     template = (TEMPLATE / "kernel.py").read_text()
     kernel = (out / "kernel.py").read_text()
-    keys = {"layers": 3, "distill_weight": 0.5, "correct_syllables": True}
+    keys = {"layers": 3, "distill_weight": 0.5, "frame_weight": 0.25, "correct_syllables": True}
     assert literal(kernel, "INIT_FROM") == "mlime-e2e-v2-rank-g4"
     assert literal(kernel, "KEYS") == keys
     assert literal(kernel, "KEY_WARM_UP") is True
@@ -395,7 +405,7 @@ def test_a_key_warm_up_that_trains_the_tower_stamps_one_switch_more(
     assert result.exit_code == 0, result.output
     template = (TEMPLATE / "kernel.py").read_text()
     kernel = (out / "kernel.py").read_text()
-    keys = {"layers": 2, "distill_weight": 1.0, "correct_syllables": True}
+    keys = {"layers": 2, "distill_weight": 1.0, "frame_weight": 0.0, "correct_syllables": True}
     assert sorted(changed_lines(template, kernel)) == sorted(
         f"{name} = {value!r}"
         for name, value in {
