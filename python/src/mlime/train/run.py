@@ -23,7 +23,7 @@ from __future__ import annotations
 import hashlib
 import subprocess
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 
 import torch
@@ -60,17 +60,23 @@ from mlime.train.samples import (
     TrainingExample,
 )
 from mlime.train.spans import SpanVocab
+from mlime.train.units import UnitMatcher
 from mlime.typo import CorrectionTable, NoiseModel
 
 
 @dataclass(frozen=True)
 class RunPaths:
-    """Where a run reads and writes."""
+    """Where a run reads and writes.
+
+    ``unit_lexicon`` is the knowledge lexicon the unit initials augmentation
+    reads its idioms and internet phrases from; ``None`` for a run without it.
+    """
 
     samples: Path
     labels: Path
     char_table: Path
     out: Path
+    unit_lexicon: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -231,6 +237,14 @@ class Vocabularies:
     lexicon: Lexicon
     arbitration: ReadingArbitration
     syllables: frozenset[str]
+    #: Finds the idioms and internet phrases the unit initials augmentation types
+    #: whole; ``None`` for a run that does not.
+    units: UnitMatcher | None = None
+
+    def with_units(self, unit_lexicon: Path | None) -> Vocabularies:
+        """These tables with the unit matcher read from *unit_lexicon*, or without one."""
+        units = None if unit_lexicon is None else UnitMatcher.load(unit_lexicon)
+        return replace(self, units=units)
 
     @classmethod
     def load(
@@ -287,6 +301,7 @@ class Vocabularies:
             seed=seed,
             noise=self.noise_model(augmented.typos),
             candidates=self.candidate_space(augmented.typos),
+            units=self.units,
         )
 
     def stream(
@@ -336,6 +351,7 @@ class Vocabularies:
             augmented,
             seed=seed,
             noise=self.noise_model(augmented.typos),
+            units=self.units,
         )
 
     def key_collator(
@@ -406,7 +422,9 @@ class CorpusLane:
 
     def open(self) -> tuple[CorpusStream, BatchCollator]:
         """Load the tables, then build this lane's stream and collator over them."""
-        vocabularies = Vocabularies.load(self.paths.char_table, self.base_model, self.context)
+        vocabularies = Vocabularies.load(
+            self.paths.char_table, self.base_model, self.context
+        ).with_units(self.paths.unit_lexicon)
         if self.keys is not None:
             if self.ranking is not None:
                 raise ValueError("a key-level lane has no lattice readings to rank")

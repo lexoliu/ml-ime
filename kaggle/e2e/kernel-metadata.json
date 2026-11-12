@@ -17,6 +17,8 @@
     "lexoliu/mlime-run3-v1-labels",
     "lexoliu/mlime-run3-rest-samples",
     "lexoliu/mlime-run3-rest-labels",
+    "lexoliu/mlime-enrich-samples",
+    "lexoliu/mlime-enrich-labels",
     "lexoliu/mlime-e2e-init",
     "lexoliu/mlime-e2e-census",
     "lexoliu/mlime-e2e-resume-a",

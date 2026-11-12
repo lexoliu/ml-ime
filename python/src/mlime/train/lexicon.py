@@ -377,6 +377,18 @@ def write_emittable(path: Path, lexicon: Lexicon) -> int:
     return lexicon.size
 
 
+def read_emittable(path: Path) -> tuple[str, ...]:
+    """The characters of an emittable file in emission order, one per line."""
+    if not path.is_file():
+        raise FileNotFoundError(f"no emittable set at {path}")
+    characters = tuple(path.read_text(encoding="utf-8").split())
+    if not characters or any(len(character) != 1 for character in characters):
+        raise ValueError(f"{path} is not a one-character-per-line emittable set")
+    if len(set(characters)) != len(characters):
+        raise ValueError(f"{path} lists a character twice")
+    return characters
+
+
 def build_lexicon(
     readings: Mapping[str, tuple[str, ...]],
     vocabulary: Mapping[str, int],

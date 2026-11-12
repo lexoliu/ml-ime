@@ -42,9 +42,9 @@ from mlime.train.samples import (
     TrainingExample,
     example_rng,
     letter_id,
-    type_syllables,
 )
 from mlime.train.spans import SpanVocab
+from mlime.train.units import UnitMatcher
 from mlime.typo import MULTI_LETTER_INITIALS, NoiseModel
 
 #: The QWERTY letter rows, top to bottom, and how far each row's first key
@@ -216,6 +216,7 @@ class KeySampleBuilder(SampleBuilder):
         augmentation: Augmentation | None = None,
         seed: int = 0,
         noise: NoiseModel | None = None,
+        units: UnitMatcher | None = None,
     ):
         augmented = augmentation or Augmentation()
         if (noise is not None) != augmented.typos:
@@ -225,7 +226,9 @@ class KeySampleBuilder(SampleBuilder):
             )
         if legality.characters != lexicon.characters:
             raise ValueError("the legality automaton emits over a different set than the lexicon")
-        super().__init__(lexicon, spans, arbitration, replace(augmented, typos=False), seed)
+        super().__init__(
+            lexicon, spans, arbitration, replace(augmented, typos=False), seed, units=units
+        )
         self.augmentation = augmented
         self.legality = legality
         self.config = config
@@ -240,7 +243,7 @@ class KeySampleBuilder(SampleBuilder):
             return None
         readings, targets = settled
         rng = example_rng(self.seed, epoch, sample.id)
-        meant = type_syllables(readings, rng, self.augmentation)
+        meant = self.type_readings(sample.text, readings, rng)
         if not self.candidates.admits_all(meant, targets):
             self.counts.target_not_admitted += 1
             return None

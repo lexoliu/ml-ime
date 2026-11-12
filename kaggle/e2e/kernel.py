@@ -160,6 +160,10 @@ HELD_OUT = (
 #: The shard by which each mount is recognised.
 V1_MARKER = "dialogue-00000.parquet"
 REST_MARKER = "dialogue-rest-00000.parquet"
+#: The enrichment mount (`mlime-enrich-samples` / `-labels`) holds `lift-*` shards,
+#: which only an explicit `TRAIN_SHARDS` entry brings into a run (see `stage_enrichment`).
+ENRICH_PREFIX = "lift-"
+ENRICH_MARKER = "lift-00000.parquet"
 
 #: The files `lexoliu/mlime-e2e-init` holds: route A v2's final weights and the
 #: transformer reader's.
@@ -230,7 +234,8 @@ WHOLE_ALPHABET = False
 SEARCH_GRAPHS = False
 
 #: The training shards a run makes its epoch over; None trains on every
-#: mounted shard but the held-out ones. Stamped per push.
+#: staged shard but the held-out ones, which never includes an enrichment shard:
+#: those are staged only when named here. Stamped per push.
 TRAIN_SHARDS = None
 
 #: The Qwen model that reads the context in place of MacBERT (#222), as
@@ -285,6 +290,16 @@ SEGMENTER = "ime-segment"
 #: Off by default so the running chain stays on clean input until a pushed
 #: copy turns it on deliberately.
 TYPOS = False
+
+#: The probability that the idioms and internet phrases of a sentence are typed
+#: as initials whole (`mlime train e2e --unit-initials`). 0 leaves the typing
+#: styles as they are. Stamped per push.
+UNIT_INITIALS = 0.0
+
+#: The knowledge lexicon (`word<TAB>category` rows) those units are read from,
+#: as the name of a file in the assets mount beside `char_pinyin.tsv`. Named
+#: exactly when `UNIT_INITIALS` is above 0. Stamped per push.
+UNIT_LEXICON = None
 
 #: The three files a leg hands the next one.
 RESUME_MARKERS = ("checkpoint-paused.pt", "run-config.json", "run-summary.json")
@@ -529,6 +544,36 @@ def stage_data(mounts):
     return DATA
 
 
+def enrichment_shards(train_shards):
+    """The enrichment shards *train_shards* names, which are the only ones staged.
+
+    The default shard list is every shard staged under `samples/` less the
+    held-out ones, so an enrichment shard is reachable only by being absent
+    from staging unless named: with no `TRAIN_SHARDS` this is empty and the
+    mount is not even looked for, so a run that does not use it needs nothing
+    of it.
+    """
+    return [name for name in train_shards or () if name.startswith(ENRICH_PREFIX)]
+
+
+def stage_enrichment(names):
+    """Link the named enrichment shards, samples and labels, beside the others."""
+    if not names:
+        return
+    samples, labels = parquet_mounts(ENRICH_MARKER)
+    for kind, source in (("samples", samples), ("labels", labels)):
+        target = DATA / kind
+        for name in names:
+            shard = source / name
+            if not shard.is_file():
+                raise FileNotFoundError(f"{name} is not in the enrichment {kind} mount {source}")
+            link = target / name
+            if link.exists():
+                raise FileExistsError(f"{name} is staged twice under {target}")
+            link.symlink_to(shard)
+    print(f"enrichment: {len(names)} shards staged", flush=True)
+
+
 def warm_cache():
     """Download the base model's small files once, before the ranks race for them.
 
@@ -599,8 +644,7 @@ def count_argv(char_table, out, segmenter, census=None):
         *ranking_argv(segmenter),
         *keys_argv(),
     ]
-    if TYPOS:
-        argv.append("--typos")
+    argv += typing_argv(char_table)
     if census is not None:
         argv += ["--reuse-census", str(census)]
     return argv
@@ -624,6 +668,9 @@ def stage():
         "keys": KEYS,
         "key_warm_up": KEY_WARM_UP,
         "train_fill_tower": TRAIN_FILL_TOWER,
+        "typos": TYPOS,
+        "unit_initials": UNIT_INITIALS,
+        "unit_lexicon": UNIT_LEXICON,
     }
 
 
@@ -634,7 +681,9 @@ def stage_of(config):
     the plain run from route A and the reader. A run before #222 records no
     context tower: it read its context with MacBERT. A run before #223 records
     no key front: it is the span model. A run before #241 records no fill
-    tower switch: its tower was frozen.
+    tower switch: its tower was frozen. A run before the unit initials records
+    none: it typed no unit whole, and a run before `typos` was recorded turned
+    them on only by a hand-stamped kernel, which no stage of this chain did.
     """
     return {
         "ranking": config.get("ranking"),
@@ -645,6 +694,9 @@ def stage_of(config):
         "keys": config.get("keys"),
         "key_warm_up": config.get("key_warm_up", False),
         "train_fill_tower": config.get("train_fill_tower"),
+        "typos": config.get("typos", False),
+        "unit_initials": config.get("unit_initials", 0.0),
+        "unit_lexicon": config.get("unit_lexicon"),
     }
 
 
@@ -695,6 +747,21 @@ def key_training_argv():
         argv.append("--train-fill-tower")
         if TRAIN_FILL_TOWER["cross_attention"]:
             argv.append("--train-cross-attention")
+    return argv
+
+
+def typing_argv(char_table):
+    """The typing augmentation's switches beyond the styles, shared by counting and training.
+
+    The unit lexicon is read from the assets mount *char_table* is in; a leg
+    whose mount lacks it fails here, before a count or a segment starts.
+    """
+    argv = ["--typos"] if TYPOS else []
+    if UNIT_INITIALS > 0:
+        lexicon = char_table.parent / UNIT_LEXICON
+        if not lexicon.is_file():
+            raise FileNotFoundError(f"the assets mount holds no unit lexicon {lexicon.name}")
+        argv += ["--unit-initials", str(UNIT_INITIALS), "--unit-lexicon", str(lexicon)]
     return argv
 
 
@@ -805,8 +872,7 @@ def train_argv(
         argv += ["--resume", str(resume)]
     if ACTIVATION_CHECKPOINTING:
         argv.append("--activation-checkpointing")
-    if TYPOS:
-        argv.append("--typos")
+    argv += typing_argv(char_table)
     argv += keys_argv() + key_training_argv()
     return argv
 
@@ -1308,12 +1374,15 @@ def main():
         raise RuntimeError("the key warm-up trains a key front; stamp KEYS")
     if TRAIN_FILL_TOWER is not None and not KEY_WARM_UP:
         raise RuntimeError("the fill tower trains in the key warm-up; stamp KEY_WARM_UP")
+    if (UNIT_INITIALS > 0) != (UNIT_LEXICON is not None):
+        raise RuntimeError("the unit initials and their lexicon come together; stamp both")
     install()
     packages = package_root()
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)
     rest_samples, rest_labels = parquet_mounts(REST_MARKER)
     assets = locate("char_pinyin.tsv", "lattice.jsonl")
     stage_data({"samples": (v1_samples, rest_samples), "labels": (v1_labels, rest_labels)})
+    stage_enrichment(enrichment_shards(TRAIN_SHARDS))
     print(
         subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, check=True).stdout,
         flush=True,

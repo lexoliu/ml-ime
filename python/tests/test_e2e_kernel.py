@@ -580,6 +580,66 @@ def test_a_key_stage_passes_its_front_to_the_count_and_the_trainer(
     assert getattr(augmentation, "typos", None) is True
 
 
+def test_the_unit_initials_reach_the_count_and_the_trainer_from_the_assets_mount(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The lexicon is a file beside char_pinyin.tsv; both commands parse the switches."""
+    import typer
+    from typer.core import TyperGroup
+
+    import mlime.__main__ as cli
+
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-final")
+    char_table = tmp_path / "char_pinyin.tsv"
+    assert kernel.UNIT_INITIALS == 0.0 and kernel.UNIT_LEXICON is None
+    for build in (
+        lambda: kernel.count_argv(char_table, tmp_path / "counts.json", None),
+        lambda: kernel.train_argv(
+            char_table,
+            tmp_path / "run",
+            max_steps=100,
+            wall_budget=3600,
+            start=kernel.start_argv(None, tmp_path / "checkpoint-final.pt"),
+            resume=None,
+            token_budget=12288,
+        ),
+    ):
+        assert "--unit-initials" not in build()
+    monkeypatch.setattr(kernel, "UNIT_INITIALS", 0.5)
+    monkeypatch.setattr(kernel, "UNIT_LEXICON", "unit-entries.tsv")
+    assert kernel.stage()["unit_initials"] == 0.5
+    assert kernel.stage()["unit_lexicon"] == "unit-entries.tsv"
+    assert kernel.stage_of({}) == {
+        **kernel.stage_of({}),
+        "unit_initials": 0.0,
+        "unit_lexicon": None,
+        "typos": False,
+    }
+    with pytest.raises(FileNotFoundError, match=r"unit-entries\.tsv"):
+        kernel.count_argv(char_table, tmp_path / "counts.json", None)
+    (tmp_path / "unit-entries.tsv").write_text("一帆风顺\tidiom\n", encoding="utf-8")
+    count_argv = kernel.count_argv(char_table, tmp_path / "counts.json", None)
+    train_argv = kernel.train_argv(
+        char_table,
+        tmp_path / "run",
+        max_steps=100,
+        wall_budget=3600,
+        start=kernel.start_argv(None, tmp_path / "checkpoint-final.pt"),
+        resume=None,
+        token_budget=12288,
+    )
+    group = typer.main.get_command(cli.app)
+    assert isinstance(group, TyperGroup)
+    train = group.commands["train"]
+    assert isinstance(train, TyperGroup)
+    for name, argv in (("count-batches", count_argv), ("e2e", train_argv)):
+        tail = [str(arg) for arg in argv[argv.index("mlime") + 3 :]]
+        assert tail[tail.index("--unit-initials") + 1] == "0.5"
+        assert tail[tail.index("--unit-lexicon") + 1] == str(tmp_path / "unit-entries.tsv")
+        train.commands[name].make_context(name, tail)
+
+
 def test_a_joint_key_stage_passes_its_transition_weight_and_no_warm_up_weight(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -771,3 +831,66 @@ def test_a_key_section_continues_from_a_mounted_earlier_output(
     kernel.seed_key_section("eval3-mixed-context-off")
     assert not (tmp_path / "working" / "keys-eval3-mixed-context-off").exists()
     assert kernel.schedule_seconds([5.0, 4.0, 3.0, 3.0], 2) == 8.0
+
+
+def mount(root: Path, name: str, shards: dict[str, str]) -> Path:
+    """A mounted shard repo whose parquet files carry the given column."""
+    import polars as pl
+
+    directory = root / name
+    directory.mkdir(parents=True)
+    for shard, column in shards.items():
+        pl.DataFrame({"id": ["a"], column: ["x"]}).write_parquet(directory / shard)
+    return directory
+
+
+def test_enrichment_shards_are_staged_only_when_named(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The default shard list is whatever is staged, so unnamed enrichment shards are not."""
+    inputs = tmp_path / "inputs"
+    mount(inputs, "mlime-run3-v1-samples", {"dialogue-00000.parquet": "text"})
+    mount(
+        inputs, "mlime-enrich-samples", {"lift-00000.parquet": "text", "lift-00001.parquet": "text"}
+    )
+    mount(
+        inputs,
+        "mlime-enrich-labels",
+        {"lift-00000.parquet": "syllables", "lift-00001.parquet": "syllables"},
+    )
+    kernel = load_kernel(monkeypatch, inputs, segment=0)
+    monkeypatch.setattr(kernel, "DATA", tmp_path / "data")
+    kernel.stage_data({"samples": (inputs / "mlime-run3-v1-samples",)})
+    (tmp_path / "data" / "labels").mkdir()
+
+    assert kernel.enrichment_shards(None) == []
+    assert kernel.enrichment_shards(["dialogue-00000.parquet"]) == []
+    kernel.stage_enrichment(kernel.enrichment_shards(None))
+    assert not list((tmp_path / "data").rglob("lift-*"))
+
+    # The default list, as `Slices.all_but` forms it, is every staged sample shard.
+    from mlime.train.run import Slices
+
+    default = Slices.all_but(tmp_path / "data" / "samples", ())
+    assert not any(name.startswith("lift-") for name in default.train)
+
+    named = kernel.enrichment_shards(["dialogue-00000.parquet", "lift-00001.parquet"])
+    assert named == ["lift-00001.parquet"]
+    kernel.stage_enrichment(named)
+    staged = {p.name for p in (tmp_path / "data" / "samples").iterdir()}
+    assert staged == {"dialogue-00000.parquet", "lift-00001.parquet"}
+    assert [p.name for p in (tmp_path / "data" / "labels").iterdir()] == ["lift-00001.parquet"]
+
+
+def test_a_named_enrichment_shard_the_mount_lacks_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    inputs = tmp_path / "inputs"
+    mount(inputs, "mlime-enrich-samples", {"lift-00000.parquet": "text"})
+    mount(inputs, "mlime-enrich-labels", {"lift-00000.parquet": "syllables"})
+    kernel = load_kernel(monkeypatch, inputs, segment=0)
+    monkeypatch.setattr(kernel, "DATA", tmp_path / "data")
+    for kind in ("samples", "labels"):
+        (tmp_path / "data" / kind).mkdir(parents=True)
+    with pytest.raises(FileNotFoundError, match="lift-00007"):
+        kernel.stage_enrichment(["lift-00007.parquet"])

@@ -43,6 +43,8 @@ V1_RECIPE: dict[str, Any] = {
     "RANKING": None,
     "WHOLE_ALPHABET": False,
     "TYPOS": False,
+    "UNIT_INITIALS": 0.0,
+    "UNIT_LEXICON": None,
     "ACTIVATION_CHECKPOINTING": False,
     "CONTEXT_TOWER": None,
     "CONTEXT_WARM_UP": False,
@@ -52,7 +54,8 @@ V1_RECIPE: dict[str, Any] = {
 }
 
 #: What a v2 leg mounts, each a Hugging Face dataset repo the stager downloads:
-#: the assets, the four shard repos, and the two initialisation checkpoints.
+#: the assets, the six shard repos (the enrichment pair among them), and the
+#: initialisation checkpoints.
 #: Nothing of v1's chain -- its census, its resume datasets, its segments --
 #: and nothing for the code, which a leg fetches from GitHub at its commit.
 E2E_V2_SOURCES = (
@@ -61,6 +64,8 @@ E2E_V2_SOURCES = (
     "lexoliu/mlime-run3-v1-labels",
     "lexoliu/mlime-run3-rest-samples",
     "lexoliu/mlime-run3-rest-labels",
+    "lexoliu/mlime-enrich-samples",
+    "lexoliu/mlime-enrich-labels",
     "lexoliu/mlime-e2e-init",
 )
 
@@ -168,7 +173,11 @@ class E2EV2Stage:
     where everything trains on the CTC and the transition. *train_fill_tower*
     (``TRAIN_FILL_TOWER``) trains the fill tower in S1 as well, and with
     ``cross_attention`` its gated context blocks, against frozen copies of
-    *init_from*'s (#241).
+    *init_from*'s (#241). *typos* (``TYPOS``) corrupts the typed keystrokes with
+    the shared noise model. *unit_initials* (``UNIT_INITIALS``) is the
+    probability that the idioms and internet phrases of a sentence are typed as
+    initials whole, and *unit_lexicon* (``UNIT_LEXICON``) the file in the
+    assets mount that holds them; the two come together.
     """
 
     init_from: str
@@ -181,9 +190,19 @@ class E2EV2Stage:
     keys: dict[str, Any] | None = None
     key_warm_up: bool = False
     train_fill_tower: dict[str, Any] | None = None
+    typos: bool = False
+    unit_initials: float = 0.0
+    unit_lexicon: str | None = None
 
     def __post_init__(self) -> None:
         _v2_name(self.init_from)
+        if not 0.0 <= self.unit_initials <= 1.0:
+            raise ValueError(f"unit_initials is a probability, got {self.unit_initials}")
+        if (self.unit_initials > 0.0) != (self.unit_lexicon is not None):
+            raise ValueError(
+                "unit_initials types the lexicon's units and the lexicon is read only for "
+                f"them; got unit_initials={self.unit_initials}, unit_lexicon={self.unit_lexicon!r}"
+            )
         if self.context_tower is not None and set(self.context_tower) != CONTEXT_TOWER_FIELDS:
             raise ValueError(
                 f"a context tower names {sorted(CONTEXT_TOWER_FIELDS)}, "
@@ -224,6 +243,9 @@ class E2EV2Stage:
             "KEYS": self.keys,
             "KEY_WARM_UP": self.key_warm_up,
             "TRAIN_FILL_TOWER": self.train_fill_tower,
+            "TYPOS": self.typos,
+            "UNIT_INITIALS": self.unit_initials,
+            "UNIT_LEXICON": self.unit_lexicon,
         }
 
 

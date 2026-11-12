@@ -147,6 +147,18 @@ TRANSITION_WEIGHT = typer.Option(
     help="Weight of the decoder's transition term beside the constrained CTC in the joint "
     "stage (S2: --keys without --key-warm-up; default 1.0)",
 )
+UNIT_INITIALS = typer.Option(
+    0.0,
+    "--unit-initials",
+    help="Probability that an idiom or internet phrase in a sentence is typed as initials whole; "
+    "needs --unit-lexicon",
+)
+UNIT_LEXICON = typer.Option(
+    None,
+    "--unit-lexicon",
+    help="The knowledge lexicon (`word<TAB>category` rows) whose idiom and internet entries "
+    "are the units; needs --unit-initials",
+)
 CORRECT_SYLLABLES = typer.Option(
     True,
     "--correct-syllables/--no-correct-syllables",
@@ -511,9 +523,13 @@ def train_labels(
 
 
 def route_a_paths(
-    data_dir: Path, labels: Path | None, char_table: Path | None, out: Path
+    data_dir: Path,
+    labels: Path | None,
+    char_table: Path | None,
+    out: Path,
+    unit_lexicon: Path | None = None,
 ) -> RunPaths:
-    """The four paths a route A command reads and writes, with the table located.
+    """The paths a route A command reads and writes, with the table located.
 
     The import is inside the body for the same reason the commands' are: this
     module is also the one that prints ``--help``, and ``mlime.train.run`` pulls
@@ -531,6 +547,7 @@ def route_a_paths(
         labels=labels or data_dir / "labels",
         char_table=table,
         out=out,
+        unit_lexicon=unit_lexicon,
     )
 
 
@@ -628,6 +645,16 @@ def key_settings(
         else transition_weight,
         correct_syllables=correct_syllables,
     )
+
+
+def check_units(unit_initials: float, unit_lexicon: object | None) -> None:
+    """Refuse ``--unit-initials`` and ``--unit-lexicon`` unless they come together."""
+    if unit_initials > 0.0 and unit_lexicon is None:
+        raise typer.BadParameter("--unit-initials types the lexicon's units; pass --unit-lexicon")
+    if unit_initials == 0.0 and unit_lexicon is not None:
+        raise typer.BadParameter(
+            "--unit-lexicon is read only by --unit-initials; pass a probability above 0"
+        )
 
 
 def fill_tower_settings(tower: bool, cross_attention: bool) -> FillTowerTraining | None:
@@ -768,6 +795,8 @@ def train_e2e(
         "--typos/--no-typos",
         help="Corrupt the typed keystrokes with the shared noise model, per its authored rate",
     ),
+    unit_initials: float = UNIT_INITIALS,
+    unit_lexicon: Path | None = UNIT_LEXICON,
     context_tower: str | None = CONTEXT_TOWER,
     context_revision: str | None = CONTEXT_REVISION,
     context_lora_rank: int = CONTEXT_LORA_RANK,
@@ -881,10 +910,11 @@ def train_e2e(
     ranking_config = ranking_settings(
         ranking, rank_segmentations, rank_beam, rank_negatives, rank_weight
     )
+    check_units(unit_initials, unit_lexicon)
     typer.echo(f"device: {describe_device()}")
     try:
         result = e2e(
-            route_a_paths(data_dir, labels, char_table, out),
+            route_a_paths(data_dir, labels, char_table, out, unit_lexicon),
             route_a_slices(data_dir, train_shard, held_out_shard, max_held_out),
             TrainingConfig(
                 max_steps=max_steps,
@@ -912,7 +942,7 @@ def train_e2e(
             init_encoder=init_encoder,
             init_decoder=init_decoder,
             aux_weight=aux_weight,
-            augmentation=Augmentation(typos=typos),
+            augmentation=Augmentation(typos=typos, unit_initials=unit_initials),
             resume=resume,
             activation_checkpointing=activation_checkpointing,
             run_config=run_config,
@@ -1024,6 +1054,8 @@ def train_count_batches(
         "--typos/--no-typos",
         help="Count the run that corrupts its keystrokes with the shared noise model",
     ),
+    unit_initials: float = UNIT_INITIALS,
+    unit_lexicon: Path | None = UNIT_LEXICON,
     keys: bool = KEYS,
     correct_syllables: bool = CORRECT_SYLLABLES,
     workers: int | None = typer.Option(
@@ -1053,7 +1085,8 @@ def train_count_batches(
         workers = os.cpu_count()
         if workers is None:
             raise typer.BadParameter("the cores are not countable here; pass --workers")
-    paths = route_a_paths(data_dir, labels, char_table, out.parent)
+    check_units(unit_initials, unit_lexicon)
+    paths = route_a_paths(data_dir, labels, char_table, out.parent, unit_lexicon)
     # The batches are packed by characters, so the context tower's tokenizer
     # does not enter the count: the base model's own stands for every tower.
     census = count_batches(
@@ -1071,7 +1104,7 @@ def train_count_batches(
         ),
         segmenter=segmenter,
         workers=workers,
-        augmentation=Augmentation(typos=typos),
+        augmentation=Augmentation(typos=typos, unit_initials=unit_initials),
         # The count reads only the sampling fields, which no stage's weights touch.
         keys=key_settings(keys, None, None, None, None, correct_syllables, key_warm_up=False),
     )
@@ -1081,6 +1114,71 @@ def train_count_batches(
         f"{len(census.shards)} shards on {world_size} rank(s); "
         f"per rank {[rank.total for rank in census.ranks]}"
     )
+
+
+@train_app.command("enrich")
+def train_enrich(
+    out: Path = typer.Option(..., help="The directory to create: samples/, labels/, census.json"),
+    unit_lexicon: Path = typer.Option(
+        ..., "--unit-lexicon", help="The knowledge lexicon whose idiom and internet entries lift"
+    ),
+    emittable: Path = typer.Option(
+        ...,
+        help="The emittable set the run trains over; units holding another character are blocked",
+    ),
+    data_dir: Path = DATA_DIR,
+    labels: list[Path] = typer.Option(
+        None,
+        "--labels",
+        help="A directory of label shards, whose sharding need not follow the samples'; "
+        "repeatable. Defaults to <data-dir>/labels",
+    ),
+    floor: int = typer.Option(20, help="Occurrences every present unit is lifted to"),
+    max_repeats: int = typer.Option(8, help="Most copies of one sentence"),
+    rows_per_shard: int = typer.Option(100_000, help="Rows per output shard"),
+    workers: int | None = typer.Option(
+        None,
+        "--workers",
+        help="Processes that scan the shards; every core this process may use when omitted. "
+        "The output does not depend on it",
+    ),
+    extra: list[Path] = typer.Option(
+        None,
+        "--extra",
+        help="A sample shard of sentences judged elsewhere, passed through; repeatable",
+    ),
+    extra_labels: Path | None = typer.Option(
+        None, "--extra-labels", help="Label shards of the same names as the --extra shards"
+    ),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Write the enrichment shards: rare units lifted to a floor, and extra shards passed through.
+
+    Each idiom and internet entry of the lexicon that is not blocked and occurs
+    fewer than --floor times in the trainable sentences of the corpus has its
+    own sentences repeated, at most --max-repeats times each, as separate rows
+    whose labels are copied from the originals. The census beside them records
+    what was lifted and what stays under the floor.
+    """
+    configure(verbose)
+    from mlime.train.enrich import enrich
+    from mlime.train.lexicon import read_emittable
+    from mlime.train.units import UnitMatcher
+
+    census = enrich(
+        DataLayout(data_dir).samples,
+        labels or [data_dir / "labels"],
+        UnitMatcher.load(unit_lexicon),
+        frozenset(read_emittable(emittable)),
+        out,
+        floor=floor,
+        max_repeats=max_repeats,
+        rows_per_shard=rows_per_shard,
+        workers=workers,
+        extras=extra or (),
+        extra_labels=extra_labels,
+    )
+    typer.echo(json.dumps(census, ensure_ascii=False, indent=2))
 
 
 @train_app.command("emittable")
@@ -1359,6 +1457,18 @@ def e2e_stamp(
     key_warm_up: bool = KEY_WARM_UP,
     train_fill_tower: bool = TRAIN_FILL_TOWER,
     train_cross_attention: bool = TRAIN_CROSS_ATTENTION,
+    typos: bool = typer.Option(
+        False,
+        "--typos/--no-typos",
+        help="Corrupt the typed keystrokes with the shared noise model (TYPOS)",
+    ),
+    unit_initials: float = UNIT_INITIALS,
+    unit_lexicon: str | None = typer.Option(
+        None,
+        "--unit-lexicon",
+        help="The file of the assets mount holding the knowledge lexicon whose idioms and "
+        "internet phrases are the units (UNIT_LEXICON); needs --unit-initials",
+    ),
 ) -> None:
     """Write a v2 run's kernel directory: v1's recipe, the run's slug, the v2 sources.
 
@@ -1373,7 +1483,10 @@ def e2e_stamp(
     `--train-fill-tower` trains the fill tower in it, and with
     `--train-cross-attention` its gated context blocks (#241). `--keys`
     without `--key-warm-up`, over a finished S1 run, is the joint stage S2
-    (#257), weighed by `--transition-weight`.
+    (#257), weighed by `--transition-weight`. `--typos` turns the typo
+    augmentation on, and `--unit-initials` with `--unit-lexicon` types the
+    idioms and internet phrases of a sentence as initials whole, the lexicon
+    being a file of the assets mount.
     """
     from mlime.locate import find_upwards
     from mlime.stamp import E2E_V2_SOURCES, E2EV2Run, E2EV2Stage, stamp_e2e_v2
@@ -1395,7 +1508,11 @@ def e2e_stamp(
         "--keys": keys or None,
         "--key-warm-up": key_warm_up or None,
         "--train-fill-tower": train_fill_tower or None,
+        "--typos": typos or None,
+        "--unit-initials": unit_initials or None,
+        "--unit-lexicon": unit_lexicon,
     }
+    check_units(unit_initials, unit_lexicon)
     tower = context_settings(
         context_tower, context_revision, context_lora_rank, context_lora_alpha, context_layers
     )
@@ -1456,6 +1573,9 @@ def e2e_stamp(
             train_fill_tower=None
             if fill_tower is None
             else {"cross_attention": fill_tower.cross_attention},
+            typos=typos,
+            unit_initials=unit_initials,
+            unit_lexicon=unit_lexicon,
             **overrides,
         )
     spec = E2EV2Run(
