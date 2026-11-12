@@ -34,9 +34,14 @@ from torch import nn
 from transformers.models.bert.modeling_bert import BertEmbeddings, BertLayer
 
 from mlime.logging import log
-from mlime.train.charlm import _externalize, _weights_table
 from mlime.train.lexicon import Lexicon
 from mlime.train.model import ContextCrossAttention, GatedCrossAttention, RouteAModel
+from mlime.train.onnx_tools import (
+    externalize,
+    quantize_dynamic_int8,
+    weights_table,
+    write_tokenizer,
+)
 from mlime.train.samples import (
     DEFAULT_CONTEXT_TOKENS,
     LETTER_PAD,
@@ -150,6 +155,35 @@ class _ContextGraph(nn.Module):
         return hidden
 
 
+def fill_tower(
+    model: RouteAModel,
+    embeds: torch.Tensor,
+    attention_mask: torch.Tensor,
+    context: torch.Tensor,
+    context_mask: torch.Tensor,
+    has_context: torch.Tensor,
+) -> torch.Tensor:
+    """The fill tower over embeddings ``[rows, width, hidden]``, its top layers reading the context.
+
+    The graph's primitives, shared by every model that fills masks through
+    route A's towers: ``attention_mask [rows, width]`` is the padding mask,
+    ``context [rows, length, hidden]`` the context tower's output under
+    ``context_mask``, and ``has_context [rows]`` switches the gated blocks per
+    row. Returns the last hidden states ``[rows, width, hidden]``.
+    """
+    hidden = _embeddings(model.fill.embeddings, embeds)
+    mask = _additive_mask(attention_mask)
+    gated = [_bert_block(layer) for layer in model.gated_layers()]
+    gated_from = len(model.fill.encoder.layer) - len(gated)
+    for depth, layer in enumerate(model.fill.encoder.layer):
+        hidden = _encoder_layer(layer, hidden, mask)
+        if depth >= gated_from:
+            hidden = _cross_attention(
+                gated[depth - gated_from], hidden, context, context_mask, has_context
+            )
+    return hidden
+
+
 class _FillGraph(nn.Module):
     """The fill tower's masked, normalised log probabilities for one record's readings."""
 
@@ -175,40 +209,13 @@ class _FillGraph(nn.Module):
             + (model.span_embeddings(span_ids) + model.letter_encoder(span_letters))
             * span_positions.to(words.dtype)[..., None]
         )
-        hidden = _embeddings(model.fill.embeddings, embeds)
-        mask = _additive_mask(attention_mask)
-        gated = [_bert_block(layer) for layer in model.gated_layers()]
-        gated_from = len(model.fill.encoder.layer) - len(gated)
-        for depth, layer in enumerate(model.fill.encoder.layer):
-            hidden = _encoder_layer(layer, hidden, mask)
-            if depth >= gated_from:
-                hidden = _cross_attention(
-                    gated[depth - gated_from], hidden, context, context_mask, has_context
-                )
+        hidden = fill_tower(model, embeds, attention_mask, context, context_mask, has_context)
         logits: torch.Tensor = model.head(hidden)
         masks: torch.Tensor = model.candidate_mask.index_select(0, span_ids.reshape(-1)).reshape(
             *span_ids.shape, -1
         )
         log_probs: torch.Tensor = logits.masked_fill(~masks, FLOOR).log_softmax(dim=-1)
         return log_probs
-
-
-def _quantize_dynamic_int8(graph: Path) -> None:
-    """Rewrite *graph* in place with every MatMul weight dynamic-quantized to int8."""
-    from onnxruntime.quantization import QuantType, quantize_dynamic
-
-    quantized = graph.with_suffix(".quantized.onnx")
-    quantize_dynamic(
-        graph,
-        quantized,
-        op_types_to_quantize=["MatMul"],
-        per_channel=True,
-        # Seven-bit weights: x86 kernels without VNNI multiply u8 x s8 into a
-        # saturating 16-bit lane and full-range int8 overflows it.
-        reduce_range=True,
-        weight_type=QuantType.QInt8,
-    )
-    quantized.replace(graph)
 
 
 def export_onnx(
@@ -252,12 +259,12 @@ def export_onnx(
     context_graph = out_dir / "context.onnx"
     fill_graph = out_dir / "fill.onnx"
     if quantize == "int8":
-        _quantize_dynamic_int8(context_graph)
-        _quantize_dynamic_int8(fill_graph)
-    context_model = _externalize(context_graph, "context.weights")
-    fill_model = _externalize(fill_graph, "fill.weights")
-    context_table = _weights_table(context_model)
-    fill_table = _weights_table(fill_model)
+        quantize_dynamic_int8(context_graph)
+        quantize_dynamic_int8(fill_graph)
+    context_model = externalize(context_graph, "context.weights")
+    fill_model = externalize(fill_graph, "fill.weights")
+    context_table = weights_table(context_model)
+    fill_table = weights_table(fill_model)
 
     emissions = int(model.candidate_mask.shape[1])
     mask_names = [
@@ -270,16 +277,7 @@ def export_onnx(
         raise ValueError(
             f"the fill graph's weights hold {len(mask_names)} candidate masks, not one"
         )
-    save_pretrained = getattr(tokenizer, "save_pretrained", None)
-    save = getattr(tokenizer, "save", None)
-    if save_pretrained is not None:
-        save_pretrained(str(out_dir))
-    elif save is not None:
-        save(str(out_dir / "tokenizer.json"))
-    else:
-        raise ValueError("the tokenizer has neither save_pretrained nor save")
-    if not (out_dir / "tokenizer.json").is_file():
-        raise ValueError("the tokenizer did not write tokenizer.json into the export directory")
+    write_tokenizer(tokenizer, out_dir)
     hidden = int(model.fill.embeddings.word_embeddings.weight.shape[1])
     manifest = out_dir / "route-a.json"
     manifest.write_text(
@@ -323,15 +321,23 @@ def export_onnx(
     return fill_graph, manifest
 
 
-def _export_graphs(
-    model: RouteAModel, tokenizer: BaseTokenizer, out_dir: Path, context_tokens: int
-) -> None:
-    """Trace `context.onnx` and `fill.onnx` into *out_dir*."""
-    context_ids = torch.tensor(
+def _example_context(tokenizer: BaseTokenizer) -> tuple[torch.Tensor, torch.Tensor]:
+    """The example context the graphs are traced with: ``[CLS] [PAD] [SEP]``, all real."""
+    ids = torch.tensor(
         [[tokenizer.cls_token_id, tokenizer.pad_token_id, tokenizer.sep_token_id]],
         dtype=torch.long,
     )
-    context_mask = torch.ones(1, context_ids.shape[1], dtype=torch.long)
+    return ids, torch.ones_like(ids)
+
+
+def export_context_graph(model: RouteAModel, tokenizer: BaseTokenizer, out_dir: Path) -> None:
+    """Trace `context.onnx`, the context tower alone, into *out_dir*.
+
+    ``(context_ids [rows, length], context_mask) -> context [rows, length,
+    hidden]``, which is the graph every model built on route A's context path
+    shares: the key-level model reuses it unchanged.
+    """
+    context_ids, context_mask = _example_context(tokenizer)
     torch.onnx.export(
         _ContextGraph(model),
         (context_ids, context_mask),
@@ -347,6 +353,13 @@ def _export_graphs(
         dynamo=False,
     )
 
+
+def _export_graphs(
+    model: RouteAModel, tokenizer: BaseTokenizer, out_dir: Path, context_tokens: int
+) -> None:
+    """Trace `context.onnx` and `fill.onnx` into *out_dir*."""
+    export_context_graph(model, tokenizer, out_dir)
+    context_ids, _ = _example_context(tokenizer)
     paths, width = 2, 5
     input_ids = torch.zeros(paths, width, dtype=torch.long)
     attention_mask = torch.ones(paths, width, dtype=torch.long)
