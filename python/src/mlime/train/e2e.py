@@ -12,6 +12,7 @@ itself.
 from __future__ import annotations
 
 import functools
+from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Any
@@ -23,9 +24,16 @@ from mlime.data.shards import shard_paths
 from mlime.logging import log
 from mlime.train.charlm_model import CharLmConfig
 from mlime.train.charlm_vocab import CharVocab
-from mlime.train.e2e_model import E2EConfig, E2EModel, RankingConfig, emittable_ids
+from mlime.train.e2e_model import (
+    E2EConfig,
+    E2EModel,
+    KeyRankingConfig,
+    RankingConfig,
+    emittable_ids,
+)
 from mlime.train.e2e_search import SearchGraphs
 from mlime.train.key_model import KeyE2EModel, joint_evaluate, key_evaluate, letter_token_ids
+from mlime.train.key_ranking import KeyRankingModel
 from mlime.train.keys import FillTowerTraining, KeyExample, KeyFrontConfig
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import Distributed, MetricLog, TrainingConfig, evaluate, train
@@ -70,9 +78,9 @@ def _weights(state: dict[str, Any], path: Path | str) -> dict[str, torch.Tensor]
 
 
 def model_class(config: E2EConfig) -> type[E2EModel]:
-    """The model a config trains: the key-level one, the ranking one, or the plain one."""
+    """The model a config trains: a key-level one, the ranking one, or the plain one."""
     if config.keys is not None:
-        return KeyE2EModel
+        return KeyE2EModel if config.key_ranking is None else KeyRankingModel
     return E2EModel if config.ranking is None else RankingE2EModel
 
 
@@ -311,6 +319,7 @@ def build_from(
     keys: KeyFrontConfig | None = None,
     key_warm_up: bool = False,
     train_fill_tower: FillTowerTraining | None = None,
+    key_ranking: KeyRankingConfig | None = None,
 ) -> tuple[E2EModel, Vocabularies]:
     """The model the e2e checkpoint at *source* describes, under this stage's losses.
 
@@ -325,7 +334,9 @@ def build_from(
     front, under this stage's loss weights. The joint stage (S2) starts from
     a finished warm-up (:meth:`~mlime.train.key_model.KeyE2EModel.load_warmed_up`),
     dropping what only the warm-up holds, and a warm-up never starts from a
-    joint run, whose decoder has no span input. The checkpoint is gigabytes,
+    joint run, whose decoder has no span input. The key ranking stage (S4)
+    starts from a finished joint run and keeps its weights as they are: it
+    adds a loss term and no parameter. The checkpoint is gigabytes,
     and it lives only in this frame: nothing holds it once the model is built.
     """
     state = torch.load(source, map_location="cpu", weights_only=False)
@@ -340,6 +351,7 @@ def build_from(
         keys=keys,
         key_warm_up=key_warm_up,
         train_fill_tower=train_fill_tower,
+        key_ranking=key_ranking,
     )
     vocabularies = Vocabularies.load(char_table, recorded.base_model, context)
     model = from_checkpoint(state, vocabularies.lexicon, wanted)
@@ -475,7 +487,9 @@ def compile_modules(model: E2EModel, mode: str) -> None:
     its units are the context tower, the fill pass and the key front, each
     one graph whatever fills the fill pass's positions. Its decoder compiles
     both ways it runs: over span-end states in S1 (``forward``) and over
-    every key in the joint stage (``over_keys``).
+    every key in the joint stage (``over_keys``). The key ranking stage
+    (S4) adds the candidate search's position, ``advance_keys``, compiled
+    whole.
     """
     options = inductor_options(mode)
     if isinstance(model, KeyE2EModel):
@@ -497,6 +511,11 @@ def compile_modules(model: E2EModel, mode: str) -> None:
         model.decoder.over_keys = torch.compile(  # type: ignore[method-assign]
             model.decoder.over_keys, dynamic=True, options=options
         )
+        if isinstance(model, KeyRankingModel):
+            # The candidate search's position, whole as the span model's is.
+            model.decoder.advance_keys = whole_compile(  # type: ignore[method-assign]
+                model.decoder.advance_keys, options
+            )
         log.info("key front, towers and decoder compiled", mode=mode)
         return
     if model.context.separate:
@@ -509,16 +528,21 @@ def compile_modules(model: E2EModel, mode: str) -> None:
     model.decoder.forward = torch.compile(  # type: ignore[method-assign]
         model.decoder.forward, dynamic=True, options=options
     )
-    advance = torch.compile(model.decoder.advance, dynamic=True, options=options)
+    model.decoder.advance = whole_compile(model.decoder.advance, options)  # type: ignore[method-assign]
+    log.info("towers and decoder compiled", mode=mode)
 
-    @functools.wraps(model.decoder.advance)
-    def whole_advance(*args: Any, **kwargs: Any) -> Any:
+
+def whole_compile(advance: Callable[..., Any], options: dict[str, Any]) -> Callable[..., Any]:
+    """*advance*, a search position, compiled as one graph with no gradient-bucket cuts."""
+    compiled = torch.compile(advance, dynamic=True, options=options)
+
+    @functools.wraps(advance)
+    def whole(*args: Any, **kwargs: Any) -> Any:
         # Read when dynamo compiles a frame, which is inside this call.
         with torch._dynamo.config.patch(optimize_ddp=False):
-            return advance(*args, **kwargs)
+            return compiled(*args, **kwargs)
 
-    model.decoder.advance = whole_advance  # type: ignore[method-assign]
-    log.info("towers and decoder compiled", mode=mode)
+    return whole
 
 
 def e2e(
@@ -545,6 +569,7 @@ def e2e(
     keys: KeyFrontConfig | None = None,
     key_warm_up: bool = False,
     train_fill_tower: FillTowerTraining | None = None,
+    key_ranking: KeyRankingConfig | None = None,
 ) -> RunResult:
     """Train the end-to-end model over *slices.train*; score held-out both ways.
 
@@ -581,6 +606,12 @@ def e2e(
     the key path trains on the constrained CTC and the transition's term,
     and the finished run reports the decoder's teacher-forced accuracy over
     the whole emittable set and the CTC loss, with context and without.
+    *key_ranking* adds the sequence-level term over the key model's own
+    constrained search (S4, #278) to the joint stage, started with
+    *init_e2e* from a finished joint run: the same weights and the same
+    held-out record, with *search_graphs* replaying its candidate search.
+    Its typos are the typo augmentation's, which it keeps (the refusal of
+    ranking with typos is the span model's, about ``ime-segment``).
     """
     world = Distributed.from_environment()
     starts = (
@@ -632,6 +663,7 @@ def e2e(
             keys=keys,
             key_warm_up=key_warm_up,
             train_fill_tower=train_fill_tower,
+            key_ranking=key_ranking,
         )
     else:
         if init_encoder is None or init_decoder is None:
@@ -656,8 +688,10 @@ def e2e(
     if training.compile:
         compile_modules(model, training.compile_mode)
     if search_graphs:
-        if not isinstance(model, RankingE2EModel):
-            raise ValueError("--search-graphs captures the ranking loss's search; add --ranking")
+        if not isinstance(model, RankingE2EModel | KeyRankingModel):
+            raise ValueError(
+                "--search-graphs captures the ranking loss's search; add --ranking or --key-ranking"
+            )
         if not torch.cuda.is_available():
             raise ValueError("--search-graphs replays CUDA graphs and this run has no CUDA device")
         model.search_graphs = SearchGraphs()
@@ -691,6 +725,7 @@ def e2e(
             ranking=lane_ranking,
             context=context,
             keys=keys,
+            key_ranking=key_ranking,
         )
         for index in range(virtual)
     ]

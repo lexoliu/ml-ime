@@ -10,8 +10,9 @@ log-probability over the whole emittable set, restricted afterwards.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from typing import Any, TypeVar
 
 import torch
 from torch import nn
@@ -20,6 +21,9 @@ from mlime.logging import log
 from mlime.train.charlm_vocab import BOS
 from mlime.train.e2e_model import Decoder, E2EModel
 from mlime.train.shapes import bucket
+
+#: What a captured search reads: :class:`SearchInputs`, or :class:`KeySearchInputs`.
+_Inputs = TypeVar("_Inputs")
 
 
 @dataclass(frozen=True)
@@ -195,6 +199,139 @@ def run_search(decoder: Decoder, inputs: SearchInputs) -> tuple[torch.Tensor, to
     return walk_back(torch.stack(parents), torch.stack(choices)), scores
 
 
+@dataclass(frozen=True)
+class KeySearchInputs:
+    """What a search over cover lanes of keys reads on the device (S4, #278).
+
+    A lane is one cover of one record's keys: ``gains [L, M, E]`` holds, for
+    each of its ``lane_lengths [L]`` positions, the gain of every character
+    at the span the cover puts there -- minus infinity where the span does not
+    admit it (:func:`~mlime.train.key_ranking.lane_gains`). The decoder
+    cross-attends to its record's key states: lane ``l`` reads row
+    ``lane_owner[l]`` of ``states [B, S, enc]`` under ``key_mask [B, S]``.
+    ``beta`` weighs the transition's log-probability in the step score, and is
+    a constant of the search.
+    """
+
+    states: torch.Tensor
+    key_mask: torch.Tensor
+    lane_owner: torch.Tensor
+    gains: torch.Tensor
+    lane_lengths: torch.Tensor
+    width: int
+    beta: float
+
+
+def padded_key_inputs(inputs: KeySearchInputs, *, bucketed: bool) -> KeySearchInputs:
+    """*inputs* padded to :func:`bucket` sizes when *bucketed*, as :func:`padded_inputs` pads lanes.
+
+    The records, keys, lanes and positions are each rounded up. A padded lane
+    reads the first record and admits nothing, so every row of it stays at
+    minus infinity; a padded record has only its first key unmasked; a padded
+    position is a step every lane has ended at.
+    """
+    if not bucketed:
+        return inputs
+    states, key_mask = inputs.states, inputs.key_mask
+    records, keys = states.shape[0], states.shape[1]
+    lanes, positions = inputs.gains.shape[0], inputs.gains.shape[1]
+    padded_records, padded_keys = bucket(records), bucket(keys)
+    padded_lanes, padded_positions = bucket(lanes), bucket(positions)
+    states = nn.functional.pad(states, (0, 0, 0, padded_keys - keys, 0, padded_records - records))
+    key_mask = nn.functional.pad(key_mask, (0, padded_keys - keys, 0, padded_records - records))
+    key_mask[records:, 0] = True
+    gains = nn.functional.pad(
+        inputs.gains,
+        (0, 0, 0, padded_positions - inputs.gains.shape[1], 0, padded_lanes - lanes),
+        value=float("-inf"),
+    )
+    return KeySearchInputs(
+        states=states,
+        key_mask=key_mask,
+        lane_owner=nn.functional.pad(inputs.lane_owner, (0, padded_lanes - lanes)),
+        gains=gains,
+        lane_lengths=nn.functional.pad(inputs.lane_lengths, (0, padded_lanes - lanes), value=1),
+        width=inputs.width,
+        beta=inputs.beta,
+    )
+
+
+def run_key_search(decoder: Decoder, inputs: KeySearchInputs) -> tuple[torch.Tensor, torch.Tensor]:
+    """The whole search over cover lanes on the device.
+
+    Each beam's sentence is ``[L, W, M]`` and its score ``[L, W]``.
+
+    :func:`run_search`'s loop for a decoder that reads keys: every lane owns
+    a block of ``width`` rows from the first step, the unused ones at minus
+    infinity, and each step scores a character by the decoder's transition
+    plus the lane's gain at that position
+    (:meth:`~mlime.train.e2e_model.Decoder.advance_keys`). A lane's keys and
+    values are projected once per record and gathered to its lanes. The
+    sentences are walked back on the device past a lane's own length as the
+    free steps' emission 0; nothing reads back to the host, so the search can
+    be captured as one CUDA graph (:class:`SearchGraphs`).
+    """
+    gains = inputs.gains
+    device = gains.device
+    count, length, emittable = gains.shape
+    width = inputs.width
+    rows = count * width
+    lane_of_row = torch.arange(count, device=device).repeat_interleave(width)
+    owner = inputs.lane_owner
+    encoder_kv = [
+        (keys.index_select(0, owner).contiguous(), values.index_select(0, owner).contiguous())
+        for keys, values in (cross.kv(inputs.states) for cross in decoder.gated_layers())
+    ]
+    encoder_mask = inputs.key_mask.index_select(0, owner)
+    carried = torch.full((emittable,), float("-inf"), device=device)
+    carried[:1].fill_(0.0)
+    layers, heads = decoder.reader.config.layers, decoder.reader.config.heads
+    head_dim = decoder.reader.config.hidden // heads
+    cached = (
+        torch.get_autocast_dtype(device.type)
+        if torch.is_autocast_enabled(device.type)
+        else decoder.reader.embed.weight.dtype
+    )
+    keys = torch.zeros(layers, rows, heads, length, head_dim, dtype=cached, device=device)
+    values = torch.zeros_like(keys)
+    scores = torch.full((count, width), float("-inf"), device=device)
+    scores[:, :1].fill_(0.0)
+    tokens = torch.full((rows,), BOS, dtype=torch.long, device=device)
+    block = torch.arange(count, device=device).unsqueeze(1) * width
+    positions = torch.arange(length, device=device)
+    parents: list[torch.Tensor] = []
+    choices: list[torch.Tensor] = []
+    # Marked as in :func:`run_search`: a compiled advance's first graph is the
+    # dynamic one.
+    for tensor in (lane_of_row, tokens, scores, block, inputs.lane_lengths, gains, encoder_mask):
+        torch._dynamo.maybe_mark_dynamic(tensor, 0)
+    for tensor in (gains, encoder_mask):
+        torch._dynamo.maybe_mark_dynamic(tensor, 1)
+    for tensor in (keys, values):
+        torch._dynamo.maybe_mark_dynamic(tensor, (1, 3))
+    for pair in encoder_kv:
+        for part in pair:
+            torch._dynamo.maybe_mark_dynamic(part, (0, 2))
+    for position in range(length):
+        tokens, scores, (keys, values), parent, choice = decoder.advance_keys(
+            positions[position],
+            tokens,
+            scores,
+            (keys, values),
+            gains,
+            lane_of_row,
+            encoder_kv,
+            encoder_mask,
+            inputs.lane_lengths,
+            carried,
+            block,
+            inputs.beta,
+        )
+        parents.append(parent)
+        choices.append(choice)
+    return walk_back(torch.stack(parents), torch.stack(choices)), scores
+
+
 def walk_back(parents: torch.Tensor, choices: torch.Tensor) -> torch.Tensor:
     """``[L, W, T]``: each final beam's emissions, read back from ``parents``/``choices [T, L, W]``.
 
@@ -230,7 +367,7 @@ class SearchGraphs:
         self.flat: dict[str, torch.Tensor] = {}
         self.captured: dict[
             tuple[object, ...],
-            tuple[torch.cuda.CUDAGraph, SearchInputs, tuple[torch.Tensor, ...]],
+            tuple[torch.cuda.CUDAGraph, Any, dict[str, torch.Tensor], tuple[torch.Tensor, ...]],
         ] = {}
 
     def _view(self, name: str, like: torch.Tensor) -> torch.Tensor:
@@ -258,41 +395,106 @@ class SearchGraphs:
         """:func:`run_search` over *inputs*, from this shape's captured graph."""
         autocast = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None
         key = (inputs.masks.shape, inputs.vectors.dtype, inputs.ragged, inputs.width, autocast)
-        given = (inputs.vectors, inputs.masks, inputs.lane_lengths)
+
+        def build(views: dict[str, torch.Tensor]) -> SearchInputs:
+            return SearchInputs(
+                views["vectors"],
+                views["masks"],
+                views["lane_lengths"],
+                ragged=inputs.ragged,
+                width=inputs.width,
+            )
+
+        return self._replay(
+            key,
+            {
+                "vectors": inputs.vectors,
+                "masks": inputs.masks,
+                "lane_lengths": inputs.lane_lengths,
+            },
+            build,
+            lambda static: run_search(decoder, static),
+            autocast,
+        )
+
+    def run_keys(
+        self, decoder: Decoder, inputs: KeySearchInputs
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """:func:`run_key_search` over *inputs*, from this shape's captured graph."""
+        autocast = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None
+        key = (
+            "keys",
+            inputs.states.shape,
+            inputs.gains.shape,
+            inputs.states.dtype,
+            inputs.width,
+            inputs.beta,
+            autocast,
+        )
+
+        def build(views: dict[str, torch.Tensor]) -> KeySearchInputs:
+            return KeySearchInputs(
+                states=views["key_states"],
+                key_mask=views["key_mask"],
+                lane_owner=views["lane_owner"],
+                gains=views["key_gains"],
+                lane_lengths=views["key_lane_lengths"],
+                width=inputs.width,
+                beta=inputs.beta,
+            )
+
+        return self._replay(
+            key,
+            {
+                "key_states": inputs.states,
+                "key_mask": inputs.key_mask,
+                "lane_owner": inputs.lane_owner,
+                "key_gains": inputs.gains,
+                "key_lane_lengths": inputs.lane_lengths,
+            },
+            build,
+            lambda static: run_key_search(decoder, static),
+            autocast,
+        )
+
+    def _replay(
+        self,
+        key: tuple[object, ...],
+        given: dict[str, torch.Tensor],
+        build: Callable[[dict[str, torch.Tensor]], _Inputs],
+        search: Callable[[_Inputs], tuple[torch.Tensor, torch.Tensor]],
+        autocast: torch.dtype | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Copy *given* into the graph of *key*'s shape (captured first if need be) and replay it.
+
+        *build* makes a search's inputs from views of the flat buffers named
+        by *given*'s keys, and *search* runs the search over them.
+        """
         captured = self.captured.get(key)
         if captured is None:
-            vectors, masks, lane_lengths = (
-                self._view(name, tensor)
-                for name, tensor in zip(("vectors", "masks", "lane_lengths"), given, strict=True)
-            )
-            static = SearchInputs(
-                vectors, masks, lane_lengths, ragged=inputs.ragged, width=inputs.width
-            )
+            views = {name: self._view(name, tensor) for name, tensor in given.items()}
+            static = build(views)
         else:
-            static = captured[1]
-        for view, tensor in zip(
-            (static.vectors, static.masks, static.lane_lengths), given, strict=True
-        ):
-            view.copy_(tensor)
+            _, static, views, _ = captured
+        for name, tensor in given.items():
+            views[name].copy_(tensor)
         if captured is None:
-            captured = self.captured[key] = self._capture(decoder, static, autocast)
+            graph, outputs = self._capture(search, static, autocast)
+            captured = self.captured[key] = (graph, static, views, outputs)
             # Each capture costs a search run eagerly and once more under
             # capture; a measured span starts after the last of them.
-            log.info(
-                "search graph captured",
-                lanes=static.masks.shape[0],
-                length=static.masks.shape[1],
-                ragged=static.ragged,
-                graphs=len(self.captured),
-            )
-        graph, _, outputs = captured
+            log.info("search graph captured", shape=str(key[:3]), graphs=len(self.captured))
+        graph, _, _, outputs = captured
         graph.replay()
         sequences, scores = outputs
         return sequences, scores
 
     def _capture(
-        self, decoder: Decoder, static: SearchInputs, autocast: torch.dtype | None
-    ) -> tuple[torch.cuda.CUDAGraph, SearchInputs, tuple[torch.Tensor, ...]]:
+        self,
+        run: Callable[[_Inputs], tuple[torch.Tensor, torch.Tensor]],
+        static: _Inputs,
+        autocast: torch.dtype | None,
+    ) -> tuple[torch.cuda.CUDAGraph, tuple[torch.Tensor, ...]]:
         """Warm the search up on a side stream, then capture it over *static*.
 
         Autocast's weight-cast cache would hand the graph casts made outside
@@ -301,9 +503,9 @@ class SearchGraphs:
 
         def search() -> tuple[torch.Tensor, torch.Tensor]:
             if autocast is None:
-                return run_search(decoder, static)
+                return run(static)
             with torch.autocast("cuda", dtype=autocast, cache_enabled=False):
-                return run_search(decoder, static)
+                return run(static)
 
         side = torch.cuda.Stream()  # type: ignore[no-untyped-call]  # torch ships it untyped
         side.wait_stream(torch.cuda.current_stream())
@@ -313,7 +515,7 @@ class SearchGraphs:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, pool=self.pool):
             outputs = search()
-        return graph, static, outputs
+        return graph, outputs
 
 
 def search(
@@ -323,6 +525,15 @@ def search(
     if graphs is None:
         return run_search(decoder, inputs)
     return graphs.run(decoder, inputs)
+
+
+def search_cover_lanes(
+    decoder: Decoder, inputs: KeySearchInputs, graphs: SearchGraphs | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`run_key_search` over *inputs*, replayed from *graphs* when given."""
+    if graphs is None:
+        return run_key_search(decoder, inputs)
+    return graphs.run_keys(decoder, inputs)
 
 
 def decode_lanes(

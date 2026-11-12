@@ -33,7 +33,8 @@ from mlime.data.shards import shard_paths
 from mlime.legality import Legality
 from mlime.logging import log
 from mlime.train.arbitration import ReadingArbitration
-from mlime.train.e2e_model import RankingConfig
+from mlime.train.e2e_model import KeyRankingConfig, RankingConfig
+from mlime.train.key_ranking import KeyRankCollator
 from mlime.train.keys import KeyCollator, KeyFrontConfig, KeySampleBuilder
 from mlime.train.lexicon import CandidateSpace, Lexicon, build_lexicon, read_char_readings
 from mlime.train.loop import (
@@ -367,6 +368,26 @@ class Vocabularies:
         """
         return KeyCollator(self.collator(context_dropout, max_context_tokens, seed))
 
+    def key_rank_collator(
+        self,
+        keys: KeyFrontConfig,
+        ranking: KeyRankingConfig,
+        context_dropout: float = 0.3,
+        max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+        seed: int = 0,
+    ) -> KeyRankCollator:
+        """The collator a key ranking run (S4, #278) pads its batches with.
+
+        It also ships the legal spans of each batch's keys, under the
+        automaton the run's examples are built with.
+        """
+        return KeyRankCollator(
+            self.key_collator(context_dropout, max_context_tokens, seed),
+            self.legality(),
+            keys.options,
+            ranking,
+        )
+
     def collator(
         self,
         context_dropout: float = 0.3,
@@ -419,6 +440,9 @@ class CorpusLane:
     context: QwenContextConfig | None = None
     #: The key front a key-level lane types its examples for (#223).
     keys: KeyFrontConfig | None = None
+    #: The sequence-level term a key-level lane's batches carry the legal spans
+    #: for (S4, #278).
+    key_ranking: KeyRankingConfig | None = None
 
     def open(self) -> tuple[CorpusStream, BatchCollator]:
         """Load the tables, then build this lane's stream and collator over them."""
@@ -429,10 +453,20 @@ class CorpusLane:
             if self.ranking is not None:
                 raise ValueError("a key-level lane has no lattice readings to rank")
             keyed = vocabularies.key_builder(self.augmentation, self.seed, self.keys)
-            return (
-                vocabularies.stream(self.paths, self.shards, keyed, self.rank, self.world_size),
-                vocabularies.key_collator(self.context_dropout, self.max_context_tokens, self.seed),
+            stream = vocabularies.stream(self.paths, self.shards, keyed, self.rank, self.world_size)
+            if self.key_ranking is None:
+                return stream, vocabularies.key_collator(
+                    self.context_dropout, self.max_context_tokens, self.seed
+                )
+            return stream, vocabularies.key_rank_collator(
+                self.keys,
+                self.key_ranking,
+                self.context_dropout,
+                self.max_context_tokens,
+                self.seed,
             )
+        if self.key_ranking is not None:
+            raise ValueError("the key ranking term needs a key front")
         builder = vocabularies.builder(self.augmentation, self.seed)
         stream = vocabularies.stream(self.paths, self.shards, builder, self.rank, self.world_size)
         collator = vocabularies.collator(

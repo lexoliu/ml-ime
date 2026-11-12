@@ -51,6 +51,7 @@ V1_RECIPE: dict[str, Any] = {
     "KEYS": None,
     "KEY_WARM_UP": False,
     "TRAIN_FILL_TOWER": None,
+    "KEY_RANKING": None,
 }
 
 #: What a v2 leg mounts, each a Hugging Face dataset repo the stager downloads:
@@ -94,6 +95,12 @@ JOINT_WEIGHTS = frozenset({"transition_weight"})
 #: What a stamped ``TRAIN_FILL_TOWER`` holds: what S1 trains of the fill path
 #: beside the tower itself (#241).
 FILL_TOWER_FIELDS = frozenset({"cross_attention"})
+
+#: What a stamped ``KEY_RANKING`` holds: the kernel's ``--key-rank-*`` options,
+#: the key-level model's sequence-level term and the search behind it (#278).
+KEY_RANKING_FIELDS = frozenset(
+    {"beam", "negatives", "other_lengths", "weight", "beta", "gamma", "objective"}
+)
 
 
 def literal(source: str, name: str) -> Any:
@@ -173,8 +180,12 @@ class E2EV2Stage:
     where everything trains on the CTC and the transition. *train_fill_tower*
     (``TRAIN_FILL_TOWER``) trains the fill tower in S1 as well, and with
     ``cross_attention`` its gated context blocks, against frozen copies of
-    *init_from*'s (#241). *typos* (``TYPOS``) corrupts the typed keystrokes with
-    the shared noise model. *unit_initials* (``UNIT_INITIALS``) is the
+    *init_from*'s (#241). *key_ranking* (``KEY_RANKING``) adds the key-level
+    model's sequence-level term over its own constrained search (S4, #278) to
+    the joint stage: its ``beam``, ``negatives``, ``other_lengths``,
+    ``weight``, ``beta``, ``gamma`` and ``objective``. *typos* (``TYPOS``)
+    corrupts the typed keystrokes with the shared noise model. *unit_initials*
+    (``UNIT_INITIALS``) is the
     probability that the idioms and internet phrases of a sentence are typed as
     initials whole, and *unit_lexicon* (``UNIT_LEXICON``) the file in the
     assets mount that holds them; the two come together.
@@ -190,6 +201,7 @@ class E2EV2Stage:
     keys: dict[str, Any] | None = None
     key_warm_up: bool = False
     train_fill_tower: dict[str, Any] | None = None
+    key_ranking: dict[str, Any] | None = None
     typos: bool = False
     unit_initials: float = 0.0
     unit_lexicon: str | None = None
@@ -229,6 +241,16 @@ class E2EV2Stage:
                 )
         elif self.key_warm_up:
             raise ValueError("the key warm-up trains a key front; name one with keys")
+        if self.key_ranking is not None:
+            if set(self.key_ranking) != KEY_RANKING_FIELDS:
+                raise ValueError(
+                    f"a key ranking term names {sorted(KEY_RANKING_FIELDS)}, "
+                    f"got {sorted(self.key_ranking)}"
+                )
+            if self.keys is None or self.key_warm_up:
+                raise ValueError(
+                    "the key ranking term follows the joint stage; stamp KEYS without KEY_WARM_UP"
+                )
 
     def fields(self) -> dict[str, Any]:
         """The recipe fields this stage stamps over v1's."""
@@ -243,6 +265,7 @@ class E2EV2Stage:
             "KEYS": self.keys,
             "KEY_WARM_UP": self.key_warm_up,
             "TRAIN_FILL_TOWER": self.train_fill_tower,
+            "KEY_RANKING": self.key_ranking,
             "TYPOS": self.typos,
             "UNIT_INITIALS": self.unit_initials,
             "UNIT_LEXICON": self.unit_lexicon,
@@ -286,7 +309,9 @@ class E2EV2Run:
             raise ValueError(
                 f"{self.run}: a key-level run is named {E2E_KEYS_RUN}*, and only a key-level run is"
             )
-        if self.search_graphs and (self.stage is None or self.stage.ranking is None):
+        if self.search_graphs and (
+            self.stage is None or (self.stage.ranking is None and self.stage.key_ranking is None)
+        ):
             raise ValueError("only a ranking stage has a search to replay from CUDA graphs")
         tower = None if self.stage is None else self.stage.context_tower
         if self.tower_graphs and (tower is None or tower["lora_rank"]):

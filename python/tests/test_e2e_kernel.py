@@ -945,3 +945,80 @@ def test_a_named_enrichment_shard_the_mount_lacks_is_refused(
         (tmp_path / "data" / kind).mkdir(parents=True)
     with pytest.raises(FileNotFoundError, match="lift-00007"):
         kernel.stage_enrichment(["lift-00007.parquet"])
+
+
+def test_a_key_ranking_stage_passes_its_term_to_the_count_and_the_trainer(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """S4 (#278): both the count and the trainer get ``--key-rank-*`` and parse them."""
+    import typer
+    from typer.core import TyperGroup
+
+    import mlime.__main__ as cli
+
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-keys-s3-a100")
+    monkeypatch.setattr(
+        kernel,
+        "KEYS",
+        {"layers": 2, "transition_weight": 1.0, "correct_syllables": True},
+    )
+    ranking = {
+        "beam": 8,
+        "negatives": 6,
+        "other_lengths": 1,
+        "weight": 0.05,
+        "beta": 2.0,
+        "gamma": 1.0,
+        "objective": "rank",
+    }
+    monkeypatch.setattr(kernel, "KEY_RANKING", ranking)
+    monkeypatch.setattr(kernel, "SEARCH_GRAPHS", True)
+    assert kernel.stage()["key_ranking"] == ranking
+    assert kernel.stage_of({"keys": kernel.KEYS})["key_ranking"] is None
+    group = typer.main.get_command(cli.app)
+    assert isinstance(group, TyperGroup)
+    train = group.commands["train"]
+    assert isinstance(train, TyperGroup)
+
+    counted = kernel.count_argv(tmp_path / "char_pinyin.tsv", tmp_path / "counts.json", None, None)
+    train_argv = kernel.train_argv(
+        tmp_path / "char_pinyin.tsv",
+        tmp_path / "run",
+        max_steps=100,
+        wall_budget=3600,
+        start=kernel.start_argv(None, tmp_path / "checkpoint-final.pt"),
+        resume=None,
+        token_budget=36864,
+        trace_steps=0,
+        segmenter=None,
+    )
+    for name, argv in (("count-batches", counted), ("e2e", train_argv)):
+        tail = [str(arg) for arg in argv[argv.index("mlime") + 3 :]]
+        assert "--key-ranking" in tail, name
+        assert tail[tail.index("--key-rank-negatives") + 1] == "6"
+        assert tail[tail.index("--key-rank-objective") + 1] == "rank"
+        train.commands[name].make_context(name, tail)
+
+    # The term follows the joint stage.
+    monkeypatch.setattr(kernel, "KEY_WARM_UP", True)
+    with pytest.raises(RuntimeError, match="follows the joint stage"):
+        kernel.main()
+
+
+def test_the_key_evaluation_decodes_the_sum_combination_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    argv = kernel.key_eval_argv(
+        tmp_path / "checkpoint-final.pt",
+        tmp_path / "eval3.jsonl",
+        tmp_path / "keys-eval3-context-on",
+        tmp_path / "report.txt",
+        tmp_path / "char_pinyin.tsv",
+        tmp_path / "ml-ime",
+        True,
+        (1.0,),
+        False,
+    )
+    assert "--sum" in argv and "--viterbi" not in argv

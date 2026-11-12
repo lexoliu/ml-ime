@@ -98,6 +98,69 @@ class RankingConfig:
             raise ValueError(f"the ranking weight must be positive, got {self.weight}")
 
 
+#: The two sequence-level terms of the key ranking stage: the softmax over the
+#: scored sentences (N-best MMI with the reference forced in), or the expected
+#: risk of the same softmax.
+KEY_RANKING_OBJECTIVES = ("rank", "risk")
+
+
+@dataclass(frozen=True)
+class KeyRankingConfig:
+    """The sequence-level ranking term of the key-level model (S4, #278), and its search.
+
+    Every candidate sentence is scored with the constrained search's own path
+    score at fixed weights, ``-constrained_ctc(gamma * cost) + beta * sum of
+    the transition's log-probabilities``, which is what the search returns
+    without a beam and with the sum combination. ``beta`` and ``gamma`` are
+    constants of the stage, not parameters: the dev sweep after training
+    re-centres ``beta``. The candidates come from a no-grad beam of ``beam``
+    hypotheses over cover lanes -- the gold's own typed cover, and
+    ``other_lengths`` lanes holding the model's best cover of another length --
+    and the ``negatives`` best distinct sentences that are not the gold one are
+    scored against it. ``objective`` is ``"rank"``, the softmax over the gold
+    and the negatives, or ``"risk"``, their expected normalised edit distance
+    to the gold. ``weight`` scales the term beside the joint stage's two; at 0
+    the stage trains the joint stage's loss over the same batches and searches
+    nothing.
+    """
+
+    beam: int = 8
+    negatives: int = 8
+    other_lengths: int = 1
+    weight: float = 0.05
+    beta: float = 2.0
+    gamma: float = 1.0
+    objective: str = "rank"
+
+    def __post_init__(self) -> None:
+        for name in ("beam", "negatives", "other_lengths"):
+            if getattr(self, name) < 1:
+                raise ValueError(f"key ranking {name} must be positive, got {getattr(self, name)}")
+        for name in ("weight", "beta", "gamma"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"key ranking {name} must be finite and not negative, got {value}")
+        if self.objective not in KEY_RANKING_OBJECTIVES:
+            raise ValueError(
+                f"key ranking objective must be one of {KEY_RANKING_OBJECTIVES}, "
+                f"got {self.objective!r}"
+            )
+
+    @property
+    def lanes(self) -> int:
+        """Cover lanes an example is searched on: the gold's, then ``other_lengths`` more."""
+        return 1 + self.other_lengths
+
+    def rows(self) -> int:
+        """Rows an example costs a step at the fill width: its key row, and the scored sentences.
+
+        The gold's and each negative's decoder row, as the span model's
+        ranking stage budgets its paths (:meth:`RankCollator.rows
+        <mlime.train.ranking.RankCollator.rows>`), plus the keys' own.
+        """
+        return 2 + self.negatives
+
+
 @dataclass(frozen=True)
 class E2EConfig(RouteAConfig):
     """Route A's config, plus what the decoder adds.
@@ -139,6 +202,10 @@ class E2EConfig(RouteAConfig):
     #: targets stay the parent's, through a frozen copy of each part that
     #: trains (#241).
     train_fill_tower: FillTowerTraining | None = None
+    #: The sequence-level ranking term of the joint stage's successor (S4, #278):
+    #: the key-level model trained to rank whole sentences over its own
+    #: constrained search. Needs the joint stage's front.
+    key_ranking: KeyRankingConfig | None = None
 
     def __post_init__(self) -> None:
         super().__post_init__()
@@ -178,6 +245,14 @@ class E2EConfig(RouteAConfig):
                     )
         elif self.key_warm_up:
             raise ValueError("the key warm-up trains a key front; name one with keys")
+        if self.key_ranking is not None:
+            if self.keys is None:
+                raise ValueError("the key ranking term scores sentences over keys; name a front")
+            if self.key_warm_up:
+                raise ValueError(
+                    "the key ranking term follows the joint stage; the warm-up (S1) has no "
+                    "transition to rank with"
+                )
         if self.train_fill_tower is not None and not self.key_warm_up:
             raise ValueError("the fill tower trains beside a key front in its warm-up (S1)")
 
@@ -204,6 +279,8 @@ class E2EConfig(RouteAConfig):
             fields["keys"] = KeyFrontConfig.from_record(fields["keys"])
         if fields.get("train_fill_tower") is not None:
             fields["train_fill_tower"] = FillTowerTraining.from_record(fields["train_fill_tower"])
+        if fields.get("key_ranking") is not None:
+            fields["key_ranking"] = KeyRankingConfig(**fields["key_ranking"])
         return cls(**fields)
 
 
@@ -580,6 +657,92 @@ class Decoder(nn.Module):
         # Reordered first and written after: the new keys follow their rows
         # to the surviving beams, and the cache the call was given is never
         # written, which a captured graph must not do to its inputs.
+        keys, values = cache
+        keys = keys.index_select(1, source)
+        values = values.index_select(1, source)
+        keys.index_copy_(3, at.view(1), new_keys.index_select(1, source))
+        values.index_copy_(3, at.view(1), new_values.index_select(1, source))
+        return self.emit_ids[choice.reshape(rows)], top.values, (keys, values), parent, choice
+
+    def step_keys(
+        self,
+        tokens: torch.Tensor,
+        position: torch.Tensor,
+        state: tuple[torch.Tensor, torch.Tensor],
+        encoder_kv: Sequence[tuple[torch.Tensor, torch.Tensor]],
+        encoder_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """Advance a decoder that reads keys one position: logits over the whole emittable set.
+
+        :meth:`step`'s arithmetic for a decoder without a span input
+        (#216 §6): ``tokens [R]`` are each row's previous reader id,
+        ``position`` the step as a 0-d long tensor, ``state`` the cache
+        ``[layers, R, heads, T, head_dim]`` over the positions before it, and
+        ``encoder_kv`` each block's keys and values of the record's key
+        states per lane, ``[lanes, heads, S, head_dim]``, with ``encoder_mask
+        [lanes, S]`` marking the real keys. The rows are lanes of beams,
+        lane-major. Returns the position's logits ``[R, E]`` over every
+        emittable character -- the distribution the training term reads and
+        the search masks without renormalising -- and its keys and values
+        ``[layers, R, heads, 1, head_dim]``, for the caller to write in; the
+        step writes nothing it is given.
+        """
+        keys, values = state
+        x = self.embed(tokens.unsqueeze(1), None, position)
+        before = torch.arange(keys.shape[3], device=keys.device) < position
+        new_keys, new_values = [], []
+        for layer, (block, cross) in enumerate(
+            zip(self.reader.layers(), self.gated_layers(), strict=True)
+        ):
+            x, k, v = _attend_step(block, x, keys[layer], values[layer], before)
+            enc_keys, enc_values = encoder_kv[layer]
+            x = cross.attend_beams(x, enc_keys, enc_values, encoder_mask)
+            new_keys.append(k)
+            new_values.append(v)
+        features: torch.Tensor = self.reader.norm(x).squeeze(1)
+        return self.emission_logits(features), (torch.stack(new_keys), torch.stack(new_values))
+
+    def advance_keys(
+        self,
+        at: torch.Tensor,
+        tokens: torch.Tensor,
+        scores: torch.Tensor,
+        cache: tuple[torch.Tensor, torch.Tensor],
+        gains: torch.Tensor,
+        lane_of_row: torch.Tensor,
+        encoder_kv: Sequence[tuple[torch.Tensor, torch.Tensor]],
+        encoder_mask: torch.Tensor,
+        lane_lengths: torch.Tensor,
+        carried: torch.Tensor,
+        block: torch.Tensor,
+        beta: float,
+    ) -> tuple[
+        torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor
+    ]:
+        """One position of the beam search over cover lanes, start to finish on the device.
+
+        :meth:`advance`'s bookkeeping with the search's own additive step
+        score: a hypothesis that emits character ``c`` at lane position
+        ``at`` gains ``beta * log T(c | prefix) + gains[lane, at, c]``, where
+        ``gains [L, M, E]`` is the lane's emission-minus-blank-minus-cost
+        row for the span it covers there, minus infinity for every character
+        the span does not admit (:func:`~mlime.train.key_ranking.lane_gains`).
+        A row whose lane has ended (``lane_lengths [L]``) takes ``carried``,
+        the free step. ``encoder_mask [L, S]`` marks each lane's real keys.
+        Returns what :meth:`advance` does; like it, one graph a search shape.
+        """
+        count, width = scores.shape
+        rows = count * width
+        emittable = gains.shape[-1]
+        logits, (new_keys, new_values) = self.step_keys(tokens, at, cache, encoder_kv, encoder_mask)
+        log_probs = beta * logits.float().log_softmax(dim=-1) + gains[lane_of_row, at.view(1)]
+        ended = (lane_lengths <= at)[lane_of_row]
+        log_probs = torch.where(ended.unsqueeze(1), carried, log_probs)
+        total = (scores.reshape(rows, 1) + log_probs).reshape(count, width * emittable)
+        top = total.topk(width, dim=1)
+        parent = top.indices // emittable
+        choice = top.indices % emittable
+        source = (block + parent).reshape(rows)
         keys, values = cache
         keys = keys.index_select(1, source)
         values = values.index_select(1, source)

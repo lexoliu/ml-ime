@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any
 
 from mlime.logging import log
-from mlime.train.e2e_model import RankingConfig
+from mlime.train.e2e_model import KeyRankingConfig, RankingConfig
 from mlime.train.keys import KeyFrontConfig
 from mlime.train.ranking import RankCollator
 from mlime.train.run import RunPaths, Slices, Vocabularies
@@ -120,6 +120,10 @@ class BatchCensus:
     #: with ``augmentation.unit_initials`` decides how the examples are typed;
     #: ``None`` for a run without unit initials.
     unit_lexicon: str | None = None
+    #: The key ranking term's shape when the count weighed each example by every
+    #: row that stage makes of it (see :func:`key_ranking_shape`); ``None`` for
+    #: a run without it.
+    key_ranking: dict[str, Any] | None = None
 
     def write(self, path: Path) -> None:
         """Write the census as JSON, which is how the kernel reads it back."""
@@ -141,6 +145,7 @@ class BatchCensus:
         # A span-level census written before key-level counts existed.
         data.setdefault("keys", None)
         data.setdefault("unit_lexicon", None)
+        data.setdefault("key_ranking", None)
         return cls(**data)
 
 
@@ -165,6 +170,14 @@ class CountSpec:
     ranking: dict[str, Any] | None
     keys: dict[str, Any] | None = None
     unit_lexicon: str | None = None
+    key_ranking: dict[str, Any] | None = None
+
+
+def key_ranking_shape(ranking: KeyRankingConfig | None) -> dict[str, Any] | None:
+    """The key ranking settings a count depends on: the rows an example costs, not its weights."""
+    if ranking is None:
+        return None
+    return {"negatives": ranking.negatives}
 
 
 def ranking_shape(ranking: RankingConfig | None) -> dict[str, Any] | None:
@@ -205,6 +218,7 @@ def matching_census(path: Path, spec: CountSpec) -> tuple[BatchCensus | None, li
     # A span-level census from before key-level counts records no keys.
     data.setdefault("keys", None)
     data.setdefault("unit_lexicon", None)
+    data.setdefault("key_ranking", None)
     declared = {field.name for field in fields(BatchCensus)}
     differed = sorted(set(data) ^ declared)
     if differed:
@@ -238,6 +252,7 @@ class _CountContext:
     ranking: RankingConfig | None
     segmenter: Path | None
     keys: KeyFrontConfig | None = None
+    key_ranking: KeyRankingConfig | None = None
 
 
 @dataclass(frozen=True)
@@ -263,6 +278,12 @@ class _ShardCount:
 
 def _collator(context: _CountContext) -> BatchCollator:
     """The collator whose context budget and row weights the run batches by."""
+    if context.key_ranking is not None:
+        if context.keys is None:
+            raise ValueError("the key ranking term needs a key front")
+        return context.vocabularies.key_rank_collator(
+            context.keys, context.key_ranking, 0.0, context.max_context_tokens, context.seed
+        )
     plain = context.vocabularies.collator(0.0, context.max_context_tokens, context.seed)
     if context.ranking is None:
         return plain
@@ -392,6 +413,7 @@ def count_batches(
     segmenter: Path | None = None,
     workers: int = 1,
     keys: KeyFrontConfig | None = None,
+    key_ranking: KeyRankingConfig | None = None,
 ) -> BatchCensus:
     """Count the batches every rank takes over *epochs*, the way the loop would.
 
@@ -416,6 +438,8 @@ def count_batches(
 
     *keys* counts a key-level run: its builder types keys and drops the golds
     the automaton rejects, and an example's width is its keys' and its spans'.
+    *key_ranking* weighs each key example by the rows its sequence-level term
+    makes of it (S4, #278).
     """
     if workers < 1:
         raise ValueError(f"a count needs at least one worker, got {workers}")
@@ -427,6 +451,8 @@ def count_batches(
         raise ValueError(f"an optimiser step holds at least one micro-batch, got {accumulate}")
     if keys is not None and ranking is not None:
         raise ValueError("a key-level run has no lattice readings to rank")
+    if key_ranking is not None and keys is None:
+        raise ValueError("the key ranking term needs a key front")
     augmentation = augmentation or Augmentation()
     vocabularies = vocabularies.with_units(paths.unit_lexicon)
     sampling = None if keys is None else keys.sampling()
@@ -443,6 +469,7 @@ def count_batches(
         ranking=ranking_shape(ranking),
         keys=sampling,
         unit_lexicon=None if vocabularies.units is None else vocabularies.units.digest,
+        key_ranking=key_ranking_shape(key_ranking),
     )
     if reuse_census is not None:
         stored, differed = matching_census(reuse_census, spec)
@@ -461,6 +488,7 @@ def count_batches(
         ranking=ranking,
         segmenter=segmenter,
         keys=keys,
+        key_ranking=key_ranking,
     )
     # The stream decides the reading order and where each shard starts in it,
     # exactly as each rank's stream will in the run.
@@ -488,6 +516,7 @@ def count_batches(
         ranking=ranking_shape(ranking),
         keys=sampling,
         unit_lexicon=spec.unit_lexicon,
+        key_ranking=spec.key_ranking,
     )
     log.info(
         "batches counted",
