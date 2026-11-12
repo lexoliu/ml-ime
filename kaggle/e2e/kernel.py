@@ -44,7 +44,9 @@ the first segment builds the front over the finished run's weights, and
 encoder states, which is S1; `TRAIN_FILL_TOWER` trains the fill tower in S1
 as well, and with its `cross_attention` the tower's gated context blocks,
 against frozen copies of that run's (#241). Without `KEY_WARM_UP` the stage is
-the joint one (S2, #257) over a finished S1 run. A key-level run is scored by the
+the joint one (S2, #257) over a finished S1 run, and `KEY_RANKING` adds the
+sequence-level term over its own constrained search to a joint stage over a
+finished joint run (S4, #278). A key-level run is scored by the
 trainer's held-out record -- in S1 the parent's decoder fed the front's states,
 in S2 the decoder's teacher-forced accuracy and the CTC loss -- not by the
 lattice search, which does not decode it. A finished S2 run is then decoded
@@ -278,6 +280,13 @@ KEY_WARM_UP = False
 #: blocks beside it, against a frozen copy of those too.
 TRAIN_FILL_TOWER = None
 
+#: The key-level model's sequence-level term over its own constrained search
+#: (S4, #278), as `mlime train e2e`'s `--key-rank-*` options: a dict of `beam`,
+#: `negatives`, `other_lengths`, `weight`, `beta`, `gamma` and `objective`
+#: ("rank" or "risk"). Needs `KEYS` without `KEY_WARM_UP`, over a finished joint
+#: run. None trains the joint stage's loss alone. Stamped per push.
+KEY_RANKING = None
+
 #: The (pretrained, new) learning rates; None keeps `mlime train e2e`'s.
 LEARNING_RATES = None
 
@@ -285,8 +294,9 @@ LEARNING_RATES = None
 #: `eval3<suffix>.jsonl` in the assets mount, each with the gammas its dev
 #: sweep tries: the correction cost's weight moves nothing on a twin whose
 #: keystrokes are clean, so those decode one, and only the typo twin sweeps it.
-#: The dev sweep's grid is every beta x the twin's gammas, both combinations of
-#: a prefix's covers.
+#: The dev sweep's grid is every beta x the twin's gammas, the sum combination
+#: of a prefix's covers only: the max never differed from it in S2's or S3's
+#: sweeps.
 KEY_TWINS = {
     "": (1.0,),
     "-abbreviated": (1.0,),
@@ -656,6 +666,7 @@ def count_argv(char_table, out, segmenter, census=None):
         str(out),
         *ranking_argv(segmenter),
         *keys_argv(),
+        *key_ranking_argv(),
     ]
     argv += typing_argv(char_table)
     if census is not None:
@@ -681,6 +692,7 @@ def stage():
         "keys": KEYS,
         "key_warm_up": KEY_WARM_UP,
         "train_fill_tower": TRAIN_FILL_TOWER,
+        "key_ranking": KEY_RANKING,
         "typos": TYPOS,
         "unit_initials": UNIT_INITIALS,
         "unit_lexicon": UNIT_LEXICON,
@@ -694,7 +706,8 @@ def stage_of(config):
     the plain run from route A and the reader. A run before #222 records no
     context tower: it read its context with MacBERT. A run before #223 records
     no key front: it is the span model. A run before #241 records no fill
-    tower switch: its tower was frozen. A run before the unit initials records
+    tower switch: its tower was frozen. A run before #278 records no key
+    ranking term: it trained the joint stage's loss alone. A run before the unit initials records
     none: it typed no unit whole, and a run before `typos` was recorded turned
     them on only by a hand-stamped kernel, which no stage of this chain did.
     """
@@ -707,6 +720,7 @@ def stage_of(config):
         "keys": config.get("keys"),
         "key_warm_up": config.get("key_warm_up", False),
         "train_fill_tower": config.get("train_fill_tower"),
+        "key_ranking": config.get("key_ranking"),
         "typos": config.get("typos", False),
         "unit_initials": config.get("unit_initials", 0.0),
         "unit_lexicon": config.get("unit_lexicon"),
@@ -741,6 +755,16 @@ def keys_argv():
     argv = ["--keys"]
     if not KEYS["correct_syllables"]:
         argv.append("--no-correct-syllables")
+    return argv
+
+
+def key_ranking_argv():
+    """The key ranking term's switches, shared by counting and training: its rows weigh the batches."""
+    if KEY_RANKING is None:
+        return []
+    argv = ["--key-ranking"]
+    for name, value in KEY_RANKING.items():
+        argv += [f"--key-rank-{name.replace('_', '-')}", str(value)]
     return argv
 
 
@@ -886,7 +910,7 @@ def train_argv(
     if ACTIVATION_CHECKPOINTING:
         argv.append("--activation-checkpointing")
     argv += typing_argv(char_table)
-    argv += keys_argv() + key_training_argv()
+    argv += keys_argv() + key_ranking_argv() + key_training_argv()
     return argv
 
 
@@ -1134,6 +1158,8 @@ def key_eval_argv(
         "--select-on-dev",
         *(item for beta in KEY_BETAS for item in ("--beta", str(beta))),
         *(item for gamma in gammas for item in ("--gamma", str(gamma))),
+        # The sum only: the max never differed from it in S2's or S3's sweeps.
+        "--sum",
         "--context" if context else "--no-context",
         "--dump-dir",
         str(dump_dir),
@@ -1416,8 +1442,10 @@ def main():
     started = time.monotonic()
     if RANKING is not None and INIT_FROM is None:
         raise RuntimeError("a ranking stage starts from a finished run; stamp INIT_FROM")
-    if SEARCH_GRAPHS and RANKING is None:
-        raise RuntimeError("only a ranking stage has a search to replay; stamp RANKING")
+    if SEARCH_GRAPHS and RANKING is None and KEY_RANKING is None:
+        raise RuntimeError(
+            "only a ranking stage has a search to replay; stamp RANKING or KEY_RANKING"
+        )
     if (CONTEXT_TOWER is not None or CONTEXT_WARM_UP) and INIT_FROM is None:
         raise RuntimeError("a context tower is swapped into a finished run; stamp INIT_FROM")
     if TOWER_GRAPHS and (CONTEXT_TOWER is None or CONTEXT_TOWER["lora_rank"]):
@@ -1428,6 +1456,10 @@ def main():
         raise RuntimeError("the key warm-up trains a key front; stamp KEYS")
     if TRAIN_FILL_TOWER is not None and not KEY_WARM_UP:
         raise RuntimeError("the fill tower trains in the key warm-up; stamp KEY_WARM_UP")
+    if KEY_RANKING is not None and (KEYS is None or KEY_WARM_UP):
+        raise RuntimeError(
+            "the key ranking term follows the joint stage; stamp KEYS, not KEY_WARM_UP"
+        )
     if (UNIT_INITIALS > 0) != (UNIT_LEXICON is not None):
         raise RuntimeError("the unit initials and their lexicon come together; stamp both")
     install()

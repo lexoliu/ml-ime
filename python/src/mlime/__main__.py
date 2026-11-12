@@ -26,7 +26,7 @@ from mlime.logging import configure
 
 if TYPE_CHECKING:  # the training modules pull in torch; --help must not
     from mlime.data import idiom_set
-    from mlime.train.e2e_model import E2EConfig, RankingConfig
+    from mlime.train.e2e_model import E2EConfig, KeyRankingConfig, RankingConfig
     from mlime.train.keys import FillTowerTraining, KeyFrontConfig
     from mlime.train.qwen_tower import QwenContextConfig
     from mlime.train.run import RunPaths, Slices
@@ -179,6 +179,33 @@ TRAIN_CROSS_ATTENTION = typer.Option(
     False,
     "--train-cross-attention/--no-train-cross-attention",
     help="With --train-fill-tower, train its gated context blocks too, against a frozen copy",
+)
+
+
+KEY_RANKING = typer.Option(
+    False,
+    "--key-ranking/--no-key-ranking",
+    help="Add the sequence-level term over the key-level model's own constrained search to "
+    "the joint stage (S4, #278); needs --keys",
+)
+KEY_RANK_BEAM = typer.Option(None, help="Beam width of each cover lane's search (default 8)")
+KEY_RANK_NEGATIVES = typer.Option(
+    None, help="Negatives each example ranks the gold sentence against (default 8)"
+)
+KEY_RANK_OTHER_LENGTHS = typer.Option(
+    None, help="Lanes of the model's best cover of another length than the gold's (default 1)"
+)
+KEY_RANK_WEIGHT = typer.Option(
+    None, help="Weight of the sequence-level term beside the joint stage's (default 0.05)"
+)
+KEY_RANK_BETA = typer.Option(
+    None, help="The transition's weight in the sentence score, a constant of the stage (default 2)"
+)
+KEY_RANK_GAMMA = typer.Option(
+    None, help="The correction cost's weight in the sentence score (default 1)"
+)
+KEY_RANK_OBJECTIVE = typer.Option(
+    None, help="rank: softmax over the gold and the negatives; risk: their expected edit distance"
 )
 
 
@@ -623,6 +650,47 @@ def ranking_settings(
     )
 
 
+def key_ranking_settings(
+    key_ranking: bool,
+    keys: bool,
+    key_warm_up: bool,
+    beam: int | None,
+    negatives: int | None,
+    other_lengths: int | None,
+    weight: float | None,
+    beta: float | None,
+    gamma: float | None,
+    objective: str | None,
+) -> KeyRankingConfig | None:
+    """The key ranking term's settings from its switch and its ``--key-rank-*`` knobs."""
+    knobs = (beam, negatives, other_lengths, weight, beta, gamma, objective)
+    if not key_ranking:
+        if any(value is not None for value in knobs):
+            raise typer.BadParameter(
+                "the --key-rank-* options set the key ranking term; pass --key-ranking"
+            )
+        return None
+    if not keys or key_warm_up:
+        raise typer.BadParameter(
+            "--key-ranking follows the joint stage; pass --keys without --key-warm-up"
+        )
+    from mlime.train.e2e_model import KeyRankingConfig
+
+    default = KeyRankingConfig()
+    try:
+        return KeyRankingConfig(
+            beam=default.beam if beam is None else beam,
+            negatives=default.negatives if negatives is None else negatives,
+            other_lengths=default.other_lengths if other_lengths is None else other_lengths,
+            weight=default.weight if weight is None else weight,
+            beta=default.beta if beta is None else beta,
+            gamma=default.gamma if gamma is None else gamma,
+            objective=default.objective if objective is None else objective,
+        )
+    except ValueError as error:
+        raise typer.BadParameter(str(error)) from error
+
+
 def context_settings(
     tower: str | None,
     revision: str | None,
@@ -866,6 +934,14 @@ def train_e2e(
     key_warm_up: bool = KEY_WARM_UP,
     train_fill_tower: bool = TRAIN_FILL_TOWER,
     train_cross_attention: bool = TRAIN_CROSS_ATTENTION,
+    key_ranking: bool = KEY_RANKING,
+    key_rank_beam: int | None = KEY_RANK_BEAM,
+    key_rank_negatives: int | None = KEY_RANK_NEGATIVES,
+    key_rank_other_lengths: int | None = KEY_RANK_OTHER_LENGTHS,
+    key_rank_weight: float | None = KEY_RANK_WEIGHT,
+    key_rank_beta: float | None = KEY_RANK_BETA,
+    key_rank_gamma: float | None = KEY_RANK_GAMMA,
+    key_rank_objective: str | None = KEY_RANK_OBJECTIVE,
     max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
     token_budget: int = TOKEN_BUDGET,
     base_lr: float = typer.Option(3e-5, help="Learning rate for the pretrained weights"),
@@ -1020,6 +1096,18 @@ def train_e2e(
             ),
             key_warm_up=key_warm_up,
             train_fill_tower=fill_tower_settings(train_fill_tower, train_cross_attention),
+            key_ranking=key_ranking_settings(
+                key_ranking,
+                keys,
+                key_warm_up,
+                key_rank_beam,
+                key_rank_negatives,
+                key_rank_other_lengths,
+                key_rank_weight,
+                key_rank_beta,
+                key_rank_gamma,
+                key_rank_objective,
+            ),
         )
     except torch.cuda.OutOfMemoryError as error:
         # The peak is recorded even at the crash, and the cache freed before
@@ -1107,6 +1195,14 @@ def train_count_batches(
     unit_lexicon: Path | None = UNIT_LEXICON,
     keys: bool = KEYS,
     correct_syllables: bool = CORRECT_SYLLABLES,
+    key_ranking: bool = KEY_RANKING,
+    key_rank_beam: int | None = KEY_RANK_BEAM,
+    key_rank_negatives: int | None = KEY_RANK_NEGATIVES,
+    key_rank_other_lengths: int | None = KEY_RANK_OTHER_LENGTHS,
+    key_rank_weight: float | None = KEY_RANK_WEIGHT,
+    key_rank_beta: float | None = KEY_RANK_BETA,
+    key_rank_gamma: float | None = KEY_RANK_GAMMA,
+    key_rank_objective: str | None = KEY_RANK_OBJECTIVE,
     workers: int | None = typer.Option(
         None,
         "--workers",
@@ -1156,6 +1252,18 @@ def train_count_batches(
         augmentation=Augmentation(typos=typos, unit_initials=unit_initials),
         # The count reads only the sampling fields, which no stage's weights touch.
         keys=key_settings(keys, None, None, None, None, correct_syllables, key_warm_up=False),
+        key_ranking=key_ranking_settings(
+            key_ranking,
+            keys,
+            False,
+            key_rank_beam,
+            key_rank_negatives,
+            key_rank_other_lengths,
+            key_rank_weight,
+            key_rank_beta,
+            key_rank_gamma,
+            key_rank_objective,
+        ),
     )
     census.write(out)
     typer.echo(
@@ -1548,6 +1656,14 @@ def e2e_stamp(
     key_warm_up: bool = KEY_WARM_UP,
     train_fill_tower: bool = TRAIN_FILL_TOWER,
     train_cross_attention: bool = TRAIN_CROSS_ATTENTION,
+    key_ranking: bool = KEY_RANKING,
+    key_rank_beam: int | None = KEY_RANK_BEAM,
+    key_rank_negatives: int | None = KEY_RANK_NEGATIVES,
+    key_rank_other_lengths: int | None = KEY_RANK_OTHER_LENGTHS,
+    key_rank_weight: float | None = KEY_RANK_WEIGHT,
+    key_rank_beta: float | None = KEY_RANK_BETA,
+    key_rank_gamma: float | None = KEY_RANK_GAMMA,
+    key_rank_objective: str | None = KEY_RANK_OBJECTIVE,
     typos: bool = typer.Option(
         False,
         "--typos/--no-typos",
@@ -1574,11 +1690,14 @@ def e2e_stamp(
     `--train-fill-tower` trains the fill tower in it, and with
     `--train-cross-attention` its gated context blocks (#241). `--keys`
     without `--key-warm-up`, over a finished S1 run, is the joint stage S2
-    (#257), weighed by `--transition-weight`. `--typos` turns the typo
+    (#257), weighed by `--transition-weight`; `--key-ranking` adds the
+    sequence-level term over its own constrained search (S4, #278). `--typos` turns the typo
     augmentation on, and `--unit-initials` with `--unit-lexicon` types the
     idioms and internet phrases of a sentence as initials whole, the lexicon
     being a file of the assets mount.
     """
+    from dataclasses import asdict
+
     from mlime.locate import find_upwards
     from mlime.stamp import E2E_V2_SOURCES, E2EV2Run, E2EV2Stage, stamp_e2e_v2
 
@@ -1599,6 +1718,7 @@ def e2e_stamp(
         "--keys": keys or None,
         "--key-warm-up": key_warm_up or None,
         "--train-fill-tower": train_fill_tower or None,
+        "--key-ranking": key_ranking or None,
         "--typos": typos or None,
         "--unit-initials": unit_initials or None,
         "--unit-lexicon": unit_lexicon,
@@ -1617,6 +1737,18 @@ def e2e_stamp(
         key_warm_up,
     )
     fill_tower = fill_tower_settings(train_fill_tower, train_cross_attention)
+    key_ranking_config = key_ranking_settings(
+        key_ranking,
+        keys,
+        key_warm_up,
+        key_rank_beam,
+        key_rank_negatives,
+        key_rank_other_lengths,
+        key_rank_weight,
+        key_rank_beta,
+        key_rank_gamma,
+        key_rank_objective,
+    )
     stage = None
     if init_from is None:
         given = [option for option, value in recipe_options.items() if value is not None]
@@ -1664,6 +1796,7 @@ def e2e_stamp(
             train_fill_tower=None
             if fill_tower is None
             else {"cross_attention": fill_tower.cross_attention},
+            key_ranking=None if key_ranking_config is None else asdict(key_ranking_config),
             typos=typos,
             unit_initials=unit_initials,
             unit_lexicon=unit_lexicon,
@@ -2093,6 +2226,84 @@ def eval_keys(
     rendered = f"{heading}\n\n{report}"
     if statistics is not None:
         rendered += f"\n\n{statistics.render()}"
+    typer.echo(rendered)
+    if out is not None:
+        out.write_text(rendered + "\n", encoding="utf-8")
+
+
+@eval_app.command("rerank-keys")
+def eval_rerank_keys(
+    checkpoint: Path = typer.Option(..., help="The key-level checkpoint that scores the sentences"),
+    dump: Path = typer.Option(..., help="An `eval keys` dump of one slice at one weight point"),
+    eval_set: Path = typer.Option(..., help="The eval set the dump was decoded from"),
+    char_table: Path = CHAR_TABLE,
+    typo_table: Path = typer.Option(
+        None, help="ime-pinyin's typo.json; found upwards when omitted"
+    ),
+    syllables: Path = typer.Option(None, help="ime-pinyin's syllables.txt; found upwards"),
+    beta: float = typer.Option(
+        None, help="The transition's weight in S; the checkpoint's key ranking stage's when omitted"
+    ),
+    gamma: float = typer.Option(
+        None, help="The correction cost's weight in S; the checkpoint's when omitted"
+    ),
+    dev_share: float = typer.Option(0.0905, help="Share of the set that is development data"),
+    context: bool = typer.Option(True, help="Let the model read each record's context"),
+    token_budget: int = typer.Option(8192, help="Padded positions per encoder forward"),
+    out: Path = typer.Option(None, help="Where the report text goes"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Score a key decode's dumped hypotheses and the gold by the stage's training score (S4)."""
+    configure(verbose)
+    from dataclasses import asdict
+
+    from mlime.data.corpus import default_char_table
+    from mlime.locate import find_upwards
+    from mlime.train.e2e import recorded_config
+    from mlime.train.e2e_model import KeyRankingConfig
+    from mlime.train.key_eval import KeyDecoder, eval_key_records, load_key_run
+    from mlime.train.key_rerank import rerank_dump
+    from mlime.typo import SYLLABLES_RELATIVE, default_typo_table
+
+    table = char_table or default_char_table()
+    if table is None:
+        raise typer.BadParameter("no char_pinyin.tsv found above the working directory")
+    typo = typo_table or default_typo_table()
+    if typo is None:
+        raise typer.BadParameter("no typo.json found above the working directory; pass it")
+    inventory = syllables or find_upwards(SYLLABLES_RELATIVE)
+    if inventory is None:
+        raise typer.BadParameter("no syllables.txt found above the working directory; pass it")
+    recorded = recorded_config(checkpoint).key_ranking
+    if recorded is None and (beta is None or gamma is None):
+        raise typer.BadParameter("the checkpoint has no key ranking stage; give --beta and --gamma")
+    base = recorded or KeyRankingConfig()
+    ranking = KeyRankingConfig(
+        **{
+            **asdict(base),
+            **({"beta": beta} if beta is not None else {}),
+            **({"gamma": gamma} if gamma is not None else {}),
+        }
+    )
+    run, step = load_key_run(
+        checkpoint,
+        eval_set,
+        char_table=table,
+        typo_table=typo,
+        syllables=inventory,
+        with_context=context,
+        token_budget=token_budget,
+        dev_share=dev_share,
+    )
+    decoder = run.decoder
+    if not isinstance(decoder, KeyDecoder):
+        raise TypeError(f"expected the PyTorch key decoder, got {type(decoder).__name__}")
+    decoder.model.eval()
+    report = rerank_dump(decoder, eval_key_records(run.eval_rows), dump, ranking)
+    rendered = (
+        f"checkpoint: {checkpoint} (step {step}), beta {ranking.beta}, gamma {ranking.gamma}, "
+        f"context {'on' if context else 'off'}\n\n{report.render()}"
+    )
     typer.echo(rendered)
     if out is not None:
         out.write_text(rendered + "\n", encoding="utf-8")

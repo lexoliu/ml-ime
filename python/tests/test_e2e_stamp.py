@@ -534,3 +534,70 @@ def test_the_context_blocks_train_only_with_the_tower(tmp_path: Path) -> None:
     )
     assert refused.exit_code == 2, refused.output
     assert "pass --train-fill-tower" in error(refused.output)
+
+
+def test_a_key_ranking_stage_stamps_its_term_over_a_finished_joint_run(tmp_path: Path) -> None:
+    """S4 (#278): ``KEY_RANKING`` is the only line a stage adds beside the joint stage's fields."""
+    out = tmp_path / "ranking"
+    argv = ["e2e", "stamp", "mlime-e2e-keys-s4-check", "--out", str(out)]
+    stage = ["--init-from", "mlime-e2e-keys-s3-check", "--keys", "--typos", "--key-ranking"]
+    knobs = ["--key-rank-weight", "0.1", "--key-rank-objective", "risk", "--search-graphs"]
+    result = CliRunner().invoke(app, [*argv, *stage, *knobs])
+    assert result.exit_code == 0, result.output
+    template = (TEMPLATE / "kernel.py").read_text()
+    kernel = (out / "kernel.py").read_text()
+    ranking = {
+        "beam": 8,
+        "negatives": 8,
+        "other_lengths": 1,
+        "weight": 0.1,
+        "beta": 2.0,
+        "gamma": 1.0,
+        "objective": "risk",
+    }
+    keys = {"layers": 2, "transition_weight": 1.0, "correct_syllables": True}
+    assert sorted(changed_lines(template, kernel)) == sorted(
+        f"{name} = {value!r}"
+        for name, value in {
+            "INIT_FROM": "mlime-e2e-keys-s3-check",
+            "KEYS": keys,
+            "KEY_RANKING": ranking,
+            "TYPOS": True,
+            "SEARCH_GRAPHS": True,
+            "PROFILE_STEPS": 30,
+            "TRACE_STEPS": 3,
+        }.items()
+    )
+    assert literal(kernel, "KEY_RANKING") == ranking
+    assert literal(template, "KEY_RANKING") is None
+
+    # The term follows the joint stage: a front, no warm-up, a stage to be one of.
+    joint = {"layers": 2, "transition_weight": 1.0, "correct_syllables": True}
+    with pytest.raises(ValueError, match="names"):
+        E2EV2Stage(init_from="mlime-e2e-keys-s3-check", keys=joint, key_ranking={"beam": 8})
+    with pytest.raises(ValueError, match="follows the joint stage"):
+        E2EV2Stage(init_from="mlime-e2e-keys-s3-check", key_ranking=ranking)
+    warm = {"layers": 2, "distill_weight": 1.0, "frame_weight": 0.0, "correct_syllables": True}
+    with pytest.raises(ValueError, match="follows the joint stage"):
+        E2EV2Stage(init_from="mlime-e2e-v2-g4", keys=warm, key_warm_up=True, key_ranking=ranking)
+    for option, wanted in (
+        (["--key-ranking"], "pass --keys"),
+        (["--keys", "--key-rank-beam", "4"], "pass --key-ranking"),
+        (["--keys", "--key-ranking", "--key-warm-up"], "without --key-warm-up"),
+        (["--keys", "--key-ranking", "--key-rank-objective", "mean"], "objective"),
+    ):
+        refused = CliRunner().invoke(
+            app,
+            [
+                "e2e",
+                "stamp",
+                "mlime-e2e-keys-s4-x",
+                "--out",
+                str(tmp_path / "x"),
+                "--init-from",
+                "mlime-e2e-keys-s3-check",
+                *option,
+            ],
+        )
+        assert refused.exit_code == 2, (option, refused.output)
+        assert wanted in error(refused.output), option

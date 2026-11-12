@@ -634,7 +634,14 @@ class KeyE2EModel(E2EModel):
 
         *student* is the fill tower over the keys, flat ``[B * (Wk + 2), H]``.
         """
-        log_probs = self.ctc_log_probs(student.index_select(0, batch.key_positions))
+        return self.gold_alignment(
+            batch, self.ctc_log_probs(student.index_select(0, batch.key_positions))
+        )
+
+    def gold_alignment(
+        self, batch: KeyBatch, log_probs: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """:meth:`ctc_alignment` over the keys' CTC log-probabilities *log_probs* ``[K, E + 1]``."""
         blank, emit = alignment_scores(log_probs, batch.key_index, batch.gold)
         nll = constrained_ctc(blank, emit, batch.cost, batch.keys, batch.lengths)
         return nll, blank, emit

@@ -555,53 +555,18 @@ class RankingE2EModel(E2EModel):
         past the last real step score a step nobody reads.
         """
         decoder = self.decoder
-        device = spans.device
-        count, length = sequences.shape
         said = sequences.clamp(min=0)
-        mask = steps
-        real = mask.reshape(-1)
-        # Each real step's place in the packed order, and a spare place past
-        # the bound for every other one (whose index then points nowhere read).
-        place = torch.where(real, real.cumsum(0) - 1, bound)
-        flat = torch.arange(real.numel(), device=device)
-        taken = torch.zeros(bound + 1, dtype=torch.long, device=device).scatter(0, place, flat)[
-            :bound
-        ]
-        owner = torch.full((bound + 1,), count, dtype=torch.long, device=device).scatter(
-            0, place, flat // length
-        )[:bound]
-
         reader_ids = decoder.emit_ids[said]
         previous = torch.cat([torch.full_like(reader_ids[:, :1], BOS), reader_ids[:, :-1]], dim=1)
         read_spans = spans.index_select(0, rows)
         # The compiled decoder sees a new item count and length every step;
         # marked here, its first compile is the dynamic one (as in `_scored`).
-        for tensor in (previous, read_spans, mask):
+        for tensor in (previous, read_spans, steps):
             torch._dynamo.maybe_mark_dynamic(tensor, (0, 1))
-        features = decoder(previous, read_spans, mask)
+        features = decoder(previous, read_spans, steps)
         reader = decoder.reader
         projected: torch.Tensor = reader.project(reader.dropout(features))
-        picked = projected.reshape(-1, projected.shape[-1]).index_select(0, taken)
-        targets = said.reshape(-1).index_select(0, taken)
-        emitted = self._emitted()
-        stepped = torch.cat(
-            [
-                torch.as_tensor(
-                    torch.utils.checkpoint.checkpoint(
-                        _step_log_probabilities,
-                        picked[start : start + STEP_CHUNK],
-                        emitted,
-                        targets[start : start + STEP_CHUNK],
-                        use_reentrant=False,
-                    )
-                )
-                for start in range(0, bound, STEP_CHUNK)
-            ]
-        )
-        paths = torch.zeros(count + 1, dtype=stepped.dtype, device=device).index_add(
-            0, owner, stepped
-        )[:count]
-        return paths, projected
+        return packed_path_scores(projected, self._emitted(), said, steps, bound), projected
 
     def _emitted(self) -> torch.Tensor:
         """``[E, D]``: the reader's embedding row of each emittable character."""
@@ -624,10 +589,63 @@ class RankingE2EModel(E2EModel):
         return admitted.scatter_(2, spare, True)[..., :emittable]
 
 
-#: Steps whose whole-alphabet logits exist at once in :meth:`RankingE2EModel.path_scores`:
+#: Steps whose whole-alphabet logits exist at once in :func:`packed_path_scores`:
 #: 2048 of them over 7,322 characters is 90 MiB in fp32, beside activations of
 #: gigabytes.
 STEP_CHUNK = 2048
+
+
+def packed_path_scores(
+    projected: torch.Tensor,
+    emitted: torch.Tensor,
+    said: torch.Tensor,
+    steps: torch.Tensor,
+    bound: int,
+) -> torch.Tensor:
+    """Each path's summed step log-probabilities over the whole emittable set ``[I]``.
+
+    ``projected [I, S, D]`` are the decoder's features at every step of every
+    path, *emitted* ``[E, D]`` the reader's embedding row of each emittable
+    character, ``said [I, S]`` the character each step says (emission
+    indices, any valid value past a path's end) and ``steps [I, S]`` marks the
+    real steps. The whole-alphabet logits exist only a chunk of steps at a
+    time and are recomputed in backward rather than kept: a step needs its
+    own logit and the normaliser, not the seven thousand others, and keeping
+    them would hold more than the decoder's own activations do. They are
+    taken over the real steps alone, packed in order into *bound* slots --
+    a count the host knows, so nothing is read back -- and the slots past the
+    last real step score a step nobody reads.
+    """
+    device = projected.device
+    count, length = said.shape
+    real = steps.reshape(-1)
+    # Each real step's place in the packed order, and a spare place past
+    # the bound for every other one (whose index then points nowhere read).
+    place = torch.where(real, real.cumsum(0) - 1, bound)
+    flat = torch.arange(real.numel(), device=device)
+    taken = torch.zeros(bound + 1, dtype=torch.long, device=device).scatter(0, place, flat)[:bound]
+    owner = torch.full((bound + 1,), count, dtype=torch.long, device=device).scatter(
+        0, place, flat // length
+    )[:bound]
+    picked = projected.reshape(-1, projected.shape[-1]).index_select(0, taken)
+    targets = said.reshape(-1).index_select(0, taken)
+    stepped = torch.cat(
+        [
+            torch.as_tensor(
+                torch.utils.checkpoint.checkpoint(
+                    _step_log_probabilities,
+                    picked[start : start + STEP_CHUNK],
+                    emitted,
+                    targets[start : start + STEP_CHUNK],
+                    use_reentrant=False,
+                )
+            )
+            for start in range(0, bound, STEP_CHUNK)
+        ]
+    )
+    return torch.zeros(count + 1, dtype=stepped.dtype, device=device).index_add(0, owner, stepped)[
+        :count
+    ]
 
 
 def _step_log_probabilities(
