@@ -421,3 +421,71 @@ fn the_automaton_agrees_with_the_python_fixture() {
         );
     }
 }
+
+#[test]
+fn a_forced_cut_keeps_only_covers_with_a_boundary_there() {
+    // xi'an reads 西安 and can no longer read 先, whose span straddles the cut.
+    let legality = legality();
+    let plain = legality.lattice(&keys("xian"), LegalityOptions::OFFLINE);
+    let cut = plain.with_forced_cuts(&[2]);
+    let ids = |sentence: &str| -> Vec<EmitId> {
+        sentence
+            .chars()
+            .map(|ch| legality.emit_id(ch).expect("the sample is emittable"))
+            .collect()
+    };
+    assert_eq!(plain.cost(&ids("先")), Some(0.0));
+    assert_eq!(cut.cost(&ids("先")), None);
+    assert_eq!(cut.cost(&ids("西安")), Some(0.0));
+    assert!(cut.edges().all(|edge| edge.end() <= 2 || edge.start() >= 2));
+}
+
+#[test]
+fn forced_cuts_prune_to_complete_covers_again() {
+    // Every kept edge still starts where a cover of the keys before it ends
+    // and ends where a cover of the keys after it begins, cuts or not.
+    let legality = legality();
+    for typed in ["shuijiap", "zgrm", "wojaijia", "hm"] {
+        let lattice = legality.lattice(&keys(typed), LegalityOptions::OFFLINE);
+        let forced: [&[usize]; 5] = [&[], &[1], &[2], &[1, 3], &[typed.len() - 1]];
+        for cuts in forced {
+            let cut = lattice.with_forced_cuts(cuts);
+            let mut reachable = vec![false; typed.len() + 1];
+            reachable[0] = true;
+            for edge in cut.edges() {
+                assert!(
+                    !cuts.iter().any(|&c| edge.start() < c && c < edge.end()),
+                    "{typed} {cuts:?}"
+                );
+                reachable[edge.end()] |= reachable[edge.start()];
+            }
+            let mut productive = vec![false; typed.len() + 1];
+            productive[typed.len()] = true;
+            for edge in cut.edges().collect::<Vec<_>>().into_iter().rev() {
+                productive[edge.start()] |= productive[edge.end()];
+            }
+            for edge in cut.edges() {
+                assert!(
+                    reachable[edge.start()] && productive[edge.end()],
+                    "{typed} {cuts:?}"
+                );
+            }
+            if cuts.is_empty() {
+                assert_eq!(cut.arc_count(), lattice.arc_count());
+            }
+        }
+    }
+}
+
+#[test]
+fn a_cut_at_an_end_straddles_nothing() {
+    // Cuts at 0 and at the key count lie on no span's inside, so the lattice
+    // is unchanged; a cut inside the keys only ever removes arcs.
+    let legality = legality();
+    for typed in ["hm", "xian"] {
+        let lattice = legality.lattice(&keys(typed), LegalityOptions::OFFLINE);
+        let ends = lattice.with_forced_cuts(&[0, typed.len()]);
+        assert_eq!(ends.arc_count(), lattice.arc_count());
+        assert!(lattice.with_forced_cuts(&[1]).arc_count() <= lattice.arc_count());
+    }
+}

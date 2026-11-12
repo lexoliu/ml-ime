@@ -362,7 +362,9 @@ class _Record:
             open_ = ~np.concatenate(taken)
             owner, position, scores = owner[open_], position[open_], scores[open_]
             if limit is not None and scores.size > limit:
-                keep = np.sort(np.argpartition(-scores, limit - 1)[:limit])
+                # Exact ties at the boundary go to the earlier extension, so the
+                # selection is fully determined.
+                keep = np.sort(np.argsort(-scores, kind="stable")[:limit])
                 owner, position = owner[keep], position[keep]
             fresh = list(zip(owner.tolist(), position.tolist(), strict=True))
         for index, at in fresh:

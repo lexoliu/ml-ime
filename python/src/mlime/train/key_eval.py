@@ -362,6 +362,7 @@ def checked_row(
                 "ctc": hypothesis.ctc,
                 "transition": hypothesis.transition,
                 "correction": hypothesis.correction,
+                "cuts": list(hypothesis.cuts),
             }
         )
     return {"record": record.record, "text": record.text, "hypotheses": written}
