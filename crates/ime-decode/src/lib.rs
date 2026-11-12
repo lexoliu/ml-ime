@@ -14,6 +14,7 @@ mod arcs;
 mod beam;
 mod candidates;
 mod emissions;
+mod keys;
 mod score;
 
 pub use arcs::{WordArc, WordLexicon, WordLexiconError, WordLexiconStats};
@@ -22,6 +23,10 @@ pub use candidates::{CandidatePath, Candidates};
 pub use emissions::{
     EmissionError, Emittable, LatticePath, LatticeRecord, ScoreRecord, Scored, Weighted,
     lattice_paths,
+};
+pub use keys::{
+    Combine, KeyHypothesis, KeyLogProbs, KeyLogProbsError, KeySearchOptions, KeySearchStats,
+    KeyTransition, PrefixId, PrefixTrie, Weight, WeightError, key_search,
 };
 pub use score::{Asked, Both, Emission, History, MAX_HISTORY, NoTransition, Transition, Uniform};
 
