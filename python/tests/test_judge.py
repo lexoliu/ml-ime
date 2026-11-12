@@ -227,14 +227,18 @@ def test_the_review_model_gets_the_prompt_with_the_unit_filled_in() -> None:
         return httpx.Response(200, json={"choices": [{"message": {"content": content}}]})
 
     review = judge.Review(
-        poster(handler, Sleeps()), "http://review.test/v1/", "review-model", api_key="k"
+        poster(handler, Sleeps()),
+        "http://review.test/v1/",
+        "review-model",
+        api_key="k",
+        temperature=0.25,
     )
     answer = asyncio.run(review.ask(unit("他小时候家里穷得一丁不识", context="他说起往事。")))
     assert answer == ReviewAnswer(context_spun=False, sentence_natural=True)
     assert str(seen[0].url) == "http://review.test/v1/chat/completions"
     body = json.loads(seen[0].content)
     assert body["model"] == "review-model"
-    assert body["temperature"] == 0
+    assert body["temperature"] == 0.25
     prompt = body["messages"][0]["content"]
     assert "包含词条「一丁不识」" in prompt
     assert "上文：他说起往事。\n句子：他小时候家里穷得一丁不识\n" in prompt

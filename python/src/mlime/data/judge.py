@@ -185,6 +185,11 @@ class ReviewSettings(BaseSettings):
     base_url: str = Field(description="Root of the OpenAI-compatible API, ending in /v1")
     model: str = Field(description="Model id to review with")
     key_file: Path = Field(description="File holding the endpoint's bearer token")
+    temperature: float = Field(
+        default=0.0,
+        description="Sampling temperature of a review; an endpoint that refuses 0 takes "
+        "its smallest accepted value",
+    )
 
     @classmethod
     def load(cls) -> ReviewSettings:
@@ -493,6 +498,7 @@ class Review:
     base_url: str
     model: str
     api_key: str = field(repr=False)
+    temperature: float = 0.0
     template: Template = field(default_factory=review_template, repr=False)
 
     async def ask(self, unit: Unit) -> ReviewAnswer:
@@ -503,7 +509,7 @@ class Review:
             {
                 "model": self.model,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0,
+                "temperature": self.temperature,
             },
             {"Authorization": f"Bearer {self.api_key}"},
         )
@@ -1166,6 +1172,7 @@ async def judge_with_endpoints(
                 review_settings.base_url,
                 review_settings.model,
                 review_settings.api_key(),
+                review_settings.temperature,
             ),
             jev_concurrency,
             review_concurrency,
