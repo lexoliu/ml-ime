@@ -6,15 +6,13 @@ set: the cold load (the load and the first predict, which is where a missing com
 its minutes), then ``WARMUP_CALLS`` warm-up predicts and ``TIMED_CALLS`` timed ones over one fixed
 feed, reported as median and p95.
 
-Core ML keys its compiled-bundle cache by process name (``~/Library/Caches/<process>/
-com.apple.e5rt.e5bundlecache``): two executables of one name evict each other's bundles. The
-measurement therefore renames its own process before it loads anything
-(:func:`set_process_name`), so the cache it fills and reads is its own.
+Core ML keys its compiled-bundle cache by the executable's name (``~/Library/Caches/<process>/
+com.apple.e5rt.e5bundlecache``): two executables of one name evict each other's bundles, and a
+name set at run time does not change the key.
 """
 
 from __future__ import annotations
 
-import ctypes
 import json
 import logging
 import shutil
@@ -35,11 +33,6 @@ from mlime_coreml.spec import Family
 from mlime_coreml.verify import Placement, placement
 
 log = logging.getLogger(__name__)
-
-
-def set_process_name(name: str) -> None:
-    """Name this process *name* for ``getprogname`` before Core ML reads it."""
-    ctypes.CDLL(None).setprogname(name.encode())
 
 
 @dataclass(frozen=True)

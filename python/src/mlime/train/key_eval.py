@@ -327,6 +327,22 @@ def build_key_collator(
     )
 
 
+def check_automaton(legality: Legality, lexicon: Lexicon, options: LegalityOptions) -> None:
+    """Refuse an automaton a decode of complete records cannot use.
+
+    Its arcs must name the head's rows, so it emits over the lexicon's set in
+    the lexicon's order, and an evaluation record is complete input, so its
+    tail rule is off.
+    """
+    if legality.characters != lexicon.characters:
+        raise ValueError(
+            "the legality automaton emits over a different set than the model's lexicon; "
+            "its arcs would not name the head's rows"
+        )
+    if options.unfinished_tail:
+        raise ValueError("an evaluation record is complete input; the tail rule is off")
+
+
 @dataclass(frozen=True)
 class KeyDecoder:
     """Everything a constrained decode of typed records needs, fixed for a run."""
@@ -348,13 +364,7 @@ class KeyDecoder:
             raise ValueError(
                 f"the model emits {emittable} characters against the lexicon's {self.lexicon.size}"
             )
-        if self.legality.characters != self.lexicon.characters:
-            raise ValueError(
-                "the legality automaton emits over a different set than the model's lexicon; "
-                "its arcs would not name the head's rows"
-            )
-        if self.options.unfinished_tail:
-            raise ValueError("an evaluation record is complete input; the tail rule is off")
+        check_automaton(self.legality, self.lexicon, self.options)
 
     def groups(self, records: Sequence[KeyRecord]) -> Iterator[list[KeyRecord]]:
         """*records* in order, grouped under the token budget as training groups examples."""
@@ -716,18 +726,41 @@ def load_key_run(
         beam=beam,
         top_k=top_k,
     )
-    verifier = LegalityVerifier.load(
-        char_table=char_table, typo_table=typo_table, syllables=syllables
-    )
-    run = KeyRun(
-        decoder=decoder,
-        verifier=verifier,
-        eval_rows=read_eval_records(eval_set),
+    run = build_key_run(
+        decoder,
+        eval_set,
+        char_table=char_table,
+        typo_table=typo_table,
+        syllables=syllables,
         dev_share=dev_share,
         records_per_chunk=records_per_chunk,
         limit=limit,
     )
     return run, step
+
+
+def build_key_run(
+    decoder: Decoding,
+    eval_set: Path,
+    *,
+    char_table: Path,
+    typo_table: Path,
+    syllables: Path,
+    dev_share: float,
+    records_per_chunk: int = DEFAULT_RECORDS_PER_CHUNK,
+    limit: int | None = None,
+) -> KeyRun:
+    """*decoder* over *eval_set*, its hypotheses checked by the verifier over the tables."""
+    return KeyRun(
+        decoder=decoder,
+        verifier=LegalityVerifier.load(
+            char_table=char_table, typo_table=typo_table, syllables=syllables
+        ),
+        eval_rows=read_eval_records(eval_set),
+        dev_share=dev_share,
+        records_per_chunk=records_per_chunk,
+        limit=limit,
+    )
 
 
 Ambiguity = Callable[[Path, str], str]

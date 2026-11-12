@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -1894,7 +1895,21 @@ def eval_e2e(
 
 @eval_app.command("keys")
 def eval_keys(
-    checkpoint: Path = typer.Option(..., help="A joint-stage key-level checkpoint (S2, #257)"),
+    checkpoint: Path = typer.Option(
+        None, help="A joint-stage key-level checkpoint (S2, #257), decoded by PyTorch"
+    ),
+    coreml: Path = typer.Option(
+        None,
+        "--coreml",
+        help="The converted Core ML model instead of a checkpoint (macOS): the directory "
+        "`mlime-coreml convert` leaves, with key-model.json beside the models (#266)",
+    ),
+    replay: bool = typer.Option(
+        False,
+        "--replay",
+        help="With --coreml, decode each record as its key prefixes typed in order, each "
+        "keystroke speculating on the last one's queries; the last keystroke is the result",
+    ),
     eval_set: Path = typer.Option(..., help="The eval set: each record's pinyin is its keys"),
     char_table: Path = CHAR_TABLE,
     typo_table: Path = typer.Option(
@@ -1960,6 +1975,15 @@ def eval_keys(
 
     if records is not None and records < 1:
         raise typer.BadParameter("--records must be positive")
+    if (checkpoint is None) == (coreml is None):
+        raise typer.BadParameter("name exactly one of --checkpoint and --coreml")
+    if replay and coreml is None:
+        raise typer.BadParameter("--replay replays keystrokes through the Core ML model")
+    if coreml is not None and sys.platform != "darwin":
+        raise typer.BadParameter(
+            f"--coreml runs the converted model through Core ML, which needs macOS, not "
+            f"{sys.platform}"
+        )
 
     table = char_table or default_char_table()
     if table is None:
@@ -1980,20 +2004,49 @@ def eval_keys(
     grid = weight_grid(beta, gamma, combinations)
     if not select_on_dev and len(grid) != 1:
         raise typer.BadParameter("a fixed --slice decodes one --beta and one --gamma")
-    run, step = load_key_run(
-        checkpoint,
-        eval_set,
-        char_table=table,
-        typo_table=typo,
-        syllables=inventory,
-        with_context=context,
-        token_budget=token_budget,
-        dev_share=dev_share,
-        beam=beam,
-        top_k=top_k,
-        records_per_chunk=records_per_chunk,
-        limit=records,
-    )
+    statistics = None
+    if coreml is not None:
+        try:
+            from mlime.train.key_coreml import load_coreml_key_run
+        except ModuleNotFoundError as error:
+            raise typer.BadParameter(
+                f"--coreml needs coremltools ({error}), which is installed on macOS under "
+                "Python 3.12 and 3.13"
+            ) from error
+
+        run, coreml_decoder, step = load_coreml_key_run(
+            coreml,
+            eval_set,
+            char_table=table,
+            typo_table=typo,
+            syllables=inventory,
+            with_context=context,
+            dev_share=dev_share,
+            replay=replay,
+            beam=beam,
+            top_k=top_k,
+            records_per_chunk=records_per_chunk,
+            limit=records,
+        )
+        statistics = coreml_decoder.statistics
+        source = f"core ml: {coreml}{' (replayed keystrokes)' if replay else ''}"
+    else:
+        assert checkpoint is not None
+        run, step = load_key_run(
+            checkpoint,
+            eval_set,
+            char_table=table,
+            typo_table=typo,
+            syllables=inventory,
+            with_context=context,
+            token_budget=token_budget,
+            dev_share=dev_share,
+            beam=beam,
+            top_k=top_k,
+            records_per_chunk=records_per_chunk,
+            limit=records,
+        )
+        source = f"checkpoint: {checkpoint}"
     report = report_keys(
         run,
         dump_dir,
@@ -2004,8 +2057,10 @@ def eval_keys(
         if ambiguity is None
         else lambda dump, name: ambiguity_report(ambiguity, eval_set, dump, name, dev_share),
     )
-    heading = f"checkpoint: {checkpoint} (step {step}), context {'on' if context else 'off'}"
+    heading = f"{source} (step {step}), context {'on' if context else 'off'}"
     rendered = f"{heading}\n\n{report}"
+    if statistics is not None:
+        rendered += f"\n\n{statistics.render()}"
     typer.echo(rendered)
     if out is not None:
         out.write_text(rendered + "\n", encoding="utf-8")

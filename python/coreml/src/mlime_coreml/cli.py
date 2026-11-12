@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 from mlime_coreml import spec
-from mlime_coreml.bundle import read_bundle
+from mlime_coreml.bundle import MANIFEST, TOKENIZER, read_bundle
 from mlime_coreml.port import check_padding, check_port
 from mlime_coreml.spec import Family
 
@@ -47,6 +47,9 @@ def _convert(args: argparse.Namespace) -> None:
         shutil.rmtree(converted[family].package)
     if build_dir.exists():
         shutil.rmtree(build_dir)
+    # `models/` is then what the archive unpacks to, less the report: a loader's directory.
+    for name in (MANIFEST, TOKENIZER):
+        shutil.copyfile(args.bundle / name, models_dir / name)
     if args.no_package:
         return
     archive, digest = build_archive(
@@ -67,9 +70,8 @@ def _package(args: argparse.Namespace) -> None:
 
 
 def _bench(args: argparse.Namespace) -> None:
-    from mlime_coreml.measure import bench, set_process_name
+    from mlime_coreml.measure import bench
 
-    set_process_name(args.process_name)
     families: tuple[Family, ...] = tuple(args.family) if args.family else spec.FAMILIES
     bench(read_bundle(args.bundle), args.work_dir.resolve(), families)
 
@@ -104,11 +106,6 @@ def main() -> None:
     bench = with_bundle("bench", "convert each family and measure every function")
     bench.add_argument("--work-dir", required=True, type=Path)
     bench.add_argument("--family", action="append", choices=spec.FAMILIES)
-    bench.add_argument(
-        "--process-name",
-        default="mlime-coreml-bench",
-        help="this process's name: Core ML's compiled-bundle cache is keyed by it",
-    )
     bench.set_defaults(run=_bench)
 
     args = parser.parse_args()
