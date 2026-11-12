@@ -56,6 +56,7 @@ from mlime.train.arbitration import ReadingArbitration
 from mlime.train.labels import keyboard_form
 from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.spans import SpanVocab, initial
+from mlime.train.units import UnitMatcher
 from mlime.typo import NoiseModel
 
 #: Loss is not taken at padding or at the two sentinel positions.
@@ -105,6 +106,12 @@ class Augmentation:
     ``typos`` is a switch, not a rate: on, the keystrokes the styles produce
     pass through the shared noise model, whose own per-sentence coin decides
     each example.
+
+    ``unit_initials`` is the probability, for an example whose sentence holds a
+    unit (an idiom or an internet phrase), that every unit in it is typed as
+    initials whole, however the rest of the sentence is typed. It needs the
+    matcher that finds the units (:class:`~mlime.train.units.UnitMatcher`), and
+    the builder refuses one without the other.
     """
 
     full: float = 0.55
@@ -112,6 +119,7 @@ class Augmentation:
     mixed: float = 0.20
     abbreviate_syllable: float = 0.7
     typos: bool = False
+    unit_initials: float = 0.0
 
     def __post_init__(self) -> None:
         total = self.full + self.abbreviated + self.mixed
@@ -134,7 +142,10 @@ class Augmentation:
 
 
 def type_syllables(
-    syllables: Sequence[str], rng: random.Random, augmentation: Augmentation
+    syllables: Sequence[str],
+    rng: random.Random,
+    augmentation: Augmentation,
+    units: Sequence[tuple[int, int]] = (),
 ) -> tuple[str, ...]:
     """The spans somebody would have pressed for *syllables*, one style sampled.
 
@@ -142,21 +153,45 @@ def type_syllables(
     the sentence; a one-syllable sentence has nowhere to put a cut and is
     abbreviated whole, which is what "get lazy after the first syllable" degrades
     to when there is only one.
+
+    *units* are the ``(start, end)`` syllable ranges of the units the sentence
+    holds, non-overlapping. When there are any and the ``unit_initials`` coin
+    lands, each is typed as initials whole and the rest of the sentence keeps its
+    drawn style; a mixed cut that falls inside one moves to its start. The coin
+    is thrown only for a sentence that holds a unit, after the style's draw, so a
+    run without units draws exactly what it always did.
     """
     if not syllables:
         raise ValueError("a sentence with no syllables has nothing to type")
     style = augmentation.style(rng)
+    held: Sequence[tuple[int, int]] = ()
+    if units and augmentation.unit_initials > 0.0 and rng.random() < augmentation.unit_initials:
+        held = units
+    in_unit = [False] * len(syllables)
+    for start, end in held:
+        in_unit[start:end] = [True] * (end - start)
     if style == "full":
-        return tuple(syllables)
+        return tuple(
+            initial(syllable) if abbreviate else syllable
+            for syllable, abbreviate in zip(syllables, in_unit, strict=True)
+        )
     if style == "abbreviated":
         return tuple(
-            initial(syllable) if rng.random() < augmentation.abbreviate_syllable else syllable
-            for syllable in syllables
+            initial(syllable)
+            if abbreviate or rng.random() < augmentation.abbreviate_syllable
+            else syllable
+            for syllable, abbreviate in zip(syllables, in_unit, strict=True)
         )
     if len(syllables) == 1:
         return (initial(syllables[0]),)
     cut = rng.randrange(1, len(syllables))
-    return (*syllables[:cut], *(initial(syllable) for syllable in syllables[cut:]))
+    for start, end in held:
+        if start < cut < end:
+            cut = start
+    return tuple(
+        initial(syllable) if abbreviate or at >= cut else syllable
+        for at, (syllable, abbreviate) in enumerate(zip(syllables, in_unit, strict=True))
+    )
 
 
 def example_rng(seed: int, epoch: int, sample_id: str) -> random.Random:
@@ -250,7 +285,9 @@ class SampleBuilder:
     and a builder that loaded its own could differ from the one the provenance
     record describes. *noise* is the shared typo model the ``typos`` switch
     expects: a builder told to corrupt without it is a wiring bug, not a quiet
-    clean pass, and so is a noise model handed in beside the switch off.
+    clean pass, and so is a noise model handed in beside the switch off. The
+    same holds for *units*, the matcher that finds the idioms and internet
+    phrases of a sentence, and ``augmentation.unit_initials``.
     """
 
     def __init__(
@@ -262,6 +299,7 @@ class SampleBuilder:
         seed: int = 0,
         noise: NoiseModel | None = None,
         candidates: CandidateSpace | None = None,
+        units: UnitMatcher | None = None,
     ):
         self.lexicon = lexicon
         self.spans = spans
@@ -275,7 +313,13 @@ class SampleBuilder:
                 "augmentation.typos must come together; "
                 f"got noise={has_noise}, table={has_table}, typos={self.augmentation.typos}"
             )
+        if (units is not None) != (self.augmentation.unit_initials > 0.0):
+            raise ValueError(
+                "the unit matcher and augmentation.unit_initials must come together; "
+                f"got units={units is not None}, unit_initials={self.augmentation.unit_initials}"
+            )
         self.noise = noise
+        self.units = units
         self.candidates = candidates or CandidateSpace(spans, lexicon.candidate_mask)
         self.seed = seed
         self.counts = BuildCounts()
@@ -294,7 +338,7 @@ class SampleBuilder:
             return None
         readings, targets = settled
         rng = example_rng(self.seed, epoch, sample.id)
-        spans = type_syllables(readings, rng, self.augmentation)
+        spans = self.type_readings(sample.text, readings, rng)
         if self.noise is not None:
             # The styles choose *which* keys the typist meant to press and the
             # noise model then slips them -- corrupting before the abbreviation
@@ -311,6 +355,17 @@ class SampleBuilder:
             targets=targets,
             context=sample.context,
         )
+
+    def type_readings(
+        self, text: str, readings: Sequence[str], rng: random.Random
+    ) -> tuple[str, ...]:
+        """The spans pressed for *text*'s *readings*, its units found first when the run types them.
+
+        *text* is all Han and as long as *readings* (:meth:`settle`), so a unit's
+        character range is its syllable range.
+        """
+        units = self.units.spans(text) if self.units is not None else ()
+        return type_syllables(readings, rng, self.augmentation, units)
 
     def settle(
         self, sample: Sample, syllables: Sequence[str] | None

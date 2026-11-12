@@ -649,6 +649,7 @@ def e2e(
             ranking=ranking,
             whole_alphabet=whole_alphabet,
         )
+    vocabularies = vocabularies.with_units(paths.unit_lexicon)
     if activation_checkpointing:
         model.enable_encoder_checkpointing()
         log.info("encoder activation checkpointing on", trade="memory for one extra forward")

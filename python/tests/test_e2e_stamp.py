@@ -477,6 +477,44 @@ def test_a_joint_key_stage_stamps_its_transition_weight_and_no_warm_up_weight(
         assert wanted in error(refused.output), option
 
 
+def test_a_stage_stamps_its_typing_augmentation(tmp_path: Path) -> None:
+    """The typo switch, the unit initials and their lexicon file are the only lines added."""
+    out = tmp_path / "typing"
+    argv = ["e2e", "stamp", "mlime-e2e-keys-s3-check", "--out", str(out)]
+    stage = ["--init-from", "mlime-e2e-keys-s2-check", "--keys", "--typos"]
+    units = ["--unit-initials", "0.5", "--unit-lexicon", "unit-entries.tsv"]
+    result = CliRunner().invoke(app, [*argv, *stage, *units])
+    assert result.exit_code == 0, result.output
+    template = (TEMPLATE / "kernel.py").read_text()
+    kernel = (out / "kernel.py").read_text()
+    keys = {"layers": 2, "transition_weight": 1.0, "correct_syllables": True}
+    assert sorted(changed_lines(template, kernel)) == sorted(
+        f"{name} = {value!r}"
+        for name, value in {
+            "INIT_FROM": "mlime-e2e-keys-s2-check",
+            "KEYS": keys,
+            "TYPOS": True,
+            "UNIT_INITIALS": 0.5,
+            "UNIT_LEXICON": "unit-entries.tsv",
+            "PROFILE_STEPS": 30,
+            "TRACE_STEPS": 3,
+        }.items()
+    )
+    # The pair comes together, as a stage and as an option, and only a stage has them.
+    with pytest.raises(ValueError, match="read only for them"):
+        E2EV2Stage(init_from="mlime-e2e-v2-g4", unit_initials=0.5)
+    with pytest.raises(ValueError, match="read only for them"):
+        E2EV2Stage(init_from="mlime-e2e-v2-g4", unit_lexicon="unit-entries.tsv")
+    with pytest.raises(ValueError, match="probability"):
+        E2EV2Stage(init_from="mlime-e2e-v2-g4", unit_initials=2.0, unit_lexicon="unit-entries.tsv")
+    for option in (["--typos"], units):
+        refused = CliRunner().invoke(
+            app, ["e2e", "stamp", "mlime-e2e-v2-x", "--out", str(tmp_path / "x"), *option]
+        )
+        assert refused.exit_code == 2, refused.output
+        assert "pass --init-from" in error(refused.output), option
+
+
 def test_the_context_blocks_train_only_with_the_tower(tmp_path: Path) -> None:
     """``--train-cross-attention`` names a part of the tower ``--train-fill-tower`` trains."""
     refused = CliRunner().invoke(

@@ -116,6 +116,10 @@ class BatchCensus:
     #: legal and how long a key string may be, and every example's width is
     #: its keys' and its spans'. ``None`` for a span-level run.
     keys: dict[str, Any] | None = None
+    #: The fingerprint of the unit entries the count found units with, which
+    #: with ``augmentation.unit_initials`` decides how the examples are typed;
+    #: ``None`` for a run without unit initials.
+    unit_lexicon: str | None = None
 
     def write(self, path: Path) -> None:
         """Write the census as JSON, which is how the kernel reads it back."""
@@ -136,6 +140,7 @@ class BatchCensus:
         data.setdefault("census_version", 0)
         # A span-level census written before key-level counts existed.
         data.setdefault("keys", None)
+        data.setdefault("unit_lexicon", None)
         return cls(**data)
 
 
@@ -159,6 +164,7 @@ class CountSpec:
     census_version: int
     ranking: dict[str, Any] | None
     keys: dict[str, Any] | None = None
+    unit_lexicon: str | None = None
 
 
 def ranking_shape(ranking: RankingConfig | None) -> dict[str, Any] | None:
@@ -198,6 +204,7 @@ def matching_census(path: Path, spec: CountSpec) -> tuple[BatchCensus | None, li
         return None, ["<unreadable>"]
     # A span-level census from before key-level counts records no keys.
     data.setdefault("keys", None)
+    data.setdefault("unit_lexicon", None)
     declared = {field.name for field in fields(BatchCensus)}
     differed = sorted(set(data) ^ declared)
     if differed:
@@ -393,6 +400,9 @@ def count_batches(
     and dropping it changes the count -- so the count has to be taken against the
     same tables the run will use, not against tables it built for itself.
 
+    The units the unit initials augmentation types whole are read from
+    ``paths.unit_lexicon``, as the run reads them.
+
     *reuse_census* is a stored count from a previous run: it is used only when
     every configuration field and the shard list equal this call's, and the
     fields that differed are logged when it is refused.
@@ -418,6 +428,7 @@ def count_batches(
     if keys is not None and ranking is not None:
         raise ValueError("a key-level run has no lattice readings to rank")
     augmentation = augmentation or Augmentation()
+    vocabularies = vocabularies.with_units(paths.unit_lexicon)
     sampling = None if keys is None else keys.sampling()
     spec = CountSpec(
         world_size=world_size,
@@ -431,6 +442,7 @@ def count_batches(
         census_version=CENSUS_VERSION,
         ranking=ranking_shape(ranking),
         keys=sampling,
+        unit_lexicon=None if vocabularies.units is None else vocabularies.units.digest,
     )
     if reuse_census is not None:
         stored, differed = matching_census(reuse_census, spec)
@@ -475,6 +487,7 @@ def count_batches(
         build_counts=build_counts,
         ranking=ranking_shape(ranking),
         keys=sampling,
+        unit_lexicon=spec.unit_lexicon,
     )
     log.info(
         "batches counted",

@@ -47,6 +47,7 @@ from mlime.train.samples import (
     SampleBuilder,
 )
 from mlime.train.spans import SpanVocab
+from mlime.train.units import UnitMatcher
 
 #: Small enough that the two-shard fixture is many batches rather than one.
 BUDGET = 64
@@ -707,3 +708,57 @@ def test_a_ranking_census_reads_the_segmenter_in_every_worker(
         workers=2,
     )
     assert asdict(census) == asdict(replace(serial, ranking=ranking_shape(RANKING)))
+
+
+def test_the_census_records_the_units_it_typed_with_and_is_not_reused_for_others(
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    vocabularies = Vocabularies(
+        spans=spans,
+        tokenizer=tokenizer,
+        context_tokenizer=tokenizer,
+        lexicon=lexicon,
+        arbitration=arbitration,
+        syllables=frozenset(),
+    )
+    units = tmp_path / "knowledge.tsv"
+    units.write_text("北京\tidiom\n", encoding="utf-8")
+    paths = replace(census_paths(corpus, tmp_path), unit_lexicon=units)
+    augmentation = Augmentation(unit_initials=0.5)
+    counted = count_batches(
+        vocabularies,
+        paths,
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+        augmentation=augmentation,
+    )
+    assert counted.unit_lexicon == UnitMatcher(["北京"]).digest
+    assert counted.augmentation["unit_initials"] == 0.5
+    stored = tmp_path / "batch-counts.json"
+    counted.write(stored)
+    spec = spec_for(augmentation=asdict(augmentation), unit_lexicon=counted.unit_lexicon)
+    reused, differed = matching_census(stored, spec)
+    assert reused is not None and differed == []
+    other = UnitMatcher(["钟爱"]).digest
+    assert matching_census(stored, replace(spec, unit_lexicon=other))[1] == ["unit_lexicon"]
+    # A count of a run without units records none, and a census from before the field reads as that.
+    plain = count_batches(
+        vocabularies,
+        census_paths(corpus, tmp_path),
+        Slices(train=SHARDS, held_out=()),
+        token_budget=BUDGET,
+        seed=SEED,
+    )
+    assert plain.unit_lexicon is None
+    plain.write(stored)
+    older = json.loads(stored.read_text(encoding="utf-8"))
+    del older["unit_lexicon"]
+    stored.write_text(json.dumps(older), encoding="utf-8")
+    reused, differed = matching_census(stored, spec_for())
+    assert reused is not None and differed == []
