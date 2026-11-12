@@ -443,3 +443,35 @@ def test_the_verifier_agrees_with_the_legality_fixture(verifier: LegalityVerifie
             assert got is None, case
         else:
             assert got == pytest.approx(float(case["cost"]), abs=1e-9), case
+
+
+@pytest.mark.parametrize("beam", [3, 8])
+def test_a_tie_at_the_beam_boundary_goes_to_the_earlier_character(
+    small: Legality, beam: int
+) -> None:
+    """Exactly tied extensions are selected stably: the lowest emission ids win."""
+    homophones = Legality(
+        tuple("是时十石史师世市事室式"),
+        read_char_readings(DATA / "char_pinyin.tsv"),
+        small.corrections,
+    )
+    lattice = homophones.lattice("shi", OFFLINE)
+    width = len(homophones.characters)
+    log_probs = torch.full((1, 3, width + 1), -1.0)
+    flat = StubFlat(width)
+    [found] = search([lattice], log_probs, flat, beta=BETA, gamma=0.0, beam=beam)
+    assert [hypothesis.ids for hypothesis in found] == [(index,) for index in range(beam)]
+    again = search([lattice], log_probs, StubFlat(width), beta=BETA, gamma=0.0, beam=beam)
+    assert [hypothesis.ids for hypothesis in again[0]] == [(index,) for index in range(beam)]
+
+
+class StubFlat:
+    """A transition that gives every character the same row."""
+
+    def __init__(self, width: int) -> None:
+        self.width = width
+
+    def __call__(
+        self, records: Sequence[int], prefixes: Sequence[Prefix]
+    ) -> npt.NDArray[np.float32]:
+        return np.zeros((len(prefixes), self.width), dtype=np.float32)

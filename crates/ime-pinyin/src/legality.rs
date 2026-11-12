@@ -331,28 +331,7 @@ impl Legality {
                 }
             }
         }
-        // `found` is in (start, end) order, so one forward and one backward
-        // sweep settle reachability from the start and to the end.
-        let mut reachable = vec![false; width + 1];
-        reachable[0] = true;
-        for edge in &found {
-            if reachable[edge.start] {
-                reachable[edge.end] = true;
-            }
-        }
-        let mut productive = vec![false; width + 1];
-        productive[width] = true;
-        for edge in found.iter().rev() {
-            if productive[edge.end] {
-                productive[edge.start] = true;
-            }
-        }
-        KeyLattice::from_edges(
-            width,
-            found
-                .into_iter()
-                .filter(|edge| reachable[edge.start] && productive[edge.end]),
-        )
+        KeyLattice::complete_covers(width, found)
     }
 
     /// *sentence*'s cost over *keys*: its cheapest legal cover, `None` when
@@ -504,6 +483,57 @@ pub struct KeyLattice {
 }
 
 impl KeyLattice {
+    /// The lattice of *found*, pruned to the edges that lie on a complete
+    /// cover of the *keys*. *found* is in `(start, end)` order, so one forward
+    /// and one backward sweep settle reachability from the start and to the
+    /// end.
+    fn complete_covers(keys: usize, found: Vec<FoundEdge>) -> Self {
+        let mut reachable = vec![false; keys + 1];
+        reachable[0] = true;
+        for edge in &found {
+            if reachable[edge.start] {
+                reachable[edge.end] = true;
+            }
+        }
+        let mut productive = vec![false; keys + 1];
+        productive[keys] = true;
+        for edge in found.iter().rev() {
+            if productive[edge.end] {
+                productive[edge.start] = true;
+            }
+        }
+        Self::from_edges(
+            keys,
+            found
+                .into_iter()
+                .filter(|edge| reachable[edge.start] && productive[edge.end]),
+        )
+    }
+
+    /// The lattice with every span that straddles one of *cuts* dropped, and
+    /// the rest pruned again to complete covers: the covers that place a span
+    /// boundary at each cut. A cut is a key offset, the number of keys before
+    /// the boundary -- where an apostrophe was typed; one at `0` or at or past
+    /// [`KeyLattice::keys`] straddles nothing.
+    #[must_use]
+    pub fn with_forced_cuts(&self, cuts: &[usize]) -> Self {
+        let found = self
+            .edges()
+            .filter(|edge| !cuts.iter().any(|&cut| edge.start < cut && cut < edge.end))
+            .map(|edge| FoundEdge {
+                start: edge.start,
+                end: edge.end,
+                arcs: edge
+                    .ids()
+                    .iter()
+                    .copied()
+                    .zip(edge.costs().iter().copied())
+                    .collect(),
+            })
+            .collect();
+        Self::complete_covers(self.keys, found)
+    }
+
     fn from_edges(keys: usize, kept: impl Iterator<Item = FoundEdge>) -> Self {
         let mut slots = vec![NO_EDGE; keys * MAX_CORRECTED_LEN];
         let mut open = vec![false; keys * MAX_CORRECTED_LEN];

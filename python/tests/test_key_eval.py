@@ -169,7 +169,9 @@ def test_a_tiny_model_decodes_real_records_and_resumes_to_the_same_report(
         scores = [hypothesis["score"] for hypothesis in row["hypotheses"]]
         assert scores == sorted(scores, reverse=True)
         for hypothesis in row["hypotheses"]:
-            assert set(hypothesis) == {"text", "score", "ctc", "transition", "correction"}
+            assert set(hypothesis) == {"text", "score", "ctc", "transition", "correction", "cuts"}
+            assert hypothesis["cuts"][-1] == len(pinyin)
+            assert len(hypothesis["cuts"]) == len(hypothesis["text"])
             cost = verifier.cost(pinyin, hypothesis["text"], legality_options(model))
             assert cost is not None, (pinyin, hypothesis["text"])
             assert cost <= hypothesis["correction"] + 1e-6

@@ -3,6 +3,12 @@
 //! weights, or none — the decode `fused-eval` runs, as a session's
 //! [`Engine`].
 //!
+//! A refresh segments the pending input into its k-best readings (each
+//! `'`-separated piece alone, only the last one possibly half-typed), builds
+//! the candidate sets and the word arcs over them, scores them with the
+//! towers, and runs the beam; a hypothesis becomes a sentence whose
+//! characters end where its reading's syllables end.
+//!
 //! `incremental` is the session's reuse switch: the context tower's output
 //! depends only on the context, so a keystroke that changes none of it never
 //! re-encodes it. The fill tower's output is not cached: it sees the whole
@@ -10,20 +16,39 @@
 //! the issue's gate is that the incremental answer equals the full decode's,
 //! so the fill graph re-runs on each keystroke as one batched forward.
 
-use crate::{Engine, Reading, nanos};
-use ime_decode::{Emittable, LatticeRecord, Scored, Transition, Weighted, lattice_paths};
+use crate::{Engine, Pending, Placed, Sentence, nanos};
+use ime_decode::{
+    BeamOptions, Breakdown, Candidates, DecodeError, Emittable, LatticeRecord, Record, Scored,
+    Transition, Weighted, WordLexicon, decode_many_stats, lattice_paths,
+};
 use ime_neural::{EncodedContext, NeuralError, RouteA};
-use ime_pinyin::{CharId, Lexicon};
+use ime_pinyin::{
+    CharId, Lexicon, SegmentError, SegmentLattice, SegmentOptions, Segmentation, SyllableTable,
+};
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::time::Instant;
+use thiserror::Error;
 
-/// The towers' knobs a fused engine runs under, apart from the transition.
+/// What a fused engine decodes under, apart from the transition.
 #[derive(Clone)]
 pub struct FusedConfig<'a> {
+    /// The syllable inventory the keystrokes segment against.
+    pub table: &'a SyllableTable,
+    /// How the keystrokes may segment. The live default admits a trailing
+    /// half-typed syllable; an offline replay can turn it off to mirror an
+    /// evaluation exactly.
+    pub segment: SegmentOptions,
+    /// The beam's width and arity — the product's shape is width 16, top 8
+    /// — and the word arcs' prior and slots.
+    pub beam: BeamOptions,
+    /// The curated lexicon whose entries the beam proposes whole where the
+    /// keystrokes spell them; `None` decodes character by character only.
+    pub words: Option<&'a WordLexicon>,
     /// The emittable set the lattice's candidates are restricted to.
     pub emittable: &'a Emittable,
-    /// The lexicon the emittable set and the candidates name characters
-    /// through.
+    /// The character lexicon every table is indexed through: the emittable
+    /// set, the candidates and the sentences name characters through it.
     pub lexicon: &'a Lexicon,
     /// Neural weight — `Weighted`'s scale on every emission score.
     pub weight: f32,
@@ -56,6 +81,52 @@ pub struct EngineStats {
     pub fill_calls: Cell<u64>,
     /// Tokens the fill graph encoded, `rows * width` summed over calls.
     pub fill_tokens: Cell<u64>,
+}
+
+/// Where a fused engine's refreshes spend their time, cumulative.
+#[derive(Clone, Debug, Default)]
+pub struct FusedStages {
+    /// Refreshes that produced no reading: a half-typed syllable under a
+    /// strict segmentation is a normal, cheap miss, not an error.
+    pub undecodable: u64,
+    /// Nanos spent segmenting and resolving the candidate masks.
+    pub segment_ns: u64,
+    /// Nanos inside the towers' emission.
+    pub emission_ns: u64,
+    /// Nanos inside the beam decode.
+    pub decode_ns: u64,
+    /// The beam's host-side breakdown — expansion, selection, and the
+    /// finish pass, cumulative beside `decode_ns`.
+    pub breakdown: Breakdown,
+}
+
+/// How a keystroke changed the readings, across a fused engine's refreshes.
+///
+/// Bookkeeping for the incremental step's evidence: a keystroke that only
+/// extends the last syllable leaves the ranked paths' earlier spans alone,
+/// and the histogram says where the first change lands when it does not.
+#[derive(Clone, Debug, Default)]
+pub struct Invalidation {
+    /// Refreshes that had a previous lattice to compare against.
+    pub compared: u64,
+    /// Of them, how many kept every ranked path's spans identical.
+    pub stable: u64,
+    /// First position where a ranked path's spans diverged, counted.
+    pub first_divergence: BTreeMap<usize, u64>,
+}
+
+/// Why a fused refresh failed.
+#[derive(Debug, Error)]
+pub enum FusedError {
+    /// The keystrokes could not be read under the options.
+    #[error(transparent)]
+    Segment(#[from] SegmentError),
+    /// The candidate masks could not be built.
+    #[error(transparent)]
+    Decode(#[from] DecodeError),
+    /// The towers failed their forward.
+    #[error(transparent)]
+    Neural(#[from] NeuralError),
 }
 
 /// Cumulative counters — where a transition's calls go. The beam's `advance`
@@ -186,6 +257,13 @@ pub struct Fused<'a, T> {
     context_cache: RefCell<Option<(String, EncodedContext)>>,
     /// Where the emissions' time goes, cumulative.
     stats: EngineStats,
+    /// Where the refreshes' time goes, cumulative.
+    stages: FusedStages,
+    /// How the keystrokes have changed the lattice, cumulative.
+    invalidation: Invalidation,
+    /// The previous refresh's per-path span boundaries, kept to measure how
+    /// much of the lattice a keystroke changed.
+    last_spans: Option<Vec<Vec<(usize, usize)>>>,
 }
 
 impl<'a, T> Fused<'a, T> {
@@ -199,6 +277,9 @@ impl<'a, T> Fused<'a, T> {
             config,
             context_cache: RefCell::new(None),
             stats: EngineStats::default(),
+            stages: FusedStages::default(),
+            invalidation: Invalidation::default(),
+            last_spans: None,
         }
     }
 
@@ -212,6 +293,99 @@ impl<'a, T> Fused<'a, T> {
     #[must_use]
     pub const fn stats(&self) -> &EngineStats {
         &self.stats
+    }
+
+    /// Where the refreshes have spent their time, cumulative.
+    #[must_use]
+    pub const fn stages(&self) -> &FusedStages {
+        &self.stages
+    }
+
+    /// How the keystrokes have changed the lattice, cumulative.
+    #[must_use]
+    pub const fn invalidation(&self) -> &Invalidation {
+        &self.invalidation
+    }
+
+    /// The pending input's readings, in k-best order; `Ok(None)` is a normal
+    /// miss — a half-typed syllable under a strict segmentation — not an
+    /// error.
+    fn segment(&self, pending: &Pending) -> Result<Option<Vec<Segmentation>>, SegmentError> {
+        // Each piece segments alone; a `'` is the user ending a syllable by
+        // hand, so only the last piece may be a half-typed one.
+        let count = pending.cuts().len() + 1;
+        let mut paths: Vec<Segmentation> = Vec::new();
+        for (index, piece) in pending.pieces().enumerate() {
+            let options = SegmentOptions {
+                allow_incomplete_tail: self.config.segment.allow_incomplete_tail
+                    && index + 1 == count,
+                ..self.config.segment.clone()
+            };
+            let lattice = match SegmentLattice::build(piece, self.config.table, &options) {
+                Ok(lattice) => lattice,
+                Err(SegmentError::NoSegmentation { .. }) => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let kbest = lattice.k_best(&options);
+            if kbest.is_empty() {
+                return Ok(None);
+            }
+            if paths.is_empty() {
+                paths = kbest;
+                continue;
+            }
+            let mut merged = Vec::with_capacity(paths.len().saturating_mul(kbest.len()));
+            for left in &paths {
+                for right in &kbest {
+                    merged.push(Segmentation::concat(&[left, right]));
+                }
+            }
+            merged.sort_by(|a, b| a.cost().total_cmp(&b.cost()));
+            merged.truncate(self.config.segment.max_paths);
+            paths = merged;
+        }
+        Ok(Some(paths))
+    }
+
+    /// How much of the previous lattice survived this keystroke: the first
+    /// position any ranked path's spans diverge, over the paths both hold.
+    fn observe(&mut self, paths: &[Segmentation]) {
+        let spans: Vec<Vec<(usize, usize)>> = paths
+            .iter()
+            .map(|path| {
+                path.segments()
+                    .iter()
+                    .map(|segment| (segment.start(), segment.end()))
+                    .collect()
+            })
+            .collect();
+        if let Some(previous) = &self.last_spans {
+            self.invalidation.compared += 1;
+            let mut divergence = None;
+            for (old, new) in previous.iter().zip(&spans) {
+                let position = old
+                    .iter()
+                    .zip(new.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap_or_else(|| old.len().min(new.len()));
+                if position < old.len().max(new.len())
+                    && divergence.is_none_or(|first| position < first)
+                {
+                    divergence = Some(position);
+                }
+            }
+            match divergence {
+                Some(position) => {
+                    *self
+                        .invalidation
+                        .first_divergence
+                        .entry(position)
+                        .or_insert(0) += 1;
+                }
+                None => self.invalidation.stable += 1,
+            }
+        }
+        self.last_spans = Some(spans);
     }
 
     /// The context tower's output for *text*, from the cache when the session
@@ -270,41 +444,95 @@ impl<'a, T> Fused<'a, T> {
 }
 
 impl<T: Transition> Engine for Fused<'_, T> {
-    type Emission<'b>
-        = Weighted<Scored<'b>>
-    where
-        Self: 'b;
-    type Trans = T;
-    type Error = NeuralError;
+    type Error = FusedError;
 
-    fn transition(&self) -> &T {
-        &self.transition
-    }
+    /// Segment, score with the towers weighted as `fused-eval` fuses them,
+    /// and decode; every hypothesis the beam keeps is a sentence.
+    fn sentences(
+        &mut self,
+        pending: &Pending,
+        context: Option<&str>,
+    ) -> Result<Vec<Sentence>, FusedError> {
+        let tick = Instant::now();
+        let Some(paths) = self.segment(pending)? else {
+            self.stages.undecodable += 1;
+            self.last_spans = None;
+            return Ok(Vec::new());
+        };
+        self.observe(&paths);
+        let pinyin = pending.letters().as_str();
+        let lexicon = self.config.lexicon;
+        let candidates = Candidates::build(&paths, lexicon)?;
+        let candidates = match self.config.words {
+            Some(words) => candidates.with_arcs(
+                &paths,
+                pinyin,
+                words,
+                lexicon,
+                self.config.table,
+                &self.config.segment,
+            ),
+            None => candidates,
+        };
+        self.stages.segment_ns += nanos(tick);
 
-    /// The towers' table for *reading*, weighted as `fused-eval` fuses it.
-    fn emission<'b>(&'b self, reading: &Reading<'b>) -> Result<Weighted<Scored<'b>>, NeuralError> {
+        let tick = Instant::now();
         let lattice = LatticeRecord {
             record: 0,
-            pinyin: reading.pinyin.to_owned(),
-            context: reading.context.map(str::to_owned),
-            paths: lattice_paths(
-                reading.pinyin,
-                reading.segmentations,
-                reading.candidates,
-                self.config.emittable,
-                self.config.lexicon,
-            ),
+            pinyin: pinyin.to_owned(),
+            context: context.map(str::to_owned),
+            paths: lattice_paths(pinyin, &paths, &candidates, self.config.emittable, lexicon),
         };
         let scores = self.scores(&lattice)?;
-        Ok(Weighted {
+        let emission = Weighted {
             inner: Scored::attach(
                 0,
-                reading.candidates,
+                &candidates,
                 self.config.emittable,
                 scores,
                 self.config.floor,
-            )?,
+            )
+            .map_err(NeuralError::from)?,
             weight: self.config.weight,
-        })
+        };
+        self.stages.emission_ns += nanos(tick);
+
+        let tick = Instant::now();
+        let mut answers = decode_many_stats(
+            &[Record {
+                candidates: &candidates,
+                emission,
+                context,
+            }],
+            &self.transition,
+            &self.config.beam,
+            &mut self.stages.breakdown,
+        )?;
+        self.stages.decode_ns += nanos(tick);
+        let hypotheses = answers.pop().expect("one record decodes to one answer");
+        Ok(hypotheses
+            .iter()
+            .map(|hypothesis| {
+                let segments = paths[hypothesis.path()].segments();
+                Sentence {
+                    chars: hypothesis
+                        .chars()
+                        .iter()
+                        .zip(segments)
+                        .zip(hypothesis.steps())
+                        .map(|((&id, segment), &score)| Placed {
+                            ch: lexicon.character(id),
+                            end: segment.end(),
+                            score,
+                        })
+                        .collect(),
+                    score: hypothesis.score(),
+                }
+            })
+            .collect())
+    }
+
+    fn clear(&mut self) {
+        self.last_spans = None;
     }
 }

@@ -33,6 +33,8 @@
 //! pre-packs are shared too, so the model's memory is one copy of the weights
 //! plus per-thread working space no matter how many threads score.
 
+pub mod keys;
+
 use ime_decode::{Candidates, EmissionError, Emittable, LatticeRecord, Scored};
 use ime_pinyin::CorrectionTable;
 use memmap2::Mmap;

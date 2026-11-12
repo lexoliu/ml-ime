@@ -217,6 +217,38 @@ def gen_key_tree_fixture(
     log.info("key_tree_fixture.written", path=str(out), calls=calls)
 
 
+@app.command("gen-key-search-fixture")
+def gen_key_search_fixture(
+    data_dir: Path = typer.Option(
+        Path("crates/ime-pinyin/data"), help="Directory holding the generated pinyin tables"
+    ),
+    legality_fixture: Path = typer.Option(
+        Path("crates/ime-pinyin/tests/fixtures/legality.json"),
+        help="The legality fixture the training key strings are read from",
+    ),
+    out: Path = typer.Option(
+        Path("crates/ime-decode/tests/fixtures/key-search.json"),
+        help="The fixture file to write",
+    ),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Regenerate the key-search fixture the Rust search reproduces."""
+    configure(verbose)
+    from mlime.legality import Legality
+    from mlime.logging import log
+    from mlime.train.key_search_fixture import write_search_fixture
+
+    char_table = data_dir / "char_pinyin.tsv"
+    legality = Legality.load(
+        None,
+        char_table=char_table,
+        typo_table=data_dir / "typo.json",
+        syllables=data_dir / "syllables.txt",
+    )
+    runs = write_search_fixture(legality, char_table, legality_fixture, out)
+    log.info("key_search_fixture.written", path=str(out), runs=runs)
+
+
 @app.command("probe-report")
 def probe_report(
     log: Path = typer.Option(
