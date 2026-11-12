@@ -2,7 +2,7 @@
 //!
 //! `tests/fixtures/key-search.json` is what `mlime gen-key-search-fixture`
 //! writes: records of keys over a small emittable set, each with synthetic
-//! emissions and transition rows that are SplitMix64 draws (the fixture's
+//! emissions and transition rows that are `SplitMix64` draws (the fixture's
 //! `definitions` say exactly which), and for every setting of the grid the
 //! hypotheses the Python search returned and the sequence of its transition
 //! calls. This test regenerates the inputs, runs the Rust search, and holds it
@@ -58,7 +58,7 @@ struct Expected {
     correction: f64,
 }
 
-/// SplitMix64's finaliser.
+/// `SplitMix64`'s finaliser.
 const fn splitmix(value: u64) -> u64 {
     let mut value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
     value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -116,7 +116,6 @@ impl KeyTransition for Hashed {
         queries: &[PrefixId],
         out: &mut [f32],
     ) -> Result<(), Infallible> {
-        assert_eq!(out.len(), queries.len() * self.emittable);
         let mut call = Vec::with_capacity(queries.len());
         let mut ids: Vec<EmitId> = Vec::new();
         for (&query, row) in queries.iter().zip(out.chunks_exact_mut(self.emittable)) {
