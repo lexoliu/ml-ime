@@ -10,6 +10,7 @@ ranking, apart from what it did to the search.
 
 from __future__ import annotations
 
+import gzip
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -77,9 +78,12 @@ def rerank_dump(
         raise ValueError("rerank a model in evaluation mode")
     index = {character: position for position, character in enumerate(decoder.lexicon.characters)}
     rows = {}
-    for line in dump.read_text(encoding="utf-8").splitlines():
-        row = json.loads(line)
-        rows[int(row["record"])] = [str(each["text"]) for each in row["hypotheses"]]
+    # The kernel publishes its dumps gzipped; `eval keys` writes them plain.
+    opened = gzip.open if dump.suffix == ".gz" else open
+    with opened(dump, "rt", encoding="utf-8") as lines:
+        for line in lines:
+            row = json.loads(line)
+            rows[int(row["record"])] = [str(each["text"]) for each in row["hypotheses"]]
     chosen = [records[number] for number in sorted(rows)]
     counts = dict.fromkeys(("unreachable", "listed", "searched", "reranked", "outscored"), 0)
     for group in decoder.groups(chosen):

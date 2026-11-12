@@ -9,6 +9,7 @@ brute force, and the candidates and the term against hand computation.
 
 from __future__ import annotations
 
+import gzip
 import itertools
 import json
 import math
@@ -806,6 +807,10 @@ def test_reranking_a_dump_by_the_searchs_own_weights_reproduces_its_order(
     assert report.reranked <= report.listed <= report.records
     assert report.outscored >= report.searched
     assert "gold listed" in report.render()
+    # The published form of a dump is gzipped.
+    packed = tmp_path / "dump.jsonl.gz"
+    packed.write_bytes(gzip.compress(dump.read_bytes()))
+    assert rerank_dump(decoder, records, packed, RANKING) == report
 
 
 def test_a_ranking_run_trains_resumes_and_loads_for_the_search(
