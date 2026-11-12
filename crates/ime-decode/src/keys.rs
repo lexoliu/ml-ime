@@ -34,7 +34,7 @@
 //! the prefix or one of its ancestors is in the beam.
 //!
 //! The arithmetic is f64 in the order the Python search performs it, with
-//! numpy's `logaddexp` and CPython's compensated `sum`, so a search over the
+//! numpy's `logaddexp` and Python's compensated `sum`, so a search over the
 //! same inputs reproduces the Python search's hypotheses and its sequence of
 //! transition calls; `tests/key_search.rs` holds the two together on a shared
 //! fixture. Every ordering decision is a stable sort.
@@ -475,7 +475,7 @@ fn logaddexp(x: f64, y: f64) -> f64 {
     }
 }
 
-/// CPython's `sum` of floats: Neumaier's compensated summation from 0.
+/// Python's `sum` of floats: Neumaier's compensated summation from 0.
 fn compensated_sum(values: impl Iterator<Item = f64>) -> f64 {
     let (mut total, mut compensation) = (0.0_f64, 0.0_f64);
     for value in values {
@@ -504,7 +504,7 @@ fn pairwise(values: &[f64]) -> f64 {
         let mut lanes = [0.0; 8];
         lanes.copy_from_slice(&values[..8]);
         let body = n - n % 8;
-        for chunk in values[8..body].chunks_exact(8) {
+        for chunk in values[8..body].as_chunks::<8>().0 {
             for (lane, &value) in lanes.iter_mut().zip(chunk) {
                 *lane += value;
             }
@@ -868,7 +868,7 @@ impl Search {
     }
 }
 
-/// Whether *log_probs* and *lattice* agree; a violation is logged, and panics in a debug build.
+/// Whether `log_probs` and `lattice` agree; a violation is logged, and panics in a debug build.
 fn inputs_agree(lattice: &KeyLattice, log_probs: &KeyLogProbs<'_>) -> bool {
     let emittable = log_probs.emittable();
     let agree = log_probs.keys() == lattice.keys()
@@ -894,7 +894,7 @@ fn inputs_agree(lattice: &KeyLattice, log_probs: &KeyLogProbs<'_>) -> bool {
 
 /// The best legal outputs over *lattice*'s keys, best first.
 ///
-/// *log_probs* holds the head's log-softmax at the record's keys, the blank
+/// `log_probs` holds the head's log-softmax at the record's keys, the blank
 /// last. *transition* is called once per key offset with every beam prefix
 /// about to extend that has no row yet; *stats* counts the calls. A lattice
 /// with no complete cover has no outputs.
