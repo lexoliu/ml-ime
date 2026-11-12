@@ -194,6 +194,21 @@ def test_a_finished_run_has_ended_only_once_its_outputs_are_in_the_bucket(vm: Vm
     assert (report["outcome"], report["refusal"]) == ("finished", None)
 
 
+def test_a_leg_that_only_evaluated_a_finished_run_ends_when_its_evaluation_is_up(vm: Vm) -> None:
+    """Its summary carries no step, and the bucket's final predates it: the leg's state counts."""
+    vm.options()
+    vm.process("kernel.pid", "Z")
+    vm.process("publish.pid", "S")
+    vm.summary(finished=True, evaluated_checkpoint="/kaggle/input/run/run/checkpoint-final.pt")
+    report = vm.report()
+    assert report["outcome"] == "publishing"
+    assert "final checkpoint" in report["refusal"]
+
+    (vm.working / "publish-state.json").write_text(json.dumps({"final_published": True}))
+    report = vm.report()
+    assert (report["outcome"], report["refusal"]) == ("finished", None)
+
+
 def test_a_publisher_that_died_with_the_final_outputs_unpublished_fails_the_leg(vm: Vm) -> None:
     vm.options()
     vm.process("kernel.pid", "Z")

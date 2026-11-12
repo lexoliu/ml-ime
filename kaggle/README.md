@@ -110,7 +110,13 @@ on the same card restores them, so it trains without compiling again. `--census`
 shape so the GPU does not count again, and `--cpu` rehearses the staging on a
 CPU runtime before a GPU is billed for it. `--resume-from RUN` starts the leg
 from another run's newest trio (two cards racing one leg), and `--no-publish`
-runs no publisher, for a check that must not enter the run's lineage. The
+runs no publisher, for a check that must not enter the run's lineage. A leg
+started for a run whose `final/<run>/` is whole in the bucket stages that final
+(its checkpoint and config, mounted as `/kaggle/input/<run>`) and no trio, so
+the kernel evaluates the finished run and trains nothing, and the publisher
+replaces the run's evaluation files in `final/<run>/` while its checkpoint stays
+untouched; the kernel directory is stamped again from the current template with
+the run's own options, so the new evaluation is the one that runs. The
 session is named after the run. `wait --deadline SECONDS` probes the VM every
 minute through `colab/leg.py` -- each probe is the watchdog's heartbeat -- and
 exits with the leg's end, read from the processes, `run-summary.json` and

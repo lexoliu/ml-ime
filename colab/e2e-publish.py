@@ -25,12 +25,19 @@ exist on this VM alone. Once the kernel has written the finished summary --
 its last act -- they go to `final/<run>/`, outside the run's trio directory
 the rotation clears, with a `complete` marker written after them; the waiter
 reports the run finished, and `stop` releases the VM, only once it is there.
+A leg that only evaluates a finished run (the stager mounted its final; the
+summary names `evaluated_checkpoint`) publishes its evaluation over the same
+`final/<run>/`: the checkpoint and config stay as they are, the new files
+replace the old, and the old evaluation's files the new one did not write go.
+Whether the leg has published is read from its own `publish-state.json`, never
+from the bucket's marker, which an earlier leg wrote.
 
 What it last did -- step and time of the last publish, whether the final
 outputs are up, or the last error -- is written to `publish-state.json`,
 which `e2e.sh status` and the waiter read.
 """
 
+import fnmatch
 import importlib.metadata
 import json
 import os
@@ -250,6 +257,16 @@ def final_published(api, run):
     return any(entry.type == "file" and entry.path == marker for entry in entries)
 
 
+def leg_published_final():
+    """Whether this leg has put its own final outputs up.
+
+    The bucket cannot say: a leg that evaluates a finished run starts with
+    that run's earlier outputs and marker in it, and publishes over them. The
+    VM is this leg's alone, so its state file is the record.
+    """
+    return bool(json.loads(STATE.read_text()).get("final_published")) if STATE.is_file() else False
+
+
 def finished_summary():
     """The kernel's summary once the run has finished, else None.
 
@@ -262,33 +279,58 @@ def finished_summary():
     return summary if summary["finished"] else None
 
 
+#: The evaluation's files in the working root, which a finished leg publishes.
+EVALUATION_GLOBS = ("e2e-*", "eval-*.log")
+
+
 def final_outputs(summary):
     """What a finished leg leaves on this VM alone.
 
-    A leg that only evaluated a finished run mounted its checkpoint from where
-    it already lives; a leg that trained the run wrote it here.
+    A leg that only evaluated a finished run mounted its checkpoint and config
+    from where they already live, and they stay there as they are; a leg that
+    trained the run wrote them here.
     """
     trained = [] if "evaluated_checkpoint" in summary else [
         RUN / "checkpoint-final.pt",
         RUN / "metrics.jsonl",
+        WORKING / "run-config.json",
     ]
     return [
         *trained,
-        WORKING / "run-config.json",
         WORKING / "run-summary.json",
-        *sorted(WORKING.glob("e2e-*")),
-        *sorted(WORKING.glob("eval-*.log")),
+        *[path for glob in EVALUATION_GLOBS for path in sorted(WORKING.glob(glob))],
     ]
 
 
 def publish_final(api, run, summary):
-    """Upload a finished run's outputs, then their marker."""
+    """Upload a finished run's outputs, then their marker.
+
+    A leg that only evaluated the run publishes over a final that is already
+    whole: the marker is never absent meanwhile, since the checkpoint and
+    config it vouches for are not rewritten, and the previous evaluation's
+    files that this one did not write are deleted once the new ones are up. A
+    run without its marker has no checkpoint to have evaluated, which refuses.
+    """
     prefix = final_prefix(run)
+    evaluated = "evaluated_checkpoint" in summary
+    if evaluated and not final_published(api, run):
+        raise RuntimeError(
+            f"{BUCKET}/{prefix}: the leg evaluated a checkpoint, but the run has no "
+            f"`{COMPLETE}` marker to publish its evaluation beside"
+        )
     outputs = final_outputs(summary)
-    api.batch_bucket_files(
-        BUCKET, add=[(path, f"{prefix}/{path.relative_to(WORKING)}") for path in outputs]
-    )
+    uploaded = [f"{prefix}/{path.relative_to(WORKING)}" for path in outputs]
+    api.batch_bucket_files(BUCKET, add=list(zip(outputs, uploaded, strict=True)))
     api.batch_bucket_files(BUCKET, add=[(f"{len(outputs)}\n".encode(), f"{prefix}/{COMPLETE}")])
+    stale = [
+        entry.path
+        for entry in api.list_bucket_tree(BUCKET, prefix=f"{prefix}/", recursive=True)
+        if entry.type == "file"
+        and entry.path not in uploaded
+        and any(fnmatch.fnmatchcase(entry.path[len(prefix) + 1 :], glob) for glob in EVALUATION_GLOBS)
+    ]
+    if stale:
+        api.batch_bucket_files(BUCKET, delete=stale)
     print(f"published the finished run's {len(outputs)} outputs to {BUCKET}/{prefix}", flush=True)
 
 
@@ -304,9 +346,7 @@ def main():
             if published is None:
                 published = max(published_steps(api, run), default=-1)
             if final is None:
-                final = final_published(api, run)
-                if final:
-                    record_state(final_published=True)
+                final = leg_published_final()
             found = candidates()
             newest = found[-1] if found else None
             if newest is not None and newest[1] > published:
@@ -325,7 +365,8 @@ def main():
         except (httpx.HTTPError, OSError) as error:
             # A publish failure is transient until it is not: say so, keep
             # polling, and leave the error where status can read it. What the
-            # bucket holds is read again, since a failure can stop mid-publish.
+            # bucket holds is read again, since a failure can stop mid-publish;
+            # a final upload that did not finish is made again whole.
             published = None
             final = None
             record_state(last_error=f"{error}", last_error_at=time.time())

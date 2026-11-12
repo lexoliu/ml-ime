@@ -306,3 +306,57 @@ def test_a_stage_refuses_a_v2_run_whose_final_outputs_are_not_whole(
     with pytest.raises(FileNotFoundError, match=f"final/{PARENT}: no `complete` marker"):
         stager.bucket_final(publisher, bucket, PARENT)
     assert not (stager.INPUTS / PARENT).exists()
+
+
+def test_a_finished_run_is_evaluated_from_its_own_final_and_no_trio(
+    stager: ModuleType,
+    publisher: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mount is the one the kernel's `finished_runs` takes for its own finished run.
+
+    The run's trio stays in the bucket beside its final, and is not staged;
+    nor is the earlier evaluation's summary, which the kernel never reads, and
+    the leg's number continues the run's last segment.
+    """
+    kernel = load("stage_kernel", stage_kernel(tmp_path))
+    monkeypatch.setattr(kernel, "INPUTS", stager.INPUTS)
+    run = f"{PARENT}-rankw005"
+    bucket = FakeBucket({**whole_trio(run, 300), **final_outputs(run, kernel.stage(), marked=True)})
+    assert publisher.final_published(bucket, run)
+    mount = stager.bucket_final(publisher, bucket, run)
+    assert mount == stager.INPUTS / run
+    assert sorted(str(p.relative_to(mount)) for p in mount.rglob("*") if p.is_file()) == sorted(
+        stager.FINAL_READS
+    )
+    assert stager.finished_segment(kernel, mount) == 5
+    assert kernel.finished_checkpoint() == mount / "run" / "checkpoint-final.pt"
+    assert kernel.previous_segment() is None
+    assert stager.trios() == []
+
+
+def test_a_kernel_of_another_stage_than_the_finished_run_is_refused(
+    stager: ModuleType,
+    publisher: ModuleType,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Else the kernel finds no finished run and trains from scratch on the billed GPU."""
+    kernel = load("stage_kernel", stage_kernel(tmp_path))
+    monkeypatch.setattr(kernel, "INPUTS", stager.INPUTS)
+    run = f"{PARENT}-rankw005"
+    other = {"ranking": None, "whole_alphabet": False, "init_from": None}
+    mount = stager.bucket_final(publisher, FakeBucket(final_outputs(run, other, marked=True)), run)
+    with pytest.raises(RuntimeError, match="not a finished run of the stamped kernel's stage"):
+        stager.finished_segment(kernel, mount)
+
+
+def test_a_marker_without_the_checkpoint_beside_it_refuses(
+    stager: ModuleType, publisher: ModuleType
+) -> None:
+    """The real bucket raises on a missing file; the fake's lookup does the same."""
+    files = final_outputs(PARENT, {"ranking": None}, marked=True)
+    del files[f"final/{PARENT}/run/checkpoint-final.pt"]
+    with pytest.raises(KeyError, match=r"checkpoint-final\.pt"):
+        stager.bucket_final(publisher, FakeBucket(files), PARENT)

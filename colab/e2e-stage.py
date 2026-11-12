@@ -17,6 +17,10 @@ config the kernel reads mount at `/kaggle/input/<run>` -- once its `complete`
 marker says they are whole. The resume point is the newest
 `checkpoint-paused` trio by step among the run's trio in the
 `lexoliu/mlime-resume` bucket and the latest COMPLETE Kaggle segment's output.
+A run whose own `final/<run>/` is whole in the bucket has finished training:
+the leg stages that final instead of any trio or segment, so the kernel takes
+its documented path for a mounted finished run -- it evaluates the checkpoint
+and trains nothing -- and the leg is how the finished run is decoded again.
 On a GPU it also restores the inductor caches an earlier leg on the same card
 and torch packed into the bucket (#140), so the kernel does not compile again.
 It stamps the segment number, the interval checkpoint cadence, the session's
@@ -104,7 +108,8 @@ def bucket_final(publisher, api, run):
     """Download what a stage reads of finished v2 *run*'s outputs; return their mount.
 
     The mount is named after the run, which is how the kernel's
-    `init_checkpoint` finds it. A run without its `complete` marker is still
+    `init_checkpoint` finds it, and holds what its `finished_runs` reads when
+    the run is the leg's own. A run without its `complete` marker is still
     publishing, or never finished; a stage started from part of it would
     train from whatever arrived, so that refuses.
     """
@@ -124,6 +129,39 @@ def bucket_final(publisher, api, run):
     )
     print(f"{publisher.BUCKET}/{prefix}: staged under {mount}", flush=True)
     return mount
+
+
+def kernel_module(path):
+    """The stamped kernel at *path* as a module, for the predicates it decides with.
+
+    Importing it runs no training: the script starts only under `__main__`.
+    """
+    spec = importlib.util.spec_from_file_location("stamped_kernel", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def finished_segment(kernel, mount):
+    """The leg's segment for the finished run staged at *mount*; refuses what the kernel would not take.
+
+    The kernel decides a mounted run is finished by its own `finished_runs`,
+    which tells it from a parent by the stage its run-config records, and
+    falls through to training from scratch when the mount is not one. So the
+    stager asks that same predicate of the mount it made, once every transfer
+    has landed, and a *kernel* of another stage than the run's refuses here
+    rather than after the GPU is billed. The segment continues the chain's:
+    one past the run's last.
+    """
+    expected = mount / "run" / "checkpoint-final.pt"
+    found = kernel.finished_checkpoint()
+    if found != expected:
+        raise RuntimeError(
+            f"{expected} is not a finished run of the stamped kernel's stage "
+            f"(the kernel finds {found}); stamp the kernel with the run's own options"
+        )
+    config = json.loads((mount / "run-config.json").read_text())
+    return int(config.get("segment", -1)) + 1
 
 
 def compile_caches(publisher, api):
@@ -373,15 +411,30 @@ def main(argv=None):
         resumed_run, required = leg.resume_from, True
     else:
         resumed_run, required = publisher.run_name(METADATA), False
+    # A run whose final outputs are whole has finished training: the leg
+    # mounts that final and nothing to resume, so the kernel evaluates it. Its
+    # outputs go to the run's own `final/`, so no other run's final is staged.
+    finished = publisher.final_published(api, resumed_run)
+    if finished and resumed_run != publisher.run_name(METADATA):
+        raise ValueError(
+            f"{resumed_run} has finished; --resume-from names a run with a trio to "
+            "continue, and an evaluation leg is the finished run's own"
+        )
     with ThreadPoolExecutor(max_workers=STAGING_TRANSFERS) as pool:
         transfers = [
             pool.submit(hub.download, repos, INPUTS),
-            pool.submit(bucket_trio, publisher, api, resumed_run, required),
             pool.submit(compile_caches, publisher, api),
-            pool.submit(stage_latest_segment, base),
         ]
-        if finished_v2 is not None:
-            transfers.append(pool.submit(bucket_final, publisher, api, finished_v2))
+        if finished:
+            print(f"{resumed_run} has finished: evaluating its final", flush=True)
+            transfers.append(pool.submit(bucket_final, publisher, api, resumed_run))
+        else:
+            transfers += [
+                pool.submit(bucket_trio, publisher, api, resumed_run, required),
+                pool.submit(stage_latest_segment, base),
+            ]
+            if finished_v2 is not None:
+                transfers.append(pool.submit(bucket_final, publisher, api, finished_v2))
         for transfer in as_completed(transfers):
             transfer.result()
 
@@ -392,6 +445,8 @@ def main(argv=None):
     candidates = trios()
     picked = max(candidates, key=lambda candidate: candidate[2], default=None)
     segment = 0 if picked is None else picked[1] + 1
+    if finished:
+        segment = finished_segment(kernel_module(KERNEL), INPUTS / resumed_run)
     KERNEL.write_text(
         stamp(KERNEL.read_text(), **stamps(leg, segment)), encoding="utf-8"
     )

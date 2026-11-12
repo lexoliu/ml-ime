@@ -97,7 +97,6 @@ def write_finished(working: Path, summary: dict[str, object]) -> list[str]:
     """What a finished leg leaves in *working*; the outputs' paths under it."""
     (working / "run").mkdir(parents=True, exist_ok=True)
     outputs = {
-        "run-config.json": "{}",
         "run-summary.json": json.dumps(summary),
         "e2e-lattice-context-on.jsonl": "{}\n",
         "e2e-lattice-context-on-report.txt": "top-1\n",
@@ -109,6 +108,7 @@ def write_finished(working: Path, summary: dict[str, object]) -> list[str]:
     }
     if "evaluated_checkpoint" not in summary:
         outputs |= {
+            "run-config.json": "{}",
             "run/checkpoint-final.pt": "weights",
             "run/metrics.jsonl": json.dumps({"event": "summary", "finished": True}) + "\n",
         }
@@ -155,15 +155,81 @@ def test_the_trio_rotation_leaves_a_finished_runs_outputs_alone(
 def test_a_leg_that_only_evaluated_ships_no_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Its checkpoint was mounted from where it already lives."""
+    """Its checkpoint and config were mounted from where they already live."""
     working = tmp_path / "working"
-    bucket = FakeBucket()
+    bucket = finished_bucket()
     outputs = write_finished(working, {"finished": True, "evaluated_checkpoint": "/mnt/x.pt"})
     publisher = load_publisher(monkeypatch, working, bucket)
     monkeypatch.setenv("ONCE", "1")
     publisher.main()
     assert sorted(bucket.run_batches()[0][0]) == [f"final/{RUN}/{name}" for name in outputs]
-    assert f"final/{RUN}/run/checkpoint-final.pt" not in bucket.files
+    assert not {"run/checkpoint-final.pt", "run-config.json"} & set(outputs)
+
+
+def finished_bucket() -> FakeBucket:
+    """A bucket holding a finished run's final outputs, with an older evaluation's files."""
+    final = f"final/{RUN}"
+    bucket = FakeBucket()
+    bucket.files |= {
+        f"{final}/run/checkpoint-final.pt": b"weights",
+        f"{final}/run-config.json": b'{"segment": 4}',
+        f"{final}/run-summary.json": b'{"finished": true, "held_out": {}}',
+        f"{final}/e2e-keys-eval3-context-on-dev.jsonl.gz": b"old dev",
+        f"{final}/e2e-keys-eval3-context-on-test.jsonl.gz": b"old test",
+        f"{final}/eval-keys-eval3-context-on-dev.log": b"old log",
+        f"{final}/complete": b"9\n",
+    }
+    return bucket
+
+
+def test_evaluating_a_finished_run_again_replaces_its_evaluation_beside_its_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bucket's marker is the earlier leg's: this leg still publishes its own files."""
+    final = f"final/{RUN}"
+    working = tmp_path / "working"
+    bucket = finished_bucket()
+    old = dict(bucket.files)
+    outputs = write_finished(working, {"finished": True, "evaluated_checkpoint": "/mnt/x.pt"})
+    publisher = load_publisher(monkeypatch, working, bucket)
+    monkeypatch.setenv("ONCE", "1")
+    assert not publisher.leg_published_final()
+    publisher.main()
+    assert publisher.leg_published_final()
+    assert json.loads((working / "publish-state.json").read_text())["final_published"]
+    # Byte-identical checkpoint and config, never re-uploaded.
+    for kept in ("run/checkpoint-final.pt", "run-config.json"):
+        assert bucket.files[f"{final}/{kept}"] == old[f"{final}/{kept}"]
+        assert all(f"{final}/{kept}" not in added for added, _ in bucket.batches)
+    # The new summary and dumps are up; the old evaluation's test dump, which this
+    # one did not write, and its log are gone; the marker was never deleted.
+    assert bucket.files[f"{final}/run-summary.json"] != old[f"{final}/run-summary.json"]
+    assert bucket.files[f"{final}/e2e-keys-eval3-typo-context-on-test.jsonl.gz"] == b"test"
+    assert f"{final}/e2e-keys-eval3-context-on-dev.jsonl.gz" not in bucket.files
+    assert f"{final}/eval-keys-eval3-context-on-dev.log" not in bucket.files
+    assert f"{final}/complete" in bucket.files
+    assert all(f"{final}/complete" not in deleted for _, deleted in bucket.batches)
+    assert sorted(path for path in bucket.files if path.startswith(f"{final}/e2e-")) == sorted(
+        f"{final}/{name}" for name in outputs if name.startswith("e2e-")
+    )
+
+    again = load_publisher(monkeypatch, working, bucket)
+    batches = len(bucket.batches)
+    again.main()
+    assert len(bucket.batches) == batches, "the evaluation went up again"
+
+
+def test_an_evaluation_without_a_whole_final_beside_it_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    working = tmp_path / "working"
+    bucket = FakeBucket()
+    write_finished(working, {"finished": True, "evaluated_checkpoint": "/mnt/x.pt"})
+    publisher = load_publisher(monkeypatch, working, bucket)
+    monkeypatch.setenv("ONCE", "1")
+    with pytest.raises(RuntimeError, match="no `complete` marker"):
+        publisher.main()
+    assert bucket.files == {}
 
 
 def publish_once(
