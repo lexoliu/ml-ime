@@ -196,6 +196,13 @@ fn the_rust_search_reproduces_the_python_search() {
             let found = key_search(&lattice, &log_probs, &mut transition, &options, &mut stats)
                 .expect("the transition never fails");
             assert_hypotheses(&found, &setting.hypotheses, &context);
+            for hypothesis in &found {
+                assert_eq!(hypothesis.steps.len(), hypothesis.ids.len(), "{context}");
+                let whole = hypothesis.ctc - options.gamma.get() * hypothesis.correction
+                    + beta.get() * hypothesis.transition;
+                let last = *hypothesis.steps.last().expect("an output has characters");
+                assert_close(last, whole, &format!("{context}: the last running score"));
+            }
             assert_eq!(
                 transition.calls, setting.calls,
                 "{context}: the queried prefixes"

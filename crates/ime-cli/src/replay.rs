@@ -22,8 +22,8 @@ use ime_neural::RouteA;
 use ime_ngram::NgramModel;
 use ime_pinyin::CharId;
 use ime_session::{
-    CacheReport, Cached, EngineStats, Fused, FusedConfig, Session, SessionOptions, Stages, Timed,
-    TransitionStats,
+    CacheReport, Cached, EngineStats, Fused, FusedConfig, FusedStages, Invalidation, Session,
+    SessionOptions, Stages, Timed, TransitionStats,
 };
 use ort::environment::Environment;
 use serde::Serialize;
@@ -639,7 +639,7 @@ struct Harness<'a> {
 
 /// The session type one transition kind makes: the transition timed for
 /// the stage split, wrapped in the character-prefix state cache.
-type FusedSession<'a, T> = Session<'a, Fused<'a, Cached<Timed<T>>>>;
+type FusedSession<'a, T> = Session<Fused<'a, Cached<Timed<T>>>>;
 
 impl<'a> Harness<'a> {
     /// The session's beam: the search arguments, with the word arcs'
@@ -662,29 +662,7 @@ impl<'a> Harness<'a> {
 
     /// The baseline session — the same towers, every reuse lever off.
     fn baseline_session<T: Transition>(&self, transition: T) -> FusedSession<'a, T> {
-        let engine = Fused::new(
-            self.towers,
-            Cached::new(Timed::new(transition), 0),
-            FusedConfig {
-                emittable: self.emittable,
-                lexicon: self.lexicon,
-                weight: 1.0,
-                floor: self.args.unscored,
-                with_context: !self.args.no_context,
-                incremental: false,
-            },
-        );
-        Session::new(
-            engine,
-            SessionOptions {
-                lexicon: self.lexicon,
-                table: self.table,
-                segment: self.args.search.segment(),
-                beam: self.beam(),
-                words: self.words,
-                sentences: 3,
-            },
-        )
+        self.session_cached(transition, false, 0)
     }
 
     /// The same session with the state cache's capacity given directly —
@@ -700,6 +678,10 @@ impl<'a> Harness<'a> {
             self.towers,
             Cached::new(Timed::new(transition), cache_rows),
             FusedConfig {
+                table: self.table,
+                segment: self.args.search.segment(),
+                beam: self.beam(),
+                words: self.words,
                 emittable: self.emittable,
                 lexicon: self.lexicon,
                 weight: 1.0,
@@ -708,17 +690,7 @@ impl<'a> Harness<'a> {
                 incremental,
             },
         );
-        Session::new(
-            engine,
-            SessionOptions {
-                lexicon: self.lexicon,
-                table: self.table,
-                segment: self.args.search.segment(),
-                beam: self.beam(),
-                words: self.words,
-                sentences: 3,
-            },
-        )
+        Session::new(engine, SessionOptions { sentences: 3 })
     }
 }
 
@@ -756,8 +728,10 @@ struct Replays {
     mismatches: Option<Vec<Mismatch>>,
     /// The measured session's cumulative stages.
     stages: Stages,
-    /// Its invalidation counts.
-    invalidation: ime_session::Invalidation,
+    /// Its engine's cumulative stages.
+    fused: FusedStages,
+    /// Its engine's invalidation counts.
+    invalidation: Invalidation,
     /// Its engine's cumulative stats.
     engine: EngineStats,
     /// Its transition's cumulative stats.
@@ -819,7 +793,8 @@ fn replay_kind<T: Transition>(
                 .map_err(anyhow::Error::from)
                 .with_context(|| format!("could not set record {index}'s context"))?;
         }
-        let mut before = measured.stages().clone();
+        let mut before = measured.engine().stages().clone();
+        let mut listed_before = measured.stages().candidates_ns;
         for ch in record.pinyin.chars() {
             let tick = Instant::now();
             measured
@@ -827,7 +802,8 @@ fn replay_kind<T: Transition>(
                 .map_err(anyhow::Error::from)
                 .with_context(|| format!("could not press {ch:?} on record {index}"))?;
             let key_ns = nanos(tick);
-            let now = measured.stages();
+            let now = measured.engine().stages();
+            let listed = measured.stages().candidates_ns;
             let typed = measured.pending();
             samples.push(Keystroke {
                 record: index,
@@ -835,8 +811,7 @@ fn replay_kind<T: Transition>(
                 key_ns,
                 segment_ns: now.segment_ns - before.segment_ns,
                 emission_ns: now.emission_ns - before.emission_ns,
-                decode_ns: now.decode_ns - before.decode_ns
-                    + (now.candidates_ns - before.candidates_ns),
+                decode_ns: now.decode_ns - before.decode_ns + (listed - listed_before),
                 beam_expand_ns: now.breakdown.expand_ns - before.breakdown.expand_ns,
                 beam_select_ns: now.breakdown.select_ns - before.breakdown.select_ns,
                 beam_finish_ns: now.breakdown.finish_ns - before.breakdown.finish_ns,
@@ -857,6 +832,7 @@ fn replay_kind<T: Transition>(
                 std::thread::sleep(std::time::Duration::from_secs(harness.args.pause_secs));
             }
             before = now.clone();
+            listed_before = listed;
         }
         // The gate: the session's last top candidate is the full decode's,
         // which the finished reference pass computed with every lever off.
@@ -885,7 +861,8 @@ fn replay_kind<T: Transition>(
         samples,
         mismatches,
         stages: measured.stages().clone(),
-        invalidation: measured.invalidation().clone(),
+        fused: measured.engine().stages().clone(),
+        invalidation: measured.engine().invalidation().clone(),
         engine: copy_engine(measured.engine().stats()),
         transition: copy_transition(measured.engine().transition().inner().stats()),
         cache: measured.engine().transition().stats(),
@@ -999,10 +976,10 @@ fn report(
         },
         stages: StageReport {
             refreshes: replays.stages.refreshes,
-            undecodable: replays.stages.undecodable,
-            segment_ns: replays.stages.segment_ns,
-            emission_ns: replays.stages.emission_ns,
-            decode_ns: replays.stages.decode_ns,
+            undecodable: replays.fused.undecodable,
+            segment_ns: replays.fused.segment_ns,
+            emission_ns: replays.fused.emission_ns,
+            decode_ns: replays.fused.decode_ns,
             candidates_ns: replays.stages.candidates_ns,
             context_calls: replays.engine.context_calls.get(),
             context_cached: replays.engine.context_cached.get(),
@@ -1026,13 +1003,13 @@ fn report(
             cache_node_bytes: cache.map_or(0, |stats| stats.node_bytes),
             cache_live_nodes: cache.map_or(0, |stats| stats.live),
             lm_bookkeeping_ns: bookkeeping_ns,
-            beam_expand_ns: replays.stages.breakdown.expand_ns,
-            beam_select_ns: replays.stages.breakdown.select_ns,
-            beam_finish_ns: replays.stages.breakdown.finish_ns,
-            beam_expanded: replays.stages.breakdown.expanded,
-            beam_arc_starts: replays.stages.breakdown.arc_starts,
-            beam_arc_slots: replays.stages.breakdown.arc_slots,
-            beam_arcs_unprotected: replays.stages.breakdown.arcs_unprotected,
+            beam_expand_ns: replays.fused.breakdown.expand_ns,
+            beam_select_ns: replays.fused.breakdown.select_ns,
+            beam_finish_ns: replays.fused.breakdown.finish_ns,
+            beam_expanded: replays.fused.breakdown.expanded,
+            beam_arc_starts: replays.fused.breakdown.arc_starts,
+            beam_arc_slots: replays.fused.breakdown.arc_slots,
+            beam_arcs_unprotected: replays.fused.breakdown.arcs_unprotected,
         },
         invalidation: InvalidationReport {
             compared: replays.invalidation.compared,

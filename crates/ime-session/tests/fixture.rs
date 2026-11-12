@@ -44,7 +44,7 @@ fn session<'a>(
     lexicon: &'a Lexicon,
     emittable: &'a Emittable,
     incremental: bool,
-) -> Session<'a, Fused<'a, NoTransition>> {
+) -> Session<Fused<'a, NoTransition>> {
     session_with(
         towers,
         table,
@@ -65,12 +65,19 @@ fn session_with<'a>(
     incremental: bool,
     words: Option<&'a WordLexicon>,
     beam: BeamOptions,
-) -> Session<'a, Fused<'a, NoTransition>> {
+) -> Session<Fused<'a, NoTransition>> {
     Session::new(
         Fused::new(
             towers,
             NoTransition,
             FusedConfig {
+                table,
+                segment: SegmentOptions {
+                    allow_incomplete_tail: false,
+                    ..SegmentOptions::default()
+                },
+                beam,
+                words,
                 emittable,
                 lexicon,
                 weight: 1.0,
@@ -79,17 +86,7 @@ fn session_with<'a>(
                 incremental,
             },
         ),
-        Options {
-            lexicon,
-            table,
-            segment: SegmentOptions {
-                allow_incomplete_tail: false,
-                ..SegmentOptions::default()
-            },
-            beam,
-            words,
-            sentences: 3,
-        },
+        Options { sentences: 3 },
     )
 }
 
@@ -175,7 +172,7 @@ fn reference_top_with(
 
 /// Replay `pinyin` one keystroke at a time on *session* and return the last
 /// keystroke's top candidate.
-fn replay_top<E>(session: &mut Session<'_, E>, pinyin: &str) -> Option<String>
+fn replay_top<E>(session: &mut Session<E>, pinyin: &str) -> Option<String>
 where
     E: ime_session::Engine,
 {

@@ -300,6 +300,11 @@ pub struct KeyHypothesis {
     pub transition: f64,
     /// The best cover's summed correction cost.
     pub correction: f64,
+    /// The best cover's running score, one entry per character: `steps[j]`
+    /// is the path score of the first `j + 1` characters over the keys
+    /// before their cut `cuts[j]`, blanks included, weighted as `score` is.
+    /// The last is the best cover's whole path score.
+    pub steps: Vec<f64>,
 }
 
 /// What a search cost.
@@ -317,28 +322,31 @@ struct CoverId(u32);
 
 #[derive(Default)]
 struct Covers {
-    /// `(cut, the cover before it)`.
-    nodes: Vec<(usize, Option<CoverId>)>,
+    /// `(cut, the running score through it, the cover before it)`.
+    nodes: Vec<(usize, f64, Option<CoverId>)>,
 }
 
 impl Covers {
-    fn push(&mut self, before: Option<CoverId>, cut: usize) -> CoverId {
+    fn push(&mut self, before: Option<CoverId>, cut: usize, step: f64) -> CoverId {
         let id = CoverId(u32::try_from(self.nodes.len()).expect("a search's covers fit u32"));
-        self.nodes.push((cut, before));
+        self.nodes.push((cut, step, before));
         id
     }
 
-    /// The cut points of the cover ending at *last*, ascending.
-    fn cuts(&self, last: Option<CoverId>) -> Vec<usize> {
-        let mut cuts = Vec::new();
+    /// The cut points of the cover ending at *last* and its running score
+    /// through each, ascending.
+    fn walk(&self, last: Option<CoverId>) -> (Vec<usize>, Vec<f64>) {
+        let (mut cuts, mut steps) = (Vec::new(), Vec::new());
         let mut at = last;
         while let Some(id) = at {
-            let (cut, before) = self.nodes[id.0 as usize];
+            let (cut, step, before) = self.nodes[id.0 as usize];
             cuts.push(cut);
+            steps.push(step);
             at = before;
         }
         cuts.reverse();
-        cuts
+        steps.reverse();
+        (cuts, steps)
     }
 }
 
@@ -396,6 +404,9 @@ struct Span {
 struct Tables {
     keys: usize,
     blank_total: f64,
+    /// `blank_through[t]`: the blank log-probs of keys `..t` summed, for the
+    /// running scores only.
+    blank_through: Vec<f64>,
     emits: Vec<EmitId>,
     cost: Vec<f64>,
     ctc_gain: Vec<f64>,
@@ -418,6 +429,12 @@ impl Tables {
         let mut tables = Self {
             keys: n,
             blank_total: numpy_sum(&blank),
+            blank_through: std::iter::once(0.0)
+                .chain(blank.iter().scan(0.0, |total, &value| {
+                    *total += value;
+                    Some(*total)
+                }))
+                .collect(),
             emits: Vec::with_capacity(lattice.arc_count()),
             cost: Vec::with_capacity(lattice.arc_count()),
             ctc_gain: Vec::with_capacity(lattice.arc_count()),
@@ -702,13 +719,15 @@ impl Search {
 
     /// The cut state *extension* lands in at *end*.
     fn landed(&mut self, extension: &Extension, end: usize) -> CutState {
+        let step =
+            self.tables.blank_through[end] + extension.best + self.beta * extension.transition;
         CutState {
             cut: end,
             mass: extension.mass,
             best: extension.best,
             ctc: extension.ctc,
             correction: extension.correction,
-            cover: Some(self.covers.push(extension.cover, end)),
+            cover: Some(self.covers.push(extension.cover, end, step)),
         }
     }
 
@@ -833,9 +852,11 @@ impl Search {
                     .expect("every output at the last key has the cut at the key count");
                 let mut ids = Vec::new();
                 self.trie.ids_into(prefix.id, &mut ids);
+                let (cuts, steps) = self.covers.walk(state.cover);
                 KeyHypothesis {
                     ids,
-                    cuts: self.covers.cuts(state.cover),
+                    cuts,
+                    steps,
                     score: state.mass + self.beta * prefix.transition + self.tables.blank_total,
                     ctc: state.ctc + self.tables.blank_total,
                     transition: prefix.transition,
