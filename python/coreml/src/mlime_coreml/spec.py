@@ -67,19 +67,20 @@ PADDING_ATOL_FP32: Final = 2e-4
 #: elementwise over the real rows. Logits are the head's raw scores, hidden states and the cross
 #: keys and values are LayerNorm-scale activations.
 #:
-#: Each is about twice what a random-weight bundle of the real dimensions measured on the M1
+#: Each is about twice the larger of what two bundles of the real dimensions measured on the M1
 #: (the largest excess of ``|a - b|`` over ``rtol * |b|``, over every function and probe,
-#: against the reference and the exact-length port): context 0.025 (activations to 4.3), ctc
-#: logits 0.027 (to 2.5), cross keys 0.017 and values 0.019 (to 2.6), tree logits 0.188 (to 57,
-#: std 13: a random-weight decoder's logits are far wider than a trained one's, and the error
-#: scales with them, 0.4% of the range). A tiny bundle measures an order of magnitude under all
-#: of them. The tree's is the loosest in absolute terms; a wrong mask or a mis-sliced weight
-#: moves a logit by far more than 0.4 at that scale.
+#: against the reference and the exact-length port). Random weights: context 0.025, ctc logits
+#: 0.027, cross keys 0.017 and values 0.019, tree logits 0.188 (logits to 57, std 13). The
+#: joint stage's trained weights (S2, #257): context 0.012, ctc logits 0.087, cross keys 0.057
+#: and values 0.060, tree logits 0.158. Training widens the key tower's outputs and narrows
+#: the decoder's logits, so neither bundle bounds the other. A tiny bundle measures an order
+#: of magnitude under all of them. The tree's is the loosest in absolute terms; a wrong mask
+#: or a mis-sliced weight moves a logit by far more than 0.4 at that scale.
 FP16_TOLERANCE: Final[dict[str, tuple[float, float]]] = {
     "context": (5e-2, 2e-2),
-    "ctc_logits": (6e-2, 2e-2),
-    "cross_keys": (4e-2, 2e-2),
-    "cross_values": (4e-2, 2e-2),
+    "ctc_logits": (1.8e-1, 2e-2),
+    "cross_keys": (1.2e-1, 2e-2),
+    "cross_values": (1.2e-1, 2e-2),
     "logits": (4e-1, 2e-2),
 }
 
