@@ -282,7 +282,8 @@ def corpus_judge(
 ) -> None:
     """Keep only the sentences that are natural usage of their entry, resuming.
 
-    Reads JEV_API_KEY and MLIME_JUDGE_LLM_BASE_URL, _MODEL and _KEY_FILE.
+    Reads JEV_API_KEY and MLIME_JUDGE_LLM_BASE_URL, _MODEL, _KEY_FILE and, optionally,
+    _TEMPERATURE.
     """
     configure(verbose)
     from mlime.data import judge, knowledge
