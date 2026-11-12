@@ -44,6 +44,15 @@ const FETCHED: [&str; 2] = ["onnx", "weights"];
 /// One request's bound; the largest fixture is a few hundred kilobytes.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The pauses before asking again for a download the server refused for now
+/// (a 429 or a 5xx); once they are spent the refusal fails the build.
+const RETRY_PAUSES: [Duration; 4] = [
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(45),
+    Duration::from_secs(135),
+];
+
 fn main() {
     let crate_dir = PathBuf::from(var("CARGO_MANIFEST_DIR"));
     let workspace = crate_dir.join("../..");
@@ -122,13 +131,35 @@ fn agent() -> Agent {
     )
 }
 
+/// The body of *url*. A 429 or a 5xx is the server asking for the request
+/// again later, so it is asked again after each of [`RETRY_PAUSES`]; any
+/// other failure, or a refusal that outlasts them, fails the build.
+fn download(agent: &Agent, url: &str) -> Vec<u8> {
+    let mut pauses = RETRY_PAUSES.iter();
+    loop {
+        let attempt = agent
+            .get(url)
+            .call()
+            .and_then(|mut response| response.body_mut().read_to_vec());
+        match attempt {
+            Ok(bytes) => return bytes,
+            Err(ureq::Error::StatusCode(status)) if status == 429 || status >= 500 => {
+                match pauses.next() {
+                    Some(pause) => thread::sleep(*pause),
+                    None => panic!(
+                        "fetching {url}: http status {status} after {} attempts",
+                        RETRY_PAUSES.len() + 1
+                    ),
+                }
+            }
+            Err(error) => panic!("fetching {url}: {error}"),
+        }
+    }
+}
+
 /// Download *url*, check it hashes to *sha256*, and keep it as *blob*.
 fn fetch(agent: &Agent, url: &str, sha256: &str, blob: &Path) {
-    let bytes = agent
-        .get(url)
-        .call()
-        .and_then(|mut response| response.body_mut().read_to_vec())
-        .unwrap_or_else(|error| panic!("fetching {url}: {error}"));
+    let bytes = download(agent, url);
     let got = const_hex::encode(Sha256::digest(&bytes));
     assert_eq!(
         got, sha256,
