@@ -42,6 +42,10 @@ pub struct DumpedHypothesis {
     /// See [`DumpedHypothesis::ctc`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub correction: Option<f32>,
+    /// The best cover's cut points: the key offset each character ends at,
+    /// the last being the key count. Present with the terms above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuts: Option<Vec<u32>>,
 }
 
 impl DumpedHypothesis {
@@ -54,6 +58,7 @@ impl DumpedHypothesis {
             ctc: None,
             transition: None,
             correction: None,
+            cuts: None,
         }
     }
 }
@@ -96,13 +101,16 @@ mod tests {
     fn a_key_level_row_carries_its_terms_and_a_plain_one_writes_none() {
         let rows = parse_dump(concat!(
             "{\"record\": 2, \"text\": \"我爱北京\", \"hypotheses\": [{\"text\": \"我爱北京\", ",
-            "\"score\": -3.5, \"ctc\": -2.0, \"transition\": -1.25, \"correction\": 0.0}]}\n",
+            "\"score\": -3.5, \"ctc\": -2.0, \"transition\": -1.25, \"correction\": 0.0, ",
+            "\"cuts\": [1, 2, 3, 6]}]}\n",
             "{\"record\": 0, \"text\": \"他\", \"hypotheses\": [{\"text\": \"她\", \"score\": -1.5}]}\n",
             "{\"record\": 1, \"text\": \"こんにちは\", \"hypotheses\": [{\"text\": \"안녕하세요\", ",
             "\"score\": -9.0}]}\n",
         ))
         .expect("every row parses");
         assert_eq!(rows[1].hypotheses[0].ctc, None);
+        assert_eq!(rows[1].hypotheses[0].cuts, None);
+        assert_eq!(rows[2].hypotheses[0].cuts, Some(vec![1, 2, 3, 6]));
         let terms = &rows[2].hypotheses[0];
         assert_eq!(
             (terms.ctc, terms.transition, terms.correction),
