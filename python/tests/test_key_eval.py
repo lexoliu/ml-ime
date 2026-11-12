@@ -34,7 +34,7 @@ from test_keys import (
 
 from mlime.legality import Legality
 from mlime.train.charlm_vocab import CharVocab
-from mlime.train.e2e_eval import Report, SliceReports, resume_dump
+from mlime.train.e2e_eval import EvalRow, Report, SliceReports, resume_dump
 from mlime.train.key_eval import (
     KeyDecoder,
     KeyRecord,
@@ -80,16 +80,19 @@ def verifier_fixture() -> LegalityVerifier:
     )
 
 
-def eval_rows() -> list[tuple[str, str, str | None]]:
-    return [(keys, text, context) for text, context, styles in TYPED for keys in styles]
+def eval_rows() -> list[EvalRow]:
+    return [EvalRow(keys, text, context) for text, context, styles in TYPED for keys in styles]
 
 
 def write_eval_set(path: Path) -> Path:
     path.write_text(
         "".join(
-            json.dumps({"pinyin": pinyin, "text": text, "context": context}, ensure_ascii=False)
+            json.dumps(
+                {"pinyin": row.pinyin, "text": row.text, "context": row.context},
+                ensure_ascii=False,
+            )
             + "\n"
-            for pinyin, text, context in eval_rows()
+            for row in eval_rows()
         ),
         encoding="utf-8",
     )
@@ -163,7 +166,7 @@ def test_a_tiny_model_decodes_real_records_and_resumes_to_the_same_report(
     dump = dump_path(whole, "all", weights)
     rows = dumped(dump)
     assert [row["record"] for row in rows] == list(range(len(eval_rows())))
-    for row, (pinyin, expected, _) in zip(rows, eval_rows(), strict=True):
+    for row, (pinyin, expected, _, _) in zip(rows, eval_rows(), strict=True):
         assert row["text"] == expected
         assert 1 <= len(row["hypotheses"]) <= 8
         scores = [hypothesis["score"] for hypothesis in row["hypotheses"]]
@@ -283,7 +286,7 @@ def test_an_oracle_puts_the_gold_first_in_the_heads_own_indices(
     run = decoder(model, lexicon, spans, legality, token_budget=10_000)
     records = [
         KeyRecord(record=index, keys=keys, text=text, context=context)
-        for index, (keys, text, context) in enumerate(eval_rows())
+        for index, (keys, text, context, _) in enumerate(eval_rows())
     ]
     golds = [lexicon.indices(record.text) for record in records]
     assert all(gold is not None for gold in golds)

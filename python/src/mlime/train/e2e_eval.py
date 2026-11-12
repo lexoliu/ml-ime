@@ -47,7 +47,7 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from itertools import batched
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 
@@ -222,8 +222,22 @@ class Report:
         )
 
 
-def read_eval_records(path: Path) -> list[tuple[str, str, str | None]]:
-    """The eval set's ``(pinyin, text, context)`` rows, validated as Rust validates.
+class EvalRow(NamedTuple):
+    """One eval-set record: what was typed, the text meant, what was on screen.
+
+    *clean* is a typo twin's original keystrokes, of which *pinyin* is the
+    corrupted retyping; the record's identity, and so its dev or test slice,
+    is the clean one's.
+    """
+
+    pinyin: str
+    text: str
+    context: str | None
+    clean: str | None = None
+
+
+def read_eval_records(path: Path) -> list[EvalRow]:
+    """The eval set's rows, validated as Rust validates.
 
     ``deny_unknown_fields`` holds here too: a record that grew a field means a
     file from a different schema, and reading past it silently is how a digest
@@ -234,7 +248,7 @@ def read_eval_records(path: Path) -> list[tuple[str, str, str | None]]:
         if not line.strip():
             continue
         raw: dict[str, Any] = json.loads(line)
-        unknown = set(raw) - {"pinyin", "text", "context"}
+        unknown = set(raw) - {"pinyin", "text", "context", "clean"}
         if unknown:
             raise ValueError(f"{path}:{number} carries unknown fields {sorted(unknown)}")
         pinyin, text = raw.get("pinyin"), raw.get("text")
@@ -245,7 +259,10 @@ def read_eval_records(path: Path) -> list[tuple[str, str, str | None]]:
         context = raw.get("context")
         if context is not None and not isinstance(context, str):
             raise ValueError(f"{path}:{number} has a non-string context")
-        records.append((pinyin, text, context))
+        clean = raw.get("clean")
+        if clean is not None and (not isinstance(clean, str) or not clean):
+            raise ValueError(f"{path}:{number} has an empty or non-string clean")
+        records.append(EvalRow(pinyin, text, context, clean))
     if not records:
         raise ValueError(f"{path} holds no records")
     return records
@@ -302,7 +319,7 @@ def evaluate(
         for record in read_lattice(lattice):
             if record.record not in chosen or record.record in done:
                 continue
-            pinyin, _, context = eval_rows[record.record]
+            pinyin, _, context, _ = eval_rows[record.record]
             if pinyin != record.pinyin or (context or None) != (record.context or None):
                 raise ValueError(
                     f"record {record.record}: the lattice and the eval set disagree "
@@ -374,7 +391,7 @@ class SliceReports:
 
     def __init__(
         self,
-        eval_rows: Sequence[tuple[str, str, str | None]],
+        eval_rows: Sequence[EvalRow],
         slice_: str,
         dev_share: float,
         top_k: int,
@@ -383,15 +400,15 @@ class SliceReports:
             raise ValueError(f"slice {slice_!r} is not one of 'dev', 'test', 'all'")
         self.slice = slice_
         self.top_k = top_k
-        self._texts = [text for _, text, _ in eval_rows]
+        self._texts = [row.text for row in eval_rows]
         rows = [
-            {"pinyin": pinyin, "text": text, "context": context}
-            for pinyin, text, context in eval_rows
+            {"pinyin": row.pinyin, "text": row.text, "context": row.context, "clean": row.clean}
+            for row in eval_rows
         ]
         u64_max = float(2**64 - 1)
         self._is_dev = [
-            digest(pinyin, text, context) / u64_max < dev_share
-            for pinyin, text, context in eval_rows
+            digest(row.clean or row.pinyin, row.text, row.context) / u64_max < dev_share
+            for row in eval_rows
         ]
         #: The eval-set indices the slice holds, in file order.
         self.indices = slice_indices(rows, slice_, dev_share)
