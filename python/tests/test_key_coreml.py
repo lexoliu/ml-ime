@@ -462,6 +462,7 @@ def test_coreml_off_macos_is_refused_with_a_clear_message(
 def test_a_run_names_one_source_and_replay_needs_core_ml(tmp_path: Path) -> None:
     base = ["eval", "keys", "--eval-set", str(tmp_path / "e"), "--dump-dir", str(tmp_path / "d")]
     neither = CliRunner().invoke(app, base)
-    assert neither.exit_code != 0 and "exactly one of --checkpoint and --coreml" in neither.output
+    # Option names are styled where the output is coloured, so the plain words are what is held.
+    assert neither.exit_code != 0 and "name exactly one of" in neither.output
     replay = CliRunner().invoke(app, [*base, "--checkpoint", str(tmp_path / "c"), "--replay"])
-    assert replay.exit_code != 0 and "--replay" in replay.output
+    assert replay.exit_code != 0 and "replays keystrokes" in replay.output
