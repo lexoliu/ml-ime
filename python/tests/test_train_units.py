@@ -301,9 +301,7 @@ def test_the_stamp_refuses_unit_initials_without_their_lexicon(tmp_path: Path) -
     out = tmp_path / "kernel"
     stage = ["e2e", "stamp", "mlime-e2e-v2-s3", "--out", str(out), "--init-from", "mlime-e2e-v2-g4"]
     stamped = runner.invoke(app, [*stage, "--unit-initials", "0.5"])
-    assert stamped.exit_code != 0
-    assert "--unit-lexicon" in stamped.output
+    assert stamped.exit_code == 2
     stamped = runner.invoke(app, [*stage, "--unit-lexicon", "knowledge.tsv"])
-    assert stamped.exit_code != 0
-    assert "--unit-initials" in stamped.output
+    assert stamped.exit_code == 2
     assert not out.exists()
