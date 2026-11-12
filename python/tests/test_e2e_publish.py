@@ -102,6 +102,10 @@ def write_finished(working: Path, summary: dict[str, object]) -> list[str]:
         "e2e-lattice-context-on.jsonl": "{}\n",
         "e2e-lattice-context-on-report.txt": "top-1\n",
         "eval-lattice-context-on.log": "done\n",
+        # A key run's chosen-point dumps, gzipped per section by the kernel.
+        "e2e-keys-eval3-typo-context-on-selection.json": "{}\n",
+        "e2e-keys-eval3-typo-context-on-dev.jsonl.gz": "dev",
+        "e2e-keys-eval3-typo-context-on-test.jsonl.gz": "test",
     }
     if "evaluated_checkpoint" not in summary:
         outputs |= {
@@ -127,6 +131,7 @@ def test_a_finished_run_ships_its_outputs_then_their_marker_once(
     assert sorted(files[0]) == [f"{final}/{name}" for name in outputs]
     assert marker[0] == [f"{final}/complete"]
     assert bucket.files[f"{final}/run/checkpoint-final.pt"] == b"weights"
+    assert bucket.files[f"{final}/e2e-keys-eval3-typo-context-on-test.jsonl.gz"] == b"test"
     assert json.loads((working / "publish-state.json").read_text())["final_published"]
 
     again = load_publisher(monkeypatch, working, bucket)

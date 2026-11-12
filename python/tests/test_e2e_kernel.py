@@ -5,6 +5,7 @@ is imported by path; INPUTS and SEGMENT stand in for the mount layout and
 the stamp a push applies.
 """
 
+import gzip
 import importlib.util
 import json
 import os
@@ -714,29 +715,56 @@ def test_the_key_evaluation_is_an_eval_keys_command_with_or_without_test(
     evaluation = group.commands["eval"]
     assert isinstance(evaluation, TyperGroup)
     for test in (False, True):
-        argv = kernel.key_eval_argv(
-            tmp_path / "checkpoint-final.pt",
-            tmp_path / "eval3-mixed.jsonl",
-            tmp_path / "keys-eval3-mixed-context-off",
-            tmp_path / "report.txt",
-            tmp_path / "char_pinyin.tsv",
-            tmp_path / "ml-ime",
-            False,
-            test,
-        )
-        tail = argv[argv.index("keys") + 1 :]
-        assert tail[tail.index("--typo-table") + 1].endswith("crates/ime-pinyin/data/typo.json")
-        assert "--select-on-dev" in tail and "--no-context" in tail
-        assert ("--selection-only" in tail) is not test
-        betas = [float(tail[at + 1]) for at, item in enumerate(tail) if item == "--beta"]
-        assert betas == list(kernel.KEY_BETAS)
-        evaluation.commands["keys"].make_context("keys", tail)
+        for suffix, gammas in kernel.KEY_TWINS.items():
+            argv = kernel.key_eval_argv(
+                tmp_path / "checkpoint-final.pt",
+                tmp_path / f"eval3{suffix}.jsonl",
+                tmp_path / f"keys-eval3{suffix}-context-off",
+                tmp_path / "report.txt",
+                tmp_path / "char_pinyin.tsv",
+                tmp_path / "ml-ime",
+                False,
+                gammas,
+                test,
+            )
+            tail = argv[argv.index("keys") + 1 :]
+            assert tail[tail.index("--typo-table") + 1].endswith("crates/ime-pinyin/data/typo.json")
+            assert "--select-on-dev" in tail and "--no-context" in tail
+            assert ("--selection-only" in tail) is not test
+            betas = [float(tail[at + 1]) for at, item in enumerate(tail) if item == "--beta"]
+            assert betas == [1.0, 2.0, 4.0, 8.0] == list(kernel.KEY_BETAS)
+            swept = [float(tail[at + 1]) for at, item in enumerate(tail) if item == "--gamma"]
+            assert swept == list(gammas)
+            evaluation.commands["keys"].make_context("keys", tail)
+
+
+def test_only_the_typo_twin_sweeps_gamma(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    assert kernel.KEY_TWINS == {
+        "": (1.0,),
+        "-abbreviated": (1.0,),
+        "-mixed": (1.0,),
+        "-typo": (0.5, 1.0, 2.0),
+    }
+    sections = kernel.key_sections(key_assets(tmp_path))
+    assert [name for name, *_ in sections] == [
+        f"eval3{suffix}-context-{side}"
+        for suffix in ("-typo", "", "-abbreviated", "-mixed")
+        for side in ("on", "off")
+    ], "the sweeps with the most grid points are handed out first"
+    assert {name: gammas for name, _, _, gammas in sections}["eval3-typo-context-on"] == (
+        0.5,
+        1.0,
+        2.0,
+    )
+    assert all(gammas == (1.0,) for name, _, _, gammas in sections if "typo" not in name)
+    assert all(eval_set.name.startswith("eval3") for _, eval_set, _, _ in sections)
 
 
 def key_assets(tmp_path: Path) -> Path:
     assets = tmp_path / "inputs" / "assets"
     assets.mkdir(parents=True)
-    for suffix in ("", "-abbreviated", "-mixed"):
+    for suffix in ("", "-abbreviated", "-mixed", "-typo"):
         (assets / f"eval3{suffix}.jsonl").write_text("{}\n")
     return assets
 
@@ -752,6 +780,13 @@ def stub_key_runs(
         directory = Path(argv[argv.index("--dump-dir") + 1])
         directory.mkdir(parents=True, exist_ok=True)
         point = {"beta": 1.0, "gamma": 0.5, "combination": "sum"}
+        for slice_ in ("dev", "test"):
+            if slice_ == "dev" or "--selection-only" not in argv:
+                (directory / f"{slice_}-beta1-gamma0.5-sum.jsonl").write_text(
+                    f'{{"record": 1, "slice": "{slice_}"}}\n'
+                )
+        # A grid point that is not the chosen one is never published.
+        (directory / "dev-beta8-gamma0.5-sum.jsonl").write_text('{"record": 2}\n')
         (directory / "selection.json").write_text(
             json.dumps(
                 {
@@ -784,14 +819,22 @@ def test_the_key_test_slices_run_only_when_the_dev_rate_says_they_fit(
     outcome = kernel.evaluate_keys(
         "final.pt", assets, assets / "char_pinyin.tsv", tmp_path, {}, started
     )
-    # Six sections of 4000s over two GPUs need 12000s; 10000s are left.
-    assert outcome["test"] == "deferred" and "12000s" in outcome["reason"]
-    assert len(calls) == 6 and all("--selection-only" in argv for argv in calls)
+    # Eight sections of 4000s over two GPUs need 16000s; 10000s are left.
+    assert outcome["test"] == "deferred" and "16000s" in outcome["reason"]
+    assert "the 8 test sections" in outcome["reason"]
+    assert len(calls) == 8 and all("--selection-only" in argv for argv in calls)
     assert set(outcome["sections"]) == {
         f"eval3{suffix}-context-{side}"
-        for suffix in ("", "-abbreviated", "-mixed")
+        for suffix in ("", "-abbreviated", "-mixed", "-typo")
         for side in ("on", "off")
     }
+    # A deferred test publishes the selection and the dev decode at the choice only.
+    published = sorted(path.name for path in (tmp_path / "working").glob("e2e-keys-*"))
+    assert published == sorted(
+        f"e2e-keys-{name}-{part}"
+        for name in outcome["sections"]
+        for part in ("selection.json", "dev.jsonl.gz")
+    )
     section = outcome["sections"]["eval3-mixed-context-off"]
     assert section["chosen"] == {"beta": 1.0, "gamma": 0.5, "combination": "sum"}
     assert section["dev"] == {"records": 500, "top1_hits": 300, "topk_hits": 400}
@@ -800,10 +843,18 @@ def test_the_key_test_slices_run_only_when_the_dev_rate_says_they_fit(
     outcome = kernel.evaluate_keys(
         "final.pt", assets, assets / "char_pinyin.tsv", tmp_path, {}, started
     )
-    assert outcome["test"] == "decoded" and outcome["test_seconds_estimate"] == 3000.0
-    assert len(calls) == 12
-    assert sum("--selection-only" in argv for argv in calls) == 6
+    assert outcome["test"] == "decoded" and outcome["test_seconds_estimate"] == 4000.0
+    assert len(calls) == 16
+    assert sum("--selection-only" in argv for argv in calls) == 8
     assert all("test_seconds" in entry for entry in outcome["sections"].values())
+    # Each section leaves its chosen point's dev and test dumps, gzipped, and no other point's.
+    working = tmp_path / "working"
+    for name in outcome["sections"]:
+        for slice_ in ("dev", "test"):
+            with gzip.open(working / f"e2e-keys-{name}-{slice_}.jsonl.gz", "rt") as dump:
+                assert json.loads(dump.read()) == {"record": 1, "slice": slice_}
+        assert (working / f"e2e-keys-{name}-selection.json").is_file()
+    assert len(list(working.glob("e2e-keys-*"))) == 24
 
     stub_key_runs(monkeypatch, kernel, estimate=None)
     outcome = kernel.evaluate_keys(

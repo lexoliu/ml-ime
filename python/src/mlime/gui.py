@@ -53,7 +53,9 @@ def slice_indices(rows: Sequence[dict[str, Any]], slice_: str, dev_share: float)
 
     A record is development data when ``digest / u64::MAX < dev_share`` — the
     same comparison ``Slice::holds`` makes, done in f64 in all three
-    implementations so every u64 classifies identically.
+    implementations so every u64 classifies identically. A typo twin's record
+    is identified by its ``clean`` keystrokes, as ``EvalRecord::digest`` does,
+    so the twin slices exactly as its parent.
     """
     if slice_ not in ("dev", "test", "all"):
         raise ValueError(f"slice {slice_!r} is not one of 'dev', 'test', 'all'")
@@ -62,7 +64,14 @@ def slice_indices(rows: Sequence[dict[str, Any]], slice_: str, dev_share: float)
     dev = {
         index
         for index, row in enumerate(rows)
-        if float(digest(str(row["pinyin"]), str(row["text"]), row.get("context") or None)) / u64_max
+        if float(
+            digest(
+                str(row.get("clean") or row["pinyin"]),
+                str(row["text"]),
+                row.get("context") or None,
+            )
+        )
+        / u64_max
         < dev_share
     }
     if slice_ == "dev":

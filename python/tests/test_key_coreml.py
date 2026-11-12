@@ -283,7 +283,7 @@ def test_a_cached_row_is_answered_without_a_call_and_the_first_value_stays(
 def records() -> list[KeyRecord]:
     return [
         KeyRecord(record=index, keys=typed_keys(pinyin), text=text, context=context)
-        for index, (pinyin, text, context) in enumerate(eval_rows())
+        for index, (pinyin, text, context, _) in enumerate(eval_rows())
     ]
 
 

@@ -62,7 +62,7 @@ import torch
 
 from mlime.legality import KeyLattice, Legality, LegalityOptions
 from mlime.logging import log
-from mlime.train.e2e_eval import Report, SliceReports, read_eval_records
+from mlime.train.e2e_eval import EvalRow, Report, SliceReports, read_eval_records
 from mlime.train.key_model import KeyE2EModel, KeyStates
 from mlime.train.key_search import Hypothesis, LegalityVerifier, Prefix, Transition, search
 from mlime.train.keys import KeyCollator
@@ -425,11 +425,11 @@ class KeyDecoder:
         return found
 
 
-def eval_key_records(rows: Sequence[tuple[str, str, str | None]]) -> list[KeyRecord]:
-    """An eval set's ``(pinyin, text, context)`` rows as the key model reads them."""
+def eval_key_records(rows: Sequence[EvalRow]) -> list[KeyRecord]:
+    """An eval set's rows as the key model reads them."""
     return [
-        KeyRecord(record=index, keys=typed_keys(pinyin), text=text, context=context)
-        for index, (pinyin, text, context) in enumerate(rows)
+        KeyRecord(record=index, keys=typed_keys(row.pinyin), text=row.text, context=row.context)
+        for index, row in enumerate(rows)
     ]
 
 
@@ -481,7 +481,7 @@ class KeyRun:
 
     decoder: Decoding
     verifier: LegalityVerifier
-    eval_rows: Sequence[tuple[str, str, str | None]]
+    eval_rows: Sequence[EvalRow]
     dev_share: float
     records_per_chunk: int = DEFAULT_RECORDS_PER_CHUNK
     #: Decode only the first this-many records of each slice; ``None`` decodes it whole.

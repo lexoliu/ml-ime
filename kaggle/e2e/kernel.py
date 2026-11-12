@@ -50,7 +50,10 @@ from the keys by `mlime eval keys`: each twin's dev slice, context on and off,
 sweeping the search's weights and choosing per section, and the test slices
 at the choices only when the sweeps' measured rate says they fit the session
 left; otherwise the summary says so, and the kernel pushed again with this
-one's output mounted continues every section from where it stopped. A finished
+one's output mounted continues every section from where it stopped. The twins
+are eval3's three and its typo twin; each section's chosen-point dumps leave as
+gzipped `e2e-keys-<section>-{dev,test}.jsonl.gz` with its selection, which the
+Colab publisher uploads with the other final outputs. A finished
 run is told apart from the run it started from by the stage its run-config
 records.
 
@@ -69,6 +72,7 @@ stamped `ALLOW_COMMIT_CHANGE`.
 """
 
 import ctypes
+import gzip
 import json
 import os
 import shutil
@@ -276,11 +280,18 @@ TRAIN_FILL_TOWER = None
 LEARNING_RATES = None
 
 #: The twins a finished joint-stage key run (S2, #257) is decoded on, as
-#: `eval3<suffix>.jsonl` in the assets mount, and the dev sweep's grid: every
-#: beta x gamma, both combinations of a prefix's covers.
-KEY_TWINS = ("", "-abbreviated", "-mixed")
-KEY_BETAS = (0.5, 1.0, 2.0)
-KEY_GAMMAS = (0.5, 1.0, 2.0)
+#: `eval3<suffix>.jsonl` in the assets mount, each with the gammas its dev
+#: sweep tries: the correction cost's weight moves nothing on a twin whose
+#: keystrokes are clean, so those decode one, and only the typo twin sweeps it.
+#: The dev sweep's grid is every beta x the twin's gammas, both combinations of
+#: a prefix's covers.
+KEY_TWINS = {
+    "": (1.0,),
+    "-abbreviated": (1.0,),
+    "-mixed": (1.0,),
+    "-typo": (0.5, 1.0, 2.0),
+}
+KEY_BETAS = (1.0, 2.0, 4.0, 8.0)
 
 #: The segmenter binary the ranking loss pipes keystrokes through, shipped
 #: inside the package dataset.
@@ -1091,7 +1102,9 @@ def evaluate_lattices(checkpoint, assets, char_table, env):
     return evaluated
 
 
-def key_eval_argv(checkpoint, eval_set, dump_dir, report, char_table, repository, context, test):
+def key_eval_argv(
+    checkpoint, eval_set, dump_dir, report, char_table, repository, context, gammas, test
+):
     """The command that sweeps one twin's dev slice in one context setting (#257).
 
     `--select-on-dev` decodes the dev slice at every point of the grid and
@@ -1118,7 +1131,7 @@ def key_eval_argv(checkpoint, eval_set, dump_dir, report, char_table, repository
         str(data / "syllables.txt"),
         "--select-on-dev",
         *(item for beta in KEY_BETAS for item in ("--beta", str(beta))),
-        *(item for gamma in KEY_GAMMAS for item in ("--gamma", str(gamma))),
+        *(item for gamma in gammas for item in ("--gamma", str(gamma))),
         "--context" if context else "--no-context",
         "--dump-dir",
         str(dump_dir),
@@ -1132,15 +1145,20 @@ def key_eval_argv(checkpoint, eval_set, dump_dir, report, char_table, repository
 
 
 def key_sections(assets):
-    """The key evaluation's sections: each twin of `KEY_TWINS`, context on and off."""
+    """The key evaluation's sections: each twin of `KEY_TWINS`, context on and off.
+
+    A section is `(name, eval set, context, gammas)`, the sweeps with the most
+    grid points first, so that the queue of sections hands the long ones out
+    before the short.
+    """
     sections = []
-    for suffix in KEY_TWINS:
+    for suffix, gammas in sorted(KEY_TWINS.items(), key=lambda twin: -len(twin[1])):
         eval_set = assets / f"eval3{suffix}.jsonl"
         if not eval_set.is_file():
             raise FileNotFoundError(f"no eval set at {eval_set}; mounts hold {describe()}")
         for context in (True, False):
             sections.append(
-                (f"eval3{suffix}-context-{'on' if context else 'off'}", eval_set, context)
+                (f"eval3{suffix}-context-{'on' if context else 'off'}", eval_set, context, gammas)
             )
     return sections
 
@@ -1175,19 +1193,52 @@ def schedule_seconds(estimates, workers):
     return max(loads)
 
 
+def publish_key_dumps(outcome):
+    """Leave each section's chosen-point dumps in the output, gzipped, for the final upload.
+
+    Per section: `e2e-keys-<name>-selection.json` (the dev sweep's grid and
+    the choice), `e2e-keys-<name>-dev.jsonl.gz` and, once test was decoded,
+    `e2e-keys-<name>-test.jsonl.gz`: the top-k hypotheses of every record of
+    the slice at the chosen weights, with the terms of each score. The sweep's
+    other grid points stay in `keys-<name>/`, which the next kernel over the
+    same run continues from; they are not published.
+    """
+    from mlime.train.key_eval import KeyWeights, dump_path
+
+    for name, section in outcome["sections"].items():
+        directory = WORKING / f"keys-{name}"
+        chosen = section["chosen"]
+        weights = KeyWeights(chosen["beta"], chosen["gamma"], chosen["combination"] == "viterbi")
+        shutil.copyfile(directory / "selection.json", WORKING / f"e2e-keys-{name}-selection.json")
+        slices = ("dev", "test") if outcome["test"] == "decoded" else ("dev",)
+        for slice_ in slices:
+            with (
+                dump_path(directory, slice_, weights).open("rb") as source,
+                gzip.open(WORKING / f"e2e-keys-{name}-{slice_}.jsonl.gz", "wb") as sink,
+            ):
+                shutil.copyfileobj(source, sink)
+
+
 def evaluate_keys(checkpoint, assets, char_table, repository, env, started):
+    """`mlime eval keys` over the twins' sections, then the chosen points' dumps published."""
+    outcome = decode_keys(checkpoint, assets, char_table, repository, env, started)
+    publish_key_dumps(outcome)
+    return outcome
+
+
+def decode_keys(checkpoint, assets, char_table, repository, env, started):
     """`mlime eval keys` over the twins' sections, dev first, test only if it fits.
 
     Every section sweeps its own dev slice and chooses its own weights -- per
     evaluation set and context setting, as the repository's selections are
-    made. The six dev sweeps run first, one per GPU at a time; each writes the
-    test decode's estimate from its measured rate. Test then runs only if
-    those estimates, scheduled over the GPUs, fit the session left after the
-    reserve; otherwise it is left for a later kernel over the same finished
-    run, which continues every section from this one's output.
+    made. The dev sweeps run first, one per GPU at a time, the longest first;
+    each writes the test decode's estimate from its measured rate. Test then
+    runs only if those estimates, scheduled over the GPUs, fit the session left
+    after the reserve; otherwise it is left for a later kernel over the same
+    finished run, which continues every section from this one's output.
     """
     sections = key_sections(assets)
-    for name, _, _ in sections:
+    for name, _, _, _ in sections:
         seed_key_section(name)
 
     def sweep(test):
@@ -1200,7 +1251,7 @@ def evaluate_keys(checkpoint, assets, char_table, repository, env, started):
             measured = {}
             while True:
                 try:
-                    name, eval_set, context = queue.get_nowait()
+                    name, eval_set, context, gammas = queue.get_nowait()
                 except Empty:
                     return measured
                 dump_dir = WORKING / f"keys-{name}"
@@ -1215,6 +1266,7 @@ def evaluate_keys(checkpoint, assets, char_table, repository, env, started):
                         char_table,
                         repository,
                         context,
+                        gammas,
                         test,
                     ),
                     worker_env,
@@ -1235,7 +1287,7 @@ def evaluate_keys(checkpoint, assets, char_table, repository, env, started):
 
     dev = sweep(test=False)
     evaluated = {}
-    for name, _, _ in sections:
+    for name, _, _, _ in sections:
         selection = json.loads((WORKING / f"keys-{name}" / "selection.json").read_text())
         chosen = next(
             point
@@ -1265,7 +1317,7 @@ def evaluate_keys(checkpoint, assets, char_table, repository, env, started):
     if needed > left:
         outcome["test"] = "deferred"
         outcome["reason"] = (
-            f"the six test sections need about {needed:.0f}s against {left:.0f}s left; push this "
+            f"the {len(sections)} test sections need about {needed:.0f}s against {left:.0f}s left; push this "
             "kernel again with its output mounted, and it decodes test from where this one stopped"
         )
         return outcome

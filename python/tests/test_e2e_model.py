@@ -33,8 +33,10 @@ from mlime.train.charlm_vocab import BOS, SPECIALS, CharVocab
 from mlime.train.e2e import e2e, from_checkpoint, initialise
 from mlime.train.e2e_eval import (
     RANK_SCALE,
+    EvalRow,
     Observation,
     Report,
+    SliceReports,
     decode_records,
     read_eval_records,
     resume_dump,
@@ -778,6 +780,56 @@ def test_the_eval_set_parse_is_strict(tmp_path: Path) -> None:
     empty.write_text('{"pinyin": "", "text": "我"}\n', encoding="utf-8")
     with pytest.raises(ValueError, match="pinyin"):
         read_eval_records(empty)
+
+
+def test_a_typo_twin_slices_as_its_parent_does(tmp_path: Path) -> None:
+    """A twin's record is identified by its `clean` keystrokes (`EvalRecord::digest`)."""
+    clean = [
+        ("zhongguo", "中国", None),
+        ("renmin", "人民", None),
+        ("yinhang", "银行", "我要去"),
+        ("beijing", "北京", None),
+        ("tianqi", "天气", "今天的"),
+        ("wo", "我", None),
+        ("nimenhao", "你们好", "吧"),
+        ("tashiwojiejie", "她是我姐姐", None),
+    ]
+    parent = tmp_path / "eval3.jsonl"
+    parent.write_text(
+        "".join(
+            json.dumps({"pinyin": p, "text": t, "context": c}, ensure_ascii=False) + "\n"
+            for p, t, c in clean
+        ),
+        encoding="utf-8",
+    )
+    twin = tmp_path / "eval3-typo.jsonl"
+    twin.write_text(
+        "".join(
+            json.dumps(
+                {"pinyin": p[:-1] + "x", "text": t, "context": c, "clean": p}, ensure_ascii=False
+            )
+            + "\n"
+            for p, t, c in clean
+        ),
+        encoding="utf-8",
+    )
+    rows = read_eval_records(twin)
+    assert [row.clean for row in rows] == [p for p, _, _ in clean]
+    assert all(row.pinyin != row.clean for row in rows)
+    for side in ("dev", "test"):
+        assert (
+            SliceReports(rows, side, DEV_SHARE, 8).indices
+            == SliceReports(read_eval_records(parent), side, DEV_SHARE, 8).indices
+        )
+    assert SliceReports(rows, "dev", DEV_SHARE, 8).indices == [0, 6]
+    # Hashing the corrupted keystrokes instead would move records between the slices.
+    assert SliceReports(
+        [EvalRow(r.pinyin, r.text, r.context) for r in rows], "dev", DEV_SHARE, 8
+    ).indices != [0, 6]
+    blank = tmp_path / "blank.jsonl"
+    blank.write_text('{"pinyin": "wo", "text": "我", "clean": ""}\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="clean"):
+        read_eval_records(blank)
 
 
 def test_the_report_fold_rebuilds_identically() -> None:
