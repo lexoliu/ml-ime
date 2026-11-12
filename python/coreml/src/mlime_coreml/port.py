@@ -341,7 +341,7 @@ def check_padding(bundle: Bundle) -> list[Check]:
     modules: dict[tuple[Family, int], nn.Module] = {}
 
     def module_for(family: Family, length: int) -> nn.Module:
-        key = (family, length if family == "keys" else 0)
+        key = (family, 0 if family == "tree" else length)
         if key not in modules:
             modules.clear()
             modules[key] = build_module(bundle, family, length)

@@ -28,33 +28,96 @@ from mlime_coreml.bundle import Bundle, DecoderDims, KeyFrontDims, Manifest, Tow
 from mlime_coreml.spec import Family
 
 
+def unflatten(x: torch.Tensor, dim: int, sizes: tuple[int, int]) -> torch.Tensor:
+    """Split *dim* of *x* into *sizes* (one may be -1): a reshape that reads no traced shape."""
+    return cast(torch.Tensor, x.unflatten(dim, sizes))  # type: ignore[no-untyped-call]
+
+
 def split_heads(x: torch.Tensor, heads: int) -> torch.Tensor:
     """``[1, L, heads * d]`` to ``[1, heads, L, d]``."""
-    return x.view(1, x.shape[1], heads, -1).transpose(1, 2)
+    return unflatten(x, 2, (heads, -1)).transpose(1, 2)
 
 
 def merge_heads(x: torch.Tensor) -> torch.Tensor:
     """``[1, heads, L, d]`` to ``[1, L, heads * d]``."""
-    return x.transpose(1, 2).reshape(1, x.shape[2], -1)
+    return x.transpose(1, 2).flatten(2)
 
 
-def attend(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor | None
+def attend_heads(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor, scale: float
 ) -> torch.Tensor:
     """Attention spelled out: scaled scores, the additive *bias*, softmax, weighted values.
 
-    The queries are scaled before the product, not the scores after it: the same value, and the
-    product's float16 range is the smaller.
+    *q*, *k* and *v* are ``[1, heads, L, d]``. The queries are scaled by the constant *scale*
+    (``head_dim ** -0.5``, a Python float so no shape is read from the traced tensors) before the
+    product, not the scores after it: the same value, and the product's float16 range is the
+    smaller.
     """
-    scores = (q * q.shape[-1] ** -0.5) @ k.transpose(-1, -2)
-    if bias is not None:
-        scores = scores + bias
-    return cast(torch.Tensor, scores.softmax(dim=-1) @ v)
+    scores = (q * scale) @ k.transpose(-1, -2) + bias
+    return scores.softmax(dim=-1) @ v
+
+
+@dataclass(frozen=True)
+class Heads:
+    """How one attention's heads are laid out: the count, the scale and the projection groups.
+
+    The Neural Engine compiler rejects a head split of a projection 768 channels wide (measured
+    on the M1, see :data:`~mlime_coreml.spec.MAX_PROJECTION_WIDTH`), so the projections'
+    channels are cut into *groups* of at most
+    :data:`~mlime_coreml.spec.MAX_PROJECTION_WIDTH`, each attended on its own heads. The groups
+    hold disjoint heads, so the result is the same attention.
+    """
+
+    heads: int
+    groups: int
+    width: int
+    scale: float
+
+    @classmethod
+    def of(cls, hidden: int, heads: int) -> Heads:
+        """The fewest groups of whole heads that keep each group's channels within the limit."""
+        groups = next(
+            g
+            for g in range(1, heads + 1)
+            if heads % g == 0 and hidden // g <= spec.MAX_PROJECTION_WIDTH
+        )
+        return cls(heads, groups, hidden // groups, (hidden // heads) ** -0.5)
+
+    def attend(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, bias: torch.Tensor
+    ) -> torch.Tensor:
+        """Attention over the projections *q*, *k*, *v* ``[1, L, hidden]`` to ``[1, L, hidden]``."""
+        if self.groups == 1:
+            return merge_heads(
+                attend_heads(
+                    split_heads(q, self.heads),
+                    split_heads(k, self.heads),
+                    split_heads(v, self.heads),
+                    bias,
+                    self.scale,
+                )
+            )
+        per_group = self.heads // self.groups
+        outputs = []
+        for group in range(self.groups):
+            channels = slice(group * self.width, (group + 1) * self.width)
+            outputs.append(
+                merge_heads(
+                    attend_heads(
+                        split_heads(q[..., channels], per_group),
+                        split_heads(k[..., channels], per_group),
+                        split_heads(v[..., channels], per_group),
+                        bias,
+                        self.scale,
+                    )
+                )
+            )
+        return torch.cat(outputs, dim=-1)
 
 
 def padding_bias(mask: torch.Tensor) -> torch.Tensor:
     """``[1, L]`` mask (1 real, 0 padding) to the additive ``[1, 1, 1, L]`` bias."""
-    return ((1.0 - mask) * spec.NEG)[:, None, None, :]
+    return cast(torch.Tensor, ((1.0 - mask) * spec.NEG).unsqueeze(1).unsqueeze(1))
 
 
 # --- BERT towers (the context tower and the fill tower) ---------------------------------------
@@ -63,8 +126,9 @@ def padding_bias(mask: torch.Tensor) -> torch.Tensor:
 class Embeddings(nn.Module):
     """BERT's embeddings: word, position and token type 0, then LayerNorm."""
 
-    def __init__(self, dims: TowerDims):
+    def __init__(self, dims: TowerDims, length: int):
         super().__init__()
+        self.length = length
         self.word_embeddings = nn.Embedding(dims.vocabulary, dims.hidden)
         self.position_embeddings = nn.Embedding(dims.positions, dims.hidden)
         self.token_type_embeddings = nn.Embedding(2, dims.hidden)
@@ -72,10 +136,9 @@ class Embeddings(nn.Module):
 
     def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
         """``[1, L, H]`` word vectors, summed with the positions ``0..L-1`` and type 0."""
-        length = inputs_embeds.shape[1]
         summed = (
             inputs_embeds
-            + self.position_embeddings.weight[:length]
+            + self.position_embeddings.weight[: self.length]
             + self.token_type_embeddings.weight[0]
         )
         return cast(torch.Tensor, self.LayerNorm(summed))
@@ -131,7 +194,7 @@ class BertLayer(nn.Module):
 
     def __init__(self, dims: TowerDims):
         super().__init__()
-        self.heads = dims.heads
+        self.heads = Heads.of(dims.hidden, dims.heads)
         self.attention = Attention(dims)
         self.intermediate = Intermediate(dims)
         self.output = Output(dims)
@@ -139,14 +202,7 @@ class BertLayer(nn.Module):
     def forward(self, x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
         """``[1, L, H]`` and the ``[1, 1, 1, L]`` bias to ``[1, L, H]``."""
         own = self.attention.self
-        attended = merge_heads(
-            attend(
-                split_heads(own.query(x), self.heads),
-                split_heads(own.key(x), self.heads),
-                split_heads(own.value(x), self.heads),
-                bias,
-            )
-        )
+        attended = self.heads.attend(own.query(x), own.key(x), own.value(x), bias)
         x = self.attention.output.LayerNorm(self.attention.output.dense(attended) + x)
         lifted = nn.functional.gelu(self.intermediate.dense(x))
         return cast(torch.Tensor, self.output.LayerNorm(self.output.dense(lifted) + x))
@@ -175,7 +231,7 @@ class GatedContext(nn.Module):
 
     def __init__(self, hidden: int, heads: int):
         super().__init__()
-        self.heads = heads
+        self.heads = Heads.of(hidden, heads)
         self.norm = nn.LayerNorm(hidden, eps=spec.DEFAULT_LAYER_NORM_EPS)
         self.attention = ContextAttention(hidden)
         self.gate = nn.Parameter(torch.zeros(()))
@@ -190,13 +246,11 @@ class GatedContext(nn.Module):
         """
         wq, wk, wv = self.attention.in_proj_weight.chunk(3)
         bq, bk, bv = self.attention.in_proj_bias.chunk(3)
-        attended = merge_heads(
-            attend(
-                split_heads(nn.functional.linear(self.norm(x), wq, bq), self.heads),
-                split_heads(nn.functional.linear(context, wk, bk), self.heads),
-                split_heads(nn.functional.linear(context, wv, bv), self.heads),
-                bias,
-            )
+        attended = self.heads.attend(
+            nn.functional.linear(self.norm(x), wq, bq),
+            nn.functional.linear(context, wk, bk),
+            nn.functional.linear(context, wv, bv),
+            bias,
         )
         return cast(torch.Tensor, x + self.gate * present * self.attention.out_proj(attended))
 
@@ -204,9 +258,9 @@ class GatedContext(nn.Module):
 class BertTower(nn.Module):
     """Embeddings and layers: the context tower, or the fill tower (hooked at its top layers)."""
 
-    def __init__(self, dims: TowerDims):
+    def __init__(self, dims: TowerDims, length: int):
         super().__init__()
-        self.embeddings = Embeddings(dims)
+        self.embeddings = Embeddings(dims, length)
         self.encoder = Encoder(dims)
 
 
@@ -243,9 +297,9 @@ def run_tower(
 class ContextEncoder(nn.Module):
     """``ctx_L``: the context tower over ``[1, L]`` token ids, once per context text."""
 
-    def __init__(self, dims: TowerDims):
+    def __init__(self, dims: TowerDims, length: int):
         super().__init__()
-        self.context = BertTower(dims)
+        self.context = BertTower(dims, length)
 
     def forward(self, context_ids: torch.Tensor, context_mask: torch.Tensor) -> torch.Tensor:
         """``[1, L]`` ids (int32) and mask (1 real) to the ``[1, L, H]`` context rows.
@@ -265,7 +319,7 @@ class KeyBlock(nn.Module):
 
     def __init__(self, width: int, heads: int, feedforward: int):
         super().__init__()
-        self.heads = heads
+        self.heads = Heads.of(width, heads)
         self.attention_norm = nn.LayerNorm(width, eps=spec.DEFAULT_LAYER_NORM_EPS)
         self.qkv = nn.Linear(width, 3 * width)
         self.out = nn.Linear(width, width)
@@ -276,14 +330,7 @@ class KeyBlock(nn.Module):
     def forward(self, x: torch.Tensor, causal: torch.Tensor) -> torch.Tensor:
         """``[1, W, H]`` under the baked causal bias ``[W, W]``."""
         q, k, v = self.qkv(self.attention_norm(x)).chunk(3, dim=-1)
-        attended = merge_heads(
-            attend(
-                split_heads(q, self.heads),
-                split_heads(k, self.heads),
-                split_heads(v, self.heads),
-                causal,
-            )
-        )
+        attended = self.heads.attend(q, k, v, causal)
         x = x + self.out(attended)
         return cast(
             torch.Tensor, x + self.down(nn.functional.gelu(self.up(self.feedforward_norm(x))))
@@ -295,6 +342,7 @@ class KeyFront(nn.Module):
 
     def __init__(self, dims: KeyFrontDims, width: int, hidden: int, letters: int):
         super().__init__()
+        self.width = width
         self.letter_table = nn.Parameter(torch.zeros(letters, hidden))
         self.positions = nn.Embedding(dims.positions, hidden)
         self.blocks = nn.ModuleList(
@@ -307,7 +355,7 @@ class KeyFront(nn.Module):
         """``[1, W]`` letter ids to ``[1, W, H]``."""
         x = (
             nn.functional.embedding(letters, self.letter_table)
-            + self.positions.weight[: letters.shape[1]]
+            + self.positions.weight[: self.width]
         )
         for block in self.blocks:
             x = block(x, self.causal)
@@ -367,7 +415,8 @@ class KeysGraph(nn.Module):
         super().__init__()
         dims = manifest.dims
         hidden = dims.fill.hidden
-        self.fill = BertTower(dims.fill)
+        self.width = width
+        self.fill = BertTower(dims.fill, width)
         self.cross_attention = nn.ModuleList(
             GatedContext(hidden, dims.fill.heads) for _ in range(dims.gated)
         )
@@ -419,18 +468,18 @@ class KeysGraph(nn.Module):
         states = run_tower(self.fill, inputs, padding_bias(attention_mask), read)
         transformed = self.head.transform(states)
         logits = nn.functional.linear(transformed, self.logit_weight, self.logit_bias)
-        real = states[:, 1 : states.shape[1] - 1]
-        keep = at_key[:, 1 : states.shape[1] - 1]
+        real = states[:, 1 : self.width - 1]
+        keep = at_key[:, 1 : self.width - 1]
         keys = self._slots(nn.functional.linear(real, self.key_weight, self.key_bias) * keep)
         values = self._slots(nn.functional.linear(real, self.value_weight, self.value_bias) * keep)
         return logits, keys, values
 
     def _slots(self, projected: torch.Tensor) -> torch.Tensor:
         """``[1, K, layers * hidden]`` to ``[layers, heads, N_MAX, head_dim]``, zero-padded."""
-        count = projected.shape[1]
-        shaped = projected.view(count, self.layer_count * self.decoder_heads, -1).transpose(0, 1)
-        padded = nn.functional.pad(shaped, (0, 0, 0, self.slots - count))
-        return padded.view(self.layer_count, self.decoder_heads, self.slots, -1)
+        count = self.width - spec.KEY_SENTINELS
+        shaped = unflatten(projected.squeeze(0), 1, (self.layer_count * self.decoder_heads, -1))
+        padded = nn.functional.pad(shaped.transpose(0, 1), (0, 0, 0, self.slots - count))
+        return unflatten(padded, 0, (self.layer_count, self.decoder_heads))
 
 
 # --- the tree family --------------------------------------------------------------------------
@@ -441,7 +490,7 @@ class ReaderBlock(nn.Module):
 
     def __init__(self, dims: DecoderDims):
         super().__init__()
-        self.heads = dims.heads
+        self.heads = Heads.of(dims.hidden, dims.heads)
         self.norm1 = nn.LayerNorm(dims.hidden, eps=dims.layer_norm_eps)
         self.qkv = nn.Linear(dims.hidden, 3 * dims.hidden)
         self.out = nn.Linear(dims.hidden, dims.hidden)
@@ -455,14 +504,7 @@ class ReaderBlock(nn.Module):
     def forward(self, x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
         """Self-attention under the tree's additive bias ``[1, 1, S, S]``, then the feed-forward."""
         q, k, v = self.qkv(self.norm1(x)).chunk(3, dim=-1)
-        attended = merge_heads(
-            attend(
-                split_heads(q, self.heads),
-                split_heads(k, self.heads),
-                split_heads(v, self.heads),
-                bias,
-            )
-        )
+        attended = self.heads.attend(q, k, v, bias)
         x = x + self.out(attended)
         return x + cast(torch.Tensor, self.ff(self.norm2(x)))
 
@@ -485,7 +527,9 @@ class TreeCross(nn.Module):
 
     def __init__(self, dims: DecoderDims):
         super().__init__()
-        self.heads = dims.heads
+        self.heads = Heads.of(dims.hidden, dims.heads)
+        if self.heads.groups != 1:
+            raise ValueError("the tree's cross-attention reads one block of cached heads")
         self.norm = nn.LayerNorm(dims.hidden, eps=spec.DEFAULT_LAYER_NORM_EPS)
         self.query = nn.Linear(dims.hidden, dims.hidden)
         self.out = nn.Linear(dims.hidden, dims.hidden)
@@ -495,8 +539,10 @@ class TreeCross(nn.Module):
         self, x: torch.Tensor, keys: torch.Tensor, values: torch.Tensor, bias: torch.Tensor
     ) -> torch.Tensor:
         """Nodes *x* ``[1, S, hidden]`` attend into ``[heads, N, d]`` keys and values."""
-        q = split_heads(self.query(self.norm(x)), self.heads)
-        attended = merge_heads(attend(q, keys.unsqueeze(0), values.unsqueeze(0), bias))
+        q = split_heads(self.query(self.norm(x)), self.heads.heads)
+        attended = merge_heads(
+            attend_heads(q, keys.unsqueeze(0), values.unsqueeze(0), bias, self.heads.scale)
+        )
         return cast(torch.Tensor, x + self.gate * self.out(attended))
 
 
@@ -567,7 +613,7 @@ def build_module(bundle: Bundle, family: Family, length: int) -> nn.Module:
     manifest = bundle.manifest
     module: nn.Module
     if family == "context":
-        module = ContextEncoder(manifest.dims.context)
+        module = ContextEncoder(manifest.dims.context, length)
     elif family == "keys":
         if length > manifest.dims.key_front.positions:
             raise ValueError(

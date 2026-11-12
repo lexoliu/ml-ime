@@ -125,8 +125,10 @@ def placement(compiled: Path, function: str) -> Placement:
             )
         device = _device_name(usage)
         counts[device] = counts.get(device, 0) + 1
-        if operation.operator_name in spec.MAIN_OPS and device != "NeuralEngine":
-            off[operation.operator_name] = off.get(operation.operator_name, 0) + 1
+        # The plan names an op with its opset ("ios18.linear"); the allow-list does not.
+        name = operation.operator_name.rpartition(".")[2]
+        if name in spec.MAIN_OPS and device != "NeuralEngine":
+            off[name] = off.get(name, 0) + 1
     del plan
     gc.collect()
     return Placement(function, counts, off)

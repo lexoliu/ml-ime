@@ -164,6 +164,8 @@ def convert_family(
     directory = models_dir / spec.DIRECTORIES[family]
     directory.mkdir(parents=True, exist_ok=True)
     compiled = directory / f"{spec.DIRECTORIES[family]}.mlmodelc"
+    # compile_model nests its output inside a directory that exists; a rerun replaces instead.
+    shutil.rmtree(compiled, ignore_errors=True)
     ct.utils.compile_model(str(package), str(compiled))
     write_directory_manifest(bundle.manifest, family, directory)
     log.info("compiled %s", compiled)

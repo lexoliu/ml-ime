@@ -27,7 +27,10 @@ def test_a_tiny_bundle_converts_verifies_and_packages_deterministically(
     build, models = tmp_path / "build", tmp_path / "models"
     build.mkdir()
     converted = {family: convert_family(bundle, family, build, models) for family in spec.FAMILIES}
-    # A host without a Neural Engine (a hosted runner) cannot be held to the placement gate.
+    # The placement gate is off here: a host without a Neural Engine (a hosted runner) cannot be
+    # held to it, and the tiny model's ops all place on the CPU even on one that has an engine
+    # (measured on the M1: 0 of 62 to 163 ops per function). The gate runs on the real-size
+    # bundle, in `mlime-coreml convert`, where 98% of the ops place on the engine.
     report = verify(bundle, converted, build, tmp_path, require_neural_engine=False)
     assert report["passed"] and json.loads((tmp_path / "verification.json").read_text())["passed"]
     for family in spec.FAMILIES:
