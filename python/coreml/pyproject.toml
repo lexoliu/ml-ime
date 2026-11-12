@@ -1,0 +1,53 @@
+[project]
+name = "mlime-coreml"
+version = "0.1.0"
+description = "Convert a key-level model bundle to Core ML multifunction models, verify them and package them"
+requires-python = ">=3.13"
+license = "MIT OR Apache-2.0"
+# torch 2.7.0 with coremltools 9.0 is the pair repo-search's conversion ships on. It is why
+# this project is apart from ../ (mlime), whose training needs a newer torch; the bundle
+# directory is the only interchange, and nothing here imports mlime.
+dependencies = [
+    "coremltools==9.0",
+    "numpy>=2.5.4",
+    "safetensors>=0.8.0",
+    "torch==2.7.0",
+    "zstandard>=0.25.0",
+]
+
+[project.scripts]
+mlime-coreml = "mlime_coreml.cli:main"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8",
+    "pytest>=8.3",
+    "mypy>=1.14",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.8,<0.14.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF", "T20"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# A test still running after five minutes dumps every thread's stack, so a hang names
+# itself in the log instead of holding a runner until it is cancelled.
+faulthandler_timeout = 300
+markers = ["coreml: needs macOS and Core ML; skipped elsewhere"]
+
+[tool.mypy]
+strict = true
+
+# coremltools ships no type information; `convert`, `verify` and `reference` are the only
+# modules that touch it, and each annotates what it gets back.
+[[tool.mypy.overrides]]
+module = ["coremltools.*"]
+ignore_missing_imports = true

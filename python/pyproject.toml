@@ -26,13 +26,15 @@ dependencies = [
     "jinja2>=3.1.6",
     "onnx>=1.17",
     "onnxruntime==1.28.0",
+    "safetensors>=0.8.0",
+    # The Core ML key engine (`mlime eval keys --coreml`) runs on macOS only. 9.0 is the version
+    # python/coreml converts with, so the models are loaded by the runtime that wrote them. It
+    # ships native wheels up to Python 3.13 (see .python-version), none for 3.14.
+    "coremltools==9.0; sys_platform == 'darwin' and python_full_version < '3.14'",
 ]
 
 [project.scripts]
 mlime = "mlime.__main__:run"
-
-[project.optional-dependencies]
-train = ["safetensors>=0.4"]
 
 [dependency-groups]
 dev = [
@@ -75,6 +77,12 @@ strict = true
 # import them, so the untypedness stops at those adapters.
 [[tool.mypy.overrides]]
 module = ["g2pw.*", "datasets.*", "opencc.*"]
+ignore_missing_imports = true
+
+# `coremltools` ships no type information and is installed on macOS only; `mlime.train.key_coreml`
+# is the only module that imports it, and it annotates what it gets back.
+[[tool.mypy.overrides]]
+module = ["coremltools.*"]
 ignore_missing_imports = true
 
 # `transformers` and `onnxruntime` ship enough annotations to be followed and not

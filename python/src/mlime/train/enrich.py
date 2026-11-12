@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing as mp
 import os
 from collections import Counter
 from collections.abc import Iterable, Iterator, Sequence
@@ -374,7 +375,9 @@ def enrich(
     if workers is None:
         raise ValueError("the cores are not countable here; pass workers")
     scan = partial(scan_shard, matcher=matcher, emittable=emittable)
-    with ProcessPoolExecutor(max_workers=workers) as pool:
+    # Spawned, not forked: a fork of a process holding polars' thread pool can deadlock in the
+    # child, and fork is still Linux's default start method before Python 3.14.
+    with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context("spawn")) as pool:
         scanned = list(pool.map(scan, shards, chunksize=1))
     held = [match for shard in scanned for match in shard.matches]
     log.info("samples scanned", shards=len(shards), matched=len(held))

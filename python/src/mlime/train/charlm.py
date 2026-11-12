@@ -32,9 +32,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-import numpy as np
-import onnx
-import onnx.external_data_helper
 import polars as pl
 import torch
 from torch import nn
@@ -54,6 +51,12 @@ from mlime.train.charlm_model import (
 )
 from mlime.train.charlm_vocab import BOS, EOS, PAD, SEP, UNK, CharVocab
 from mlime.train.loop import Distributed, MetricLog, agreed, cosine_with_warmup, seed_everything
+from mlime.train.onnx_tools import (
+    external_tensors,
+    externalize,
+    quantize_weights_int8,
+    weights_table,
+)
 from mlime.train.run import Slices
 from mlime.train.samples import context_tail
 
@@ -568,68 +571,6 @@ def batch_axes(names: Sequence[str], axis: int = 0) -> dict[str, dict[int, str]]
     return {name: {axis: "batch"} for name in names}
 
 
-def _external_tensors(model: onnx.ModelProto) -> Iterator[onnx.TensorProto]:
-    """Every initializer of *model*, nested subgraphs included, backed by external data."""
-    graphs = [model.graph]
-    while graphs:
-        graph = graphs.pop()
-        for tensor in graph.initializer:
-            if tensor.data_location == onnx.TensorProto.EXTERNAL:
-                yield tensor
-        for node in graph.node:
-            for attribute in node.attribute:
-                if attribute.HasField("g"):
-                    graphs.append(attribute.g)
-                graphs.extend(attribute.graphs)
-
-
-def _externalize(graph: Path, location: str) -> onnx.ModelProto:
-    """Move every initializer of *graph* into the *location* file beside it.
-
-    *location* is relative to the graph's directory. Returns the saved model
-    reloaded without its external data (``load_external_data=False`` keeps the
-    ``external_data`` entries; a plain ``onnx.load`` folds the bytes back into
-    ``raw_data`` and strips them), so the callers read offsets and lengths of
-    what was written, not of the in-memory proto.
-    """
-    (graph.parent / location).unlink(missing_ok=True)  # appends otherwise
-    model = onnx.load(str(graph))
-    # The file is written back-to-back in initializer order, so a tensor's
-    # offset stays a multiple of its element size when larger elements go
-    # first -- the Rust side hands the runtime raw pointers into the mapped
-    # file, which must be aligned for their dtype.
-    initializers = sorted(
-        model.graph.initializer,
-        key=lambda tensor: -onnx.helper.tensor_dtype_to_np_dtype(tensor.data_type).itemsize,
-    )
-    model.graph.ClearField("initializer")
-    model.graph.initializer.extend(initializers)
-    onnx.external_data_helper.convert_model_to_external_data(
-        model,
-        all_tensors_to_one_file=True,
-        location=location,
-        size_threshold=0,
-        convert_attribute=False,
-    )
-    onnx.save_model(model, str(graph))
-    return onnx.load(str(graph), load_external_data=False)
-
-
-def _weights_table(model: onnx.ModelProto) -> dict[str, dict[str, Any]]:
-    """The manifest's tensor table of a saved externalized model, keyed by name."""
-    table = {}
-    for tensor in _external_tensors(model):
-        entries = {entry.key: entry.value for entry in tensor.external_data}
-        table[tensor.name] = {
-            "name": tensor.name,
-            "dtype": np.dtype(onnx.helper.tensor_dtype_to_np_dtype(tensor.data_type)).name,
-            "shape": list(tensor.dims),
-            "offset": int(entries.get("offset", "0")),
-            "length": int(entries["length"]),
-        }
-    return table
-
-
 def _external_weights(step_graph: Path, prefill_graph: Path) -> dict[str, Any]:
     """Externalize both graphs' weights and return the manifest's ``weights`` value.
 
@@ -639,10 +580,10 @@ def _external_weights(step_graph: Path, prefill_graph: Path) -> dict[str, Any]:
     differ each graph gets its own weights file and the manifest holds one
     table per graph under ``step``/``prefill``.
     """
-    step_model = _externalize(step_graph, "charlm.weights")
-    prefill_model = _externalize(prefill_graph, "prefill.weights")
-    step_table = _weights_table(step_model)
-    prefill_table = _weights_table(prefill_model)
+    step_model = externalize(step_graph, "charlm.weights")
+    prefill_model = externalize(prefill_graph, "prefill.weights")
+    step_table = weights_table(step_model)
+    prefill_table = weights_table(prefill_model)
     if set(prefill_table) != set(step_table):
         log.info("step and prefill tensors differ by name: one weights file each")
         return {
@@ -662,7 +603,7 @@ def _external_weights(step_graph: Path, prefill_graph: Path) -> dict[str, Any]:
     # name. The model is serialized directly rather than through
     # ``onnx.save_model``, which would rewrite the weights file from the
     # (unloaded) ``raw_data`` fields.
-    for tensor in _external_tensors(prefill_model):
+    for tensor in external_tensors(prefill_model):
         entry = step_table[tensor.name]
         for pair in tensor.external_data:
             if pair.key == "location":
@@ -675,75 +616,6 @@ def _external_weights(step_graph: Path, prefill_graph: Path) -> dict[str, Any]:
     (dir / "prefill.weights").unlink()
     log.info("step and prefill share charlm.weights", tensors=len(step_table))
     return {"file": "charlm.weights", "tensors": list(step_table.values())}
-
-
-def _quantize_weights_int8(graph: Path) -> None:
-    """Rewrite *graph* in place keeping only the MatMul weights int8.
-
-    Each weight folds into a per-output-channel int8 constant plus a
-    ``DequantizeLinear`` that rebuilds it float32 ahead of the matmul, so
-    activations stay float32 end to end and no row's value depends on its
-    batchmates. Full int8 range applies: nothing here reaches a u8 x s8
-    kernel, so the seven-bit guard of the dynamic path is unneeded.
-    """
-    model = onnx.load(str(graph))
-    initializers = {tensor.name: tensor for tensor in model.graph.initializer}
-    added: list[onnx.TensorProto] = []
-    dropped: set[str] = set()
-    dequantized: dict[str, str] = {}  # weight name -> dequantized tensor name
-    nodes: list[onnx.NodeProto] = []
-    for node in model.graph.node:
-        weight_input = -1
-        if node.op_type == "MatMul":
-            for index in (0, 1):
-                if node.input[index] in initializers:
-                    weight_input = index
-                    break
-        if weight_input >= 0:
-            wname = node.input[weight_input]
-            if wname not in dequantized:
-                weight = onnx.numpy_helper.to_array(initializers[wname]).astype(np.float32)
-                # Channels are the matmul's output features: the last axis of
-                # a [K, N] weight, or the first of [N, K].
-                axis = weight.ndim - 1 if weight_input == 1 else 0
-                bound = np.abs(weight).max(axis=axis ^ 1)
-                scale = (bound / 127.0).astype(np.float32)
-                scale[scale == 0.0] = 1.0
-                shape = [1] * weight.ndim
-                shape[axis] = weight.shape[axis]
-                quantized_weight = np.clip(
-                    np.round(weight / scale.reshape(shape)), -127, 127
-                ).astype(np.int8)
-                added += [
-                    onnx.numpy_helper.from_array(quantized_weight, f"{wname}_int8"),
-                    onnx.numpy_helper.from_array(scale, f"{wname}_scale"),
-                ]
-                dequantized[wname] = f"{wname}_dequantized"
-                dropped.add(wname)
-                nodes.append(
-                    onnx.helper.make_node(
-                        "DequantizeLinear",
-                        [f"{wname}_int8", f"{wname}_scale"],
-                        [dequantized[wname]],
-                        axis=axis,
-                    )
-                )
-            inputs = list(node.input)
-            inputs[weight_input] = dequantized[wname]
-            nodes.append(onnx.helper.make_node("MatMul", inputs, list(node.output), name=node.name))
-        else:
-            nodes.append(node)
-    model.graph.ClearField("node")
-    model.graph.node.extend(nodes)
-    kept = {name for node in model.graph.node for name in node.input if name in initializers}
-    model.graph.ClearField("initializer")
-    model.graph.initializer.extend(
-        tensor for name, tensor in initializers.items() if name not in dropped or name in kept
-    )
-    model.graph.initializer.extend(added)
-    rewritten = graph.with_suffix(".rewritten.onnx")
-    onnx.save_model(model, str(rewritten))
-    rewritten.replace(graph)
 
 
 def export_onnx(
@@ -957,8 +829,8 @@ def export_onnx(
         dynamo=False,
     )
     if quantize == "int8":
-        _quantize_weights_int8(step_graph)
-        _quantize_weights_int8(prefill_graph)
+        quantize_weights_int8(step_graph)
+        quantize_weights_int8(prefill_graph)
     weights = _external_weights(step_graph, prefill_graph)
     manifest = out_dir / "charlm.json"
     manifest.write_text(

@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
@@ -198,6 +199,22 @@ def gen_pinyin_tables(
     from mlime.data.pinyin_tables import build
 
     build(out_dir)
+
+
+@app.command("gen-key-tree-fixture")
+def gen_key_tree_fixture(
+    out: Path = typer.Option(
+        Path("crates/ime-neural/tests/fixtures/key-tree.json"), help="The fixture file to write"
+    ),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Regenerate the tree-packing fixture the Rust session reproduces."""
+    configure(verbose)
+    from mlime.logging import log
+    from mlime.train.key_tree import write_tree_fixture
+
+    calls = write_tree_fixture(out)
+    log.info("key_tree_fixture.written", path=str(out), calls=calls)
 
 
 @app.command("gen-key-search-fixture")
@@ -1421,6 +1438,48 @@ def export_route_a(
     typer.echo(f"{graph}\n{manifest}")
 
 
+@export_app.command("keys")
+def export_keys(
+    checkpoint: Path = typer.Argument(..., help="A joint-stage key-level checkpoint (S2, #257)"),
+    out: Path = typer.Option(
+        ...,
+        "--out",
+        help="Where weights.safetensors, key-model.json, tokenizer.json and reference.npz go",
+    ),
+    char_table: Path = CHAR_TABLE,
+    verbose: bool = VERBOSE,
+) -> None:
+    """Write the key-level model's bundle for the Core ML conversion to read."""
+    configure(verbose)
+    import torch
+
+    from mlime.data.corpus import default_char_table
+    from mlime.train.e2e import load_key_model, recorded_config
+    from mlime.train.key_bundle import write_key_bundle
+    from mlime.train.run import Vocabularies
+
+    table = char_table or default_char_table()
+    if table is None:
+        raise typer.BadParameter("no char_pinyin.tsv found above the working directory")
+    recorded = recorded_config(checkpoint)
+    if recorded.context is not None:
+        raise typer.BadParameter(
+            f"{checkpoint} reads context through a Qwen tower; the key bundle is MacBERT's "
+            "context tower only"
+        )
+    vocabularies = Vocabularies.load(table, recorded.base_model, None)
+    model, step = load_key_model(checkpoint, vocabularies.lexicon, torch.device("cpu"))
+    manifest = write_key_bundle(
+        model,
+        step,
+        vocabularies.lexicon,
+        vocabularies.legality(),
+        vocabularies.tokenizer,
+        out,
+    )
+    typer.echo(str(manifest))
+
+
 @e2e_app.command("stamp")
 def e2e_stamp(
     run: str = typer.Argument(..., help="The run's name, such as mlime-e2e-v2-a100"),
@@ -1868,7 +1927,21 @@ def eval_e2e(
 
 @eval_app.command("keys")
 def eval_keys(
-    checkpoint: Path = typer.Option(..., help="A joint-stage key-level checkpoint (S2, #257)"),
+    checkpoint: Path = typer.Option(
+        None, help="A joint-stage key-level checkpoint (S2, #257), decoded by PyTorch"
+    ),
+    coreml: Path = typer.Option(
+        None,
+        "--coreml",
+        help="The converted Core ML model instead of a checkpoint (macOS): the directory "
+        "`mlime-coreml convert` leaves, with key-model.json beside the models (#266)",
+    ),
+    replay: bool = typer.Option(
+        False,
+        "--replay",
+        help="With --coreml, decode each record as its key prefixes typed in order, each "
+        "keystroke speculating on the last one's queries; the last keystroke is the result",
+    ),
     eval_set: Path = typer.Option(..., help="The eval set: each record's pinyin is its keys"),
     char_table: Path = CHAR_TABLE,
     typo_table: Path = typer.Option(
@@ -1905,6 +1978,9 @@ def eval_keys(
     top_k: int = typer.Option(8, help="Hypotheses kept per record"),
     context: bool = typer.Option(True, help="Let the model read each record's context"),
     token_budget: int = typer.Option(8192, help="Padded positions per encoder forward"),
+    records: int = typer.Option(
+        None, help="Decode only the first N records of each slice; the whole slice when omitted"
+    ),
     dump_dir: Path = typer.Option(
         ...,
         help="Where each slice and weight point's dump goes, and the selection; "
@@ -1929,6 +2005,18 @@ def eval_keys(
     from mlime.train.key_eval import load_key_run, report_keys, weight_grid
     from mlime.typo import SYLLABLES_RELATIVE, default_typo_table
 
+    if records is not None and records < 1:
+        raise typer.BadParameter("--records must be positive")
+    if (checkpoint is None) == (coreml is None):
+        raise typer.BadParameter("name exactly one of --checkpoint and --coreml")
+    if replay and coreml is None:
+        raise typer.BadParameter("--replay replays keystrokes through the Core ML model")
+    if coreml is not None and sys.platform != "darwin":
+        raise typer.BadParameter(
+            f"--coreml runs the converted model through Core ML, which needs macOS, not "
+            f"{sys.platform}"
+        )
+
     table = char_table or default_char_table()
     if table is None:
         raise typer.BadParameter("no char_pinyin.tsv found above the working directory")
@@ -1948,19 +2036,49 @@ def eval_keys(
     grid = weight_grid(beta, gamma, combinations)
     if not select_on_dev and len(grid) != 1:
         raise typer.BadParameter("a fixed --slice decodes one --beta and one --gamma")
-    run, step = load_key_run(
-        checkpoint,
-        eval_set,
-        char_table=table,
-        typo_table=typo,
-        syllables=inventory,
-        with_context=context,
-        token_budget=token_budget,
-        dev_share=dev_share,
-        beam=beam,
-        top_k=top_k,
-        records_per_chunk=records_per_chunk,
-    )
+    statistics = None
+    if coreml is not None:
+        try:
+            from mlime.train.key_coreml import load_coreml_key_run
+        except ModuleNotFoundError as error:
+            raise typer.BadParameter(
+                f"--coreml needs coremltools ({error}), which is installed on macOS under "
+                "Python 3.12 and 3.13"
+            ) from error
+
+        run, coreml_decoder, step = load_coreml_key_run(
+            coreml,
+            eval_set,
+            char_table=table,
+            typo_table=typo,
+            syllables=inventory,
+            with_context=context,
+            dev_share=dev_share,
+            replay=replay,
+            beam=beam,
+            top_k=top_k,
+            records_per_chunk=records_per_chunk,
+            limit=records,
+        )
+        statistics = coreml_decoder.statistics
+        source = f"core ml: {coreml}{' (replayed keystrokes)' if replay else ''}"
+    else:
+        assert checkpoint is not None
+        run, step = load_key_run(
+            checkpoint,
+            eval_set,
+            char_table=table,
+            typo_table=typo,
+            syllables=inventory,
+            with_context=context,
+            token_budget=token_budget,
+            dev_share=dev_share,
+            beam=beam,
+            top_k=top_k,
+            records_per_chunk=records_per_chunk,
+            limit=records,
+        )
+        source = f"checkpoint: {checkpoint}"
     report = report_keys(
         run,
         dump_dir,
@@ -1971,8 +2089,10 @@ def eval_keys(
         if ambiguity is None
         else lambda dump, name: ambiguity_report(ambiguity, eval_set, dump, name, dev_share),
     )
-    heading = f"checkpoint: {checkpoint} (step {step}), context {'on' if context else 'off'}"
+    heading = f"{source} (step {step}), context {'on' if context else 'off'}"
     rendered = f"{heading}\n\n{report}"
+    if statistics is not None:
+        rendered += f"\n\n{statistics.render()}"
     typer.echo(rendered)
     if out is not None:
         out.write_text(rendered + "\n", encoding="utf-8")

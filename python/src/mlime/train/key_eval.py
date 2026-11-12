@@ -55,19 +55,27 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import asdict, dataclass, field
 from itertools import batched
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import torch
 
-from mlime.legality import Legality, LegalityOptions
+from mlime.legality import KeyLattice, Legality, LegalityOptions
 from mlime.logging import log
 from mlime.train.e2e_eval import Report, SliceReports, read_eval_records
 from mlime.train.key_model import KeyE2EModel, KeyStates
-from mlime.train.key_search import Hypothesis, LegalityVerifier, Prefix, search
+from mlime.train.key_search import Hypothesis, LegalityVerifier, Prefix, Transition, search
 from mlime.train.keys import KeyCollator
 from mlime.train.lexicon import CandidateSpace, Lexicon
-from mlime.train.samples import DEFAULT_CONTEXT_TOKENS, BudgetPacker, Collator, context_width
+from mlime.train.samples import (
+    DEFAULT_CONTEXT_TOKENS,
+    BaseTokenizer,
+    BudgetPacker,
+    Collator,
+    ContextTokenizer,
+    context_width,
+)
+from mlime.train.spans import SpanVocab
 
 #: The search's width and the report's depth: the product's shape, eight beams
 #: a step (AGENTS.md), and fused-eval's top-8.
@@ -225,6 +233,116 @@ class ModelTransition:
         return rows
 
 
+def search_points(
+    lattices: Sequence[KeyLattice],
+    log_probs: torch.Tensor,
+    transition: Transition,
+    grid: Sequence[KeyWeights],
+    *,
+    beam: int,
+    top_k: int,
+    times: DecodeTimes,
+) -> list[list[list[Hypothesis]]]:
+    """The search at every grid point over one group's encoding: ``[point][record]``.
+
+    Neither the lattices nor the emissions depend on the weights, so a group's
+    encoding serves every point; which hypotheses a beam keeps does, so each
+    point runs its own search. The transition's time is whatever the
+    transition added to ``times.transition`` during the call, and is taken out
+    of the search's.
+    """
+    found = []
+    for weights in grid:
+        queried = times.transition
+        began = time.perf_counter()
+        found.append(
+            search(
+                lattices,
+                log_probs,
+                transition,
+                beta=weights.beta,
+                gamma=weights.gamma,
+                beam=beam,
+                top_k=top_k,
+                viterbi=weights.viterbi,
+            )
+        )
+        spent = time.perf_counter() - began
+        times.search += spent - (times.transition - queried)
+    return found
+
+
+class Decoding(Protocol):
+    """What a :class:`KeyRun` asks of a decoder: the PyTorch model's, or an export's."""
+
+    @property
+    def lexicon(self) -> Lexicon:
+        """The emittable set the hypotheses' indices name."""
+        ...
+
+    @property
+    def options(self) -> LegalityOptions:
+        """The automaton's options the lattices were built under."""
+        ...
+
+    @property
+    def top_k(self) -> int:
+        """Hypotheses kept per record."""
+        ...
+
+    @property
+    def times(self) -> DecodeTimes:
+        """Where the wall time goes."""
+        ...
+
+    def decode(
+        self, records: Sequence[KeyRecord], grid: Sequence[KeyWeights]
+    ) -> list[list[list[Hypothesis]]]:
+        """Each grid point's hypotheses for each record, best first: ``[point][record]``."""
+        ...
+
+
+def build_key_collator(
+    spans: SpanVocab,
+    lexicon: Lexicon,
+    tokenizer: BaseTokenizer,
+    context_tokenizer: ContextTokenizer,
+    *,
+    with_context: bool,
+    max_context_tokens: int,
+) -> KeyCollator:
+    """The collator a decode of typed records reads its keys and contexts through.
+
+    *with_context* off drops every context, as a context dropout of 1 does in
+    training.
+    """
+    return KeyCollator(
+        Collator(
+            tokenizer,
+            context_tokenizer,
+            CandidateSpace(spans, lexicon.candidate_mask),
+            context_dropout=0.0 if with_context else 1.0,
+            max_context_tokens=max_context_tokens,
+        )
+    )
+
+
+def check_automaton(legality: Legality, lexicon: Lexicon, options: LegalityOptions) -> None:
+    """Refuse an automaton a decode of complete records cannot use.
+
+    Its arcs must name the head's rows, so it emits over the lexicon's set in
+    the lexicon's order, and an evaluation record is complete input, so its
+    tail rule is off.
+    """
+    if legality.characters != lexicon.characters:
+        raise ValueError(
+            "the legality automaton emits over a different set than the model's lexicon; "
+            "its arcs would not name the head's rows"
+        )
+    if options.unfinished_tail:
+        raise ValueError("an evaluation record is complete input; the tail rule is off")
+
+
 @dataclass(frozen=True)
 class KeyDecoder:
     """Everything a constrained decode of typed records needs, fixed for a run."""
@@ -246,13 +364,7 @@ class KeyDecoder:
             raise ValueError(
                 f"the model emits {emittable} characters against the lexicon's {self.lexicon.size}"
             )
-        if self.legality.characters != self.lexicon.characters:
-            raise ValueError(
-                "the legality automaton emits over a different set than the model's lexicon; "
-                "its arcs would not name the head's rows"
-            )
-        if self.options.unfinished_tail:
-            raise ValueError("an evaluation record is complete input; the tail rule is off")
+        check_automaton(self.legality, self.lexicon, self.options)
 
     def groups(self, records: Sequence[KeyRecord]) -> Iterator[list[KeyRecord]]:
         """*records* in order, grouped under the token budget as training groups examples."""
@@ -296,23 +408,18 @@ class KeyDecoder:
             self.times.lattice += encoding - started
             self.times.encode += searching - encoding
             transition = ModelTransition(self.model, states, self.times)
-            for point, weights in enumerate(grid):
-                queried = self.times.transition
-                began = time.perf_counter()
-                found[point].extend(
-                    search(
-                        lattices,
-                        log_probs,
-                        transition,
-                        beta=weights.beta,
-                        gamma=weights.gamma,
-                        beam=self.beam,
-                        top_k=self.top_k,
-                        viterbi=weights.viterbi,
-                    )
+            for point, hypotheses in enumerate(
+                search_points(
+                    lattices,
+                    log_probs,
+                    transition,
+                    grid,
+                    beam=self.beam,
+                    top_k=self.top_k,
+                    times=self.times,
                 )
-                spent = time.perf_counter() - began
-                self.times.search += spent - (self.times.transition - queried)
+            ):
+                found[point].extend(hypotheses)
             self.times.records += len(group)
             self.times.searches += len(group) * len(grid)
         return found
@@ -372,11 +479,18 @@ def checked_row(
 class KeyRun:
     """One evaluation set under one context setting: what every decode of it shares."""
 
-    decoder: KeyDecoder
+    decoder: Decoding
     verifier: LegalityVerifier
     eval_rows: Sequence[tuple[str, str, str | None]]
     dev_share: float
     records_per_chunk: int = DEFAULT_RECORDS_PER_CHUNK
+    #: Decode only the first this-many records of each slice; ``None`` decodes it whole.
+    limit: int | None = None
+
+    def indices(self, slice_: str) -> list[int]:
+        """The eval-set indices *slice_* decodes, in file order, cut to :attr:`limit`."""
+        held = SliceReports(self.eval_rows, slice_, self.dev_share, self.decoder.top_k).indices
+        return list(held if self.limit is None else held[: self.limit])
 
     def evaluate(
         self, slice_: str, grid: Sequence[KeyWeights], dumps: Sequence[Path]
@@ -397,7 +511,9 @@ class KeyRun:
         sliced = [SliceReports(self.eval_rows, slice_, self.dev_share, decoder.top_k) for _ in grid]
         done = [reports.resume(dump) for reports, dump in zip(sliced, dumps, strict=True)]
         pending = [
-            records[index] for index in sliced[0].indices if any(index not in held for held in done)
+            records[index]
+            for index in self.indices(slice_)
+            if any(index not in held for held in done)
         ]
         decoded = 0
         started = time.monotonic()
@@ -525,8 +641,8 @@ def select_on_dev(run: KeyRun, grid: Sequence[KeyWeights], directory: Path) -> S
         (weights, dict(section)["dev"]) for weights, section in zip(grid, sections, strict=True)
     )
     chosen = choose(reports)
-    dev = len(SliceReports(run.eval_rows, "dev", run.dev_share, 1).indices)
-    test = len(SliceReports(run.eval_rows, "test", run.dev_share, 1).indices)
+    dev = len(run.indices("dev"))
+    test = len(run.indices("test"))
     estimate: float | None = None
     if measured.records:
         estimate = test * measured.per_record(1)
@@ -574,6 +690,7 @@ def load_key_run(
     top_k: int = DEFAULT_TOP_K,
     records_per_chunk: int = DEFAULT_RECORDS_PER_CHUNK,
     max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
+    limit: int | None = None,
 ) -> tuple[KeyRun, int]:
     """Everything an evaluation of *checkpoint* on *eval_set* needs, and the checkpoint's step.
 
@@ -591,14 +708,13 @@ def load_key_run(
     vocabularies = Vocabularies.load(char_table, recorded.base_model, recorded.context)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model, step = load_key_model(checkpoint, vocabularies.lexicon, device)
-    collator = KeyCollator(
-        Collator(
-            vocabularies.tokenizer,
-            vocabularies.context_tokenizer,
-            CandidateSpace(vocabularies.spans, vocabularies.lexicon.candidate_mask),
-            context_dropout=0.0 if with_context else 1.0,
-            max_context_tokens=max_context_tokens,
-        )
+    collator = build_key_collator(
+        vocabularies.spans,
+        vocabularies.lexicon,
+        vocabularies.tokenizer,
+        vocabularies.context_tokenizer,
+        with_context=with_context,
+        max_context_tokens=max_context_tokens,
     )
     decoder = KeyDecoder(
         model=model,
@@ -611,17 +727,41 @@ def load_key_run(
         beam=beam,
         top_k=top_k,
     )
-    verifier = LegalityVerifier.load(
-        char_table=char_table, typo_table=typo_table, syllables=syllables
+    run = build_key_run(
+        decoder,
+        eval_set,
+        char_table=char_table,
+        typo_table=typo_table,
+        syllables=syllables,
+        dev_share=dev_share,
+        records_per_chunk=records_per_chunk,
+        limit=limit,
     )
-    run = KeyRun(
+    return run, step
+
+
+def build_key_run(
+    decoder: Decoding,
+    eval_set: Path,
+    *,
+    char_table: Path,
+    typo_table: Path,
+    syllables: Path,
+    dev_share: float,
+    records_per_chunk: int = DEFAULT_RECORDS_PER_CHUNK,
+    limit: int | None = None,
+) -> KeyRun:
+    """*decoder* over *eval_set*, its hypotheses checked by the verifier over the tables."""
+    return KeyRun(
         decoder=decoder,
-        verifier=verifier,
+        verifier=LegalityVerifier.load(
+            char_table=char_table, typo_table=typo_table, syllables=syllables
+        ),
         eval_rows=read_eval_records(eval_set),
         dev_share=dev_share,
         records_per_chunk=records_per_chunk,
+        limit=limit,
     )
-    return run, step
 
 
 Ambiguity = Callable[[Path, str], str]

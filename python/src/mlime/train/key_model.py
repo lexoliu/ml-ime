@@ -71,6 +71,7 @@ log-probabilities and no per-step legal set is built on the host.
 from __future__ import annotations
 
 import copy
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -81,10 +82,12 @@ from torch import nn
 from transformers import BertConfig, BertForMaskedLM, BertModel
 
 from mlime.logging import log
-from mlime.train.charlm_model import TransformerCharLm
+from mlime.train.charlm_model import Block, TransformerCharLm
 from mlime.train.charlm_vocab import BOS
 from mlime.train.ctc import alignment_components, alignment_scores, constrained_ctc
-from mlime.train.e2e_model import E2EConfig, E2EModel, context_tower
+from mlime.train.e2e_model import E2EConfig, E2EModel, EncoderAttention, context_tower
+from mlime.train.key_manifest import N_MAX, NEG
+from mlime.train.key_tree import TreeCall
 from mlime.train.keys import (
     KeyBatch,
     KeyCollator,
@@ -140,6 +143,68 @@ class KeyStates:
 
     states: torch.Tensor
     mask: torch.Tensor
+
+
+@dataclass(frozen=True)
+class CrossMemory:
+    """One record's key states as the decoder's cross-attention reads them, at a fixed length.
+
+    ``keys`` and ``values`` are ``[layers, heads, N, head_dim]``: key ``j``'s
+    projection at slot ``j``, zeros after the real keys. ``bias``
+    ``[1, 1, 1, N]`` is additive: 0 at a real key, :data:`~mlime.train.key_manifest.NEG`
+    at a padded slot.
+    """
+
+    keys: torch.Tensor
+    values: torch.Tensor
+    bias: torch.Tensor
+
+
+@dataclass(frozen=True)
+class TreeFeeds:
+    """A tree call's node inputs: ``[1, S]`` reader ids and depths, and ``[1, 1, S, S]`` bias.
+
+    ``tree_bias`` is additive: 0 where the column is an ancestor of the row or
+    the row itself, :data:`~mlime.train.key_manifest.NEG` elsewhere.
+    """
+
+    reader_ids: torch.Tensor
+    positions: torch.Tensor
+    tree_bias: torch.Tensor
+
+
+def _tree_attention(block: Block, x: torch.Tensor, bias: torch.Tensor) -> torch.Tensor:
+    """One decoder block's self-attention under an additive *bias* ``[1, 1, S, S]``.
+
+    The arithmetic of :meth:`~mlime.train.charlm_model.Block.forward` with
+    the mask a tree needs, attention written out as a matrix product, an
+    additive mask, a softmax and a matrix product so the same module converts
+    for the Neural Engine, which has no fused attention.
+    """
+    q, k, v = block.split(x)
+    scores = (q @ k.transpose(-1, -2)) / math.sqrt(block.head_dim) + bias
+    return block.merge(x, scores.softmax(dim=-1) @ v)
+
+
+def _cross_attention(
+    cross: EncoderAttention,
+    x: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    bias: torch.Tensor,
+) -> torch.Tensor:
+    """One gated cross-attention of nodes *x* ``[1, S, hidden]`` into a layer's key states.
+
+    *keys* and *values* ``[heads, N, head_dim]`` are the layer's slice of a
+    :class:`CrossMemory`, *bias* its additive ``[1, 1, 1, N]``. Spelled out as
+    :func:`_tree_attention` is.
+    """
+    length = x.shape[1]
+    q = cross.query(cross.norm(x)).view(1, length, cross.heads, cross.head_dim).transpose(1, 2)
+    scores = (q @ keys.transpose(-1, -2)) / math.sqrt(cross.head_dim) + bias
+    attended = (scores.softmax(dim=-1) @ values).transpose(1, 2).reshape(x.shape)
+    result: torch.Tensor = x + cross.gate * cross.out(attended)
+    return result
 
 
 @dataclass(frozen=True)
@@ -523,11 +588,17 @@ class KeyE2EModel(E2EModel):
             spans.has_context,
         )
 
+    def ctc_logits(self, states: torch.Tensor) -> torch.Tensor:
+        """``[..., H]`` key states to ``[..., E + 1]`` logits, the blank last."""
+        transformed = self.head.transform(states)
+        logits: torch.Tensor = torch.cat(
+            [self.head.decoder(transformed), self.blank(transformed)], dim=-1
+        )
+        return logits
+
     def ctc_log_probs(self, states: torch.Tensor) -> torch.Tensor:
         """``[K, H]`` key states to ``[K, E + 1]`` log-probabilities, the blank last, in float32."""
-        transformed = self.head.transform(states)
-        logits = torch.cat([self.head.decoder(transformed), self.blank(transformed)], dim=-1)
-        return logits.float().log_softmax(dim=-1)
+        return self.ctc_logits(states).float().log_softmax(dim=-1)
 
     def at_span_ends(self, batch: KeyBatch, ends: torch.Tensor) -> torch.Tensor:
         """The ``[P, H]`` span-end states in the span batch's columns, ``[B, W, H]``.
@@ -732,6 +803,98 @@ class KeyE2EModel(E2EModel):
         at = torch.arange(tokens.shape[0], device=tokens.device) * steps + lengths
         last = features.reshape(-1, features.shape[-1]).index_select(0, at)
         return decoder.emission_logits(last).float().log_softmax(dim=-1)
+
+    def cross_memory(self, keys: KeyStates, row: int = 0, length: int = N_MAX) -> CrossMemory:
+        """Record *row*'s key states as the decoder's cross keys and values, padded to *length*.
+
+        The projections are what the tree recompute reads at every call, made
+        once per keystroke: :meth:`~mlime.train.e2e_model.EncoderAttention.kv`
+        of each gated block over the row's real keys.
+        """
+        real = int(keys.mask[row].sum())
+        if real == 0 or not bool(keys.mask[row, :real].all()):
+            raise ValueError(f"record {row}'s real keys are not a non-empty prefix of its row")
+        if real > length:
+            raise ValueError(f"{real} keys do not fit a cross length of {length}")
+        states = keys.states[row : row + 1, :real]
+        projected = [cross.kv(states) for cross in self.decoder.gated_layers()]
+        heads, head_dim = int(projected[0][0].shape[1]), int(projected[0][0].shape[3])
+        shape = (len(projected), heads, length, head_dim)
+        key_slots = states.new_zeros(shape)
+        value_slots = states.new_zeros(shape)
+        for layer, (layer_keys, layer_values) in enumerate(projected):
+            key_slots[layer, :, :real] = layer_keys[0]
+            value_slots[layer, :, :real] = layer_values[0]
+        bias = states.new_full((1, 1, 1, length), NEG)
+        bias[..., :real] = 0.0
+        return CrossMemory(keys=key_slots, values=value_slots, bias=bias)
+
+    def tree_feeds(self, call: TreeCall) -> TreeFeeds:
+        """A packed call's inputs: reader ids, depths and the additive tree bias.
+
+        A node's token is its prefix's last character mapped to the reader's
+        id, ``<bos>`` for the root; a padding row is ``<bos>`` at depth 0 and
+        sees only itself.
+        """
+        size = call.bucket
+        device = self.decoder.emit_ids.device
+        reader_ids = torch.full((1, size), BOS, dtype=torch.long, device=device)
+        positions = torch.zeros((1, size), dtype=torch.long, device=device)
+        for row, node in enumerate(call.nodes):
+            if node:
+                reader_ids[0, row] = self.decoder.emit_ids[node[-1]]
+            positions[0, row] = len(node)
+        bias = torch.full((1, 1, size, size), NEG, device=device)
+        for row in range(size):
+            bias[0, 0, row, list(call.visible(row))] = 0.0
+        return TreeFeeds(reader_ids=reader_ids, positions=positions, tree_bias=bias)
+
+    def tree_logits(
+        self,
+        reader_ids: torch.Tensor,
+        positions: torch.Tensor,
+        tree_bias: torch.Tensor,
+        cross: CrossMemory,
+    ) -> torch.Tensor:
+        """Every node's next-character logits over a packed prefix tree, ``[1, S, E]``.
+
+        ``reader_ids [1, S]`` is each node's last token as a reader id and
+        ``positions [1, S]`` its depth; ``tree_bias [1, 1, S, S]`` is additive,
+        0 where the column is an ancestor of the row or the row itself and
+        :data:`~mlime.train.key_manifest.NEG` elsewhere; *cross* is the
+        record's key states. Row ``i`` is what :meth:`transition_logits` gives
+        after the prefix ending at node ``i``: a node attending to exactly its
+        ancestors at their depths is causal attention over its prefix. A
+        padding row that sees only itself changes no other row. Attention is
+        a matrix product, an additive mask, a softmax and a matrix product,
+        and no row is fully masked, so the module converts for the Neural
+        Engine as written. Call under ``eval()`` and ``torch.no_grad()``.
+        """
+        decoder = self.decoder
+        reader = decoder.reader
+        x = reader.dropout(reader.input(reader.embed(reader_ids)) + reader.positions(positions))
+        for layer, (block, gate) in enumerate(
+            zip(reader.layers(), decoder.gated_layers(), strict=True)
+        ):
+            x = _tree_attention(block, x, tree_bias)
+            x = _cross_attention(
+                gate,
+                x,
+                cross.keys[layer].unsqueeze(0),
+                cross.values[layer].unsqueeze(0),
+                cross.bias,
+            )
+        return decoder.emission_logits(reader.norm(x))
+
+    def tree_log_probs(
+        self,
+        reader_ids: torch.Tensor,
+        positions: torch.Tensor,
+        tree_bias: torch.Tensor,
+        cross: CrossMemory,
+    ) -> torch.Tensor:
+        """:meth:`tree_logits` log-softmaxed over the emittable set in float32, ``[1, S, E]``."""
+        return self.tree_logits(reader_ids, positions, tree_bias, cross).float().log_softmax(-1)
 
     def student_frame(self, batch: KeyBatch) -> torch.Tensor:
         """The parent's decoder frame fed the key front's states at the span ends.
