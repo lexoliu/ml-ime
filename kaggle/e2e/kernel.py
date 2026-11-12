@@ -19,7 +19,9 @@ assets mount with `mlime eval e2e`, context on and off, one evaluation per GPU
 at a time, and writes each record's hypotheses and the report alongside the
 checkpoint. A segment that mounts a run whose training already finished --
 `run/checkpoint-final.pt` in its output, the evaluation having stopped before
-its report -- evaluates that checkpoint and trains nothing.
+its report -- evaluates that checkpoint and trains nothing. It reads nothing of
+the mounted run's summary, so an earlier evaluation never stands in for this
+one; on Colab the stager mounts a finished run's own final for it.
 
 A stage is the same chain with `INIT_FROM` stamped: the first segment starts
 from the finished run mounted under that name -- v1's dataset
