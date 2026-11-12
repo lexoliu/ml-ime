@@ -26,13 +26,11 @@ dependencies = [
     "jinja2>=3.1.6",
     "onnx>=1.17",
     "onnxruntime==1.28.0",
+    "safetensors>=0.8.0",
 ]
 
 [project.scripts]
 mlime = "mlime.__main__:run"
-
-[project.optional-dependencies]
-train = ["safetensors>=0.4"]
 
 [dependency-groups]
 dev = [

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -400,6 +401,26 @@ def test_the_collator_refuses_mismatched_contexts(lexicon: Lexicon, spans: SpanV
         collator.inputs(["wo"], [None, None])
     with pytest.raises(ValueError, match="empty"):
         collator.inputs([], [])
+
+
+def test_a_limit_cuts_each_slice_to_its_first_records(
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    legality: Legality,
+    reader_vocab: CharVocab,
+    verifier: LegalityVerifier,
+    tmp_path: Path,
+) -> None:
+    model = tiny_joint_model(lexicon, reader_vocab)
+    run = replace(key_run(model, lexicon, spans, legality, verifier), limit=2)
+    for name in ("dev", "test"):
+        held = run.indices(name)
+        assert len(held) == 2 and held == sorted(held)
+    report_keys(run, tmp_path, [KeyWeights(1.0, 1.0, False)], slice_="all")
+    written = (tmp_path / "all-beta1-gamma1-sum.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(written) == 2
+    assert run.indices("all") == [0, 1]
+    assert run.decoder.times.records == 2
 
 
 def test_a_decoder_refuses_an_automaton_over_another_emission_order(

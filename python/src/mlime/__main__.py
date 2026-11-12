@@ -200,6 +200,22 @@ def gen_pinyin_tables(
     build(out_dir)
 
 
+@app.command("gen-key-tree-fixture")
+def gen_key_tree_fixture(
+    out: Path = typer.Option(
+        Path("crates/ime-neural/tests/fixtures/key-tree.json"), help="The fixture file to write"
+    ),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Regenerate the tree-packing fixture the Rust session reproduces."""
+    configure(verbose)
+    from mlime.logging import log
+    from mlime.train.key_tree import write_tree_fixture
+
+    calls = write_tree_fixture(out)
+    log.info("key_tree_fixture.written", path=str(out), calls=calls)
+
+
 @app.command("probe-report")
 def probe_report(
     log: Path = typer.Option(
@@ -1393,28 +1409,20 @@ def export_route_a(
 def export_keys(
     checkpoint: Path = typer.Argument(..., help="A joint-stage key-level checkpoint (S2, #257)"),
     out: Path = typer.Option(
-        ..., "--out", help="Where the graphs, their weights, key-model.json and tokenizer.json go"
+        ...,
+        "--out",
+        help="Where weights.safetensors, key-model.json, tokenizer.json and reference.npz go",
     ),
     char_table: Path = CHAR_TABLE,
-    quantize: Literal["int8"] | None = typer.Option(
-        None,
-        help="Quantize the context and keys graphs to dynamic per-channel int8, and the decoder "
-        "as --decoder-quantize says",
-    ),
-    decoder_quantize: Literal["weights", "dynamic"] = typer.Option(
-        "weights",
-        help="With --quantize: the decoder's MatMul weights alone int8 behind a "
-        "DequantizeLinear ('weights', as char-lm's), or dynamic int8 ('dynamic')",
-    ),
     verbose: bool = VERBOSE,
 ) -> None:
-    """Export the context, keys and decoder-step graphs of a key-level model for `ime-neural`."""
+    """Write the key-level model's bundle for the Core ML conversion to read."""
     configure(verbose)
     import torch
 
     from mlime.data.corpus import default_char_table
     from mlime.train.e2e import load_key_model, recorded_config
-    from mlime.train.key_export import export_key_model
+    from mlime.train.key_bundle import write_key_bundle
     from mlime.train.run import Vocabularies
 
     table = char_table or default_char_table()
@@ -1423,20 +1431,18 @@ def export_keys(
     recorded = recorded_config(checkpoint)
     if recorded.context is not None:
         raise typer.BadParameter(
-            f"{checkpoint} reads context through a Qwen tower; the key export is MacBERT's "
-            "context graph only"
+            f"{checkpoint} reads context through a Qwen tower; the key bundle is MacBERT's "
+            "context tower only"
         )
     vocabularies = Vocabularies.load(table, recorded.base_model, None)
     model, step = load_key_model(checkpoint, vocabularies.lexicon, torch.device("cpu"))
-    manifest = export_key_model(
+    manifest = write_key_bundle(
         model,
         step,
         vocabularies.lexicon,
         vocabularies.legality(),
         vocabularies.tokenizer,
         out,
-        quantize,
-        decoder_quantize,
     )
     typer.echo(str(manifest))
 
@@ -1888,14 +1894,7 @@ def eval_e2e(
 
 @eval_app.command("keys")
 def eval_keys(
-    checkpoint: Path = typer.Option(
-        None, help="A joint-stage key-level checkpoint (S2, #257); or --onnx"
-    ),
-    onnx: Path = typer.Option(
-        None,
-        help="An export (`mlime export keys`) to decode with onnxruntime, over the very same "
-        "search, instead of a checkpoint",
-    ),
+    checkpoint: Path = typer.Option(..., help="A joint-stage key-level checkpoint (S2, #257)"),
     eval_set: Path = typer.Option(..., help="The eval set: each record's pinyin is its keys"),
     char_table: Path = CHAR_TABLE,
     typo_table: Path = typer.Option(
@@ -1931,9 +1930,7 @@ def eval_keys(
     beam: int = typer.Option(8, help="Prefixes the search keeps after each key"),
     top_k: int = typer.Option(8, help="Hypotheses kept per record"),
     context: bool = typer.Option(True, help="Let the model read each record's context"),
-    token_budget: int = typer.Option(
-        8192, help="Padded positions per encoder forward (a checkpoint; an export runs one row)"
-    ),
+    token_budget: int = typer.Option(8192, help="Padded positions per encoder forward"),
     records: int = typer.Option(
         None, help="Decode only the first N records of each slice; the whole slice when omitted"
     ),
@@ -1953,7 +1950,7 @@ def eval_keys(
     out: Path = typer.Option(None, help="Where the report text goes"),
     verbose: bool = VERBOSE,
 ) -> None:
-    """Decode a key-level checkpoint or its ONNX export from each record's keys."""
+    """Decode a key-level checkpoint from each record's keys and report as `ime-eval` does."""
     configure(verbose)
     from mlime.data.corpus import default_char_table
     from mlime.locate import find_upwards
@@ -1961,8 +1958,6 @@ def eval_keys(
     from mlime.train.key_eval import load_key_run, report_keys, weight_grid
     from mlime.typo import SYLLABLES_RELATIVE, default_typo_table
 
-    if (checkpoint is None) == (onnx is None):
-        raise typer.BadParameter("name exactly one of --checkpoint and --onnx")
     if records is not None and records < 1:
         raise typer.BadParameter("--records must be positive")
 
@@ -1985,37 +1980,20 @@ def eval_keys(
     grid = weight_grid(beta, gamma, combinations)
     if not select_on_dev and len(grid) != 1:
         raise typer.BadParameter("a fixed --slice decodes one --beta and one --gamma")
-    if onnx is not None:
-        from mlime.train.key_onnx import load_onnx_key_run
-
-        run, step = load_onnx_key_run(
-            onnx,
-            eval_set,
-            char_table=table,
-            typo_table=typo,
-            syllables=inventory,
-            with_context=context,
-            dev_share=dev_share,
-            beam=beam,
-            top_k=top_k,
-            records_per_chunk=records_per_chunk,
-            limit=records,
-        )
-    else:
-        run, step = load_key_run(
-            checkpoint,
-            eval_set,
-            char_table=table,
-            typo_table=typo,
-            syllables=inventory,
-            with_context=context,
-            token_budget=token_budget,
-            dev_share=dev_share,
-            beam=beam,
-            top_k=top_k,
-            records_per_chunk=records_per_chunk,
-            limit=records,
-        )
+    run, step = load_key_run(
+        checkpoint,
+        eval_set,
+        char_table=table,
+        typo_table=typo,
+        syllables=inventory,
+        with_context=context,
+        token_budget=token_budget,
+        dev_share=dev_share,
+        beam=beam,
+        top_k=top_k,
+        records_per_chunk=records_per_chunk,
+        limit=records,
+    )
     report = report_keys(
         run,
         dump_dir,
@@ -2026,8 +2004,7 @@ def eval_keys(
         if ambiguity is None
         else lambda dump, name: ambiguity_report(ambiguity, eval_set, dump, name, dev_share),
     )
-    source = f"checkpoint: {checkpoint}" if onnx is None else f"onnx export: {onnx}"
-    heading = f"{source} (step {step}), context {'on' if context else 'off'}"
+    heading = f"checkpoint: {checkpoint} (step {step}), context {'on' if context else 'off'}"
     rendered = f"{heading}\n\n{report}"
     typer.echo(rendered)
     if out is not None:

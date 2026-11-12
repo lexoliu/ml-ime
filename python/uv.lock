@@ -1108,16 +1108,12 @@ dependencies = [
     { name = "rapidfuzz" },
     { name = "regex" },
     { name = "rich" },
+    { name = "safetensors" },
     { name = "structlog" },
     { name = "torch" },
     { name = "tqdm" },
     { name = "transformers" },
     { name = "typer" },
-]
-
-[package.optional-dependencies]
-train = [
-    { name = "safetensors" },
 ]
 
 [package.dev-dependencies]
@@ -1146,14 +1142,13 @@ requires-dist = [
     { name = "rapidfuzz", specifier = ">=3.10" },
     { name = "regex", specifier = ">=2026.7.19" },
     { name = "rich", specifier = ">=13.9" },
-    { name = "safetensors", marker = "extra == 'train'", specifier = ">=0.4" },
+    { name = "safetensors", specifier = ">=0.8.0" },
     { name = "structlog", specifier = ">=24.4" },
     { name = "torch", specifier = ">=2.13.0" },
     { name = "tqdm", specifier = ">=4.67" },
     { name = "transformers", specifier = ">=5.16" },
     { name = "typer", specifier = ">=0.15" },
 ]
-provides-extras = ["train"]
 
 [package.metadata.requires-dev]
 dev = [
