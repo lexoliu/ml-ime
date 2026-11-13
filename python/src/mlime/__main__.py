@@ -525,6 +525,30 @@ def lexicon_knowledge(
     typer.echo(f"{out}: {len(lexicon)} entries")
 
 
+@lexicon_app.command("arcs")
+def lexicon_arcs(
+    entries: Path = typer.Option(
+        ..., help="The corpus audit's entries table (entry, category, occurrences, ...)"
+    ),
+    out: Path = typer.Option(..., help="The `word<TAB>category` arc lexicon to write"),
+    min_occurrences: int = typer.Option(
+        20, help="Keep the entries the corpus holds at least this often"
+    ),
+    category: list[str] = typer.Option(
+        ["idiom"], "--category", help="A category to keep; repeat for several"
+    ),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Write the key search's word-arc lexicon: the entries frequent enough to propose (#282)."""
+    configure(verbose)
+    from mlime.train.key_arcs import frequent_entries
+
+    kept = frequent_entries(entries, category, min_occurrences)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("".join(f"{word}\t{kind}\n" for word, kind in kept), encoding="utf-8")
+    typer.echo(f"wrote {len(kept)} entries to {out}")
+
+
 @lexicon_app.command("list")
 def lexicon_list() -> None:
     """Show the available Sogou dictionaries and their quality metadata."""

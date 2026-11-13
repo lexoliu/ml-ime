@@ -36,7 +36,7 @@ from test_key_search import (
 )
 
 from mlime.legality import OFFLINE, KeyLattice, Legality
-from mlime.train.key_arcs import ArcLexicon, WordArc
+from mlime.train.key_arcs import ArcLexicon, WordArc, frequent_entries
 from mlime.train.key_search import (
     DEFAULT_ARC_WIDTH,
     ArcCounts,
@@ -588,6 +588,43 @@ def test_an_arc_adds_its_prior_to_exactly_its_own_output(homophones: Legality) -
     after = {h.ids: h.score for h in with_arc[0]}
     assert after.pop(entry) == pytest.approx(before.pop(entry) + 7.0)
     assert after == pytest.approx(before)
+
+
+def test_the_frequency_floor_keeps_the_entries_the_corpus_holds_often_enough(
+    tmp_path: Path,
+) -> None:
+    table = tmp_path / "entries.tsv"
+    header = "entry\tcategory\toccurrences\tsentences\tblocked\n"
+    table.write_text(
+        header
+        + "一丁不识\tidiom\t0\t0\t0\n"
+        + "一不做二不休\tidiom\t20\t19\t0\n"
+        + "東京タワー\tplace\t400\t380\t0\n"
+        + "서울\tplace\t5\t5\t0\n"
+        + "一丝不挂\tidiom\t131\t120\t0\n",
+        encoding="utf-8",
+    )
+    assert frequent_entries(table, ["idiom"], 20) == [
+        ("一不做二不休", "idiom"),
+        ("一丝不挂", "idiom"),
+    ]
+    assert frequent_entries(table, ["idiom", "place"], 100) == [
+        ("東京タワー", "place"),
+        ("一丝不挂", "idiom"),
+    ]
+    assert len(frequent_entries(table, ["idiom"], 0)) == 3
+    with pytest.raises(ValueError, match="holds no entry"):
+        frequent_entries(table, ["idiom"], 1000)
+    with pytest.raises(ValueError, match="category"):
+        frequent_entries(table, [], 20)
+    with pytest.raises(FileNotFoundError):
+        frequent_entries(tmp_path / "missing.tsv", ["idiom"], 20)
+    table.write_text("entry\tcategory\n一丝不挂\tidiom\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="no column"):
+        frequent_entries(table, ["idiom"], 20)
+    table.write_text(header + "一丝不挂\tidiom\tmany\t1\t0\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="not a row"):
+        frequent_entries(table, ["idiom"], 20)
 
 
 def test_the_lexicon_loads_its_categories_and_counts_what_it_skips(
