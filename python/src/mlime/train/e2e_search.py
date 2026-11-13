@@ -513,7 +513,10 @@ class SearchGraphs:
             search()
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self.pool):
+        # Thread-local: the producer's pinner thread allocates page-locked
+        # memory while a step runs, which the default, global mode takes as a
+        # breach by the capture and invalidates it (#283).
+        with torch.cuda.graph(graph, pool=self.pool, capture_error_mode="thread_local"):
             outputs = search()
         return graph, outputs
 

@@ -742,7 +742,8 @@ class TowerGraphs:
             tower.frozen_states(ids, mask)
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, pool=self.pool):
+        # Thread-local, as the search's captures are (#283).
+        with torch.cuda.graph(graph, pool=self.pool, capture_error_mode="thread_local"):
             output = tower.frozen_states(ids, mask)
         return graph, output
 
