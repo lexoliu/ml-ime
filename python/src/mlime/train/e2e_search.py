@@ -20,7 +20,7 @@ from torch import nn
 from mlime.logging import log
 from mlime.train.charlm_vocab import BOS
 from mlime.train.e2e_model import Decoder, E2EModel
-from mlime.train.shapes import bucket
+from mlime.train.shapes import bucket, capturing
 
 #: What a captured search reads: :class:`SearchInputs`, or :class:`KeySearchInputs`.
 _Inputs = TypeVar("_Inputs")
@@ -513,10 +513,7 @@ class SearchGraphs:
             search()
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
-        # Thread-local: the producer's pinner thread allocates page-locked
-        # memory while a step runs, which the default, global mode takes as a
-        # breach by the capture and invalidates it (#283).
-        with torch.cuda.graph(graph, pool=self.pool, capture_error_mode="thread_local"):
+        with capturing(graph, self.pool):
             outputs = search()
         return graph, outputs
 

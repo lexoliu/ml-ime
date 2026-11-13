@@ -7,6 +7,35 @@ set of sizes first.
 
 from __future__ import annotations
 
+import gc
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import Any
+
+import torch
+
+
+@contextmanager
+def capturing(graph: torch.cuda.CUDAGraph, pool: Any) -> Iterator[None]:
+    """Capture the body into *graph* over the memory *pool*, kept from what would invalidate it.
+
+    Two things outside the captured code can break a capture. Another thread
+    making a call the capture forbids -- the batch producer's pinner
+    allocating page-locked memory -- does in the default, global error mode,
+    so the capture is thread-local (#283). And the cyclic collector, run by
+    the body's own allocations, can free a compiled kernel whose module is
+    then unloaded on the capturing thread, so it is paused for the capture
+    (#286); ``torch.cuda.graph`` collects once on entry all the same.
+    """
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        with torch.cuda.graph(graph, pool=pool, capture_error_mode="thread_local"):
+            yield
+    finally:
+        if collecting:
+            gc.enable()
+
 
 def bucket(size: int) -> int:
     """*size* rounded up to the next of four steps an octave: 8, 10, 12, 14, 16, 20, ...
