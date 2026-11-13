@@ -276,12 +276,13 @@ class _Arrival:
     """Every arc landing on one prefix at one offset, combined."""
 
     transition: float
-    #: The additional mass the arcs give, and the whole mass of their covers
-    #: with the prior: what stands in when the character-by-character path
-    #: did not reach the prefix.
+    #: The additional mass the arcs give when the character-by-character path
+    #: reached the prefix.
     extra: float
-    whole: float
-    #: The best landing's cut, its mass ``whole``.
+    #: The best landing's cut with its own whole mass and the prior: what
+    #: stands in when that path did not reach the prefix. Landings that overlap
+    #: are alternatives of one cover, so their whole masses are not summed and
+    #: the state is a lower bound of the covers' mass.
     cut: _Cut
 
 
@@ -465,10 +466,9 @@ class _Record:
             )
             held = out.get(landed)
             if held is None:
-                out[landed] = _Arrival(transition, extra, whole, cut)
+                out[landed] = _Arrival(transition, extra, cut)
                 continue
             held.extra = _combine((held.extra, extra), self.viterbi)
-            held.whole = _combine((held.whole, whole), self.viterbi)
             if cut.best > held.cut.best:
                 held.cut = cut
         return out

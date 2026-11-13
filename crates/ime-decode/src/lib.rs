@@ -14,6 +14,7 @@ mod arcs;
 mod beam;
 mod candidates;
 mod emissions;
+mod key_arcs;
 mod keys;
 mod score;
 
@@ -24,9 +25,10 @@ pub use emissions::{
     EmissionError, Emittable, LatticePath, LatticeRecord, ScoreRecord, Scored, Weighted,
     lattice_paths,
 };
+pub use key_arcs::{KeyArcLexicon, KeyArcLexiconStats, KeyWordArc};
 pub use keys::{
-    Combine, KeyHypothesis, KeyLogProbs, KeyLogProbsError, KeySearchOptions, KeySearchStats,
-    KeyTransition, PrefixId, PrefixTrie, Weight, WeightError, key_search,
+    Combine, DEFAULT_ARC_WIDTH, KeyHypothesis, KeyLogProbs, KeyLogProbsError, KeySearchOptions,
+    KeySearchStats, KeyTransition, PrefixId, PrefixTrie, Weight, WeightError, key_search,
 };
 pub use score::{Asked, Both, Emission, History, MAX_HISTORY, NoTransition, Transition, Uniform};
 

@@ -8,12 +8,16 @@ over a small emittable set the fixture names.
 
 Each record carries, per setting (combination, beam, gamma), the hypotheses the
 Python search returned -- ids, cuts and the four score terms at ``repr``
-precision -- and the sequence of transition calls it made.
+precision -- and the sequence of transition calls it made. The arc records (#293)
+also carry a small lexicon's load over their alphabet, the word arcs it
+enumerates over their lattice, and settings over the arc prior and width whose
+hypotheses carry their arc counts.
 """
 
 from __future__ import annotations
 
 import json
+import tempfile
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,7 +29,8 @@ import torch
 
 from mlime.legality import OFFLINE, Legality
 from mlime.legality import _splitmix as splitmix
-from mlime.train.key_search import Hypothesis, Prefix, search
+from mlime.train.key_arcs import ArcLexicon, WordArc
+from mlime.train.key_search import DEFAULT_ARC_WIDTH, ArcCounts, Hypothesis, Prefix, search
 from mlime.train.lexicon import read_char_readings
 
 #: Where the fixture lives, relative to the repository root.
@@ -45,6 +50,80 @@ BEAM = 8
 
 #: A record with at most this many keys also runs without a beam.
 UNBOUNDED_MAX_KEYS = 8
+
+#: The arc priors of the arc records' grid; 0 pins the search without arcs.
+ARC_PRIORS = (0.0, 1.5, 6.0)
+
+#: The arc widths of the arc records' grid: one landing per offset, and the default.
+ARC_WIDTHS = (1, DEFAULT_ARC_WIDTH)
+
+#: The correction weight of the arc records' settings.
+ARC_GAMMA = 0.5
+
+#: The categories the arc lexicon is read for.
+LEXICON_CATEGORIES = ("idiom",)
+
+#: The arc lexicon's ``word<TAB>category`` rows. Besides the entries the records'
+#: emittable sets hold, it carries what a load skips: a single character, entries
+#: past an emittable set (Chinese, Japanese and Korean alike), a repeated entry
+#: and entries of a category nobody asked for.
+LEXICON_ROWS = (
+    "逐光捡金\tidiom",
+    "逐光\tidiom",
+    "捡金\tidiom",
+    "十周年快乐\tidiom",
+    "十周年\tidiom",
+    "周年\tidiom",
+    "快乐\tidiom",
+    "快乐\tidiom",
+    "李云龙\tidiom",
+    "太欢乐\tidiom",
+    "欢乐\tidiom",
+    "这个\tidiom",
+    "这个女人\tidiom",
+    "女人\tidiom",
+    "晚上\tidiom",
+    "他将\tidiom",
+    "首发\tidiom",
+    "抱起\tidiom",
+    "就一个\tidiom",
+    "一个\tidiom",
+    "飞奔\tidiom",
+    "可不\tidiom",
+    "不好\tidiom",
+    "好惹\tidiom",
+    "玉米\tidiom",
+    "浓汤\tidiom",
+    "盖饭\tidiom",
+    "数学家们\tidiom",
+    "数学家\tidiom",
+    "数学\tidiom",
+    "拓展\tidiom",
+    "概念\tidiom",
+    "这些\tidiom",
+    "是时\tidiom",
+    "时事\tidiom",
+    "十是\tidiom",
+    "史石\tidiom",
+    "市是时\tidiom",
+    "事室\tidiom",
+    "师世\tidiom",
+    "是时十\tidiom",
+    "时十\tidiom",
+    "十是时\tidiom",
+    "就金\tidiom",
+    "金捡\tidiom",
+    "时金\tidiom",
+    "十就\tidiom",
+    "捡金捡\tidiom",
+    "金\tidiom",
+    "中国\tidiom",
+    "日本語\tidiom",
+    "ありがとう\tidiom",
+    "안녕하세요\tidiom",
+    "张三丰\tname",
+    "こんにちは\tname",
+)
 
 #: The fixture's own account of how Rust reproduces its inputs.
 DEFINITIONS: dict[str, str] = {
@@ -70,6 +149,17 @@ DEFINITIONS: dict[str, str] = {
         "every legal output without a beam. 'calls' lists the prefixes of each transition "
         "call, in call order, as emission-id lists."
     ),
+    "arcs": (
+        "A record with a 'lexicon' reads the header's lexicon rows over its alphabet for the "
+        "header's categories (an entry is a row's word: at least two characters, all in the "
+        "alphabet, as emission ids) and enumerates 'words' over its lattice: entry ids, start "
+        "and end cut, and the chains, each the indices of its lattice arcs in the order the "
+        "lattice's edges list them (by start, then end, then emission id), sorted by start, "
+        "entry, end. 'lexicon' counts the entries kept and the rows skipped as too short or "
+        "outside the alphabet. A setting of such a record adds 'prior' and 'arc_width', its "
+        "hypotheses their 'arcs', and 'counts' the arcs offered, the arcs landed and the "
+        "transition rows asked for landings alone. A record without a lexicon runs at prior 0."
+    ),
 }
 
 
@@ -84,6 +174,8 @@ class FixtureRecord:
     emission: str
     transition: str
     seed: int
+    #: Whether the record runs with the arc lexicon over the arc grid.
+    lexicon: bool = False
 
 
 #: Hand-picked characters the hand cases need, beyond the training sentences'.
@@ -114,6 +206,18 @@ _HAND_CASES: tuple[tuple[str, str, str, str, str], ...] = (
     ("tie-initials", "sjsjsjsjs", "initials", "flat", "flat"),
     ("tie-small", "shishi", "small", "flat", "flat"),
 )
+
+#: The arc cases: ``(name, keys, alphabet, emission, transition)``. The flat ones tie.
+_ARC_CASES: tuple[tuple[str, str, str, str, str], ...] = (
+    ("arc-small", "shsh", "small", "hash", "hash"),
+    ("arc-tie-small", "shsh", "small", "flat", "flat"),
+    ("arc-initials", "sjsjsjsjs", "initials", "hash", "hash"),
+    ("arc-tie-initials", "sjsjsjsjs", "initials", "flat", "flat"),
+    ("arc-shi", "shishishi", "shi", "hash", "hash"),
+)
+
+#: The training records (indices of :data:`TRAINING_KEYS`) that also run with arcs.
+ARC_TRAINING = (0, 1, 2, 3, 4, 6, 8)
 
 #: The small alphabets of the hand cases.
 _HAND_ALPHABETS = {
@@ -193,11 +297,24 @@ def _records(training: Sequence[tuple[str, str]]) -> list[FixtureRecord]:
         )
     for index, (name, keys, alphabet, emission, transition) in enumerate(_HAND_CASES):
         records.append(FixtureRecord(name, keys, alphabet, emission, transition, 2000 + index))
+    for index, (name, keys, alphabet, emission, transition) in enumerate(_ARC_CASES):
+        records.append(
+            FixtureRecord(name, keys, alphabet, emission, transition, 3000 + index, lexicon=True)
+        )
+    for index in ARC_TRAINING:
+        keys, _ = training[index]
+        short = len(keys) <= UNBOUNDED_MAX_KEYS
+        alphabet = f"train-{index}" if short else "shared"
+        records.append(
+            FixtureRecord(
+                f"arc-train-{index}", keys, alphabet, "hash", "hash", 3100 + index, lexicon=True
+            )
+        )
     return records
 
 
-def _hypothesis(hypothesis: Hypothesis) -> dict[str, Any]:
-    return {
+def _hypothesis(hypothesis: Hypothesis, *, arcs: bool) -> dict[str, Any]:
+    row: dict[str, Any] = {
         "ids": list(hypothesis.ids),
         "cuts": list(hypothesis.cuts),
         "score": hypothesis.score,
@@ -205,6 +322,53 @@ def _hypothesis(hypothesis: Hypothesis) -> dict[str, Any]:
         "transition": hypothesis.transition,
         "correction": hypothesis.correction,
     }
+    if arcs:
+        row["arcs"] = hypothesis.arcs
+    return row
+
+
+def _word(word: WordArc) -> dict[str, Any]:
+    return {
+        "entry": list(word.entry),
+        "start": word.start,
+        "end": word.end,
+        "chains": word.chains.tolist(),
+    }
+
+
+def _search(
+    lattice_legality: Legality,
+    record: FixtureRecord,
+    *,
+    viterbi: bool,
+    beam: int | None,
+    gamma: float,
+    words: Sequence[WordArc] | None = None,
+    prior: float = 0.0,
+    arc_width: int = DEFAULT_ARC_WIDTH,
+) -> tuple[list[Hypothesis], HashedTransition, ArcCounts]:
+    """The Python search over one record: hypotheses, the transition's calls, the arc counts."""
+    width = len(lattice_legality.characters)
+    lattice = lattice_legality.lattice(record.keys, OFFLINE)
+    log_probs = torch.from_numpy(
+        emissions(len(record.keys), width, record.seed, record.emission == "flat")
+    )[None]
+    transition = HashedTransition(width, record.seed ^ _TRANSITION_XOR, record.transition == "flat")
+    counts = ArcCounts()
+    [found] = search(
+        [lattice],
+        log_probs,
+        transition,
+        beta=BETA,
+        gamma=gamma,
+        beam=beam,
+        viterbi=viterbi,
+        words=None if words is None else [words],
+        prior=prior,
+        arc_width=arc_width,
+        counts=counts,
+    )
+    return found, transition, counts
 
 
 def run_setting(
@@ -216,21 +380,48 @@ def run_setting(
     gamma: float,
 ) -> dict[str, Any]:
     """One record under one setting: the search's hypotheses and its transition calls."""
-    width = len(lattice_legality.characters)
-    lattice = lattice_legality.lattice(record.keys, OFFLINE)
-    log_probs = torch.from_numpy(
-        emissions(len(record.keys), width, record.seed, record.emission == "flat")
-    )[None]
-    transition = HashedTransition(width, record.seed ^ _TRANSITION_XOR, record.transition == "flat")
-    [found] = search(
-        [lattice], log_probs, transition, beta=BETA, gamma=gamma, beam=beam, viterbi=viterbi
+    found, transition, _ = _search(
+        lattice_legality, record, viterbi=viterbi, beam=beam, gamma=gamma
     )
     return {
         "combine": "viterbi" if viterbi else "sum",
         "beam": beam,
         "gamma": gamma,
-        "hypotheses": [_hypothesis(hypothesis) for hypothesis in found],
+        "hypotheses": [_hypothesis(hypothesis, arcs=False) for hypothesis in found],
         "calls": transition.calls,
+    }
+
+
+def run_arc_setting(
+    lattice_legality: Legality,
+    record: FixtureRecord,
+    words: Sequence[WordArc],
+    *,
+    viterbi: bool,
+    beam: int | None,
+    prior: float,
+    arc_width: int,
+) -> dict[str, Any]:
+    """One arc record under one setting: :func:`run_setting` with the arcs, their counts too."""
+    found, transition, counts = _search(
+        lattice_legality,
+        record,
+        viterbi=viterbi,
+        beam=beam,
+        gamma=ARC_GAMMA,
+        words=words,
+        prior=prior,
+        arc_width=arc_width,
+    )
+    return {
+        "combine": "viterbi" if viterbi else "sum",
+        "beam": beam,
+        "gamma": ARC_GAMMA,
+        "prior": prior,
+        "arc_width": arc_width,
+        "hypotheses": [_hypothesis(hypothesis, arcs=True) for hypothesis in found],
+        "calls": transition.calls,
+        "counts": {"offered": counts.offered, "landed": counts.landed, "rows": counts.rows},
     }
 
 
@@ -255,32 +446,66 @@ def build_fixture(
         for name, characters in alphabets.items()
     }
     records: list[dict[str, Any]] = []
-    for record in _records(training):
-        automaton = automata[record.alphabet]
-        settings = [
-            run_setting(automaton, record, viterbi=viterbi, beam=beam, gamma=gamma)
-            for viterbi in (False, True)
-            for beam in ((BEAM, None) if len(record.keys) <= UNBOUNDED_MAX_KEYS else (BEAM,))
-            for gamma in GAMMAS
-        ]
-        records.append(
-            {
-                "name": record.name,
-                "keys": record.keys,
-                "alphabet": record.alphabet,
-                "emission": record.emission,
-                "transition": record.transition,
-                "emission_seed": f"{record.seed:016x}",
-                "transition_seed": f"{record.seed ^ _TRANSITION_XOR:016x}",
-                "settings": settings,
-            }
-        )
+    with tempfile.TemporaryDirectory() as scratch:
+        rows = Path(scratch) / "lexicon.tsv"
+        rows.write_text("\n".join(LEXICON_ROWS) + "\n", encoding="utf-8")
+        for record in _records(training):
+            records.append(_record(record, automata[record.alphabet], rows))
     header: dict[str, Any] = {
         "definitions": DEFINITIONS,
         "beta": BETA,
         "alphabets": alphabets,
+        "lexicon": {"categories": list(LEXICON_CATEGORIES), "rows": list(LEXICON_ROWS)},
     }
     return header, records
+
+
+def _record(record: FixtureRecord, automaton: Legality, rows: Path) -> dict[str, Any]:
+    """One record of the fixture, searched under every setting of its grid."""
+    beams = (BEAM, None) if len(record.keys) <= UNBOUNDED_MAX_KEYS else (BEAM,)
+    document: dict[str, Any] = {
+        "name": record.name,
+        "keys": record.keys,
+        "alphabet": record.alphabet,
+        "emission": record.emission,
+        "transition": record.transition,
+        "emission_seed": f"{record.seed:016x}",
+        "transition_seed": f"{record.seed ^ _TRANSITION_XOR:016x}",
+    }
+    if not record.lexicon:
+        document["settings"] = [
+            run_setting(automaton, record, viterbi=viterbi, beam=beam, gamma=gamma)
+            for viterbi in (False, True)
+            for beam in beams
+            for gamma in GAMMAS
+        ]
+        return document
+    lexicon = ArcLexicon.load(rows, LEXICON_CATEGORIES, automaton.characters)
+    words = lexicon.arcs(automaton.lattice(record.keys, OFFLINE), record.keys)
+    document["lexicon"] = {
+        "entries": lexicon.size,
+        "skipped_short": lexicon.skipped_short,
+        "skipped_outside": lexicon.skipped_outside,
+    }
+    document["words"] = [
+        _word(word) for word in sorted(words, key=lambda arc: (arc.start, arc.entry, arc.end))
+    ]
+    document["settings"] = [
+        run_arc_setting(
+            automaton,
+            record,
+            words,
+            viterbi=viterbi,
+            beam=beam,
+            prior=prior,
+            arc_width=arc_width,
+        )
+        for viterbi in (False, True)
+        for beam in beams
+        for prior in ARC_PRIORS
+        for arc_width in ARC_WIDTHS
+    ]
+    return document
 
 
 def write_search_fixture(

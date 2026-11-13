@@ -351,6 +351,7 @@ impl<M: KeyModel> Engine for KeyEngine<'_, M> {
         let found = key_search(
             &lattice,
             &log_probs,
+            &[],
             &mut rows,
             &self.options.search,
             &mut search,
