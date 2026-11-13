@@ -33,6 +33,27 @@
 //! every beam prefix about to extend that has no row yet. A row is kept while
 //! the prefix or one of its ancestors is in the beam.
 //!
+//! **Word arcs.** With the word arcs of a lexicon ([`KeyWordArc`]) and a
+//! prior `pi > 0` the search proposes whole entries. At each offset `b` the
+//! best [`KeySearchOptions::arc_width`] arcs ending there (by their best
+//! chain's gains plus `pi`, the optimistic gain) are kept; every beam prefix
+//! with a live cut at an arc's start lands it whole: the prefix extended by
+//! the entry gets a state at cut `b` holding the chain's gains, the
+//! transition's log-probs of the entry's characters in turn (the rows of the
+//! inner prefixes are asked in rounds, round `k` the prefixes `P + c_1..c_k`),
+//! the chain's correction costs, its cut points and the prior. Several chains
+//! of one arc combine as covers. A cover is raised by `pi` for the largest
+//! set of non-overlapping arcs it contains under [`Combine::Viterbi`], and its
+//! mass multiplied by the sum over its sets `S` of non-overlapping arcs of
+//! `(e^pi - 1)^|S|` under [`Combine::Sum`]: a landed arc adds the additional
+//! mass `mass * (e^pi - 1)` to the state the character-by-character path
+//! reached for the landed prefix, or, when that path did not reach it, creates
+//! the state with the whole mass `mass * e^pi`. A cut with a kept arc ending
+//! after the current key is not dead, and the optimistic bound of an open span
+//! there also takes the arc's optimistic gain, with the transition's share
+//! bounded by 0, so a prefix about to land an idiom stays in the beam. At
+//! `pi = 0`, or with no arcs, the search is the search without arcs.
+//!
 //! The arithmetic is f64 in the order the Python search performs it, with
 //! numpy's `logaddexp` and Python's compensated `sum`, so a search over the
 //! same inputs reproduces the Python search's hypotheses and its sequence of
@@ -45,6 +66,8 @@ use std::num::NonZeroUsize;
 use hashbrown::{HashMap, HashSet};
 use ime_pinyin::{EmitId, KeyLattice};
 use thiserror::Error;
+
+use crate::key_arcs::KeyWordArc;
 
 /// Why a log-prob table is not one.
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -172,7 +195,15 @@ pub struct KeySearchOptions {
     pub top_k: Option<NonZeroUsize>,
     /// How a prefix's covers combine.
     pub combine: Combine,
+    /// The prior `pi` each contained word arc adds; 0 ignores the arcs.
+    pub prior: Weight,
+    /// The arcs landing per key offset: the best by optimistic gain.
+    pub arc_width: NonZeroUsize,
 }
+
+/// The arcs landing per offset the product's search uses: its shape, as the
+/// beam's eight.
+pub const DEFAULT_ARC_WIDTH: NonZeroUsize = NonZeroUsize::new(8).expect("8 is not zero");
 
 /// A prefix of a search's outputs: an index into its [`PrefixTrie`].
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -300,10 +331,14 @@ pub struct KeyHypothesis {
     pub transition: f64,
     /// The best cover's summed correction cost.
     pub correction: f64,
+    /// The arcs in the best cover's chosen set: its score carries the prior
+    /// for each.
+    pub arcs: usize,
     /// The best cover's running score, one entry per character: `steps[j]`
     /// is the path score of the first `j + 1` characters over the keys
-    /// before their cut `cuts[j]`, blanks included, weighted as `score` is.
-    /// The last is the best cover's whole path score.
+    /// before their cut `cuts[j]`, blanks included, weighted as `score` is. A
+    /// landed arc's prior is in the step of its last character. The last is
+    /// the best cover's whole path score.
     pub steps: Vec<f64>,
 }
 
@@ -312,8 +347,14 @@ pub struct KeyHypothesis {
 pub struct KeySearchStats {
     /// How many times the transition was called.
     pub calls: usize,
-    /// How many prefix rows those calls asked for.
+    /// How many prefix rows those calls asked for, the landings' included.
     pub rows: usize,
+    /// Arcs enumerated over the record's lattice, before the per-offset width.
+    pub arcs_offered: usize,
+    /// Kept arcs that at least one beam prefix landed.
+    pub arcs_landed: usize,
+    /// The rows asked for landings alone, on top of the beam's own.
+    pub landing_rows: usize,
 }
 
 /// A cover of the keys so far, as a persistent list in an arena.
@@ -363,6 +404,8 @@ struct CutState {
     /// The best cover's summed correction cost.
     correction: f64,
     cover: Option<CoverId>,
+    /// The arcs in the best cover's chosen set.
+    arcs: usize,
 }
 
 /// A hypothesis: a prefix, its transition sum and its live cuts, ascending.
@@ -382,6 +425,8 @@ struct Extension {
     correction: f64,
     /// The best cover the character lands from.
     cover: Option<CoverId>,
+    /// The arcs in that cover's chosen set.
+    arcs: usize,
     transition: f64,
     score: f64,
 }
@@ -408,6 +453,8 @@ struct Tables {
     /// running scores only.
     blank_through: Vec<f64>,
     emits: Vec<EmitId>,
+    /// Each arc's end offset, in the arcs' order.
+    ends: Vec<usize>,
     cost: Vec<f64>,
     ctc_gain: Vec<f64>,
     gain: Vec<f64>,
@@ -436,6 +483,7 @@ impl Tables {
                 }))
                 .collect(),
             emits: Vec::with_capacity(lattice.arc_count()),
+            ends: Vec::with_capacity(lattice.arc_count()),
             cost: Vec::with_capacity(lattice.arc_count()),
             ctc_gain: Vec::with_capacity(lattice.arc_count()),
             gain: Vec::with_capacity(lattice.arc_count()),
@@ -450,6 +498,7 @@ impl Tables {
             for (&emit, &cost) in edge.ids().iter().zip(edge.costs()) {
                 let ctc_gain = f64::from(row[emit.index()]) - blank[end - 1];
                 tables.emits.push(emit);
+                tables.ends.push(end);
                 tables.cost.push(cost);
                 tables.ctc_gain.push(ctc_gain);
                 tables.gain.push(ctc_gain - gamma * cost);
@@ -589,6 +638,51 @@ fn fresh_extensions(
     fresh
 }
 
+/// A word arc priced against its record: what a prefix landing it gains,
+/// whichever prefix it is.
+struct Landing {
+    entry: Box<[EmitId]>,
+    start: usize,
+    /// The chains' summed gains combined as covers.
+    mass: f64,
+    /// The best chain's gains alone.
+    best: f64,
+    /// The best chain's `sum (emit - blank)` and summed correction cost.
+    ctc: f64,
+    correction: f64,
+    /// The best chain's gain at each of its arcs, and the cut each ends at.
+    gains: Box<[f64]>,
+    cuts: Box<[usize]>,
+    /// The best chain's gains plus the prior: what the bound prices the arc at.
+    optimistic: f64,
+}
+
+/// One beam prefix landing one kept arc at the current offset.
+struct Planned {
+    /// Index into the offset's landings.
+    landing: usize,
+    /// The prefix `P`, then `P + c_1`, ..., then `P + entry`.
+    path: Box<[PrefixId]>,
+    /// The beam prefix's transition sum.
+    transition: f64,
+    /// The beam prefix's state at the arc's start cut.
+    state: CutState,
+}
+
+/// Every arc landing on one prefix at one offset, combined.
+struct Arrival {
+    id: PrefixId,
+    transition: f64,
+    /// The additional mass the arcs give; what stands in for the state when the
+    /// character-by-character path did reach the prefix.
+    extra: f64,
+    /// The best landing's state with its own whole mass and the prior: what
+    /// stands in when that path did not reach the prefix. Landings that overlap
+    /// are alternatives of one cover, so their whole masses are not summed and
+    /// the state is a lower bound of the covers' mass.
+    cut: CutState,
+}
+
 /// One search over one record.
 struct Search {
     tables: Tables,
@@ -601,10 +695,23 @@ struct Search {
     combine: Combine,
     beam_width: Option<NonZeroUsize>,
     top_k: Option<NonZeroUsize>,
+    prior: f64,
+    /// The extra mass a landed arc adds in the sum: `log(e^pi - 1)`.
+    bonus: f64,
+    /// The kept arcs by their end offset, best first.
+    landing: Vec<Vec<Landing>>,
+    /// The plan of the current offset: which beam prefix lands which arc.
+    plan: Vec<Planned>,
 }
 
 impl Search {
-    fn new(lattice: &KeyLattice, log_probs: &KeyLogProbs<'_>, options: &KeySearchOptions) -> Self {
+    fn new(
+        lattice: &KeyLattice,
+        log_probs: &KeyLogProbs<'_>,
+        words: &[KeyWordArc],
+        options: &KeySearchOptions,
+        stats: &mut KeySearchStats,
+    ) -> Self {
         let root = PrefixState {
             id: PrefixId::ROOT,
             transition: 0.0,
@@ -615,9 +722,11 @@ impl Search {
                 ctc: 0.0,
                 correction: 0.0,
                 cover: None,
+                arcs: 0,
             }],
         };
-        Self {
+        let prior = options.prior.get();
+        let mut search = Self {
             tables: Tables::new(lattice, log_probs, options.gamma.get()),
             trie: PrefixTrie::new(),
             covers: Covers::default(),
@@ -627,6 +736,248 @@ impl Search {
             combine: options.combine,
             beam_width: options.beam,
             top_k: options.top_k.or(options.beam),
+            prior,
+            bonus: if prior > 0.0 {
+                prior + (-(-prior).exp()).ln_1p()
+            } else {
+                f64::NEG_INFINITY
+            },
+            landing: Vec::new(),
+            plan: Vec::new(),
+        };
+        if prior > 0.0 && !words.is_empty() {
+            search.keep(words, options.arc_width.get());
+            stats.arcs_offered += words.len();
+        }
+        search
+    }
+
+    /// Price the arcs, keep the best *width* ending at each offset, and open
+    /// their cuts: a kept arc keeps its start cut alive until it can land and
+    /// raises the bound of the open span there by its optimistic gain.
+    fn keep(&mut self, words: &[KeyWordArc], width: usize) {
+        let tables = &mut self.tables;
+        let n = tables.keys;
+        let mut by_end: Vec<Vec<Landing>> = (0..=n).map(|_| Vec::new()).collect();
+        for word in words {
+            let sums: Vec<f64> = word
+                .chains()
+                .map(|chain| {
+                    let gains: Vec<f64> = chain.iter().map(|&arc| tables.gain[arc]).collect();
+                    numpy_sum(&gains)
+                })
+                .collect();
+            let top = sums
+                .iter()
+                .enumerate()
+                .fold(0, |top, (at, &sum)| if sum > sums[top] { at } else { top });
+            let chain = word
+                .chains()
+                .nth(top)
+                .expect("an arc has at least one chain");
+            let gain_of = |values: &[f64]| -> f64 {
+                numpy_sum(&chain.iter().map(|&arc| values[arc]).collect::<Vec<f64>>())
+            };
+            by_end[word.end()].push(Landing {
+                entry: word.entry().into(),
+                start: word.start(),
+                mass: combine(&sums, self.combine),
+                best: sums[top],
+                ctc: gain_of(&tables.ctc_gain),
+                correction: gain_of(&tables.cost),
+                gains: chain.iter().map(|&arc| tables.gain[arc]).collect(),
+                cuts: chain.iter().map(|&arc| tables.ends[arc]).collect(),
+                optimistic: sums[top] + self.prior,
+            });
+        }
+        for (end, group) in by_end.iter_mut().enumerate() {
+            group.sort_by(|a, b| {
+                descending(a.optimistic, b.optimistic)
+                    .then_with(|| a.start.cmp(&b.start))
+                    .then_with(|| a.entry.cmp(&b.entry))
+            });
+            group.truncate(width);
+            for arc in group.iter() {
+                let row = arc.start * (n + 1);
+                for slot in &mut tables.bound[row..row + end] {
+                    *slot = slot.max(arc.optimistic);
+                }
+                tables.max_end[arc.start] = tables.max_end[arc.start].max(end);
+            }
+        }
+        self.landing = by_end;
+    }
+
+    /// Plan offset *end*'s landings: each kept arc lands from every beam
+    /// prefix with its start cut live.
+    fn prepare(&mut self, end: usize, stats: &mut KeySearchStats) {
+        self.plan.clear();
+        let Some(landings) = self.landing.get(end) else {
+            return;
+        };
+        for (index, arc) in landings.iter().enumerate() {
+            let before = self.plan.len();
+            for prefix in &self.beam {
+                let Some(&source) = prefix.cuts.iter().find(|cut| cut.cut == arc.start) else {
+                    continue;
+                };
+                let mut path = Vec::with_capacity(arc.entry.len() + 1);
+                path.push(prefix.id);
+                for &emit in &arc.entry {
+                    let last = path[path.len() - 1];
+                    path.push(self.trie.child(last, emit));
+                }
+                self.plan.push(Planned {
+                    landing: index,
+                    path: path.into(),
+                    transition: prefix.transition,
+                    state: source,
+                });
+            }
+            stats.arcs_landed += usize::from(self.plan.len() > before);
+        }
+    }
+
+    /// The rounds of transition rows the current plan needs: its longest entry.
+    fn depth(&self) -> usize {
+        self.plan
+            .iter()
+            .map(|planned| planned.path.len() - 1)
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// The prefixes whose rows round *depth* asks for, and how many only
+    /// landings ask. Round 0 is the beam's own ([`Self::needs`]) and each
+    /// landing's source prefix; round `k` the inner prefixes `P + c_1..c_k` of
+    /// the entries longer than `k`.
+    fn requests(&self, end: usize, depth: usize) -> (Vec<PrefixId>, usize) {
+        let mut asked = if depth == 0 {
+            self.needs(end)
+        } else {
+            Vec::new()
+        };
+        let beams = asked.len();
+        let mut seen: HashSet<PrefixId> = asked.iter().copied().collect();
+        for planned in &self.plan {
+            if planned.path.len() - 1 > depth {
+                let inner = planned.path[depth];
+                if !self.rows.contains_key(&inner) && seen.insert(inner) {
+                    asked.push(inner);
+                }
+            }
+        }
+        let landings = asked.len() - beams;
+        (asked, landings)
+    }
+
+    /// The planned landings combined per landed prefix, with their transition
+    /// sums, in the order each prefix was first landed.
+    fn arrivals(&mut self, end: usize) -> Vec<Arrival> {
+        let Self {
+            plan,
+            landing,
+            rows,
+            tables,
+            covers,
+            combine: mode,
+            beta,
+            prior,
+            bonus,
+            ..
+        } = self;
+        // `T(entry | prefix)` summed character by character, then added to the prefix's own.
+        let transition_of = |planned: &Planned| -> f64 {
+            let entry = &landing[end][planned.landing].entry;
+            let mut total = planned.transition;
+            for (step, emit) in entry.iter().enumerate() {
+                total += f64::from(rows[&planned.path[step]][emit.index()]);
+            }
+            total
+        };
+        // Per landed prefix: its first landing's transition, the combined extra
+        // mass, and the landing (a plan index and its best) whose state stands for it.
+        let mut pending: Vec<(PrefixId, f64, f64, usize, f64)> = Vec::new();
+        let mut index: HashMap<PrefixId, usize> = HashMap::new();
+        for (at, planned) in plan.iter().enumerate() {
+            let arc = &landing[end][planned.landing];
+            let id = planned.path[planned.path.len() - 1];
+            let base = planned.state.mass + arc.mass;
+            let whole = base + *prior;
+            let extra = if *mode == Combine::Viterbi {
+                whole
+            } else {
+                base + *bonus
+            };
+            let best = planned.state.best + arc.best + *prior;
+            match index.get(&id) {
+                None => {
+                    index.insert(id, pending.len());
+                    pending.push((id, transition_of(planned), extra, at, best));
+                }
+                Some(&held) => {
+                    let (_, _, combined, winner, winning) = &mut pending[held];
+                    *combined = combine(&[*combined, extra], *mode);
+                    if best > *winning {
+                        (*winner, *winning) = (at, best);
+                    }
+                }
+            }
+        }
+        pending
+            .into_iter()
+            .map(|(id, transition, extra, at, best)| {
+                let planned = &plan[at];
+                let arc = &landing[end][planned.landing];
+                let state = planned.state;
+                // The running score of the cover through each of the arc's characters.
+                let mut cover = state.cover;
+                let mut running = state.best;
+                let mut total = planned.transition;
+                for step in 0..arc.entry.len() {
+                    total += f64::from(rows[&planned.path[step]][arc.entry[step].index()]);
+                    running += arc.gains[step];
+                    let gained = if step + 1 == arc.entry.len() {
+                        best
+                    } else {
+                        running
+                    };
+                    let score = tables.blank_through[arc.cuts[step]] + gained + *beta * total;
+                    cover = Some(covers.push(cover, arc.cuts[step], score));
+                }
+                Arrival {
+                    id,
+                    transition,
+                    extra,
+                    cut: CutState {
+                        cut: end,
+                        mass: state.mass + arc.mass + *prior,
+                        best,
+                        ctc: state.ctc + arc.ctc,
+                        correction: state.correction + arc.correction,
+                        cover,
+                        arcs: state.arcs + 1,
+                    },
+                }
+            })
+            .collect()
+    }
+
+    /// The state at a landed prefix's cut: what the character-by-character
+    /// path reached, plus the arcs. Reached, the arcs add their additional
+    /// mass to it; not reached, they stand for it.
+    fn merged(&self, reached: Option<CutState>, arrival: &Arrival) -> CutState {
+        let Some(reached) = reached else {
+            return arrival.cut;
+        };
+        let winner = if arrival.cut.best > reached.best {
+            arrival.cut
+        } else {
+            reached
+        };
+        CutState {
+            mass: combine(&[reached.mass, arrival.extra], self.combine),
+            ..winner
         }
     }
 
@@ -677,6 +1028,7 @@ impl Search {
                         ctc: state.ctc + tables.ctc_gain[arc],
                         correction: state.correction + tables.cost[arc],
                         cover: state.cover,
+                        arcs: state.arcs,
                         transition: 0.0,
                         score: 0.0,
                     });
@@ -728,6 +1080,7 @@ impl Search {
             ctc: extension.ctc,
             correction: extension.correction,
             cover: Some(self.covers.push(extension.cover, end, step)),
+            arcs: extension.arcs,
         }
     }
 
@@ -762,12 +1115,40 @@ impl Search {
                 cuts: vec![state],
             });
         }
+        self.land_arcs(&mut survivors, end);
         if final_key {
             return Some(self.finish(&survivors));
         }
         self.beam = self.prune(survivors, end);
         self.evict();
         None
+    }
+
+    /// Add the planned arc landings to *survivors*: a prefix no one reached
+    /// is created with the arcs' state, one that was reached takes the arcs'
+    /// additional mass at its cut *end*.
+    fn land_arcs(&mut self, survivors: &mut Vec<PrefixState>, end: usize) {
+        let mut index: HashMap<PrefixId, usize> = survivors
+            .iter()
+            .enumerate()
+            .map(|(at, prefix)| (prefix.id, at))
+            .collect();
+        for arrival in self.arrivals(end) {
+            let Some(&at) = index.get(&arrival.id) else {
+                index.insert(arrival.id, survivors.len());
+                survivors.push(PrefixState {
+                    id: arrival.id,
+                    transition: arrival.transition,
+                    cuts: vec![arrival.cut],
+                });
+                continue;
+            };
+            let cuts = &mut survivors[at].cuts;
+            match cuts.iter().position(|state| state.cut == end) {
+                Some(slot) => cuts[slot] = self.merged(Some(cuts[slot]), &arrival),
+                None => cuts.push(arrival.cut),
+            }
+        }
     }
 
     /// The old beam's prefixes at *end*: the cuts whose span cannot grow past
@@ -861,6 +1242,7 @@ impl Search {
                     ctc: state.ctc + self.tables.blank_total,
                     transition: prefix.transition,
                     correction: state.correction,
+                    arcs: state.arcs,
                 }
             })
             .collect();
@@ -916,9 +1298,13 @@ fn inputs_agree(lattice: &KeyLattice, log_probs: &KeyLogProbs<'_>) -> bool {
 /// The best legal outputs over *lattice*'s keys, best first.
 ///
 /// `log_probs` holds the head's log-softmax at the record's keys, the blank
-/// last. *transition* is called once per key offset with every beam prefix
-/// about to extend that has no row yet; *stats* counts the calls. A lattice
-/// with no complete cover has no outputs.
+/// last. *words* are the record's word arcs
+/// ([`KeyArcLexicon::arcs`](crate::KeyArcLexicon::arcs)) over *lattice*, which
+/// the search proposes whole when the prior is above 0 and ignores otherwise.
+/// *transition* is called once per round of rows at each key offset: the
+/// beam's prefixes about to extend that have no row yet, with the inner
+/// prefixes of the landing arcs in later rounds; *stats* counts the calls and
+/// what the arcs cost. A lattice with no complete cover has no outputs.
 ///
 /// # Errors
 ///
@@ -926,6 +1312,7 @@ fn inputs_agree(lattice: &KeyLattice, log_probs: &KeyLogProbs<'_>) -> bool {
 pub fn key_search<T: KeyTransition>(
     lattice: &KeyLattice,
     log_probs: &KeyLogProbs<'_>,
+    words: &[KeyWordArc],
     transition: &mut T,
     options: &KeySearchOptions,
     stats: &mut KeySearchStats,
@@ -934,17 +1321,22 @@ pub fn key_search<T: KeyTransition>(
         return Ok(Vec::new());
     }
     let width = log_probs.emittable();
-    let mut search = Search::new(lattice, log_probs, options);
+    let mut search = Search::new(lattice, log_probs, words, options, stats);
     for end in 1..=lattice.keys() {
         if search.beam.is_empty() {
             break;
         }
-        let queries = search.needs(end);
-        if !queries.is_empty() {
+        search.prepare(end, stats);
+        for depth in 0..search.depth().max(1) {
+            let (queries, landings) = search.requests(end, depth);
+            if queries.is_empty() {
+                continue;
+            }
             let mut rows = vec![0.0_f32; queries.len() * width];
             transition.rows(&search.trie, &queries, &mut rows)?;
             stats.calls += 1;
             stats.rows += queries.len();
+            stats.landing_rows += landings;
             for (&id, row) in queries.iter().zip(rows.chunks_exact(width)) {
                 search.rows.insert(id, row.into());
             }

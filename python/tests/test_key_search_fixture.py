@@ -15,14 +15,20 @@ import pytest
 
 from mlime.legality import Legality
 from mlime.train.key_search_fixture import (
+    ARC_GAMMA,
+    ARC_PRIORS,
+    ARC_WIDTHS,
     LEGALITY_RECORDS_RELATIVE,
     SEARCH_FIXTURE_RELATIVE,
     UNBOUNDED_MAX_KEYS,
+    FixtureRecord,
     HashedTransition,
     draw,
     emissions,
+    run_setting,
     write_search_fixture,
 )
+from mlime.train.lexicon import read_char_readings
 
 ROOT = Path(__file__).parent.parent.parent
 DATA = ROOT / "crates/ime-pinyin/data"
@@ -109,14 +115,27 @@ def test_the_fixture_covers_the_settings_and_the_ties(document: dict[str, Any]) 
     assert sum(name.startswith("tie-") for name in names) >= 2
     for record in document["records"]:
         keys = len(record["keys"])
-        grid = {(s["combine"], s["beam"], s["gamma"]) for s in record["settings"]}
         beams = {8, None} if keys <= UNBOUNDED_MAX_KEYS else {8}
-        assert grid == {
-            (combine, beam, gamma)
-            for combine in ("sum", "viterbi")
-            for beam in beams
-            for gamma in (0.0, 0.5)
-        }, record["name"]
+        if "lexicon" in record:
+            grid = {
+                (s["combine"], s["beam"], s["gamma"], s["prior"], s["arc_width"])
+                for s in record["settings"]
+            }
+            assert grid == {
+                (combine, beam, ARC_GAMMA, prior, width)
+                for combine in ("sum", "viterbi")
+                for beam in beams
+                for prior in ARC_PRIORS
+                for width in ARC_WIDTHS
+            }, record["name"]
+        else:
+            grid = {(s["combine"], s["beam"], s["gamma"]) for s in record["settings"]}
+            assert grid == {
+                (combine, beam, gamma)
+                for combine in ("sum", "viterbi")
+                for beam in beams
+                for gamma in (0.0, 0.5)
+            }, record["name"]
         for setting in record["settings"]:
             assert setting["hypotheses"], record["name"]
             if setting["beam"] is not None:
@@ -127,6 +146,66 @@ def test_the_fixture_covers_the_settings_and_the_ties(document: dict[str, Any]) 
                 assert hypothesis["cuts"][-1] == keys
                 assert hypothesis["cuts"] == sorted(set(hypothesis["cuts"]))
     assert FIXTURE.stat().st_size < 1_000_000
+
+
+def test_the_arc_records_pin_the_lexicon_the_arcs_and_the_prior(
+    legality: Legality, document: dict[str, Any]
+) -> None:
+    """Arc records carry their load, arcs and counts; prior 0 is the search without arcs."""
+    rows = document["lexicon"]["rows"]
+    scripts = {
+        script
+        for row in rows
+        for character in row
+        for script, low, high in (
+            ("han", 0x4E00, 0x9FFF),
+            ("kana", 0x3040, 0x30FF),
+            ("hangul", 0xAC00, 0xD7AF),
+        )
+        if low <= ord(character) <= high
+    }
+    assert scripts == {"han", "kana", "hangul"}
+    readings = read_char_readings(DATA / "char_pinyin.tsv")
+    arc_records = [record for record in document["records"] if "lexicon" in record]
+    assert {record["name"] for record in arc_records} >= {"arc-small", "arc-tie-initials"}
+    for record in arc_records:
+        assert record["lexicon"]["skipped_short"] == 1, record["name"]
+        assert record["lexicon"]["skipped_outside"] >= 3, record["name"]
+        assert record["words"], record["name"]
+        order = [(word["start"], word["entry"], word["end"]) for word in record["words"]]
+        assert order == sorted(order), record["name"]
+        automaton = Legality(
+            tuple(document["alphabets"][record["alphabet"]]), readings, legality.corrections
+        )
+        plain = FixtureRecord(
+            record["name"],
+            record["keys"],
+            record["alphabet"],
+            record["emission"],
+            record["transition"],
+            int(record["emission_seed"], 16),
+        )
+        landed = False
+        for setting in record["settings"]:
+            assert all("arcs" in hypothesis for hypothesis in setting["hypotheses"])
+            if setting["prior"] == 0.0:
+                assert setting["counts"] == {"offered": 0, "landed": 0, "rows": 0}
+                assert all(hypothesis["arcs"] == 0 for hypothesis in setting["hypotheses"])
+                arc_free = run_setting(
+                    automaton,
+                    plain,
+                    viterbi=setting["combine"] == "viterbi",
+                    beam=setting["beam"],
+                    gamma=setting["gamma"],
+                )
+                assert [
+                    {key: value for key, value in hypothesis.items() if key != "arcs"}
+                    for hypothesis in setting["hypotheses"]
+                ] == arc_free["hypotheses"], record["name"]
+                assert setting["calls"] == arc_free["calls"], record["name"]
+            else:
+                landed = landed or setting["counts"]["landed"] > 0
+        assert landed, record["name"]
 
 
 def test_a_tie_record_orders_equal_scores_stably(document: dict[str, Any]) -> None:
