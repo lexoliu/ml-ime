@@ -36,6 +36,49 @@ Entry = tuple[int, ...]
 
 #: An entry shorter than this is a single character: no word, no arc.
 MIN_ARC_CHARACTERS = 2
+#: The columns of the mined entries table (`ime-corpus`'s frequency audit) an
+#: arc lexicon is cut from.
+ENTRY_COLUMNS = ("entry", "category", "occurrences")
+
+
+def frequent_entries(
+    table: Path, categories: Collection[str], min_occurrences: int
+) -> list[tuple[str, str]]:
+    """The ``(word, category)`` rows of *table* a frequency floor keeps, in table order.
+
+    *table* is the entries table the corpus audit writes: a header naming at
+    least :data:`ENTRY_COLUMNS`, then one row per lexicon entry with how often
+    the corpus holds it. A flat prior over a whole category proposes thousands
+    of entries nobody types, and each can land where its initials happen to be
+    typed; the floor keeps the entries a sentence plausibly meant (#282).
+    """
+    if not table.is_file():
+        raise FileNotFoundError(f"no entries table at {table}")
+    wanted = frozenset(categories)
+    if not wanted:
+        raise ValueError("name at least one arc category")
+    if min_occurrences < 0:
+        raise ValueError(f"the occurrence floor must not be negative, got {min_occurrences}")
+    lines = table.read_text(encoding="utf-8").splitlines()
+    if not lines:
+        raise ValueError(f"{table} is empty")
+    header = lines[0].split("\t")
+    missing = [column for column in ENTRY_COLUMNS if column not in header]
+    if missing:
+        raise ValueError(f"{table} has no column {missing}; its header is {header}")
+    word_at, category_at, count_at = (header.index(column) for column in ENTRY_COLUMNS)
+    kept: list[tuple[str, str]] = []
+    for number, line in enumerate(lines[1:], start=2):
+        fields = line.split("\t")
+        if len(fields) != len(header) or not fields[count_at].isdecimal():
+            raise ValueError(f"{table}:{number} is not a row of {header}: {line!r}")
+        if fields[category_at] in wanted and int(fields[count_at]) >= min_occurrences:
+            kept.append((fields[word_at], fields[category_at]))
+    if not kept:
+        raise ValueError(
+            f"{table} holds no entry of {sorted(wanted)} with {min_occurrences} occurrences"
+        )
+    return kept
 
 
 @dataclass(frozen=True)
