@@ -52,7 +52,7 @@ from torch import nn
 
 from mlime.logging import log
 from mlime.train.model import ContextCrossAttention, ContextMemory, ContextTower
-from mlime.train.shapes import bucket
+from mlime.train.shapes import bucket, capturing
 
 #: Qwen's first two positions, read before every context: the end-of-text
 #: token Qwen trained documents to follow, and a line break.
@@ -742,8 +742,7 @@ class TowerGraphs:
             tower.frozen_states(ids, mask)
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
-        # Thread-local, as the search's captures are (#283).
-        with torch.cuda.graph(graph, pool=self.pool, capture_error_mode="thread_local"):
+        with capturing(graph, self.pool):
             output = tower.frozen_states(ids, mask)
         return graph, output
 
