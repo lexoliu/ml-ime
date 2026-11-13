@@ -46,6 +46,10 @@ pub struct DumpedHypothesis {
     /// the last being the key count. Present with the terms above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cuts: Option<Vec<u32>>,
+    /// How many word arcs the best cover contains (#282). Present with the
+    /// terms above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arcs: Option<u32>,
 }
 
 impl DumpedHypothesis {
@@ -59,6 +63,7 @@ impl DumpedHypothesis {
             transition: None,
             correction: None,
             cuts: None,
+            arcs: None,
         }
     }
 }
@@ -102,7 +107,7 @@ mod tests {
         let rows = parse_dump(concat!(
             "{\"record\": 2, \"text\": \"我爱北京\", \"hypotheses\": [{\"text\": \"我爱北京\", ",
             "\"score\": -3.5, \"ctc\": -2.0, \"transition\": -1.25, \"correction\": 0.0, ",
-            "\"cuts\": [1, 2, 3, 6]}]}\n",
+            "\"cuts\": [1, 2, 3, 6], \"arcs\": 1}]}\n",
             "{\"record\": 0, \"text\": \"他\", \"hypotheses\": [{\"text\": \"她\", \"score\": -1.5}]}\n",
             "{\"record\": 1, \"text\": \"こんにちは\", \"hypotheses\": [{\"text\": \"안녕하세요\", ",
             "\"score\": -9.0}]}\n",
@@ -111,6 +116,8 @@ mod tests {
         assert_eq!(rows[1].hypotheses[0].ctc, None);
         assert_eq!(rows[1].hypotheses[0].cuts, None);
         assert_eq!(rows[2].hypotheses[0].cuts, Some(vec![1, 2, 3, 6]));
+        assert_eq!(rows[2].hypotheses[0].arcs, Some(1));
+        assert_eq!(rows[1].hypotheses[0].arcs, None);
         let terms = &rows[2].hypotheses[0];
         assert_eq!(
             (terms.ctc, terms.transition, terms.correction),
