@@ -75,10 +75,10 @@ blank, and one transfer brings them over.
 ``T`` of its characters, which is the same over all of its covers and so
 exact; ``ctc`` and ``correction``, the CTC term and the summed correction
 cost of its best cover (``cuts``). With ``viterbi`` the score is exactly
-``ctc + beta * transition - gamma * correction``; with the sum it is the
-log-sum-exp over the covers the beam kept. Either way ``score - beta *
-transition`` does not depend on ``beta``, so the returned list rescored
-under another ``beta`` is exact. Under another ``gamma`` the best cover may
+``ctc + beta * transition - gamma * correction`` (plus ``pi * arcs``, see
+below); with the sum it is the log-sum-exp over the covers the beam kept.
+Either way ``score - beta * transition`` does not depend on ``beta``, so the
+returned list rescored under another ``beta`` is exact. Under another ``gamma`` the best cover may
 change, so a rescored ``ctc - gamma' * correction`` is a lower bound (the old
 cover's score). Neither re-weighting is the search re-run: which hypotheses
 the beam keeps depends on both weights.
@@ -90,6 +90,64 @@ would have passed through that state, and a descendant already in the beam
 keeps the covers it has. No prefix beam avoids that. What does hold: every
 output is legal, and with ``viterbi`` its score is exactly the score of
 ``cuts``, one of its legal covers, so at most its brute-force score.
+
+**Word arcs (#282).** With a lexicon (:mod:`mlime.train.key_arcs`) and a prior
+``pi > 0`` the search proposes whole entries. A *word arc* is an entry
+``c_1..c_L`` and a chain of the lattice's own arcs from a cut ``a`` to a cut
+``b`` emitting it, at least one span typed as an initial; its cost is the
+chain's, so it cannot make an illegal output. Arcs are enumerated per record
+before the search and the best ``arc_width`` ending at each offset ``b`` are
+kept, by their optimistic gain (the best chain's summed gains plus ``pi``);
+the rest are never offered, so the bound below prices only what can land.
+
+*The prior.* A cover's weight is raised by ``pi`` for the arcs it contains. A
+cover is a character sequence with its cut points; it contains the arc of
+entry ``E`` at characters ``i..j`` when ``E`` is those characters and one of
+their spans is initial-typed. The landing mechanics below count a *set of
+non-overlapping contained arcs*, not every contained arc, and that is the
+definition: under ``viterbi`` the cover gains ``pi`` times the size of its
+largest set of non-overlapping contained arcs; under the sum its mass is
+multiplied by ``sum_S (e^pi - 1)^|S|`` over its sets ``S`` of non-overlapping
+contained arcs. Arcs that do not overlap multiply (two of them: ``e^(2 pi)``),
+so the sum is ``e^(pi k)`` for ``k`` of them; overlapping arcs (``AB`` and
+``ABC``) are alternatives and do not stack. At ``pi = 0`` the search ignores
+the lexicon altogether: a decode is the decode without arcs, hypothesis for
+hypothesis, as it is when no arc matches.
+
+*Landing.* At offset ``b`` every beam prefix ``P`` with a live cut at ``a``
+lands each kept arc ``(E, a, b)`` whole: the prefix ``Q = P + E`` gets a state
+at cut ``b`` holding the chain's gains, the transition's log-probs of ``E``'s
+characters in turn (the rows of ``P + c_1..c_k``, ``k < L``, are asked through
+the same :class:`Transition` in rounds, round ``k`` for every record at once,
+and cached with every other row, so under the same eviction: a row stays while
+a prefix of it is in the beam, hence as long as ``P`` can still land it and
+not beyond), the chains' correction costs, the cut points and the prior.
+Several chains of one arc combine as covers. The landed mass is the
+*additional* mass the prior gives: ``mass * (e^pi - 1)``, in log space
+``mass + pi + log(1 - e^-pi)``, added by log-add-exp to the state the
+character-by-character path reached for ``(Q, b)``; under ``viterbi`` the
+landing is ``best + pi`` merged by max. When the character-by-character path
+did not reach ``(Q, b)`` -- its inner prefixes fell out of the beam, which is
+what an arc is for -- the landing creates the state holding the chain's whole
+mass, ``mass * e^pi``. Arcs landing on one absent ``Q`` from different entries
+add their masses, which counts covers they share twice; that happens only for
+a pruned lineage under a finite beam. With ``beam=None`` every ``(Q, b)`` is
+reached both ways and the sum is exactly the formula above.
+
+*Protection is the bound.* A cut with a kept arc that ends after the current
+key is not dead, and the bound of an open span at that cut, for keys before
+``b``, also takes the arc's optimistic gain: still exactly one more *event*
+priced optimistically, here the whole arc, with the transition's share
+bounded by 0. A prefix about to land an idiom therefore ranks by what the
+idiom will pay, which keeps it in the beam; nothing is kept beside the beam.
+
+*Counts.* :class:`ArcCounts` counts the arcs offered (enumerated), the arcs
+landed (kept, with at least one prefix landing them) and the transition rows
+asked only for landings.
+
+**The breakdown with arcs.** ``arcs`` is the number of arcs in the best
+cover's chosen set, so with ``viterbi`` the score is exactly ``ctc + beta *
+transition - gamma * correction + pi * arcs``.
 
 **The verifier** (#216 §8 item 5) is :class:`LegalityVerifier`: a plain
 dynamic program over ``char_pinyin.tsv`` and the corrections function that
@@ -111,6 +169,7 @@ import numpy.typing as npt
 import torch
 
 from mlime.legality import OFFLINE, KeyLattice, Legality, LegalityOptions
+from mlime.train.key_arcs import ArcLexicon, WordArc
 from mlime.typo import (
     CORRECTIONS_MAX_EDITS,
     MAX_SYLLABLE_LEN,
@@ -125,6 +184,9 @@ Ints = npt.NDArray[np.int64]
 Prefix = tuple[int, ...]
 
 _NEGATIVE = -math.inf
+
+#: Arcs landing per record per key offset (#282): the product's shape, as the beam's eight.
+DEFAULT_ARC_WIDTH = 8
 
 
 class Transition(Protocol):
@@ -157,6 +219,20 @@ class Hypothesis:
     correction: float
     #: The best cover's cut points ``b_1..b_m``; ``b_m`` is the key count.
     cuts: tuple[int, ...]
+    #: The arcs in the best cover's chosen set: its score carries ``pi`` for each.
+    arcs: int
+
+
+@dataclass
+class ArcCounts:
+    """What the word arcs cost a search: the work bound's evidence."""
+
+    #: Arcs enumerated over the records' lattices, before the per-offset width.
+    offered: int = 0
+    #: Kept arcs that at least one beam prefix landed.
+    landed: int = 0
+    #: Transition rows asked for landings alone, on top of the beam's own.
+    rows: int = 0
 
 
 @dataclass
@@ -173,6 +249,40 @@ class _Cut:
     correction: float
     #: The best cover's cut points.
     cover: tuple[int, ...]
+    #: The arcs in the best cover's chosen set.
+    arcs: int
+
+
+@dataclass(frozen=True)
+class _Landing:
+    """A word arc priced against its record: what a prefix landing it gains, whichever it is."""
+
+    entry: Prefix
+    start: int
+    end: int
+    #: The chains' summed gains combined as covers, and the best chain's alone.
+    mass: float
+    best: float
+    #: The best chain's ``sum (emit - blank)``, summed correction cost and cut points.
+    ctc: float
+    correction: float
+    cuts: tuple[int, ...]
+    #: The best chain's gains plus the prior: what the bound prices the arc at.
+    optimistic: float
+
+
+@dataclass
+class _Arrival:
+    """Every arc landing on one prefix at one offset, combined."""
+
+    transition: float
+    #: The additional mass the arcs give, and the whole mass of their covers
+    #: with the prior: what stands in when the character-by-character path
+    #: did not reach the prefix.
+    extra: float
+    whole: float
+    #: The best landing's cut, its mass ``whole``.
+    cut: _Cut
 
 
 @dataclass
@@ -194,7 +304,7 @@ class _Extensions:
     ctc: Floats
     correction: Floats
     origin: Ints
-    covers: dict[int, tuple[int, ...]]
+    sources: dict[int, _Cut]
     transition: Floats
     score: Floats
 
@@ -216,6 +326,12 @@ class _Record:
         arc_emit: Floats,
         blank: Floats,
         gamma: float,
+        words: Sequence[WordArc] = (),
+        *,
+        viterbi: bool = False,
+        prior: float = 0.0,
+        arc_width: int = DEFAULT_ARC_WIDTH,
+        counts: ArcCounts | None = None,
     ) -> None:
         n = lattice.keys
         self.n = n
@@ -244,12 +360,125 @@ class _Record:
                 self.max_end[start] = max(int(self.max_end[start]), end)
                 row = self.bound[start, :end]
                 np.maximum(row, top, out=row)
-            root = _Prefix(0.0, {0: _Cut(0.0, 0.0, 0.0, 0.0, ())})
+            root = _Prefix(0.0, {0: _Cut(0.0, 0.0, 0.0, 0.0, (), 0)})
             self.beam: dict[Prefix, _Prefix] = {(): root}
         else:
             self.beam = {}
+        self.viterbi = viterbi
+        self.prior = prior
+        #: The extra mass a landed arc adds in the sum: ``log(e^pi - 1)``.
+        self.bonus = prior + math.log1p(-math.exp(-prior)) if prior > 0 else _NEGATIVE
+        self.counts = counts if counts is not None else ArcCounts()
+        #: The kept arcs by their end offset, and the plan of the current offset:
+        #: which beam prefix lands which arc from which state.
+        self.landing: dict[int, list[_Landing]] = {}
+        self.plan: list[tuple[Prefix, _Landing, _Cut]] = []
+        if words and prior > 0 and self.chars.size:
+            self._keep(lattice, words, arc_width)
         self.rows: dict[Prefix, npt.NDArray[np.float32]] = {}
         self.results: list[Hypothesis] = []
+
+    def _keep(self, lattice: KeyLattice, words: Sequence[WordArc], width: int) -> None:
+        """Price the arcs, keep the best *width* ending at each offset, and open their cuts.
+
+        A kept arc keeps its start cut alive until it can land and raises the
+        bound of the open span there by its optimistic gain.
+        """
+        ends = lattice.end.astype(np.int64)
+        by_end: dict[int, list[_Landing]] = {}
+        for word in words:
+            gains = self.gain[word.chains].sum(axis=1)
+            top = int(np.argmax(gains))
+            by_end.setdefault(word.end, []).append(
+                _Landing(
+                    entry=word.entry,
+                    start=word.start,
+                    end=word.end,
+                    mass=_combine(gains.tolist(), self.viterbi),
+                    best=float(gains[top]),
+                    ctc=float(self.ctc_gain[word.chains[top]].sum()),
+                    correction=float(self.cost[word.chains[top]].sum()),
+                    cuts=tuple(ends[word.chains[top]].tolist()),
+                    optimistic=float(gains[top]) + self.prior,
+                )
+            )
+        self.counts.offered += len(words)
+        for end, group in by_end.items():
+            group.sort(key=lambda arc: (-arc.optimistic, arc.start, arc.entry))
+            self.landing[end] = group[:width]
+            for arc in self.landing[end]:
+                row = self.bound[arc.start, : arc.end]
+                np.maximum(row, arc.optimistic, out=row)
+                self.max_end[arc.start] = max(int(self.max_end[arc.start]), arc.end)
+
+    def prepare(self, end: int) -> None:
+        """Plan offset *end*'s landings: each kept arc lands from every prefix with its cut live."""
+        self.plan = []
+        landed = 0
+        for arc in self.landing.get(end, ()):
+            count = len(self.plan)
+            self.plan.extend(
+                (key, arc, prefix.cuts[arc.start])
+                for key, prefix in self.beam.items()
+                if arc.start in prefix.cuts
+            )
+            landed += len(self.plan) > count
+        self.counts.landed += landed
+
+    def requests(self, end: int, depth: int) -> tuple[list[Prefix], int]:
+        """The prefixes whose rows round *depth* asks for, and how many only landings ask.
+
+        Round 0 is the beam's own (:meth:`needs`) and each landing's source
+        prefix; round ``k`` the inner prefixes ``P + c_1..c_k`` of the entries
+        longer than ``k``.
+        """
+        asked = dict.fromkeys(self.needs(end)) if depth == 0 else {}
+        beams = len(asked)
+        for key, arc, _ in self.plan:
+            if len(arc.entry) > depth:
+                inner = (*key, *arc.entry[:depth])
+                if inner not in self.rows:
+                    asked.setdefault(inner)
+        return list(asked), len(asked) - beams
+
+    @property
+    def depth(self) -> int:
+        """The rounds of transition rows the current plan needs: its longest entry."""
+        return max((len(arc.entry) for _, arc, _ in self.plan), default=0)
+
+    def arrivals(self, beta: float) -> dict[Prefix, _Arrival]:
+        """The planned landings combined per landed prefix, with their transition sums."""
+        out: dict[Prefix, _Arrival] = {}
+        for key, arc, state in self.plan:
+            landed = (*key, *arc.entry)
+            transition = self.transition_sum(key, arc.entry)
+            base = state.mass + arc.mass
+            whole = base + self.prior
+            extra = whole if self.viterbi else base + self.bonus
+            cut = _Cut(
+                mass=whole,
+                best=state.best + arc.best + self.prior,
+                ctc=state.ctc + arc.ctc,
+                correction=state.correction + arc.correction,
+                cover=(*state.cover, *arc.cuts),
+                arcs=state.arcs + 1,
+            )
+            held = out.get(landed)
+            if held is None:
+                out[landed] = _Arrival(transition, extra, whole, cut)
+                continue
+            held.extra = _combine((held.extra, extra), self.viterbi)
+            held.whole = _combine((held.whole, whole), self.viterbi)
+            if cut.best > held.cut.best:
+                held.cut = cut
+        return out
+
+    def transition_sum(self, key: Prefix, entry: Prefix) -> float:
+        """``T(entry | key)`` summed character by character, then added to the prefix's own."""
+        total = self.beam[key].transition
+        for step, character in enumerate(entry):
+            total = total + float(self.rows[(*key, *entry[:step])][character])
+        return total
 
     def needs(self, end: int) -> list[Prefix]:
         """The beam prefixes that emit at *end* and have no transition row yet."""
@@ -307,7 +536,7 @@ class _Record:
                     ctc=ctc,
                     correction=correction,
                     origin=origin,
-                    covers={cut: state.cover for cut, state, _ in sources},
+                    sources={cut: state for cut, state, _ in sources},
                     transition=transition,
                     score=mass + beta * transition,
                 )
@@ -324,12 +553,14 @@ class _Record:
 
         def landed(index: int, at: int) -> _Cut:
             group = groups[index]
+            source = group.sources[int(group.origin[at])]
             return _Cut(
                 mass=float(group.mass[at]),
                 best=float(group.best[at]),
                 ctc=float(group.ctc[at]),
                 correction=float(group.correction[at]),
-                cover=(*group.covers[int(group.origin[at])], end),
+                cover=(*source.cover, end),
+                arcs=source.arcs,
             )
 
         # Old prefixes: drop the cuts whose span cannot grow past this key, and
@@ -372,6 +603,12 @@ class _Record:
             survivors[(*group.key, int(group.chars[at]))] = _Prefix(
                 float(group.transition[at]), {end: landed(index, at)}
             )
+        for key, arrival in self.arrivals(beta).items():
+            held = survivors.get(key)
+            if held is None:
+                survivors[key] = _Prefix(arrival.transition, {end: arrival.cut})
+            else:
+                held.cuts[end] = self.merged(held.cuts.get(end), arrival)
         if final:
             self._finish(survivors, beta, top_k)
             return
@@ -391,6 +628,25 @@ class _Record:
         self.beam = survivors
         self.evict()
 
+    def merged(self, reached: _Cut | None, arrival: _Arrival) -> _Cut:
+        """The state at a landed prefix's cut: what the character-wise path reached, plus the arcs.
+
+        Reached, the arcs add their additional mass to it; not reached, they
+        stand for it and hold the covers' whole mass with the prior.
+        """
+        if reached is None:
+            return arrival.cut
+        mass = _combine((reached.mass, arrival.extra), self.viterbi)
+        winner = arrival.cut if arrival.cut.best > reached.best else reached
+        return _Cut(
+            mass=mass,
+            best=winner.best,
+            ctc=winner.ctc,
+            correction=winner.correction,
+            cover=winner.cover,
+            arcs=winner.arcs,
+        )
+
     def _finish(self, outputs: dict[Prefix, _Prefix], beta: float, top_k: int | None) -> None:
         """The complete outputs at the last key, best first."""
         results = []
@@ -404,6 +660,7 @@ class _Record:
                     transition=prefix.transition,
                     correction=state.correction,
                     cuts=state.cover,
+                    arcs=state.arcs,
                 )
             )
         results.sort(key=lambda hypothesis: -hypothesis.score)
@@ -442,6 +699,10 @@ def search(
     beam: int | None = 8,
     top_k: int | None = None,
     viterbi: bool = False,
+    words: Sequence[Sequence[WordArc]] | None = None,
+    prior: float = 0.0,
+    arc_width: int = DEFAULT_ARC_WIDTH,
+    counts: ArcCounts | None = None,
 ) -> list[list[Hypothesis]]:
     """Each record's best legal outputs over its keys' lattice, best first.
 
@@ -452,6 +713,12 @@ def search(
     of outputs returned (``None``: *beam*, or all of them without a beam).
     *viterbi* combines a prefix's covers by max instead of log-sum-exp. A
     record whose lattice has no complete cover gets no outputs.
+
+    *words* are each record's word arcs (:meth:`~mlime.train.key_arcs.ArcLexicon.arcs`)
+    and *prior* the ``pi`` each contained arc adds (see the module docstring);
+    at ``prior == 0`` they are ignored and the search is the search without
+    arcs. At most *arc_width* arcs per record and offset are kept, and *counts*,
+    given, accumulates what they cost.
     """
     rows, width, columns = log_probs.shape
     if rows != len(lattices):
@@ -460,6 +727,14 @@ def search(
         raise ValueError(f"the open-span bound prices the transition at most 0; beta is {beta}")
     if beam is not None and beam < 1:
         raise ValueError(f"the beam keeps at least one prefix, got {beam}")
+    if not (math.isfinite(prior) and prior >= 0.0):
+        raise ValueError(f"the arc prior is finite and not negative, got {prior}")
+    if arc_width < 1:
+        raise ValueError(f"at least one arc lands per offset, got {arc_width}")
+    if words is not None and len(words) != rows:
+        raise ValueError(f"{len(words)} records of word arcs against {rows} rows of log-probs")
+    if prior > 0 and words is None:
+        raise ValueError("an arc prior above 0 needs the records' word arcs")
     if top_k is None:
         top_k = beam
     emittable = columns - 1
@@ -468,26 +743,52 @@ def search(
             raise ValueError(f"a record has {lattice.keys} keys against {width} log-prob rows")
         if lattice.character.size and int(lattice.character.max()) >= emittable:
             raise ValueError(f"an arc emits a character past the head's {emittable}")
-    records = _gather(lattices, log_probs, gamma)
+    counts = counts if counts is not None else ArcCounts()
+    records = _gather(
+        lattices,
+        log_probs,
+        gamma,
+        words=words if prior > 0 else None,
+        viterbi=viterbi,
+        prior=prior,
+        arc_width=arc_width,
+        counts=counts,
+    )
     longest = max((record.n for record in records), default=0)
     for end in range(1, longest + 1):
         live = [index for index, record in enumerate(records) if record.n >= end and record.beam]
-        owners: list[int] = []
-        prefixes: list[Prefix] = []
         for index in live:
-            for key in records[index].needs(end):
-                owners.append(index)
-                prefixes.append(key)
-        if prefixes:
-            fetched = _host_rows(transition(owners, prefixes), len(prefixes), emittable)
-            for index, key, row in zip(owners, prefixes, fetched, strict=True):
-                records[index].rows[key] = row
+            records[index].prepare(end)
+        # Round 0 asks the beam's rows and each landing's source prefix; round k
+        # the inner prefixes of the entries longer than k, across the whole batch.
+        for depth in range(max(1, max((records[index].depth for index in live), default=0))):
+            owners: list[int] = []
+            prefixes: list[Prefix] = []
+            for index in live:
+                asked, extra = records[index].requests(end, depth)
+                counts.rows += extra
+                owners.extend([index] * len(asked))
+                prefixes.extend(asked)
+            if prefixes:
+                fetched = _host_rows(transition(owners, prefixes), len(prefixes), emittable)
+                for index, key, row in zip(owners, prefixes, fetched, strict=True):
+                    records[index].rows[key] = row
         for index in live:
             records[index].step(end, beta, beam, top_k, viterbi)
     return [record.results for record in records]
 
 
-def _gather(lattices: Sequence[KeyLattice], log_probs: torch.Tensor, gamma: float) -> list[_Record]:
+def _gather(
+    lattices: Sequence[KeyLattice],
+    log_probs: torch.Tensor,
+    gamma: float,
+    *,
+    words: Sequence[Sequence[WordArc]] | None,
+    viterbi: bool,
+    prior: float,
+    arc_width: int,
+    counts: ArcCounts,
+) -> list[_Record]:
     """Every arc's emission log-prob and every key's blank, in one transfer to the host."""
     _, width, columns = log_probs.shape
     flat = log_probs.reshape(-1)
@@ -503,7 +804,17 @@ def _gather(lattices: Sequence[KeyLattice], log_probs: torch.Tensor, gamma: floa
     arcs = np.split(host[: sum(sizes)], np.cumsum(sizes)[:-1])
     blanks = host[sum(sizes) :].reshape(len(lattices), width)
     return [
-        _Record(lattice, emit, blanks[row], gamma)
+        _Record(
+            lattice,
+            emit,
+            blanks[row],
+            gamma,
+            () if words is None else words[row],
+            viterbi=viterbi,
+            prior=prior,
+            arc_width=arc_width,
+            counts=counts,
+        )
         for row, (lattice, emit) in enumerate(zip(lattices, arcs, strict=True))
     ]
 
@@ -520,9 +831,20 @@ def search_keys(
     beam: int | None = 8,
     top_k: int | None = None,
     viterbi: bool = False,
+    arcs: ArcLexicon | None = None,
+    prior: float = 0.0,
+    arc_width: int = DEFAULT_ARC_WIDTH,
+    counts: ArcCounts | None = None,
 ) -> list[list[Hypothesis]]:
-    """:func:`search` over the keys' lattices under *options*, offline by default."""
+    """:func:`search` over the keys' lattices under *options*, offline by default.
+
+    With *arcs* and a *prior* above 0 each record's word arcs are enumerated
+    from the lexicon over its lattice and keys.
+    """
     lattices = [legality.lattice(each, options) for each in keys]
+    words = None
+    if arcs is not None and prior > 0:
+        words = [arcs.arcs(lattice, each) for lattice, each in zip(lattices, keys, strict=True)]
     return search(
         lattices,
         log_probs,
@@ -532,6 +854,10 @@ def search_keys(
         beam=beam,
         top_k=top_k,
         viterbi=viterbi,
+        words=words,
+        prior=prior,
+        arc_width=arc_width,
+        counts=counts,
     )
 
 

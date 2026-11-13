@@ -601,3 +601,41 @@ def test_a_key_ranking_stage_stamps_its_term_over_a_finished_joint_run(tmp_path:
         )
         assert refused.exit_code == 2, (option, refused.output)
         assert wanted in error(refused.output), option
+
+
+def test_a_key_stage_stamps_the_arcs_lexicon_its_evaluation_reads(tmp_path: Path) -> None:
+    """``KEY_ARCS`` (#282) is an evaluation line beside the joint stage's, for a key front."""
+    out = tmp_path / "arcs"
+    argv = ["e2e", "stamp", "mlime-e2e-keys-s3-arcs", "--out", str(out)]
+    stage = ["--init-from", "mlime-e2e-keys-s2-check", "--keys"]
+    result = CliRunner().invoke(app, [*argv, *stage, "--key-arcs", "knowledge.tsv"])
+    assert result.exit_code == 0, result.output
+    template = (TEMPLATE / "kernel.py").read_text()
+    kernel = (out / "kernel.py").read_text()
+    keys = {"layers": 2, "transition_weight": 1.0, "correct_syllables": True}
+    assert sorted(changed_lines(template, kernel)) == sorted(
+        f"{name} = {value!r}"
+        for name, value in {
+            "INIT_FROM": "mlime-e2e-keys-s2-check",
+            "KEYS": keys,
+            "KEY_ARCS": "knowledge.tsv",
+            "PROFILE_STEPS": 30,
+            "TRACE_STEPS": 3,
+        }.items()
+    )
+    assert literal(template, "KEY_ARCS") is None
+    assert literal(kernel, "KEY_ARCS") == "knowledge.tsv"
+    assert "  KEY_ARCS = 'knowledge.tsv'" in result.output
+
+    # Without the key front there is no key evaluation to read it.
+    refused = CliRunner().invoke(app, [*argv, "--key-arcs", "knowledge.tsv"])
+    assert refused.exit_code == 2, refused.output
+    assert "pass --keys" in error(refused.output)
+    with pytest.raises(ValueError, match="stamp KEYS"):
+        E2EV2Run(run="mlime-e2e-v2-a100", key_arcs="knowledge.tsv")
+    with pytest.raises(ValueError, match="stamp KEYS"):
+        E2EV2Run(
+            run="mlime-e2e-v2-a100",
+            stage=E2EV2Stage(init_from="mlime-e2e-v2-g4"),
+            key_arcs="knowledge.tsv",
+        )

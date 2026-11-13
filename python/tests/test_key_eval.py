@@ -21,6 +21,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
+import click
 import pytest
 import torch
 from test_keys import (
@@ -172,7 +173,15 @@ def test_a_tiny_model_decodes_real_records_and_resumes_to_the_same_report(
         scores = [hypothesis["score"] for hypothesis in row["hypotheses"]]
         assert scores == sorted(scores, reverse=True)
         for hypothesis in row["hypotheses"]:
-            assert set(hypothesis) == {"text", "score", "ctc", "transition", "correction", "cuts"}
+            assert set(hypothesis) == {
+                "text",
+                "score",
+                "ctc",
+                "transition",
+                "correction",
+                "cuts",
+                "arcs",
+            }
             assert hypothesis["cuts"][-1] == len(pinyin)
             assert len(hypothesis["cuts"]) == len(hypothesis["text"])
             cost = verifier.cost(pinyin, hypothesis["text"], legality_options(model))
@@ -479,3 +488,130 @@ def test_only_a_joint_stage_checkpoint_loads_for_the_search(
             CPU,
             bert_config=TINY,
         )
+
+
+def test_a_prior_keeps_a_points_old_name_at_zero_and_old_selections_read_back() -> None:
+    plain = KeyWeights(1.0, 2.0, False)
+    assert plain.prior == 0.0
+    assert plain.name == "beta1-gamma2-sum"
+    assert KeyWeights(1.0, 2.0, True).name == "beta1-gamma2-viterbi"
+    assert KeyWeights(1.0, 2.0, False, 4.0).name == "beta1-gamma2-sum-prior4"
+    assert KeyWeights(1.0, 2.0, True, 0.5).name == "beta1-gamma2-viterbi-prior0.5"
+    assert plain.as_record() == {"beta": 1.0, "gamma": 2.0, "combination": "sum", "prior": 0.0}
+    # A selection written before the arcs has no prior in any row: 0.
+    old = {"beta": 1.0, "gamma": 2.0, "combination": "viterbi"}
+    assert KeyWeights.from_record(old) == KeyWeights(1.0, 2.0, True)
+    for point in (plain, KeyWeights(0.5, 1.0, True, 12.0)):
+        assert KeyWeights.from_record(point.as_record()) == point
+    with pytest.raises(ValueError, match="prior"):
+        KeyWeights(1.0, 1.0, False, -1.0)
+    with pytest.raises(ValueError, match="prior"):
+        KeyWeights(1.0, 1.0, False, math.inf)
+    # The grid sweeps the prior between gamma and the combination; none given is today's grid.
+    assert weight_grid([1.0, 2.0], [1.0], [False, True]) == [
+        KeyWeights(beta, 1.0, viterbi) for beta in (1.0, 2.0) for viterbi in (False, True)
+    ]
+    grid = weight_grid([1.0], [1.0], [False], [0.0, 4.0, 8.0])
+    assert [point.name for point in grid] == [
+        "beta1-gamma1-sum",
+        "beta1-gamma1-sum-prior4",
+        "beta1-gamma1-sum-prior8",
+    ]
+    with pytest.raises(ValueError, match="repeats"):
+        weight_grid([1.0], [1.0], [False], [4.0, 4.0])
+
+
+def test_the_dev_sweep_over_the_prior_decodes_with_arcs_and_counts_them(
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    legality: Legality,
+    reader_vocab: CharVocab,
+    verifier: LegalityVerifier,
+    tmp_path: Path,
+) -> None:
+    from mlime.train.key_arcs import ArcLexicon
+
+    model = tiny_joint_model(lexicon, reader_vocab)
+    table = tmp_path / "knowledge.tsv"
+    bigrams = ["北京", "爱北", "我爱", "钟爱", "绿钟", "我绿", "中重", "重我"]
+    table.write_text(
+        "".join(f"{word}\tidiom\n" for word in bigrams) + "我\tidiom\n龘龘\tidiom\n北京\tperson\n",
+        encoding="utf-8",
+    )
+    arcs = ArcLexicon.load(table, ["idiom"], lexicon.characters)
+    assert (arcs.size, arcs.skipped_short, arcs.skipped_outside) == (len(bigrams), 1, 1)
+    plain_run = key_run(model, lexicon, spans, legality, verifier)
+    run = replace(plain_run, decoder=replace(plain_run.decoder, arcs=arcs, arc_width=4))
+    grid = weight_grid([1.0], [1.0], [False], [0.0, 6.0])
+
+    # A prior without a lexicon is refused, not ignored.
+    with pytest.raises(ValueError, match="word arcs"):
+        select_on_dev(plain_run, grid, tmp_path / "refused")
+
+    selection = select_on_dev(run, grid, tmp_path / "sweep")
+    assert [weights.name for weights, _ in selection.grid] == [
+        "beta1-gamma1-sum",
+        "beta1-gamma1-sum-prior6",
+    ]
+    assert dump_path(tmp_path / "sweep", "dev", grid[0]).name == "dev-beta1-gamma1-sum.jsonl"
+    record = json.loads((tmp_path / "sweep" / "selection.json").read_text(encoding="utf-8"))
+    assert [point["prior"] for point in record["grid"]] == [0.0, 6.0]
+    assert record["chosen"]["prior"] in (0.0, 6.0)
+    assert KeyWeights.from_record(record["chosen"]) == selection.chosen
+    times = run.decoder.times
+    assert times.arcs_offered > 0 and times.arcs_landed > 0 and times.arcs > 0.0
+    assert times.arc_rows >= 0 and "arcs" in times.seconds and "arcs_offered" not in times.seconds
+    # The prior-0 point is the decode without arcs, row for row; the other lists its arcs.
+    plain = dumped(dump_path(tmp_path / "sweep", "dev", grid[0]))
+    reference = report_keys(plain_run, tmp_path / "ref", [grid[0]], slice_="dev")
+    assert dumped(dump_path(tmp_path / "ref", "dev", grid[0])) == plain
+    assert "slice: dev" in reference
+    assert all(h["arcs"] == 0 for row in plain for h in row["hypotheses"])
+    boosted = dumped(dump_path(tmp_path / "sweep", "dev", grid[1]))
+    assert any(h["arcs"] > 0 for row in boosted for h in row["hypotheses"])
+    table_text = selection.render()
+    assert "prior" in table_text and "6" in table_text
+
+    # An old selection (no prior in its rows) still resumes: the dumps are the progress.
+    for point in record["grid"] + [record["chosen"]]:
+        del point["prior"]
+    (tmp_path / "sweep" / "selection.json").write_text(json.dumps(record), encoding="utf-8")
+    again = select_on_dev(run, grid, tmp_path / "sweep")
+    assert again.chosen == selection.chosen
+    assert again.test_seconds_estimate == selection.test_seconds_estimate
+
+
+def error(output: str) -> str:
+    """A refusal's text with its styling and the error box's borders and wrapping taken out."""
+    return " ".join(click.unstyle(output).replace("│", " ").split())
+
+
+def test_the_keys_command_sweeps_the_prior_and_refuses_it_without_a_lexicon(
+    tmp_path: Path,
+) -> None:
+    from typer.testing import CliRunner
+
+    from mlime.__main__ import app
+
+    base = [
+        "eval",
+        "keys",
+        "--checkpoint",
+        str(tmp_path / "missing.pt"),
+        "--eval-set",
+        str(tmp_path / "set.jsonl"),
+        "--dump-dir",
+        str(tmp_path / "dump"),
+        "--select-on-dev",
+    ]
+    refused = CliRunner().invoke(app, [*base, "--arc-prior", "0", "--arc-prior", "4"])
+    assert refused.exit_code == 2, refused.output
+    assert "--arcs" in error(refused.output)
+    fixed = [*base[:-1], "--slice", "dev", "--arcs", str(tmp_path / "k.tsv")]
+    sweeping = CliRunner().invoke(app, [*fixed, "--arc-prior", "4", "--arc-prior", "8"])
+    assert sweeping.exit_code == 2 and "one --arc-prior" in error(sweeping.output)
+    narrow = CliRunner().invoke(app, [*base, "--arc-prior", "0", "--arc-width", "0"])
+    assert narrow.exit_code == 2 and "--arc-width" in error(narrow.output)
+    # Prior 0 needs no lexicon to parse; the missing checkpoint is what stops it.
+    parsed = CliRunner().invoke(app, [*base, "--arc-prior", "0"])
+    assert "--arc-prior" not in error(parsed.output) and "--arcs" not in error(parsed.output)

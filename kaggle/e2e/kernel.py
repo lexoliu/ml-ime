@@ -54,7 +54,9 @@ from the keys by `mlime eval keys`: each twin's dev slice, context on and off,
 sweeping the search's weights and choosing per section, and the test slices
 at the choices only when the sweeps' measured rate says they fit the session
 left; otherwise the summary says so, and the kernel pushed again with this
-one's output mounted continues every section from where it stopped. The twins
+one's output mounted continues every section from where it stopped. With
+`KEY_ARCS` stamped (#282) the abbreviated and mixed twins also sweep the word
+arcs' prior (`KEY_PRIORS`) over that lexicon. The twins
 are eval3's three and its typo twin; each section's chosen-point dumps leave as
 gzipped `e2e-keys-<section>-{dev,test}.jsonl.gz` with its selection, which the
 Colab publisher uploads with the other final outputs. A finished
@@ -304,6 +306,18 @@ KEY_TWINS = {
     "-typo": (0.5, 1.0, 2.0),
 }
 KEY_BETAS = (1.0, 2.0, 4.0, 8.0)
+
+#: The word arcs' lexicon for that evaluation (#282), as the name of a
+#: `word<TAB>category` file in the assets mount beside `char_pinyin.tsv`; its
+#: idioms are proposed whole where the keys type them. Needs `KEYS`. None
+#: decodes without arcs. Stamped per push (`mlime e2e stamp --key-arcs`).
+KEY_ARCS = None
+
+#: The prior grid the dev sweep adds to the twins whose keystrokes can type an
+#: idiom as initials (the abbreviated and the mixed one) when `KEY_ARCS` is
+#: set. The full-pinyin twin has no initial-typed span for an arc to need, and
+#: the typo twin's sweep of gamma stays as wide as it is: both keep prior 0.
+KEY_PRIORS = (0.0, 4.0, 8.0, 12.0)
 
 #: The segmenter binary the ranking loss pipes keystrokes through, shipped
 #: inside the package dataset.
@@ -1129,7 +1143,16 @@ def evaluate_lattices(checkpoint, assets, char_table, env):
 
 
 def key_eval_argv(
-    checkpoint, eval_set, dump_dir, report, char_table, repository, context, gammas, test
+    checkpoint,
+    eval_set,
+    dump_dir,
+    report,
+    char_table,
+    repository,
+    context,
+    gammas,
+    test,
+    priors=(0.0,),
 ):
     """The command that sweeps one twin's dev slice in one context setting (#257).
 
@@ -1137,6 +1160,8 @@ def key_eval_argv(
     chooses there; with *test* it goes on to the test slice at the choice,
     otherwise it stops after the choice (`--selection-only`). Both resume from
     the section's dump directory, so the test pass decodes no dev record twice.
+    A section with a prior above 0 among *priors* (#282) also reads `KEY_ARCS`
+    from the assets mount and sweeps the priors; one without decodes as before.
     """
     data = Path(repository) / "crates" / "ime-pinyin" / "data"
     argv = [
@@ -1167,26 +1192,51 @@ def key_eval_argv(
         str(report),
         "--verbose",
     ]
+    if any(prior > 0 for prior in priors):
+        if KEY_ARCS is None:
+            raise RuntimeError("a prior above 0 proposes the arcs lexicon; stamp KEY_ARCS")
+        argv += ["--arcs", str(Path(char_table).parent / KEY_ARCS)]
+        argv += [item for prior in priors for item in ("--arc-prior", str(prior))]
     if not test:
         argv.append("--selection-only")
     return argv
 
 
+def key_priors(suffix):
+    """The priors the twin *suffix* sweeps: `KEY_PRIORS` on a twin that types initials, else 0.
+
+    Only with `KEY_ARCS` stamped. The full-pinyin twin types no initial for an
+    arc to need, and the typo twin's sweep is wide enough already.
+    """
+    if KEY_ARCS is None or suffix in ("", "-typo"):
+        return (0.0,)
+    return KEY_PRIORS
+
+
 def key_sections(assets):
     """The key evaluation's sections: each twin of `KEY_TWINS`, context on and off.
 
-    A section is `(name, eval set, context, gammas)`, the sweeps with the most
-    grid points first, so that the queue of sections hands the long ones out
-    before the short.
+    A section is `(name, eval set, context, gammas, priors)`, the sweeps with
+    the most grid points first, so that the queue of sections hands the long
+    ones out before the short.
     """
+    if KEY_ARCS is not None and not (assets / KEY_ARCS).is_file():
+        raise FileNotFoundError(f"no arcs lexicon at {assets / KEY_ARCS}; mounts hold {describe()}")
     sections = []
-    for suffix, gammas in sorted(KEY_TWINS.items(), key=lambda twin: -len(twin[1])):
+    twins = sorted(KEY_TWINS.items(), key=lambda twin: -len(twin[1]) * len(key_priors(twin[0])))
+    for suffix, gammas in twins:
         eval_set = assets / f"eval3{suffix}.jsonl"
         if not eval_set.is_file():
             raise FileNotFoundError(f"no eval set at {eval_set}; mounts hold {describe()}")
         for context in (True, False):
             sections.append(
-                (f"eval3{suffix}-context-{'on' if context else 'off'}", eval_set, context, gammas)
+                (
+                    f"eval3{suffix}-context-{'on' if context else 'off'}",
+                    eval_set,
+                    context,
+                    gammas,
+                    key_priors(suffix),
+                )
             )
     return sections
 
@@ -1236,7 +1286,7 @@ def publish_key_dumps(outcome):
     for name, section in outcome["sections"].items():
         directory = WORKING / f"keys-{name}"
         chosen = section["chosen"]
-        weights = KeyWeights(chosen["beta"], chosen["gamma"], chosen["combination"] == "viterbi")
+        weights = KeyWeights.from_record(chosen)
         shutil.copyfile(directory / "selection.json", WORKING / f"e2e-keys-{name}-selection.json")
         slices = ("dev", "test") if outcome["test"] == "decoded" else ("dev",)
         for slice_ in slices:
@@ -1265,8 +1315,10 @@ def decode_keys(checkpoint, assets, char_table, repository, env, started):
     after the reserve; otherwise it is left for a later kernel over the same
     finished run, which continues every section from this one's output.
     """
+    from mlime.train.key_eval import KeyWeights
+
     sections = key_sections(assets)
-    for name, _, _, _ in sections:
+    for name, *_ in sections:
         seed_key_section(name)
 
     def sweep(test):
@@ -1279,7 +1331,7 @@ def decode_keys(checkpoint, assets, char_table, repository, env, started):
             measured = {}
             while True:
                 try:
-                    name, eval_set, context, gammas = queue.get_nowait()
+                    name, eval_set, context, gammas, priors = queue.get_nowait()
                 except Empty:
                     return measured
                 dump_dir = WORKING / f"keys-{name}"
@@ -1296,6 +1348,7 @@ def decode_keys(checkpoint, assets, char_table, repository, env, started):
                         context,
                         gammas,
                         test,
+                        priors,
                     ),
                     worker_env,
                     str(WORKING / f"eval-keys-{name}-{phase}.log"),
@@ -1315,14 +1368,12 @@ def decode_keys(checkpoint, assets, char_table, repository, env, started):
 
     dev = sweep(test=False)
     evaluated = {}
-    for name, _, _, _ in sections:
+    for name, *_ in sections:
         selection = json.loads((WORKING / f"keys-{name}" / "selection.json").read_text())
+        # A selection from before the arcs has no prior in its rows: 0.
+        picked = KeyWeights.from_record(selection["chosen"])
         chosen = next(
-            point
-            for point in selection["grid"]
-            if all(
-                point[key] == selection["chosen"][key] for key in ("beta", "gamma", "combination")
-            )
+            point for point in selection["grid"] if KeyWeights.from_record(point) == picked
         )
         evaluated[name] = {
             "dev_seconds": dev[name]["seconds"],
@@ -1462,6 +1513,8 @@ def main():
         )
     if (UNIT_INITIALS > 0) != (UNIT_LEXICON is not None):
         raise RuntimeError("the unit initials and their lexicon come together; stamp both")
+    if KEY_ARCS is not None and KEYS is None:
+        raise RuntimeError("the arcs lexicon is read by the key evaluation; stamp KEYS")
     install()
     packages = package_root()
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)

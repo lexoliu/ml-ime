@@ -51,7 +51,7 @@ from __future__ import annotations
 import json
 import math
 import time
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from itertools import batched
 from pathlib import Path
@@ -63,8 +63,17 @@ import torch
 from mlime.legality import KeyLattice, Legality, LegalityOptions
 from mlime.logging import log
 from mlime.train.e2e_eval import EvalRow, Report, SliceReports, read_eval_records
+from mlime.train.key_arcs import ArcLexicon, WordArc
 from mlime.train.key_model import KeyE2EModel, KeyStates
-from mlime.train.key_search import Hypothesis, LegalityVerifier, Prefix, Transition, search
+from mlime.train.key_search import (
+    DEFAULT_ARC_WIDTH,
+    ArcCounts,
+    Hypothesis,
+    LegalityVerifier,
+    Prefix,
+    Transition,
+    search,
+)
 from mlime.train.keys import KeyCollator
 from mlime.train.lexicon import CandidateSpace, Lexicon
 from mlime.train.samples import (
@@ -121,12 +130,16 @@ class KeyWeights:
     beta: float
     gamma: float
     viterbi: bool
+    #: The word arcs' prior (#282): what each arc a cover contains adds to it; 0 is no arcs.
+    prior: float = 0.0
 
     def __post_init__(self) -> None:
         if not (math.isfinite(self.beta) and self.beta >= 0.0):
             raise ValueError(f"beta must be finite and not negative, got {self.beta}")
         if not (math.isfinite(self.gamma) and self.gamma >= 0.0):
             raise ValueError(f"gamma must be finite and not negative, got {self.gamma}")
+        if not (math.isfinite(self.prior) and self.prior >= 0.0):
+            raise ValueError(f"the arc prior must be finite and not negative, got {self.prior}")
 
     @property
     def combination(self) -> str:
@@ -135,22 +148,42 @@ class KeyWeights:
 
     @property
     def name(self) -> str:
-        """A file-name-safe label, unique per point."""
-        return f"beta{self.beta:g}-gamma{self.gamma:g}-{self.combination}"
+        """A file-name-safe label, unique per point; a point without a prior keeps its old name."""
+        base = f"beta{self.beta:g}-gamma{self.gamma:g}-{self.combination}"
+        return f"{base}-prior{self.prior:g}" if self.prior else base
 
     def as_record(self) -> dict[str, Any]:
         """The point as JSON fields."""
-        return {"beta": self.beta, "gamma": self.gamma, "combination": self.combination}
+        return {
+            "beta": self.beta,
+            "gamma": self.gamma,
+            "combination": self.combination,
+            "prior": self.prior,
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> KeyWeights:
+        """The point :meth:`as_record` wrote; a record from before the prior has none (0)."""
+        return cls(
+            record["beta"],
+            record["gamma"],
+            record["combination"] == "viterbi",
+            record.get("prior", 0.0),
+        )
 
 
 def weight_grid(
-    betas: Sequence[float], gammas: Sequence[float], combinations: Sequence[bool]
+    betas: Sequence[float],
+    gammas: Sequence[float],
+    combinations: Sequence[bool],
+    priors: Sequence[float] = (0.0,),
 ) -> list[KeyWeights]:
-    """Every ``beta x gamma x combination``, in the order given: a dev tie goes to the first."""
+    """Every ``beta x gamma x prior x combination``, in the order given: a tie goes to the first."""
     grid = [
-        KeyWeights(beta, gamma, viterbi)
+        KeyWeights(beta, gamma, viterbi, prior)
         for beta in betas
         for gamma in gammas
+        for prior in priors
         for viterbi in combinations
     ]
     if not grid:
@@ -177,6 +210,13 @@ class DecodeTimes:
     search: float = 0.0
     #: The verifier's check of every hypothesis written.
     verify: float = 0.0
+    #: Enumerating the records' word arcs on the host (#282), paid once per record.
+    arcs: float = 0.0
+    #: The word arcs' counters (:class:`~mlime.train.key_search.ArcCounts`) over every search:
+    #: arcs offered, arcs landed, and the transition rows asked for landings alone.
+    arcs_offered: int = 0
+    arcs_landed: int = 0
+    arc_rows: int = 0
 
     def add(self, other: DecodeTimes) -> None:
         """Accumulate *other* into this."""
@@ -184,9 +224,14 @@ class DecodeTimes:
             setattr(self, name, getattr(self, name) + value)
 
     @property
+    def seconds(self) -> dict[str, float]:
+        """The phases' wall times by name, the counters left out."""
+        return {name: value for name, value in asdict(self).items() if isinstance(value, float)}
+
+    @property
     def total(self) -> float:
         """Every phase together."""
-        return self.lattice + self.encode + self.transition + self.search + self.verify
+        return self.lattice + self.arcs + self.encode + self.transition + self.search + self.verify
 
     def per_record(self, grid_points: int) -> float:
         """The seconds one record would take decoded at *grid_points* points.
@@ -196,7 +241,7 @@ class DecodeTimes:
         """
         if not self.records or not self.searches:
             raise ValueError("nothing was decoded to measure")
-        once = (self.lattice + self.encode) / self.records
+        once = (self.lattice + self.arcs + self.encode) / self.records
         each = (self.transition + self.search + self.verify) / self.searches
         return once + grid_points * each
 
@@ -242,6 +287,8 @@ def search_points(
     beam: int,
     top_k: int,
     times: DecodeTimes,
+    words: Sequence[Sequence[WordArc]] | None = None,
+    arc_width: int = DEFAULT_ARC_WIDTH,
 ) -> list[list[list[Hypothesis]]]:
     """The search at every grid point over one group's encoding: ``[point][record]``.
 
@@ -249,9 +296,13 @@ def search_points(
     encoding serves every point; which hypotheses a beam keeps does, so each
     point runs its own search. The transition's time is whatever the
     transition added to ``times.transition`` during the call, and is taken out
-    of the search's.
+    of the search's. *words* are the records' word arcs, which a point with a
+    prior needs and a decoder without a lexicon cannot give: that raises.
     """
+    if words is None and any(weights.prior > 0 for weights in grid):
+        raise ValueError("a grid point with an arc prior needs the records' word arcs")
     found = []
+    counts = ArcCounts()
     for weights in grid:
         queried = times.transition
         began = time.perf_counter()
@@ -265,10 +316,17 @@ def search_points(
                 beam=beam,
                 top_k=top_k,
                 viterbi=weights.viterbi,
+                words=words,
+                prior=weights.prior,
+                arc_width=arc_width,
+                counts=counts,
             )
         )
         spent = time.perf_counter() - began
         times.search += spent - (times.transition - queried)
+    times.arcs_offered += counts.offered
+    times.arcs_landed += counts.landed
+    times.arc_rows += counts.rows
     return found
 
 
@@ -357,6 +415,10 @@ class KeyDecoder:
     beam: int = DEFAULT_BEAM
     top_k: int = DEFAULT_TOP_K
     times: DecodeTimes = field(default_factory=DecodeTimes)
+    #: The word arcs' lexicon (#282) and the arcs that may land per record and key; a grid
+    #: point with a prior needs the lexicon.
+    arcs: ArcLexicon | None = None
+    arc_width: int = DEFAULT_ARC_WIDTH
 
     def __post_init__(self) -> None:
         emittable = int(self.model.decoder.emit_ids.numel())
@@ -407,6 +469,13 @@ class KeyDecoder:
             searching = time.perf_counter()
             self.times.lattice += encoding - started
             self.times.encode += searching - encoding
+            words = None
+            if self.arcs is not None and any(weights.prior > 0 for weights in grid):
+                words = [
+                    self.arcs.arcs(lattice, record.keys)
+                    for lattice, record in zip(lattices, group, strict=True)
+                ]
+                self.times.arcs += time.perf_counter() - searching
             transition = ModelTransition(self.model, states, self.times)
             for point, hypotheses in enumerate(
                 search_points(
@@ -417,6 +486,8 @@ class KeyDecoder:
                     beam=self.beam,
                     top_k=self.top_k,
                     times=self.times,
+                    words=words,
+                    arc_width=self.arc_width,
                 )
             ):
                 found[point].extend(hypotheses)
@@ -470,6 +541,7 @@ def checked_row(
                 "transition": hypothesis.transition,
                 "correction": hypothesis.correction,
                 "cuts": list(hypothesis.cuts),
+                "arcs": hypothesis.arcs,
             }
         )
     return {"record": record.record, "text": record.text, "hypotheses": written}
@@ -547,8 +619,11 @@ class KeyRun:
                     grid_points=len(needed),
                     records_per_second=round(decoded / (time.monotonic() - started), 2),
                     seconds={
-                        name: round(value, 2) for name, value in asdict(decoder.times).items()
+                        name: round(value, 2) for name, value in decoder.times.seconds.items()
                     },
+                    arcs_offered=decoder.times.arcs_offered,
+                    arcs_landed=decoder.times.arcs_landed,
+                    arc_rows=decoder.times.arc_rows,
                 )
         finally:
             for sink in sinks:
@@ -607,15 +682,19 @@ class Selection:
 
     def render(self) -> str:
         """The dev sweep as a table, the chosen point marked."""
+        priors = any(weights.prior for weights, _ in self.grid)
+        column = f"{'prior':>6}  " if priors else ""
+        rule = f"{'-' * 6}  " if priors else ""
         lines = [
-            f"{'beta':>6}  {'gamma':>6}  {'combine':<8}  top-1    top-k    char     MRR",
-            f"{'-' * 6}  {'-' * 6}  {'-' * 8}  {'-' * 6}   {'-' * 6}   {'-' * 6}   {'-' * 6}",
+            f"{'beta':>6}  {'gamma':>6}  {'combine':<8}  {column}top-1    top-k    char     MRR",
+            f"{'-' * 6}  {'-' * 6}  {'-' * 8}  {rule}{'-' * 6}   {'-' * 6}   {'-' * 6}   {'-' * 6}",
         ]
         for weights, report in self.grid:
             records = report.records or 1
             mark = "  <- chosen" if weights == self.chosen else ""
             lines.append(
                 f"{weights.beta:>6g}  {weights.gamma:>6g}  {weights.combination:<8}  "
+                f"{f'{weights.prior:>6g}  ' if priors else ''}"
                 f"{report.top1_hits / records:.4f}   {report.topk_hits / records:.4f}   "
                 f"{report.character_hits / (report.characters or 1):.4f}   "
                 f"{report.reciprocal_ranks / (1 << 20) / records:.4f}{mark}"
@@ -691,13 +770,18 @@ def load_key_run(
     records_per_chunk: int = DEFAULT_RECORDS_PER_CHUNK,
     max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
     limit: int | None = None,
+    arcs: Path | None = None,
+    arc_categories: Sequence[str] = ("idiom",),
+    arc_width: int = DEFAULT_ARC_WIDTH,
 ) -> tuple[KeyRun, int]:
     """Everything an evaluation of *checkpoint* on *eval_set* needs, and the checkpoint's step.
 
     The lexicon, the tokenizers and the automaton are built the way the run
     that trained the checkpoint built them (:class:`~mlime.train.run.Vocabularies`);
     the verifier reads the committed tables directly. *with_context* off
-    drops every context, as a context dropout of 1 does in training.
+    drops every context, as a context dropout of 1 does in training. *arcs*
+    is the word arcs' lexicon file (#282), read for *arc_categories* over the
+    model's emittable set.
     """
     from mlime.train.e2e import load_key_model, recorded_config
     from mlime.train.run import Vocabularies
@@ -726,6 +810,10 @@ def load_key_run(
         token_budget=token_budget,
         beam=beam,
         top_k=top_k,
+        arcs=None
+        if arcs is None
+        else ArcLexicon.load(arcs, arc_categories, vocabularies.lexicon.characters),
+        arc_width=arc_width,
     )
     run = build_key_run(
         decoder,

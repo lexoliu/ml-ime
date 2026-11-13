@@ -1676,6 +1676,12 @@ def e2e_stamp(
         help="The file of the assets mount holding the knowledge lexicon whose idioms and "
         "internet phrases are the units (UNIT_LEXICON); needs --unit-initials",
     ),
+    key_arcs: str | None = typer.Option(
+        None,
+        "--key-arcs",
+        help="The file of the assets mount whose entries the key evaluation proposes as word "
+        "arcs (KEY_ARCS, #282); needs --keys",
+    ),
 ) -> None:
     """Write a v2 run's kernel directory: v1's recipe, the run's slug, the v2 sources.
 
@@ -1724,6 +1730,8 @@ def e2e_stamp(
         "--unit-lexicon": unit_lexicon,
     }
     check_units(unit_initials, unit_lexicon)
+    if key_arcs is not None and not keys:
+        raise typer.BadParameter("--key-arcs is read by the key evaluation; pass --keys")
     tower = context_settings(
         context_tower, context_revision, context_lora_rank, context_lora_alpha, context_layers
     )
@@ -1811,6 +1819,7 @@ def e2e_stamp(
         stage=stage,
         search_graphs=search_graphs,
         tower_graphs=tower_graphs,
+        key_arcs=key_arcs,
     )
     recipe = stamp_e2e_v2(source, out, spec)
     typer.echo(f"{out}: {spec.slug}, stamped from {source}")
@@ -2091,7 +2100,8 @@ def eval_keys(
     select_on_dev: bool = typer.Option(
         False,
         "--select-on-dev",
-        help="Sweep the --beta x --gamma x combination grid on the dev slice, choose by dev "
+        help="Sweep the --beta x --gamma x --arc-prior x combination grid on the dev slice, "
+        "choose by dev "
         "top-1 (ties: top-8, then the smaller beta, then the first given), then decode test "
         "at the choice",
     ),
@@ -2109,6 +2119,22 @@ def eval_keys(
     dev_share: float = typer.Option(0.0905, help="Share of the set that is development data"),
     beam: int = typer.Option(8, help="Prefixes the search keeps after each key"),
     top_k: int = typer.Option(8, help="Hypotheses kept per record"),
+    arcs: Path = typer.Option(
+        None,
+        "--arcs",
+        help="The word arcs' lexicon (`word<TAB>category` rows, e.g. data/lexicon/knowledge.tsv): "
+        "its entries are proposed whole where the keys type them, with a prior (#282)",
+    ),
+    arc_category: list[str] = typer.Option(
+        ["idiom"], "--arc-category", help="A category of --arcs to propose; repeat for several"
+    ),
+    arc_width: int = typer.Option(8, "--arc-width", help="Arcs landing per record and key offset"),
+    arc_prior: list[float] = typer.Option(
+        [0.0],
+        "--arc-prior",
+        help="What each arc a cover contains adds to it; repeat to sweep with --select-on-dev. "
+        "0 is the search without arcs; above 0 needs --arcs",
+    ),
     context: bool = typer.Option(True, help="Let the model read each record's context"),
     token_budget: int = typer.Option(8192, help="Padded positions per encoder forward"),
     records: int = typer.Option(
@@ -2166,9 +2192,17 @@ def eval_keys(
     if selection_only and not select_on_dev:
         raise typer.BadParameter("--selection-only stops a --select-on-dev sweep")
     combinations = ([False, True] if select_on_dev else [False]) if viterbi is None else [viterbi]
-    grid = weight_grid(beta, gamma, combinations)
+    if arcs is None and any(prior > 0 for prior in arc_prior):
+        raise typer.BadParameter("an --arc-prior above 0 proposes the entries of --arcs; pass it")
+    if arcs is not None and coreml is not None:
+        raise typer.BadParameter("--arcs runs in the PyTorch decode; the Core ML one has none")
+    if arc_width < 1:
+        raise typer.BadParameter("--arc-width must be positive")
+    grid = weight_grid(beta, gamma, combinations, arc_prior)
     if not select_on_dev and len(grid) != 1:
-        raise typer.BadParameter("a fixed --slice decodes one --beta and one --gamma")
+        raise typer.BadParameter(
+            "a fixed --slice decodes one --beta, one --gamma and one --arc-prior"
+        )
     statistics = None
     if coreml is not None:
         try:
@@ -2210,6 +2244,9 @@ def eval_keys(
             top_k=top_k,
             records_per_chunk=records_per_chunk,
             limit=records,
+            arcs=arcs,
+            arc_categories=arc_category,
+            arc_width=arc_width,
         )
         source = f"checkpoint: {checkpoint}"
     report = report_keys(
