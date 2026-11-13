@@ -17,6 +17,12 @@ ended, with the code of its end:
     13  deadline -- the leg was still running when --deadline passed
     14  lost     -- no probe answered for the watchdog's timeout: the runtime
                     has released itself, or cannot be reached
+    15  blocked  -- the bucket refuses the leg's publishes and no retry will
+                    clear it (a storage limit, a token's permission); the
+                    reason is printed. The leg is not over and what it has
+                    trained is on the VM alone: clear the refusal and wait
+                    again within the watchdog's timeout, since a runtime
+                    nobody probes releases itself
 
 Codes 0 and 1 are left to a waiter that ran or crashed, so an outcome is
 never mistaken for either. `releasable` exits 0 when releasing the runtime
@@ -42,7 +48,7 @@ CHECKOUT = "/tmp/ml-ime"
 #: Bound to a name: IPython displays a cell's last value, and printing leg.py's
 #: globals raises inside IPython's printer on the runtime's Python.
 PROBE = f'import runpy\nleg = runpy.run_path("{CHECKOUT}/colab/leg.py", run_name="__main__")\n'
-ENDS = {"paused": 10, "finished": 11, "failed": 12}
+ENDS = {"paused": 10, "finished": 11, "failed": 12, "blocked": 15}
 DEADLINE = 13
 LOST = 14
 REFUSED = 3

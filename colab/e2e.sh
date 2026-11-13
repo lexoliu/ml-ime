@@ -30,7 +30,8 @@
 # --session-hours is how long the runtime is held: the kernel pauses itself
 # inside it (`SESSION_SECONDS`), so the leg ends on a known budget. `wait`
 # exits with the leg's end -- 10 paused (its trio published), 11 finished,
-# 12 failed, 13 past --deadline, 14 runtime lost -- and `stop` refuses while
+# 12 failed, 13 past --deadline, 14 runtime lost, 15 its publishes refused by
+# the bucket (clear the refusal and wait again) -- and `stop` refuses while
 # the newest trio is unpublished or a finished run is only on the VM.
 set -euo pipefail
 here=$(cd "$(dirname "$0")/.." && pwd)

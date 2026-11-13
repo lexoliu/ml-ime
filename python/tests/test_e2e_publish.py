@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 
+import httpx
 import pytest
 import torch
 
@@ -240,6 +241,53 @@ def publish_once(
     publisher = load_publisher(monkeypatch, working, bucket)
     monkeypatch.setenv("ONCE", "1")
     publisher.main()
+
+
+class Refusing(FakeBucket):
+    """A bucket that answers every write with *status* while it is set."""
+
+    def __init__(self, status: int | None) -> None:
+        super().__init__()
+        self.status = status
+
+    def batch_bucket_files(self, bucket_id: str, *, add=(), delete=()) -> None:
+        if self.status is None:
+            super().batch_bucket_files(bucket_id, add=add, delete=delete)
+            return
+        request = httpx.Request("POST", "https://hub.invalid/batch")
+        raise httpx.HTTPStatusError(
+            f"{self.status} from the bucket",
+            request=request,
+            response=httpx.Response(self.status, request=request),
+        )
+
+
+def test_a_refused_publish_is_recorded_as_one_until_the_bucket_takes_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A storage limit's 403 is a refusal; a 503 or a rate limit is retried quietly."""
+    working = tmp_path / "working"
+    state = working / "publish-state.json"
+    bucket = Refusing(403)
+    bucket.files["final/other-run/checkpoint-final.pt"] = b"weights"
+    publish_once(monkeypatch, working, bucket, 30)
+    recorded = json.loads(state.read_text())
+    assert recorded["refused"] is True and "403" in recorded["last_error"]
+    assert "bucket_bytes" in recorded
+    assert "last_published_step" not in recorded
+
+    for transient in (429, 503):
+        bucket.status = transient
+        publish_once(monkeypatch, working, bucket, 30)
+        assert json.loads(state.read_text())["refused"] is False
+
+    bucket.status = 403
+    publish_once(monkeypatch, working, bucket, 30)
+    assert json.loads(state.read_text())["refused"] is True
+    bucket.status = None
+    publish_once(monkeypatch, working, bucket, 30)
+    recorded = json.loads(state.read_text())
+    assert (recorded["refused"], recorded["last_published_step"]) == (False, 30)
 
 
 def test_each_publish_leaves_exactly_the_newest_whole_trio(

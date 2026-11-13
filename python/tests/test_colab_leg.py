@@ -273,7 +273,43 @@ def waits(
     return code, clock, calls
 
 
-@pytest.mark.parametrize(("outcome", "code"), [("paused", 10), ("finished", 11), ("failed", 12)])
+def test_a_leg_whose_publishes_the_bucket_refuses_is_blocked_while_it_trains_and_after(
+    vm: Vm,
+) -> None:
+    vm.options()
+    vm.process("stage.pid", None)
+    vm.process("kernel.pid", "R")
+    vm.process("publish.pid", "S")
+    vm.interval(15)
+    state = {"last_error": "403 Forbidden: storage limit", "refused": True, "bucket_bytes": 82.5e9}
+    (vm.working / "publish-state.json").write_text(json.dumps(state))
+    report = vm.report()
+    assert report["outcome"] == "blocked"
+    assert "403 Forbidden" in report["reason"] and "82.5 GB" in report["reason"]
+    assert "step 15 is not published" in report["refusal"]
+
+    # The run finished and was evaluated; its outputs still cannot go up.
+    vm.process("kernel.pid", "Z")
+    vm.summary(finished=True, checkpoint_step=120)
+    report = vm.report()
+    assert report["outcome"] == "blocked"
+    assert "final checkpoint" in report["refusal"]
+
+    # A failure a retry may clear leaves the leg publishing.
+    state["refused"] = False
+    (vm.working / "publish-state.json").write_text(json.dumps(state))
+    assert vm.report()["outcome"] == "publishing"
+
+    # A leg that publishes nothing is never blocked on the bucket.
+    vm.options(no_publish=True)
+    state["refused"] = True
+    (vm.working / "publish-state.json").write_text(json.dumps(state))
+    assert vm.report()["outcome"] == "finished"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "code"), [("paused", 10), ("finished", 11), ("failed", 12), ("blocked", 15)]
+)
 def test_the_waiter_exits_with_the_code_of_the_legs_end(outcome: str, code: int) -> None:
     answers = [reported("staging"), reported("training"), reported("publishing"), reported(outcome)]
     result, clock, calls = waits(answers, deadline=3600)

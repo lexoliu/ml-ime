@@ -13,7 +13,9 @@ and a JSON object:
   options (`leg.json`) and the last logged step;
 - `outcome`: `staging`, `training`, `publishing` (the kernel paused, its trio
   is still going up), or one of the leg's ends: `paused`, `finished`,
-  `failed`, with `reason` saying why for a failure;
+  `failed`, `blocked` (the bucket refuses the leg's publishes in a way no
+  retry clears, while it trains or after), with `reason` saying why for a
+  failure and a block;
 - `refusal`: why releasing the runtime now would lose work, or null.
 
 The outcome comes from the processes and the files the kernel and publisher
@@ -111,6 +113,8 @@ def facts(working: Path = WORKING, proc: Path = PROC) -> dict[str, Any]:
         "newest_trio": newest_trio(working),
         "published": publish.get("last_published_step"),
         "publish_error": publish.get("last_error"),
+        "publish_refused": publish.get("refused", False),
+        "bucket_bytes": publish.get("bucket_bytes"),
         "final_published": publish.get("final_published", False),
         "last_step": last_step(working),
     }
@@ -123,20 +127,45 @@ def publishes(known: dict[str, Any]) -> bool:
     return not known["leg"]["no_publish"]
 
 
+def blocked(known: dict[str, Any]) -> bool:
+    """Whether the bucket refuses this leg's publishes in a way no retry clears."""
+    return publishes(known) and bool(known["publish_refused"])
+
+
+def refused(known: dict[str, Any]) -> str:
+    """Why a blocked leg is blocked, with the bucket's size when the publisher read it."""
+    size = known["bucket_bytes"]
+    held = "" if size is None else f"; the bucket holds {size / 1e9:.1f} GB"
+    return (
+        "the bucket refuses this leg's publishes, so what it trains exists on this VM alone "
+        f"(last error {known['publish_error']}){held}"
+    )
+
+
 def outcome(known: dict[str, Any]) -> tuple[str, Optional[str]]:
     """The leg's state and, for a failure, why."""
     if known["kernel"] is None:
         if known["stage"]:
             return "staging", None
-        return "failed", "staging ended without launching the kernel; stage.out says why"
+        return (
+            "failed",
+            "staging ended without launching the kernel; stage.out says why",
+        )
     if known["kernel"]:
+        if blocked(known):
+            return "blocked", refused(known)
         return "training", None
     summary = known["summary"]
     if summary is None:
-        return "failed", "the kernel ended without writing run-summary.json; kernel.out says why"
+        return (
+            "failed",
+            "the kernel ended without writing run-summary.json; kernel.out says why",
+        )
     if summary["finished"]:
         if not publishes(known) or known["final_published"]:
             return "finished", None
+        if blocked(known):
+            return "blocked", refused(known)
         if known["publisher"]:
             return "publishing", None
         return "failed", (
@@ -146,6 +175,8 @@ def outcome(known: dict[str, Any]) -> tuple[str, Optional[str]]:
     step = summary["checkpoint_step"]
     if not publishes(known) or (known["published"] is not None and known["published"] >= step):
         return "paused", None
+    if blocked(known):
+        return "blocked", refused(known)
     if known["publisher"]:
         return "publishing", None
     return "failed", (
@@ -182,7 +213,12 @@ def refusal(known: dict[str, Any]) -> Optional[str]:
 def report(working: Path = WORKING, proc: Path = PROC) -> dict[str, Any]:
     known = facts(working, proc)
     state, reason = outcome(known)
-    return {"facts": known, "outcome": state, "reason": reason, "refusal": refusal(known)}
+    return {
+        "facts": known,
+        "outcome": state,
+        "reason": reason,
+        "refusal": refusal(known),
+    }
 
 
 def main() -> None:

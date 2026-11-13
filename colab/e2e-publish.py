@@ -74,6 +74,11 @@ CACHE_PREFIX = "compile-cache"
 #: the training runs has compiled, the recompile a second shape brings included.
 CACHE_AFTER_RECORDS = 5
 
+#: The client errors a retry can clear: a request timeout and a rate limit.
+#: Every other 4xx is the bucket refusing the write -- a storage limit, a
+#: token without the permission -- until somebody changes what it refuses.
+RETRIED_STATUSES = frozenset({408, 429})
+
 #: Steps already read off checkpoints, keyed by the file's identity: path,
 #: modified time, size. A trio lands whole via rename, so a rewrite makes a
 #: new key rather than a stale read.
@@ -155,6 +160,29 @@ def publish_compile_cache(api):
         api.batch_bucket_files(BUCKET, add=[(archive, path)])
         size = archive.stat().st_size
     print(f"published the compile caches ({size} bytes) to {BUCKET}/{path}", flush=True)
+
+
+def refused(error):
+    """Whether the bucket answered with a refusal that retrying cannot clear."""
+    response = getattr(error, "response", None)
+    status = getattr(response, "status_code", None)
+    return status is not None and 400 <= status < 500 and status not in RETRIED_STATUSES
+
+
+def bucket_bytes(api):
+    """What the bucket holds, for the report of a refusal over its size."""
+    return sum(
+        getattr(entry, "size", None) or 0
+        for entry in api.list_bucket_tree(BUCKET, prefix="", recursive=True)
+    )
+
+
+def record_refusal_size(api):
+    """Record the bucket's size beside a refusal, which a storage limit explains."""
+    try:
+        record_state(bucket_bytes=bucket_bytes(api))
+    except (httpx.HTTPError, OSError) as error:
+        print(f"the bucket's size could not be read: {error}", flush=True)
 
 
 def record_state(**fields):
@@ -353,7 +381,9 @@ def main():
                 step = publish(api, run, newest[0])
                 if step is not None:
                     published = step
-                    record_state(last_published_step=step, last_published_at=time.time())
+                    record_state(
+                        last_published_step=step, last_published_at=time.time(), refused=False
+                    )
             if not caches_published and compiled():
                 publish_compile_cache(api)
                 caches_published = True
@@ -361,16 +391,21 @@ def main():
             if summary is not None:
                 publish_final(api, run, summary)
                 final = True
-                record_state(final_published=True, final_published_at=time.time())
+                record_state(final_published=True, final_published_at=time.time(), refused=False)
         except (httpx.HTTPError, OSError) as error:
-            # A publish failure is transient until it is not: say so, keep
-            # polling, and leave the error where status can read it. What the
-            # bucket holds is read again, since a failure can stop mid-publish;
-            # a final upload that did not finish is made again whole.
+            # Say so, keep polling, and leave the error where status can read
+            # it. What the bucket holds is read again, since a failure can stop
+            # mid-publish; a final upload that did not finish is made again
+            # whole. A refusal no retry clears is recorded as one: the waiter
+            # ends on it, since what this leg trains then exists on this VM
+            # alone. The polling goes on, so the publish goes through once the
+            # bucket takes it.
             published = None
             final = None
-            record_state(last_error=f"{error}", last_error_at=time.time())
+            record_state(last_error=f"{error}", last_error_at=time.time(), refused=refused(error))
             print(f"publish failed: {error}", flush=True)
+            if refused(error):
+                record_refusal_size(api)
         if once:
             return
         time.sleep(POLL_SECONDS)
