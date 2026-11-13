@@ -500,8 +500,9 @@ impl<S> Worker<'_, S> {
         } else {
             let mut first_of = HashMap::new();
             for (index, candidate) in next.iter().enumerate() {
-                for guard in 0..usize::from(candidate.marks.len) {
-                    if let Some(ch) = candidate.marks.chars[guard] {
+                let marked = usize::from(candidate.marks.len);
+                for (guard, ch) in candidate.marks.chars.iter().take(marked).enumerate() {
+                    if let Some(ch) = *ch {
                         match first_of.entry((guard, ch)) {
                             Entry::Vacant(slot) => {
                                 slot.insert(index);
