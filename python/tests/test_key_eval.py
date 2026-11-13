@@ -606,7 +606,7 @@ def test_the_keys_command_sweeps_the_prior_and_refuses_it_without_a_lexicon(
     ]
     refused = CliRunner().invoke(app, [*base, "--arc-prior", "0", "--arc-prior", "4"])
     assert refused.exit_code == 2, refused.output
-    assert "--arcs" in refused.output
+    assert "--arcs" in error(refused.output)
     fixed = [*base[:-1], "--slice", "dev", "--arcs", str(tmp_path / "k.tsv")]
     sweeping = CliRunner().invoke(app, [*fixed, "--arc-prior", "4", "--arc-prior", "8"])
     assert sweeping.exit_code == 2 and "one --arc-prior" in error(sweeping.output)
