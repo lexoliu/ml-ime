@@ -286,7 +286,9 @@ class E2EV2Run:
     captured CUDA graphs (``SEARCH_GRAPHS``): how the run computes, not what it
     trains, so it is no part of the recipe. *tower_graphs* replays a frozen
     Qwen context tower's forward from captured CUDA graphs (``TOWER_GRAPHS``),
-    the same kind of choice.
+    the same kind of choice. *key_arcs* (``KEY_ARCS``) is the file of the assets
+    mount whose entries the key evaluation proposes as word arcs (#282): an
+    evaluation choice too, and one only a key-level stage evaluates.
     """
 
     run: str
@@ -297,9 +299,14 @@ class E2EV2Run:
     stage: E2EV2Stage | None = None
     search_graphs: bool = False
     tower_graphs: bool = False
+    key_arcs: str | None = None
 
     def __post_init__(self) -> None:
         _v2_name(self.run)
+        if self.key_arcs is not None and (self.stage is None or self.stage.keys is None):
+            raise ValueError(
+                "the key evaluation reads the arcs lexicon; stamp KEYS to use KEY_ARCS"
+            )
         if self.stage is not None and self.stage.init_from == self.run:
             raise ValueError(
                 f"{self.run} cannot start from itself: a stage publishes under its own name"
@@ -340,6 +347,7 @@ class E2EV2Run:
             "TRAIN_SHARDS": self.train_shards,
             "SEARCH_GRAPHS": self.search_graphs,
             "TOWER_GRAPHS": self.tower_graphs,
+            "KEY_ARCS": self.key_arcs,
         }
 
     def recipe(self) -> dict[str, Any]:

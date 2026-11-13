@@ -752,13 +752,92 @@ def test_only_the_typo_twin_sweeps_gamma(monkeypatch: pytest.MonkeyPatch, tmp_pa
         for suffix in ("-typo", "", "-abbreviated", "-mixed")
         for side in ("on", "off")
     ], "the sweeps with the most grid points are handed out first"
-    assert {name: gammas for name, _, _, gammas in sections}["eval3-typo-context-on"] == (
+    assert {name: gammas for name, _, _, gammas, _ in sections}["eval3-typo-context-on"] == (
         0.5,
         1.0,
         2.0,
     )
-    assert all(gammas == (1.0,) for name, _, _, gammas in sections if "typo" not in name)
-    assert all(eval_set.name.startswith("eval3") for _, eval_set, _, _ in sections)
+    assert all(gammas == (1.0,) for name, _, _, gammas, _ in sections if "typo" not in name)
+    assert all(eval_set.name.startswith("eval3") for _, eval_set, _, _, _ in sections)
+    assert all(priors == (0.0,) for *_, priors in sections), "no arcs lexicon, no prior"
+
+
+def test_key_arcs_sweep_the_prior_on_the_twins_that_type_initials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With KEY_ARCS stamped (#282) only the abbreviated and mixed twins read it (#282)."""
+    import typer
+    from typer.core import TyperGroup
+
+    import mlime.__main__ as cli
+
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    assert kernel.KEY_ARCS is None and kernel.KEY_PRIORS == (0.0, 4.0, 8.0, 12.0)
+    assets = key_assets(tmp_path)
+    monkeypatch.setattr(kernel, "KEY_ARCS", "knowledge.tsv")
+    with pytest.raises(FileNotFoundError, match="no arcs lexicon"):
+        kernel.key_sections(assets)
+    (assets / "knowledge.tsv").write_text("一帆风顺\tidiom\n", encoding="utf-8")
+    sections = kernel.key_sections(assets)
+    priors = {name: swept for name, _, _, _, swept in sections}
+    for side in ("on", "off"):
+        assert priors[f"eval3-context-{side}"] == (0.0,)
+        assert priors[f"eval3-typo-context-{side}"] == (0.0,)
+        assert priors[f"eval3-abbreviated-context-{side}"] == kernel.KEY_PRIORS
+        assert priors[f"eval3-mixed-context-{side}"] == kernel.KEY_PRIORS
+    assert [name for name, *_ in sections] == [
+        f"eval3{suffix}-context-{side}"
+        for suffix in ("-abbreviated", "-mixed", "-typo", "")
+        for side in ("on", "off")
+    ], "four priors on one gamma outrank three gammas on one prior"
+
+    group = typer.main.get_command(cli.app)
+    assert isinstance(group, TyperGroup)
+    evaluation = group.commands["eval"]
+    assert isinstance(evaluation, TyperGroup)
+    for name, eval_set, context, gammas, swept in sections:
+        argv = kernel.key_eval_argv(
+            tmp_path / "checkpoint-final.pt",
+            eval_set,
+            tmp_path / f"keys-{name}",
+            tmp_path / "report.txt",
+            assets / "char_pinyin.tsv",
+            tmp_path / "ml-ime",
+            context,
+            gammas,
+            False,
+            swept,
+        )
+        tail = argv[argv.index("keys") + 1 :]
+        if swept == (0.0,):
+            assert "--arcs" not in tail and "--arc-prior" not in tail
+        else:
+            assert tail[tail.index("--arcs") + 1] == str(assets / "knowledge.tsv")
+            given = [float(tail[at + 1]) for at, item in enumerate(tail) if item == "--arc-prior"]
+            assert given == list(kernel.KEY_PRIORS)
+        evaluation.commands["keys"].make_context("keys", tail)
+
+    # A prior with no lexicon stamped is a stamping mistake, not a quiet no-op.
+    monkeypatch.setattr(kernel, "KEY_ARCS", None)
+    with pytest.raises(RuntimeError, match="stamp KEY_ARCS"):
+        kernel.key_eval_argv(
+            tmp_path / "c.pt",
+            tmp_path / "e.jsonl",
+            tmp_path / "d",
+            tmp_path / "r.txt",
+            assets / "char_pinyin.tsv",
+            tmp_path / "ml-ime",
+            True,
+            (1.0,),
+            False,
+            (4.0,),
+        )
+
+    # The arcs lexicon is read by the key evaluation, which needs the key front.
+    monkeypatch.setattr(kernel, "KEY_ARCS", "knowledge.tsv")
+    monkeypatch.setattr(kernel, "KEYS", None)
+    with pytest.raises(RuntimeError, match="stamp KEYS"):
+        kernel.main()
 
 
 def key_assets(tmp_path: Path) -> Path:
