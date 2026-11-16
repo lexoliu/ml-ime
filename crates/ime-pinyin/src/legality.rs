@@ -361,7 +361,8 @@ impl Legality {
 }
 
 /// Whether *span* has the initial's shape: one letter, or zh/ch/sh.
-fn is_initial(span: &str) -> bool {
+#[must_use]
+pub fn is_initial(span: &str) -> bool {
     span.len() == 1 || MULTI_LETTER_INITIALS.contains(&span)
 }
 

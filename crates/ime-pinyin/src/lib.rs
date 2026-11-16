@@ -21,6 +21,7 @@ pub use corrections::{
 };
 pub use legality::{
     Edge, EmitId, KeyLattice, Keys, KeysError, Legality, LegalityError, LegalityOptions, Step,
+    is_initial,
 };
 pub use lexicon::{CharId, Lexicon, LexiconError};
 pub use segment::{Readings, Segment, SegmentError, SegmentLattice, SegmentOptions, Segmentation};

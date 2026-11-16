@@ -15,8 +15,8 @@ use std::convert::Infallible;
 use std::num::NonZeroUsize;
 
 use ime_decode::{
-    Combine, KeyHypothesis, KeyLogProbs, KeySearchOptions, KeySearchStats, KeyTransition, PrefixId,
-    PrefixTrie, Weight, key_search,
+    Combine, DEFAULT_ARC_WIDTH, KeyHypothesis, KeyLogProbs, KeySearchOptions, KeySearchStats,
+    KeyTransition, PrefixId, PrefixTrie, Weight, key_search,
 };
 use ime_neural::keys::{KeyModel, TreeCall, plan};
 use ime_pinyin::{EmitId, Keys, Legality, LegalityOptions};
@@ -223,6 +223,8 @@ fn options(legality: LegalityOptions) -> KeyEngineOptions {
             beam: NonZeroUsize::new(8),
             top_k: NonZeroUsize::new(8),
             combine: Combine::Sum,
+            prior: Weight::ZERO,
+            arc_width: DEFAULT_ARC_WIDTH,
         },
     }
 }
@@ -297,6 +299,7 @@ fn direct(legality: &Legality, typed: &str) -> Vec<Sentence> {
     let Ok(found) = key_search(
         &lattice,
         &log_probs,
+        &[],
         &mut reference,
         &options(LegalityOptions::LIVE).search,
         &mut KeySearchStats::default(),
