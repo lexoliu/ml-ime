@@ -17,7 +17,7 @@
 //! the queried prefixes, one set per pending length, so a backspace
 //! speculates with what the shorter input asked before.
 
-use crate::{Engine, Pending, Placed, Sentence};
+use crate::{Bounded, Engine, Pending, Placed, Sentence};
 use ime_decode::{
     KeyHypothesis, KeyLogProbs, KeyLogProbsError, KeySearchOptions, KeySearchStats, KeyTransition,
     PrefixId, PrefixTrie, key_search,
@@ -296,6 +296,12 @@ impl<'a, M: KeyModel> KeyEngine<'a, M> {
                 .collect(),
             score: hypothesis.score as f32,
         }
+    }
+}
+
+impl<M: KeyModel> Bounded for KeyEngine<'_, M> {
+    fn max_keys(&self) -> usize {
+        self.model.max_keys()
     }
 }
 

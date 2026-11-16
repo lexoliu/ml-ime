@@ -9,10 +9,11 @@
 //! may depend on its bucket and neighbours. It logs every call it serves, so
 //! the tests can hold the engine to the speculation and caching contract.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::convert::Infallible;
 use std::num::NonZeroUsize;
+use std::rc::Rc;
 
 use ime_decode::{
     Combine, DEFAULT_ARC_WIDTH, KeyHypothesis, KeyLogProbs, KeySearchOptions, KeySearchStats,
@@ -21,7 +22,8 @@ use ime_decode::{
 use ime_neural::keys::{KeyModel, TreeCall, plan};
 use ime_pinyin::{EmitId, Keys, Legality, LegalityOptions};
 use ime_session::{
-    Engine, KeyEngine, KeyEngineOptions, Pending, Placed, Sentence, Session, SessionOptions,
+    Bounded, ByLength, Engine, KeyEngine, KeyEngineOptions, Pending, Placed, Sentence, Session,
+    SessionOptions,
 };
 
 /// The characters the tests emit, in emission order.
@@ -107,6 +109,8 @@ enum Event {
 struct Synthetic {
     emittable: usize,
     vary: bool,
+    /// What [`KeyModel::max_keys`] reports.
+    limit: usize,
     calls: usize,
     events: RefCell<Vec<Event>>,
 }
@@ -116,9 +120,16 @@ impl Synthetic {
         Self {
             emittable,
             vary,
+            limit: usize::MAX,
             calls: 0,
             events: RefCell::new(Vec::new()),
         }
+    }
+
+    /// The same model holding at most *limit* keys.
+    fn limited(mut self, limit: usize) -> Self {
+        self.limit = limit;
+        self
     }
 
     fn events(&self) -> Vec<Event> {
@@ -136,6 +147,10 @@ impl KeyModel for Synthetic {
     type Error = Infallible;
     type Encoding = u64;
     type Logits = Logits;
+
+    fn max_keys(&self) -> usize {
+        self.limit
+    }
 
     fn encode(
         &mut self,
@@ -570,4 +585,157 @@ fn the_session_lists_prefixes_over_the_key_engine() {
             assert_eq!(top.consumes, session.pending());
         }
     }
+}
+
+/// What a [`Recorder`] was asked, shared with the test that built it.
+#[derive(Default)]
+struct Asked {
+    /// The pending letters of every `sentences` call, in order.
+    letters: RefCell<Vec<String>>,
+    clears: Cell<usize>,
+}
+
+/// An engine that answers one fixed character through every letter it was
+/// given and logs what it is asked.
+struct Recorder {
+    limit: usize,
+    asked: Rc<Asked>,
+}
+
+impl Recorder {
+    fn new(limit: usize) -> (Self, Rc<Asked>) {
+        let asked = Rc::new(Asked::default());
+        (
+            Self {
+                limit,
+                asked: Rc::clone(&asked),
+            },
+            asked,
+        )
+    }
+}
+
+impl Bounded for Recorder {
+    fn max_keys(&self) -> usize {
+        self.limit
+    }
+}
+
+impl Engine for Recorder {
+    type Error = Infallible;
+
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a test's key count is far below 2^24"
+    )]
+    fn sentences(
+        &mut self,
+        pending: &Pending,
+        _context: Option<&str>,
+    ) -> Result<Vec<Sentence>, Infallible> {
+        let letters = pending.letters().len();
+        self.asked
+            .letters
+            .borrow_mut()
+            .push(pending.letters().as_str().to_owned());
+        Ok(vec![Sentence {
+            chars: vec![Placed {
+                ch: '我',
+                end: letters,
+                score: letters as f32,
+            }],
+            score: letters as f32,
+        }])
+    }
+
+    fn clear(&mut self) {
+        self.asked.clears.set(self.asked.clears.get() + 1);
+    }
+}
+
+/// The key engine over a synthetic model that holds at most *limit* keys.
+fn bounded(legality: &Legality, limit: usize) -> KeyEngine<'_, Synthetic> {
+    KeyEngine::new(
+        Synthetic::new(legality.emittable().len(), false).limited(limit),
+        legality,
+        options(LegalityOptions::LIVE),
+    )
+}
+
+#[test]
+fn input_at_the_limit_goes_to_the_first_engine_and_one_key_past_it_to_the_second() {
+    let legality = legality();
+    let (long, asked) = Recorder::new(usize::MAX);
+    let mut chosen = ByLength::new(bounded(&legality, 5), long);
+    // Five letters, one of them behind an apostrophe: the limit counts
+    // letters.
+    let at = chosen
+        .sentences(&pending("wo'aib"), None)
+        .expect("the short engine answers");
+    assert_eq!(at, sentences(&mut bounded(&legality, 5), "wo'aib"));
+    assert!(
+        asked.letters.borrow().is_empty(),
+        "the second engine is not asked"
+    );
+    let encoded = chosen.short().model().events().len();
+    assert!(encoded > 0, "the first engine ran");
+
+    let past = chosen
+        .sentences(&pending("woaibj"), None)
+        .expect("the long engine answers");
+    assert_eq!(*asked.letters.borrow(), ["woaibj"]);
+    assert_eq!(past[0].chars[0].end, 6);
+    assert_eq!(
+        chosen.short().model().events().len(),
+        encoded,
+        "the first engine is not asked past its limit"
+    );
+}
+
+#[test]
+fn clear_reaches_both_engines() {
+    let (short, short_asked) = Recorder::new(3);
+    let (long, long_asked) = Recorder::new(usize::MAX);
+    let mut chosen = ByLength::new(short, long);
+    chosen.clear();
+    assert_eq!((short_asked.clears.get(), long_asked.clears.get()), (1, 1));
+}
+
+#[test]
+fn a_session_typed_across_the_limit_answers_what_each_engine_answers_directly() {
+    let legality = legality();
+    let limit = 6;
+    let typed = "woaibeijing";
+    let (long, asked) = Recorder::new(usize::MAX);
+    let mut session = Session::new(
+        ByLength::new(bounded(&legality, limit), long),
+        SessionOptions { sentences: 3 },
+    );
+    for (index, ch) in typed.char_indices() {
+        session.key(ch).expect("a keystroke decodes");
+        let so_far = &typed[..=index];
+        if index < limit {
+            assert_eq!(
+                session.sentences(),
+                sentences(&mut bounded(&legality, limit), so_far),
+                "{so_far} is the first engine's"
+            );
+        } else {
+            let (mut direct, _) = Recorder::new(usize::MAX);
+            assert_eq!(
+                session.sentences(),
+                direct.sentences(&pending(so_far), None).expect("answers"),
+                "{so_far} is the second engine's"
+            );
+        }
+    }
+    assert_eq!(asked.letters.borrow().len(), typed.len() - limit);
+    // Backspacing across the limit returns to the first engine.
+    for _ in 0..typed.len() - limit {
+        session.backspace().expect("a backspace decodes");
+    }
+    assert_eq!(
+        session.sentences(),
+        sentences(&mut bounded(&legality, limit), &typed[..limit])
+    );
 }
