@@ -25,6 +25,7 @@ use ime_decode::{
 use ime_neural::keys::{KeyModel, PlanError, TREE_BUCKETS, plan};
 use ime_pinyin::{EmitId, Legality, LegalityOptions};
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 use thiserror::Error;
 
 /// A prefix of a sentence: the emission ids of its characters so far.
@@ -68,6 +69,21 @@ pub struct KeystrokeStats {
     pub speculative_rows: usize,
     /// Tree calls the misses made.
     pub miss_calls: usize,
+    /// Tree calls the speculative pass made.
+    pub speculative_calls: usize,
+    /// Of the distinct prefixes the search asked, how many a speculative
+    /// call had already computed: the speculation's hits.
+    pub speculated_queried: usize,
+    /// Nanoseconds in the model's keys function (and the context encoder,
+    /// when the context changed).
+    pub encode_ns: u64,
+    /// Nanoseconds in the speculative pass's tree calls.
+    pub speculative_ns: u64,
+    /// Nanoseconds in the misses' tree calls, inside `search_ns`.
+    pub miss_ns: u64,
+    /// Nanoseconds in the search, the misses' tree calls included; the host
+    /// search is `search_ns - miss_ns`.
+    pub search_ns: u64,
     /// Distinct prefixes the search asked.
     pub queried: usize,
     /// Nodes of their ancestor closure, root included.
@@ -138,6 +154,8 @@ struct RowCache<'k, M: KeyModel> {
     emittable: usize,
     /// Every call's logits, in call order.
     outputs: Vec<M::Logits>,
+    /// The calls before this one were the speculative pass's.
+    speculated: usize,
     /// prefix -> (its call, its row there): the first call that computed it.
     rows: HashMap<Prefix, (usize, usize)>,
     /// The distinct prefixes the search asked, in ask order.
@@ -148,17 +166,21 @@ struct RowCache<'k, M: KeyModel> {
 
 impl<M: KeyModel> RowCache<'_, M> {
     /// Plan *requests* into tree calls, run them and cache every node the
-    /// cache does not hold yet; the number of calls made.
+    /// cache does not hold yet; the number of calls made and the nanoseconds
+    /// the model spent in them.
     fn run<P: AsRef<[EmitId]>>(
         &mut self,
         requests: &[P],
-    ) -> Result<usize, KeyEngineError<M::Error>> {
+    ) -> Result<(usize, u64), KeyEngineError<M::Error>> {
         let calls = plan(requests)?;
+        let mut nanos = 0;
         for call in &calls {
+            let tick = Instant::now();
             let logits = self
                 .model
                 .tree(self.encoding, call)
                 .map_err(KeyEngineError::Model)?;
+            nanos += elapsed_ns(tick);
             let at = self.outputs.len();
             self.outputs.push(logits);
             let bucket = TREE_BUCKETS
@@ -172,8 +194,13 @@ impl<M: KeyModel> RowCache<'_, M> {
                 }
             }
         }
-        Ok(calls.len())
+        Ok((calls.len(), nanos))
     }
+}
+
+/// The nanoseconds since *tick*, saturating at a span no keystroke reaches.
+fn elapsed_ns(tick: Instant) -> u64 {
+    u64::try_from(tick.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl<M: KeyModel> KeyTransition for RowCache<'_, M> {
@@ -199,7 +226,9 @@ impl<M: KeyModel> KeyTransition for RowCache<'_, M> {
             .filter(|prefix| !self.rows.contains_key(*prefix))
             .collect();
         if !missing.is_empty() {
-            self.stats.miss_calls += self.run(&missing)?;
+            let (calls, nanos) = self.run(&missing)?;
+            self.stats.miss_calls += calls;
+            self.stats.miss_ns += nanos;
         }
         for (prefix, row) in prefixes
             .into_iter()
@@ -208,6 +237,9 @@ impl<M: KeyModel> KeyTransition for RowCache<'_, M> {
             let (call, node) = self.rows[&prefix];
             self.model.log_softmax(&self.outputs[call], node, row);
             if self.seen.insert(prefix.clone()) {
+                if call < self.speculated {
+                    self.stats.speculated_queried += 1;
+                }
                 self.queried.push(prefix);
             }
         }
@@ -333,10 +365,12 @@ impl<M: KeyModel> Engine for KeyEngine<'_, M> {
             self.last = stats;
             return Ok(Vec::new());
         }
+        let tick = Instant::now();
         let encoding = self
             .model
             .encode(letters, context, &mut self.log_probs)
             .map_err(KeyEngineError::Model)?;
+        stats.encode_ns = elapsed_ns(tick);
         let emittable = self.legality.emittable().len();
         let log_probs = KeyLogProbs::new(letters.len(), emittable + 1, &self.log_probs)?;
         let mut rows = RowCache {
@@ -344,16 +378,21 @@ impl<M: KeyModel> Engine for KeyEngine<'_, M> {
             encoding: &encoding,
             emittable,
             outputs: Vec::new(),
+            speculated: 0,
             rows: HashMap::new(),
             queried: Vec::new(),
             seen: HashSet::new(),
             stats: &mut stats,
         };
         if !speculate.is_empty() {
-            rows.run(speculate)?;
+            let (calls, nanos) = rows.run(speculate)?;
+            rows.stats.speculative_calls = calls;
+            rows.stats.speculative_ns = nanos;
         }
+        rows.speculated = rows.outputs.len();
         rows.stats.speculative_rows = rows.rows.len();
         let mut search = KeySearchStats::default();
+        let tick = Instant::now();
         let found = key_search(
             &lattice,
             &log_probs,
@@ -362,7 +401,9 @@ impl<M: KeyModel> Engine for KeyEngine<'_, M> {
             &self.options.search,
             &mut search,
         )?;
+        let search_ns = elapsed_ns(tick);
         let queried = rows.queried;
+        stats.search_ns = search_ns;
         stats.search = search;
         stats.queried = queried.len();
         stats.closure = closure_size(&queried);

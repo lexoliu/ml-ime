@@ -5,6 +5,8 @@ mod engine;
 mod g2p;
 mod neural;
 mod replay;
+#[cfg(target_vendor = "apple")]
+mod replay_keys;
 mod synth;
 
 use anyhow::{Context as _, Result};
@@ -235,6 +237,13 @@ enum Command {
         #[command(flatten)]
         args: replay::ReplayArgs,
     },
+    /// Replay an evaluation slice through the key engine over the converted
+    /// Core ML model, one keystroke at a time, in `replay`'s report shape.
+    #[cfg(target_vendor = "apple")]
+    ReplayKeys {
+        #[command(flatten)]
+        args: replay_keys::ReplayKeysArgs,
+    },
 }
 
 /// The search knobs, shared by every command that decodes.
@@ -439,6 +448,8 @@ async fn main() -> Result<()> {
             })
         }
         Command::Replay { args } => replay::run(&args),
+        #[cfg(target_vendor = "apple")]
+        Command::ReplayKeys { args } => replay_keys::run(&args),
         Command::Corpus { command } => corpus::run(command).await,
         Command::G2p { command } => g2p::run(command).await,
         Command::Synth { command } => synth::run(command).await,
