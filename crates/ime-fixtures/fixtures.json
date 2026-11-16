@@ -1,6 +1,6 @@
 {
   "repository": "lexoliu/mlime-test-fixtures",
-  "revision": "57fcaba322d2810cc67c3d56c7e8579ee8cb92c3",
+  "revision": "738e733ae99af56e0dc2e710144888ad4b271b72",
   "sets": {
     "charlm": {
       "committed": "crates/ime-lm/tests/fixtures",
@@ -42,6 +42,31 @@
         "int8/context.weights": "c0c012f7529dd09593dc73c6e95413dc5f48feac066103c7c99870b07fce0219",
         "int8/fill.onnx": "b6083734c7c933f5fc580ae6cbd1ab2cbfb18499dc03228e6430c48cb39bb75b",
         "int8/fill.weights": "ca9ef2affba451d0d324ce042f78012d30daf423ade605f938e3eb0d97029b17"
+      }
+    },
+    "keys": {
+      "committed": "crates/ime-session/tests/fixtures/keys",
+      "fetched": [
+        "model"
+      ],
+      "files": {
+        "model/context/context.mlmodelc/analytics/coremldata.bin": "18d9feaa945fb5db9b8c34d072bb21f9c06085b1c30f3c1f456b688e16b9d253",
+        "model/context/context.mlmodelc/coremldata.bin": "054d7023ac281ff333d32806de1621b62fee3a06d0a7fa79a0b6b041b4308aec",
+        "model/context/context.mlmodelc/model.mil": "370fac56882f68d944cd35bd11c54cd5014f2bc0958bd314c8b31bf97c89cd23",
+        "model/context/context.mlmodelc/weights/weight.bin": "005c6a9d7c93d9a1ac294c7add8d024ac35d6b6b879d63ef990e178e558f2f81",
+        "model/context/manifest.json": "fef5d77abb93c4e1fd24e9f3e51d5d512be68a2980a84d9800d8c80b8477971c",
+        "model/decoder/decoder.mlmodelc/analytics/coremldata.bin": "f82f8736d5b737a3a04b9214b6fd631286ee9a6a5d46b348bd68582200005946",
+        "model/decoder/decoder.mlmodelc/coremldata.bin": "d097950334492e804cca34098d5124fce7afd8e6ad0bee57571fb58d14c40487",
+        "model/decoder/decoder.mlmodelc/model.mil": "dd7af9b355b81c86079935e9a565a5441ffbd84b20cb8a8e0a475f3dcd3a4172",
+        "model/decoder/decoder.mlmodelc/weights/weight.bin": "0901246ab8f639857316849ae6829e41ad534382b0f3021a373ca23ce141d4ce",
+        "model/decoder/manifest.json": "9113fc30c55c4540c66975dec3e3db152af784dbc9d7f55bece94ffa85cf7c66",
+        "model/key-model.json": "0aec4195e3ba2b087af95fb13b747409abc9c50bc4c121ce9b8e0e9f5a8fed01",
+        "model/keys/keys.mlmodelc/analytics/coremldata.bin": "29e24ab7be68470c4c54215a9390afac4dcfa6d728105442631b05ee0b496bd7",
+        "model/keys/keys.mlmodelc/coremldata.bin": "f79fac0547a79a4e2fa2f87f883d4b93b26641d4e6d1aa4abda8f610a2031b1d",
+        "model/keys/keys.mlmodelc/model.mil": "d31c27e8176439e4e54eecd2c3b40021465ec097308a5abf9d3b688bb945fb05",
+        "model/keys/keys.mlmodelc/weights/weight.bin": "cd31fce35f70c1761aa9991cf513286056f53844b97f8ec26e002dbd7cffa8a0",
+        "model/keys/manifest.json": "b5b18e0d359d050227e2d8bbe533b2f98fbd27d7093373058949a0f4a5609f34",
+        "model/tokenizer.json": "442390f0216045d1560b35e2cf962674fc738a1e244201016c5a512129d653e5"
       }
     }
   }

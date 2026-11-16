@@ -22,13 +22,19 @@
 //!
 //! [`KeyModel`] is what one keystroke of the key engine needs from a model:
 //! the CTC log-probs of the typed keys under the context, and the rows of a
-//! planned tree call.
+//! planned tree call. On an Apple target, `CoreMlKeyModel` implements it over
+//! the converted Core ML functions.
 
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 
 use ime_pinyin::{EmitId, Keys};
 use thiserror::Error;
+
+#[cfg(target_vendor = "apple")]
+mod coreml;
+#[cfg(target_vendor = "apple")]
+pub use coreml::{ComputeUnits, CoreMlEncoding, CoreMlKeyError, CoreMlKeyModel, CoreMlLogits};
 
 /// The tree function family's node buckets, ascending.
 pub const TREE_BUCKETS: [usize; 4] = [32, 64, 128, 256];
