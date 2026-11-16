@@ -23,6 +23,7 @@ jobs:
       rust: ${{ steps.areas.outputs.rust }}
       python: ${{ steps.areas.outputs.python }}
       tables: ${{ steps.areas.outputs.tables }}
+      coreml: ${{ steps.areas.outputs.coreml }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,7 +33,7 @@ jobs:
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
           if [ -z "$BASE" ]; then
-            printf '%s=true\n' rust python tables >> "$GITHUB_OUTPUT"
+            printf '%s=true\n' rust python tables coreml >> "$GITHUB_OUTPUT"
             exit 0
           fi
           changed=$(git diff --name-only "$BASE"...HEAD)
@@ -50,6 +51,8 @@ jobs:
           area python 'python/|colab/|kaggle/|crates/[^/]+/data/|crates/[^/]+/tests/fixtures/'
           # The generator and what it writes.
           area tables 'python/|crates/ime-pinyin/data/'
+          # A project of its own: nothing in it imports mlime.
+          area coreml 'python/coreml/'
 
   rust:
     name: rust / ${{ matrix.os }}
@@ -94,6 +97,26 @@ jobs:
       - run: uv run ruff check src tests
       - run: uv run ruff format --check src tests
       - run: uv run mypy src
+      - run: uv run pytest -q
+
+  python-coreml:
+    name: python / coreml
+    needs: changes
+    if: needs.changes.outputs.coreml == 'true'
+    # One test converts a tiny bundle and runs it through Core ML, which exists on macOS only.
+    runs-on: macos-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: python/coreml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --dev
+      - run: uv run ruff check src tests
+      - run: uv run ruff format --check src tests
       - run: uv run pytest -q
 
   generated-tables:
