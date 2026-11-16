@@ -47,6 +47,10 @@ const MANIFEST: &str = "key-model.json";
 /// The tokenizer the context encoder reads.
 const TOKENIZER: &str = "tokenizer.json";
 
+/// The text the context function is warmed with; any text the tokenizer
+/// reads does.
+const WARM_CONTEXT: &str = "a";
+
 /// Each model directory's manifest.
 const DIRECTORY_MANIFEST: &str = "manifest.json";
 
@@ -261,6 +265,7 @@ struct Dims {
 struct KeyManifest {
     step: u64,
     policy_version: u32,
+    correct_syllables: bool,
     n_max: usize,
     neg: f32,
     context_tokens: usize,
@@ -573,6 +578,7 @@ pub struct CoreMlLogits {
 /// The converted key model: three function families, each function loaded.
 pub struct CoreMlKeyModel {
     step: u64,
+    correct_syllables: bool,
     characters: Vec<char>,
     specials: Specials,
     letter_pad: i32,
@@ -639,6 +645,7 @@ impl CoreMlKeyModel {
         );
         Ok(Self {
             step: manifest.step,
+            correct_syllables: manifest.correct_syllables,
             characters: manifest.characters,
             specials: manifest.specials,
             letter_pad: manifest.letter_pad,
@@ -663,6 +670,14 @@ impl CoreMlKeyModel {
     #[must_use]
     pub const fn step(&self) -> u64 {
         self.step
+    }
+
+    /// Whether the model was trained to read a span that is itself a syllable
+    /// as a correction: the [`ime_pinyin::LegalityOptions::correct_syllables`]
+    /// it is searched under.
+    #[must_use]
+    pub const fn correct_syllables(&self) -> bool {
+        self.correct_syllables
     }
 
     /// The emittable characters in emission order: the rows of the head and
@@ -838,24 +853,41 @@ impl KeyModel for CoreMlKeyModel {
         encoding: &CoreMlEncoding,
         call: &TreeCall<'_, EmitId>,
     ) -> Result<CoreMlLogits, CoreMlKeyError> {
-        let size = call.bucket();
+        let row = self.tree_row(call)?;
+        self.run_tree(encoding, call.bucket(), &row, call.nodes().len())
+    }
+
+    fn log_softmax(&self, logits: &CoreMlLogits, node: usize, out: &mut [f32]) {
+        let width = out.len();
+        let host = logits.host.get_or_init(|| logits.tensor.read().into_data());
+        log_softmax_into(&host[node * width..(node + 1) * width], out);
+    }
+}
+
+impl CoreMlKeyModel {
+    /// Run the tree function of *size* nodes over *encoding* and *row*;
+    /// *nodes* is how many of the rows carry a node, for the log.
+    fn run_tree(
+        &mut self,
+        encoding: &CoreMlEncoding,
+        size: usize,
+        row: &TreeRow,
+        nodes: usize,
+    ) -> Result<CoreMlLogits, CoreMlKeyError> {
         let TreeRow {
             reader_ids,
             positions,
             bias,
-        } = self.tree_row(call)?;
+        } = row;
         let held = self
             .tree
             .iter_mut()
             .find(|held| held.bucket == size)
             .ok_or(CoreMlKeyError::TreeBucket(size))?;
         let mut inputs = Inputs::new();
-        inputs.insert("reader_ids", &Tensor::from_slice(&[1, size], &reader_ids)?)?;
-        inputs.insert("positions", &Tensor::from_slice(&[1, size], &positions)?)?;
-        inputs.insert(
-            "tree_bias",
-            &Tensor::from_slice(&[1, 1, size, size], &bias)?,
-        )?;
+        inputs.insert("reader_ids", &Tensor::from_slice(&[1, size], reader_ids)?)?;
+        inputs.insert("positions", &Tensor::from_slice(&[1, size], positions)?)?;
+        inputs.insert("tree_bias", &Tensor::from_slice(&[1, 1, size, size], bias)?)?;
         inputs.insert("cross_keys", &encoding.keys)?;
         inputs.insert("cross_values", &encoding.values)?;
         inputs.insert("cross_bias", &encoding.bias)?;
@@ -866,20 +898,92 @@ impl KeyModel for CoreMlKeyModel {
             &tensor,
             &[1, size, self.characters.len()],
         )?;
-        debug!(
-            bucket = size,
-            nodes = call.nodes().len(),
-            "ran a tree function"
-        );
+        debug!(bucket = size, nodes, "ran a tree function");
         Ok(CoreMlLogits {
             tensor,
             host: OnceCell::new(),
         })
     }
 
-    fn log_softmax(&self, logits: &CoreMlLogits, node: usize, out: &mut [f32]) {
-        let width = out.len();
-        let host = logits.host.get_or_init(|| logits.tensor.read().into_data());
-        log_softmax_into(&host[node * width..(node + 1) * width], out);
+    /// Run every loaded function once, so the first keystroke pays none of
+    /// the first call's cost: Core ML's lazy allocation and the Neural
+    /// Engine's program load happen on the first prediction, not at
+    /// [`CoreMlKeyModel::open`].
+    ///
+    /// The inputs are valid and carry nothing of a user's: a short context
+    /// text, keys filling each keys function, and tree rows that are all
+    /// padding. Each function's seconds go to `tracing`. No state a keystroke
+    /// reads is left behind: the context encoder's last text is untouched.
+    /// Call it off the typing path, once after `open`.
+    ///
+    /// # Errors
+    ///
+    /// If a function fails to run.
+    ///
+    /// # Panics
+    ///
+    /// If a keys function holds no key, which no converted model does.
+    pub fn warm_up(&mut self) -> Result<(), CoreMlKeyError> {
+        let started = Instant::now();
+        let tick = Instant::now();
+        self.context.run(WARM_CONTEXT)?;
+        info!(
+            function = "context",
+            seconds = tick.elapsed().as_secs_f64(),
+            "warmed a function"
+        );
+        let mut log_probs = Vec::new();
+        let mut encoding = None;
+        for position in 0..self.keys.len() {
+            let capacity = self.keys[position].capacity;
+            let keys = Keys::new(&"a".repeat(capacity))
+                .expect("a function holds at least one key, and `a` is a key");
+            let tick = Instant::now();
+            // The smallest function that holds `capacity` keys is this one:
+            // the capacities ascend.
+            let encoded = self.encode(&keys, None, &mut log_probs)?;
+            info!(
+                function = format!("keys_{}", capacity + KEY_SENTINELS),
+                seconds = tick.elapsed().as_secs_f64(),
+                "warmed a function"
+            );
+            encoding.get_or_insert(encoded);
+        }
+        let Some(encoding) = encoding else {
+            return Ok(());
+        };
+        let mut row = vec![0.0; self.characters.len()];
+        let buckets: Vec<usize> = self.tree.iter().map(|held| held.bucket).collect();
+        for size in buckets {
+            let tick = Instant::now();
+            let padding = self.padding_row(size);
+            let logits = self.run_tree(&encoding, size, &padding, 0)?;
+            self.log_softmax(&logits, 0, &mut row);
+            info!(
+                function = format!("tree_{size}"),
+                seconds = tick.elapsed().as_secs_f64(),
+                "warmed a function"
+            );
+        }
+        info!(
+            seconds = started.elapsed().as_secs_f64(),
+            "warmed the Core ML key model"
+        );
+        Ok(())
+    }
+
+    /// A tree call's inputs with no node: every row is padding, which sees
+    /// only itself.
+    fn padding_row(&self, size: usize) -> TreeRow {
+        let hidden = f16::from_f32(self.neg);
+        let mut bias = vec![hidden; size * size];
+        for row in 0..size {
+            bias[row * size + row] = f16::ZERO;
+        }
+        TreeRow {
+            reader_ids: vec![self.reader_bos; size],
+            positions: vec![0; size],
+            bias,
+        }
     }
 }

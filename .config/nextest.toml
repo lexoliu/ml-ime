@@ -5,5 +5,5 @@
 coreml = { max-threads = 1 }
 
 [[profile.default.overrides]]
-filter = 'package(ime-session) & binary(coreml)'
+filter = '(package(ime-session) & binary(coreml)) | (package(ime-cli) & test(replay_keys))'
 test-group = 'coreml'

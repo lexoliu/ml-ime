@@ -259,6 +259,44 @@ impl Engine for Beyond {
 }
 
 #[test]
+fn a_warmed_model_answers_what_a_cold_one_answers() {
+    let expected = expected();
+    let point = &expected.weights[0];
+    let mut warmed = open();
+    warmed.warm_up().expect("every function runs once");
+    // A second warm-up is harmless: it leaves nothing a keystroke reads.
+    warmed.warm_up().expect("the warm-up repeats");
+    let legality = Legality::over(warmed.characters()).expect("the characters have readings");
+    let mut warm = KeyEngine::new(warmed, &legality, options(&expected, point));
+    let mut cold = KeyEngine::new(open(), &legality, options(&expected, point));
+    for record in &expected.records {
+        let pending = Pending::parse(&record.keys)
+            .expect("the keys are letters")
+            .expect("the keys are not empty");
+        let after = warm
+            .sentences(&pending, record.context.as_deref())
+            .expect("the warmed search runs");
+        let without = cold
+            .sentences(&pending, record.context.as_deref())
+            .expect("the cold search runs");
+        assert_eq!(after.len(), without.len(), "{}", record.name);
+        for (rank, (warm, cold)) in after.iter().zip(&without).enumerate() {
+            let text = |sentence: &Sentence| -> String {
+                sentence.chars.iter().map(|placed| placed.ch).collect()
+            };
+            assert_eq!(text(warm), text(cold), "{}: sentence {rank}", record.name);
+            assert!(
+                (f64::from(warm.score) - f64::from(cold.score)).abs() <= SCORE_TOLERANCE,
+                "{}: sentence {rank} scores {} warmed, {} cold",
+                record.name,
+                warm.score,
+                cold.score
+            );
+        }
+    }
+}
+
+#[test]
 fn the_limit_is_the_largest_keys_function() {
     let model = open();
     assert_eq!(model.max_keys(), 126);

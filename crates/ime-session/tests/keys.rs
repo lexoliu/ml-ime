@@ -497,6 +497,14 @@ fn the_speculative_pass_replays_the_previous_queries() {
         let stats = engine.last_keystroke();
         assert_eq!(stats.speculative_rows, covered.len(), "{end}");
         assert_eq!(stats.miss_calls, made.len() - planned.len(), "{end}");
+        assert_eq!(stats.speculative_calls, planned.len(), "{end}");
+        let hits = engine
+            .queried()
+            .iter()
+            .filter(|prefix| covered.contains(prefix.as_ref()))
+            .count();
+        assert_eq!(stats.speculated_queried, hits, "{end}");
+        assert!(stats.search_ns >= stats.miss_ns, "{end}");
         assert_eq!(
             usize::try_from(stats.calls.iter().sum::<u64>()).expect("small"),
             made.len()

@@ -22,8 +22,8 @@ use ime_neural::RouteA;
 use ime_ngram::NgramModel;
 use ime_pinyin::CharId;
 use ime_session::{
-    CacheReport, Cached, EngineStats, Fused, FusedConfig, FusedStages, Invalidation, Session,
-    SessionOptions, Stages, Timed, TransitionStats,
+    CacheReport, Cached, Engine, EngineStats, Fused, FusedConfig, FusedStages, Invalidation,
+    Session, SessionOptions, Stages, Timed, TransitionStats,
 };
 use ort::environment::Environment;
 use serde::Serialize;
@@ -161,20 +161,20 @@ pub(crate) struct ReplayArgs {
 
 /// A latency summary in milliseconds.
 #[derive(Serialize)]
-struct Summary {
-    count: usize,
-    median_ms: f64,
-    p95_ms: f64,
-    max_ms: f64,
+pub(crate) struct Summary {
+    pub(crate) count: usize,
+    pub(crate) median_ms: f64,
+    pub(crate) p95_ms: f64,
+    pub(crate) max_ms: f64,
 }
 
 /// One typed-length band's latency summary.
 #[derive(Serialize)]
-struct BandReport {
+pub(crate) struct BandReport {
     /// The band's label, `"9-16"`-shaped or `"65+"`.
-    band: &'static str,
+    pub(crate) band: &'static str,
     #[serde(flatten)]
-    summary: Summary,
+    pub(crate) summary: Summary,
 }
 
 /// One keystroke's cost and where it went, in the JSON report.
@@ -270,9 +270,33 @@ struct ConfigEcho {
 
 /// Latency at whole-run and per-band grain.
 #[derive(Serialize)]
-struct LatencyReport {
-    all: Summary,
-    by_typed: Vec<BandReport>,
+pub(crate) struct LatencyReport {
+    pub(crate) all: Summary,
+    pub(crate) by_typed: Vec<BandReport>,
+}
+
+impl LatencyReport {
+    /// The summaries of keystrokes given as `(pending length, nanos)`.
+    pub(crate) fn of(keystrokes: impl IntoIterator<Item = (usize, u64)>) -> Self {
+        let mut bands: Vec<Vec<u64>> = (0..BANDS.len()).map(|_| Vec::new()).collect();
+        let mut all = Vec::new();
+        for (typed, key_ns) in keystrokes {
+            bands[band_index(typed)].push(key_ns);
+            all.push(key_ns);
+        }
+        Self {
+            all: summarize(&all),
+            by_typed: BANDS
+                .iter()
+                .zip(&bands)
+                .filter(|(_, samples)| !samples.is_empty())
+                .map(|((label, _, _), samples)| BandReport {
+                    band: label,
+                    summary: summarize(samples),
+                })
+                .collect(),
+        }
+    }
 }
 
 /// Cumulative stage totals, in nanos where they are timings.
@@ -400,7 +424,7 @@ fn summarize(samples: &[u64]) -> Summary {
 
 /// The process's peak resident set: `ru_maxrss`, bytes on the platforms the
 /// product runs on.
-fn peak_rss() -> i64 {
+pub(crate) fn peak_rss() -> i64 {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
     // SAFETY: `usage` points at valid, owned memory and the call writes it.
     let ok = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
@@ -415,7 +439,7 @@ fn peak_rss() -> i64 {
 /// The physical footprint `vmmap` and `/usr/bin/time` report: resident
 /// plus compressed pages, unlike `ru_maxrss`'s resident-only set. Zero
 /// where `proc_pid_rusage` does not exist.
-fn phys_footprint() -> i64 {
+pub(crate) fn phys_footprint() -> i64 {
     #[cfg(target_os = "macos")]
     {
         let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
@@ -742,10 +766,6 @@ struct Replays {
 
 /// Replay the records under transition kind *kind* — the generic holds the
 /// decode's exact `HISTORY` and `State` for each of the four configurations.
-#[expect(
-    clippy::too_many_lines,
-    reason = "the pass reads top-down: sessions, keystrokes, tallies"
-)]
 fn replay_kind<T: Transition>(
     harness: &Harness<'_>,
     transition: impl Fn() -> T,
@@ -786,22 +806,11 @@ fn replay_kind<T: Transition>(
     let mut mismatches = reference_tops.as_ref().map(|_| Vec::new());
     let mut paused = false;
     for (position, &(index, record)) in records.iter().enumerate() {
-        measured.reset();
-        if let Some(context) = record.context.as_deref() {
-            measured
-                .set_context(context)
-                .map_err(anyhow::Error::from)
-                .with_context(|| format!("could not set record {index}'s context"))?;
-        }
+        start_record(&mut measured, index, record.context.as_deref())?;
         let mut before = measured.engine().stages().clone();
         let mut listed_before = measured.stages().candidates_ns;
         for ch in record.pinyin.chars() {
-            let tick = Instant::now();
-            measured
-                .key(ch)
-                .map_err(anyhow::Error::from)
-                .with_context(|| format!("could not press {ch:?} on record {index}"))?;
-            let key_ns = nanos(tick);
+            let key_ns = timed_key(&mut measured, index, ch)?;
             let now = measured.engine().stages();
             let listed = measured.stages().candidates_ns;
             let typed = measured.pending();
@@ -908,9 +917,56 @@ fn first_divergence<T: Transition>(
     Ok(None)
 }
 
+/// The records of *slice*, with their eval-set indices, the first *cap* of
+/// them: what every replay walks.
+pub(crate) fn select_records<'s>(
+    set: &'s ime_eval::EvalSet,
+    slice: &SliceArgs,
+    cap: Option<usize>,
+) -> Vec<(usize, &'s ime_eval::EvalRecord)> {
+    set.records()
+        .iter()
+        .enumerate()
+        .filter(|(_, record)| slice.slice.slice().holds(record, slice.dev_share))
+        .take(cap.unwrap_or(usize::MAX))
+        .collect()
+}
+
+/// A fresh typing line for record *index*: the session reset, then the
+/// record's *context*, when it is read, set.
+pub(crate) fn start_record<E: Engine>(
+    session: &mut Session<E>,
+    index: usize,
+    context: Option<&str>,
+) -> Result<()> {
+    session.reset();
+    if let Some(context) = context {
+        session
+            .set_context(context)
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("could not set record {index}'s context"))?;
+    }
+    Ok(())
+}
+
+/// Press *ch* on the session for record *index* and return what the
+/// keystroke cost, in nanos: the span the input method waits for.
+pub(crate) fn timed_key<E: Engine>(
+    session: &mut Session<E>,
+    index: usize,
+    ch: char,
+) -> Result<u64> {
+    let tick = Instant::now();
+    session
+        .key(ch)
+        .map_err(anyhow::Error::from)
+        .with_context(|| format!("could not press {ch:?} on record {index}"))?;
+    Ok(nanos(tick))
+}
+
 /// An [`Instant::elapsed`] in nanos, saturating at a span no keystroke
 /// reaches.
-fn nanos(tick: Instant) -> u64 {
+pub(crate) fn nanos(tick: Instant) -> u64 {
     u64::try_from(tick.elapsed().as_nanos()).unwrap_or(u64::MAX)
 }
 
@@ -935,11 +991,6 @@ fn report(
     bookkeeping_ns: u64,
     bk_debug: (u64, u64, u64, u64),
 ) -> Result<()> {
-    let mut bands: Vec<Vec<u64>> = (0..BANDS.len()).map(|_| Vec::new()).collect();
-    for sample in &replays.samples {
-        bands[band_index(sample.typed)].push(sample.key_ns);
-    }
-    let all: Vec<u64> = replays.samples.iter().map(|s| s.key_ns).collect();
     let report = Report {
         config: ConfigEcho {
             eval_set: args.eval_set.display().to_string(),
@@ -962,18 +1013,7 @@ fn report(
         },
         records: count,
         mismatches: replays.mismatches,
-        latency: LatencyReport {
-            all: summarize(&all),
-            by_typed: BANDS
-                .iter()
-                .zip(&bands)
-                .filter(|(_, samples)| !samples.is_empty())
-                .map(|((label, _, _), samples)| BandReport {
-                    band: label,
-                    summary: summarize(samples),
-                })
-                .collect(),
-        },
+        latency: LatencyReport::of(replays.samples.iter().map(|s| (s.typed, s.key_ns))),
         stages: StageReport {
             refreshes: replays.stages.refreshes,
             undecodable: replays.fused.undecodable,
@@ -1198,13 +1238,7 @@ pub fn run(args: &ReplayArgs) -> Result<()> {
             args.lm.as_deref().expect("the model dir is checked"),
         );
     }
-    let records: Vec<(usize, &ime_eval::EvalRecord)> = set
-        .records()
-        .iter()
-        .enumerate()
-        .filter(|(_, record)| args.slice.slice.slice().holds(record, args.slice.dev_share))
-        .take(args.records.unwrap_or(usize::MAX))
-        .collect();
+    let records = select_records(&set, &args.slice, args.records);
     info!(
         records = records.len(),
         slice = args.slice.slice.label(),
