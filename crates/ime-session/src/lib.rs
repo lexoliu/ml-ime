@@ -19,6 +19,7 @@
 mod cache;
 mod fused;
 mod keys;
+mod length;
 
 use ime_pinyin::{Keys, KeysError};
 use std::time::Instant;
@@ -29,6 +30,7 @@ pub use fused::{
     EngineStats, Fused, FusedConfig, FusedError, FusedStages, Invalidation, Timed, TransitionStats,
 };
 pub use keys::{KeyEngine, KeyEngineError, KeyEngineOptions, KeystrokeStats};
+pub use length::{Bounded, ByLength, ByLengthError};
 
 /// What reads the pending keystrokes into sentences.
 ///

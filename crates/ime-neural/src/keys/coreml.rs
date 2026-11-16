@@ -775,6 +775,10 @@ impl KeyModel for CoreMlKeyModel {
     type Encoding = CoreMlEncoding;
     type Logits = CoreMlLogits;
 
+    fn max_keys(&self) -> usize {
+        self.keys.last().map_or(0, |held| held.capacity)
+    }
+
     fn encode(
         &mut self,
         keys: &Keys,
@@ -782,7 +786,7 @@ impl KeyModel for CoreMlKeyModel {
         log_probs: &mut Vec<f32>,
     ) -> Result<CoreMlEncoding, CoreMlKeyError> {
         let count = keys.len();
-        let largest = self.keys.last().map_or(0, |held| held.capacity);
+        let largest = self.max_keys();
         let position = self
             .keys
             .iter()

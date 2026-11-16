@@ -11,6 +11,7 @@
 
 #![cfg(target_vendor = "apple")]
 
+use std::convert::Infallible;
 use std::fs;
 use std::num::NonZeroUsize;
 
@@ -20,11 +21,20 @@ use ime_neural::keys::{
     POLICY_VERSION, TreeCall,
 };
 use ime_pinyin::{EmitId, Keys, Legality, LegalityOptions};
-use ime_session::{Engine, KeyEngine, KeyEngineOptions, Pending};
+use ime_session::{
+    Bounded, ByLength, Engine, KeyEngine, KeyEngineOptions, Pending, Placed, Sentence, Session,
+    SessionOptions,
+};
 use serde::Deserialize;
 
 /// How far a score may stray from the Python search's.
 const SCORE_TOLERANCE: f64 = 1e-4;
+
+/// How far a keystroke-by-keystroke score may stray from the one-shot search's
+/// over the same input: a row's fp16 value depends at the last bit on the call
+/// that computed it, and typing changes which call that is, so the sums of a
+/// sentence's rows differ by a few fp16 ulps of the logits.
+const TYPING_TOLERANCE: f64 = 1e-2;
 
 #[derive(Deserialize)]
 struct Expected {
@@ -87,6 +97,10 @@ impl KeyModel for Recording<'_> {
     type Error = CoreMlKeyError;
     type Encoding = CoreMlEncoding;
     type Logits = CoreMlLogits;
+
+    fn max_keys(&self) -> usize {
+        self.model.max_keys()
+    }
 
     fn encode(
         &mut self,
@@ -217,4 +231,97 @@ fn more_keys_than_the_largest_function_holds_are_an_error_from_encode() {
         ),
         "{error}"
     );
+}
+
+/// The engine for input past the key model's limit: one fixed sentence, so a
+/// test sees which engine answered.
+struct Beyond;
+
+impl Engine for Beyond {
+    type Error = Infallible;
+
+    fn sentences(
+        &mut self,
+        pending: &Pending,
+        _context: Option<&str>,
+    ) -> Result<Vec<Sentence>, Infallible> {
+        Ok(vec![Sentence {
+            chars: vec![Placed {
+                ch: '?',
+                end: pending.letters().len(),
+                score: 0.0,
+            }],
+            score: 0.0,
+        }])
+    }
+
+    fn clear(&mut self) {}
+}
+
+#[test]
+fn the_limit_is_the_largest_keys_function() {
+    let model = open();
+    assert_eq!(model.max_keys(), 126);
+}
+
+#[test]
+fn a_session_typed_key_by_key_ends_at_the_sentences_of_the_whole_input() {
+    let expected = expected();
+    let point = &expected.weights[0];
+    let legality = Legality::over(open().characters()).expect("the characters have readings");
+    for record in &expected.records {
+        let name = &record.name;
+        let mut session = Session::new(
+            KeyEngine::new(open(), &legality, options(&expected, point)),
+            SessionOptions { sentences: 3 },
+        );
+        session
+            .set_context(record.context.as_deref().unwrap_or_default())
+            .expect("a context sets");
+        for ch in record.keys.chars() {
+            session.key(ch).expect("a keystroke decodes");
+        }
+        let pending = Pending::parse(&record.keys)
+            .expect("the keys are letters")
+            .expect("the keys are not empty");
+        let once = KeyEngine::new(open(), &legality, options(&expected, point))
+            .sentences(&pending, record.context.as_deref())
+            .expect("the search runs");
+        assert!(!once.is_empty(), "{name}: the input reads");
+        assert_eq!(session.sentences().len(), once.len(), "{name}");
+        for (rank, (typed, whole)) in session.sentences().iter().zip(&once).enumerate() {
+            let text = |sentence: &Sentence| -> String {
+                sentence.chars.iter().map(|placed| placed.ch).collect()
+            };
+            let cuts = |sentence: &Sentence| -> Vec<usize> {
+                sentence.chars.iter().map(|placed| placed.end).collect()
+            };
+            assert_eq!(text(typed), text(whole), "{name}: sentence {rank}");
+            assert_eq!(cuts(typed), cuts(whole), "{name}: sentence {rank}'s cuts");
+            let gap = f64::from(typed.score - whole.score).abs();
+            assert!(
+                gap <= TYPING_TOLERANCE,
+                "{name}: sentence {rank} scores {}, once {}",
+                typed.score,
+                whole.score
+            );
+        }
+    }
+}
+
+#[test]
+fn more_keys_than_the_model_holds_go_to_the_second_engine() {
+    let expected = expected();
+    let legality = Legality::over(open().characters()).expect("the characters have readings");
+    let key_engine = KeyEngine::new(open(), &legality, options(&expected, &expected.weights[0]));
+    assert_eq!(key_engine.max_keys(), 126);
+    let mut chosen = ByLength::new(key_engine, Beyond);
+    let past = Pending::parse(&"a".repeat(127))
+        .expect("letters")
+        .expect("not empty");
+    let found = chosen
+        .sentences(&past, None)
+        .expect("the second engine answers");
+    assert_eq!(found[0].chars[0].ch, '?');
+    assert_eq!(found[0].chars[0].end, 127);
 }
