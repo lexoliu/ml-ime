@@ -207,6 +207,14 @@ KEY_RANK_GAMMA = typer.Option(
 KEY_RANK_OBJECTIVE = typer.Option(
     None, help="rank: softmax over the gold and the negatives; risk: their expected edit distance"
 )
+KEY_RANK_TEACHER_WEIGHT = typer.Option(
+    None,
+    help="Weight of the character LM teacher's KL term over the list (S5, #298); 0 is S4 "
+    "(default 0). A positive weight needs --key-rank-teacher on every leg",
+)
+KEY_RANK_TEACHER_SCALE = typer.Option(
+    None, help="The LM's log-probability's weight in the teacher's distribution (default 0.6)"
+)
 
 
 @app.callback()
@@ -685,9 +693,21 @@ def key_ranking_settings(
     beta: float | None,
     gamma: float | None,
     objective: str | None,
+    teacher_weight: float | None,
+    teacher_scale: float | None,
 ) -> KeyRankingConfig | None:
     """The key ranking term's settings from its switch and its ``--key-rank-*`` knobs."""
-    knobs = (beam, negatives, other_lengths, weight, beta, gamma, objective)
+    knobs = (
+        beam,
+        negatives,
+        other_lengths,
+        weight,
+        beta,
+        gamma,
+        objective,
+        teacher_weight,
+        teacher_scale,
+    )
     if not key_ranking:
         if any(value is not None for value in knobs):
             raise typer.BadParameter(
@@ -710,6 +730,8 @@ def key_ranking_settings(
             beta=default.beta if beta is None else beta,
             gamma=default.gamma if gamma is None else gamma,
             objective=default.objective if objective is None else objective,
+            teacher_weight=default.teacher_weight if teacher_weight is None else teacher_weight,
+            teacher_scale=default.teacher_scale if teacher_scale is None else teacher_scale,
         )
     except ValueError as error:
         raise typer.BadParameter(str(error)) from error
@@ -966,6 +988,14 @@ def train_e2e(
     key_rank_beta: float | None = KEY_RANK_BETA,
     key_rank_gamma: float | None = KEY_RANK_GAMMA,
     key_rank_objective: str | None = KEY_RANK_OBJECTIVE,
+    key_rank_teacher_weight: float | None = KEY_RANK_TEACHER_WEIGHT,
+    key_rank_teacher_scale: float | None = KEY_RANK_TEACHER_SCALE,
+    key_rank_teacher: Path | None = typer.Option(
+        None,
+        "--key-rank-teacher",
+        help="The character LM checkpoint (charlm.pt) that scores the ranking list; "
+        "required with a positive --key-rank-teacher-weight, refused without (S5, #298)",
+    ),
     max_steps: int = typer.Option(1000, help="Optimiser steps to run"),
     token_budget: int = TOKEN_BUDGET,
     base_lr: float = typer.Option(3e-5, help="Learning rate for the pretrained weights"),
@@ -1131,7 +1161,10 @@ def train_e2e(
                 key_rank_beta,
                 key_rank_gamma,
                 key_rank_objective,
+                key_rank_teacher_weight,
+                key_rank_teacher_scale,
             ),
+            key_teacher=key_rank_teacher,
         )
     except torch.cuda.OutOfMemoryError as error:
         # The peak is recorded even at the crash, and the cache freed before
@@ -1227,6 +1260,8 @@ def train_count_batches(
     key_rank_beta: float | None = KEY_RANK_BETA,
     key_rank_gamma: float | None = KEY_RANK_GAMMA,
     key_rank_objective: str | None = KEY_RANK_OBJECTIVE,
+    key_rank_teacher_weight: float | None = KEY_RANK_TEACHER_WEIGHT,
+    key_rank_teacher_scale: float | None = KEY_RANK_TEACHER_SCALE,
     workers: int | None = typer.Option(
         None,
         "--workers",
@@ -1287,6 +1322,8 @@ def train_count_batches(
             key_rank_beta,
             key_rank_gamma,
             key_rank_objective,
+            key_rank_teacher_weight,
+            key_rank_teacher_scale,
         ),
     )
     census.write(out)
@@ -1688,6 +1725,8 @@ def e2e_stamp(
     key_rank_beta: float | None = KEY_RANK_BETA,
     key_rank_gamma: float | None = KEY_RANK_GAMMA,
     key_rank_objective: str | None = KEY_RANK_OBJECTIVE,
+    key_rank_teacher_weight: float | None = KEY_RANK_TEACHER_WEIGHT,
+    key_rank_teacher_scale: float | None = KEY_RANK_TEACHER_SCALE,
     typos: bool = typer.Option(
         False,
         "--typos/--no-typos",
@@ -1780,6 +1819,8 @@ def e2e_stamp(
         key_rank_beta,
         key_rank_gamma,
         key_rank_objective,
+        key_rank_teacher_weight,
+        key_rank_teacher_scale,
     )
     stage = None
     if init_from is None:

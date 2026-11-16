@@ -32,6 +32,13 @@ collator computed (:class:`KeyRankBatch`).
 MMI with the reference forced in (Chow 1990; Edunov et al. 2018) -- or, with
 ``objective="risk"``, the expectation over the same softmax of the sentences'
 normalised edit distance to the gold, minus its mean.
+
+**The teacher** (S5, #298; :mod:`mlime.train.key_teacher`) adds, with a
+positive ``teacher_weight``, a frozen character LM's ordering of the same
+list: ``teacher_weight * KL(q || p)`` beside the term, ``p`` the softmax of the
+list's scores and ``q`` that of the same scores held constant plus
+``teacher_scale`` times the LM's log-probability of each sentence under the
+example's context. Without it nothing here changes.
 """
 
 from __future__ import annotations
@@ -56,6 +63,13 @@ from mlime.train.e2e_search import (
     search_cover_lanes,
 )
 from mlime.train.key_model import KeyE2EModel, KeyStates
+from mlime.train.key_teacher import (
+    Teacher,
+    TeacherContext,
+    TeacherVocab,
+    distillation,
+    teacher_context,
+)
 from mlime.train.keys import KeyBatch, KeyCollator, KeyExample
 from mlime.train.model import RouteAOutput, mark_dynamic
 from mlime.train.ranking import packed_path_scores
@@ -78,7 +92,8 @@ class KeyRankBatch:
     needs to size a tensor is a host number computed with the batch:
     ``cover_cap``, the most characters a candidate may have (the longest gold
     plus two), and ``steps``, the most real decoder steps the scored sentences
-    can have.
+    can have. With a teacher, ``teacher`` holds each example's context as the
+    LM reads it (:class:`~mlime.train.key_teacher.TeacherContext`).
     """
 
     keys: KeyBatch
@@ -89,6 +104,7 @@ class KeyRankBatch:
     unique_spans: int
     cover_cap: int
     steps: int
+    teacher: TeacherContext | None = None
 
     @property
     def scored(self) -> torch.Tensor:
@@ -115,6 +131,7 @@ class KeyRankBatch:
         return replace(
             self,
             keys=self.keys.to(device),
+            teacher=None if self.teacher is None else self.teacher.to(device),
             **{name: getattr(self, name).to(device, non_blocking=True) for name in _SPAN_TENSORS},
         )
 
@@ -123,6 +140,7 @@ class KeyRankBatch:
         return replace(
             self,
             keys=self.keys.pin_memory(),
+            teacher=None if self.teacher is None else self.teacher.pin_memory(),
             **{name: getattr(self, name).pin_memory() for name in _SPAN_TENSORS},
         )
 
@@ -138,7 +156,8 @@ class KeyRankCollator:
     :meth:`~mlime.legality.Legality.span_matches`. Offline input has no
     unfinished tail, so what a span admits does not depend on where it ends
     (:class:`~mlime.legality.LegalityOptions`). The context-dropout coin is the
-    wrapped collator's.
+    wrapped collator's. With a *teacher* alphabet each batch also ships its
+    contexts as the LM reads them, a dropped context dropped for the LM too.
     """
 
     def __init__(
@@ -147,6 +166,7 @@ class KeyRankCollator:
         legality: Legality,
         options: LegalityOptions,
         ranking: KeyRankingConfig,
+        teacher: TeacherVocab | None = None,
     ):
         if options.unfinished_tail:
             raise ValueError("the key ranking trains on complete input; the tail rule is off")
@@ -154,6 +174,7 @@ class KeyRankCollator:
         self.legality = legality
         self.options = options
         self.ranking = ranking
+        self.teacher = teacher
 
     @property
     def rng(self) -> random.Random:
@@ -194,6 +215,16 @@ class KeyRankCollator:
         sizes = [ids.size for _, ids, _ in pieces]
         lengths = [len(example.targets) for example in keyed]
         negatives = self.ranking.negatives
+        teacher = None
+        if self.teacher is not None:
+            kept = batch.spans.has_context.tolist()
+            contexts = [
+                example.context if keep else None for example, keep in zip(keyed, kept, strict=True)
+            ]
+            # The step's items are the golds, then each example's negatives
+            # (:class:`KeyItems`), their sentences padded to the cover cap.
+            owners = [*range(size), *(owner for owner in range(size) for _ in range(negatives))]
+            teacher = teacher_context(contexts, self.teacher, owners, max(lengths) + 2)
         return KeyRankBatch(
             keys=batch,
             span_rows=torch.from_numpy(np.repeat(np.arange(len(pieces), dtype=np.int64), sizes)),
@@ -207,6 +238,7 @@ class KeyRankCollator:
             unique_spans=len(pieces),
             cover_cap=max(lengths) + 2,
             steps=sum(length + negatives * (length + 2) for length in lengths),
+            teacher=teacher,
         )
 
 
@@ -580,6 +612,13 @@ def edit_distance(
     return result.float() / torch.maximum(lengths, gold_lengths).float()
 
 
+def by_example(values: torch.Tensor, examples: int, negatives: int) -> torch.Tensor:
+    """``[B, 1 + K]``: per-item *values* ``[I]`` as each example's list, the gold first."""
+    return torch.cat(
+        [values[:examples].unsqueeze(1), values[examples:].view(examples, negatives)], dim=1
+    )
+
+
 class KeyRankingModel(KeyE2EModel):
     """The joint-stage key model trained to rank whole sentences, not only keys and characters.
 
@@ -590,9 +629,14 @@ class KeyRankingModel(KeyE2EModel):
 
     ``search_graphs``, set by the trainer on a CUDA run that asks for it,
     replays the candidate search from captured CUDA graphs (#137).
+
+    ``teacher``, set by the trainer when the stage has a positive
+    ``teacher_weight``, is the frozen LM that scores the list (S5, #298). It is
+    no module of this one, so it is in no checkpoint and no optimiser.
     """
 
     search_graphs: SearchGraphs | None = None
+    teacher: Teacher | None = None
 
     @property
     def ranking(self) -> KeyRankingConfig:
@@ -650,6 +694,11 @@ class KeyRankingModel(KeyE2EModel):
         transition = -parts.transition[:examples].sum() / scored
         term, extras = self.sequence_term(items, parts, ranking)
         loss = ctc + self.keys_config.transition_weight * transition + ranking.weight * term
+        if ranking.teacher_weight > 0.0:
+            with torch.profiler.record_function("key_rank.teacher"):
+                distilled, taught = self.teacher_term(batch, items, parts, ranking)
+            loss = loss + ranking.teacher_weight * distilled
+            extras = {**extras, **taught}
         return RouteAOutput(
             loss=loss,
             extras={
@@ -718,6 +767,44 @@ class KeyRankingModel(KeyE2EModel):
         # by the scoring pass, they would cut the head out of the loss.
         torch.clear_autocast_cache()
         return items
+
+    def teacher_term(
+        self,
+        batch: KeyRankBatch,
+        items: KeyItems,
+        parts: SentenceScores,
+        ranking: KeyRankingConfig,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """``mean KL(q || p)`` over the lists, and the metrics a run with a teacher is judged by.
+
+        The LM scores every item under its example's context, no gradient;
+        the list's own scores carry the term's gradient. ``teacher_kl`` is the term itself,
+        ``teacher_flip`` how often the teacher changes the list's best
+        sentence and ``teacher_gold_first`` how often the LM alone puts the
+        gold first.
+        """
+        teacher = self.teacher
+        if teacher is None:
+            raise ValueError(
+                "the stage has a teacher weight but no teacher is loaded; "
+                "the trainer sets one from --key-rank-teacher"
+            )
+        if batch.teacher is None:
+            raise ValueError(
+                "the stage has a teacher weight but the batch carries no teacher context; "
+                "its collator was built without the teacher's alphabet"
+            )
+        examples, negatives = items.valid.shape
+        taught = teacher.log_probs(batch.teacher, items.owner, items.sequences, items.lengths)
+        listed = torch.cat([torch.ones_like(items.valid[:, :1]), items.valid], dim=1)
+        slots = by_example(parts.score(ranking.beta), examples, negatives)
+        kl, extras = distillation(
+            slots.masked_fill(~listed, _NEGATIVE),
+            listed,
+            by_example(taught, examples, negatives),
+            ranking.teacher_scale,
+        )
+        return kl.mean(), extras
 
     def sequence_term(
         self, items: KeyItems, parts: SentenceScores, ranking: KeyRankingConfig

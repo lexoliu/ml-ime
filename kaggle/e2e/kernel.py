@@ -284,9 +284,11 @@ TRAIN_FILL_TOWER = None
 
 #: The key-level model's sequence-level term over its own constrained search
 #: (S4, #278), as `mlime train e2e`'s `--key-rank-*` options: a dict of `beam`,
-#: `negatives`, `other_lengths`, `weight`, `beta`, `gamma` and `objective`
-#: ("rank" or "risk"). Needs `KEYS` without `KEY_WARM_UP`, over a finished joint
-#: run. None trains the joint stage's loss alone. Stamped per push.
+#: `negatives`, `other_lengths`, `weight`, `beta`, `gamma`, `objective`
+#: ("rank" or "risk"), and the teacher's `teacher_weight` and `teacher_scale`
+#: (S5, #298: a positive weight makes the character LM of `INIT_DECODER` score
+#: the list on every leg). Needs `KEYS` without `KEY_WARM_UP`, over a finished
+#: joint run. None trains the joint stage's loss alone. Stamped per push.
 KEY_RANKING = None
 
 #: The (pretrained, new) learning rates; None keeps `mlime train e2e`'s.
@@ -782,6 +784,18 @@ def key_ranking_argv():
     return argv
 
 
+def key_teacher_argv():
+    """The key ranking teacher's checkpoint, on every leg of a stage that has one (S5, #298).
+
+    The character LM is the decoder's own initial checkpoint, in the mount the
+    reader and the encoder start from; the trainer alone reads it, so the count
+    does not. A stage whose `KEY_RANKING` has no teacher weight names none.
+    """
+    if KEY_RANKING is None or not KEY_RANKING.get("teacher_weight"):
+        return []
+    return ["--key-rank-teacher", str(locate(INIT_DECODER) / INIT_DECODER)]
+
+
 def key_training_argv():
     """The key front's switches only the trainer reads: its shape and its losses."""
     if KEYS is None:
@@ -924,7 +938,7 @@ def train_argv(
     if ACTIVATION_CHECKPOINTING:
         argv.append("--activation-checkpointing")
     argv += typing_argv(char_table)
-    argv += keys_argv() + key_ranking_argv() + key_training_argv()
+    argv += keys_argv() + key_ranking_argv() + key_teacher_argv() + key_training_argv()
     return argv
 
 
