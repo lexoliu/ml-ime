@@ -122,6 +122,16 @@ class KeyRankingConfig:
     to the gold. ``weight`` scales the term beside the joint stage's two; at 0
     the stage trains the joint stage's loss over the same batches and searches
     nothing.
+
+    ``teacher_weight`` (``lambda_d``, S5, #298) adds a frozen character LM as a
+    teacher of the same list: the term ``lambda_d * KL(q || p)`` with ``p``
+    the softmax of the list's scores and ``q`` the softmax of the same scores,
+    held constant, plus ``teacher_scale`` (``w``) times the LM's
+    log-probability of each sentence under the example's context. At 0 the
+    stage is S4's and the LM is neither loaded nor run. The LM's checkpoint is
+    an asset of the run, not a setting of it: it is named at launch
+    (``--key-rank-teacher``), and these two numbers are what a checkpoint
+    records, so a resumed leg cannot silently run without the teacher.
     """
 
     beam: int = 8
@@ -131,12 +141,14 @@ class KeyRankingConfig:
     beta: float = 2.0
     gamma: float = 1.0
     objective: str = "rank"
+    teacher_weight: float = 0.0
+    teacher_scale: float = 0.6
 
     def __post_init__(self) -> None:
         for name in ("beam", "negatives", "other_lengths"):
             if getattr(self, name) < 1:
                 raise ValueError(f"key ranking {name} must be positive, got {getattr(self, name)}")
-        for name in ("weight", "beta", "gamma"):
+        for name in ("weight", "beta", "gamma", "teacher_weight", "teacher_scale"):
             value = getattr(self, name)
             if not math.isfinite(value) or value < 0.0:
                 raise ValueError(f"key ranking {name} must be finite and not negative, got {value}")
@@ -144,6 +156,11 @@ class KeyRankingConfig:
             raise ValueError(
                 f"key ranking objective must be one of {KEY_RANKING_OBJECTIVES}, "
                 f"got {self.objective!r}"
+            )
+        if self.teacher_weight > 0.0 and self.weight == 0.0:
+            raise ValueError(
+                "the teacher scores the list the ranking term builds; "
+                "a stage with a teacher needs a positive ranking weight"
             )
 
     @property

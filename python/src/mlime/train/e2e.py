@@ -34,6 +34,7 @@ from mlime.train.e2e_model import (
 from mlime.train.e2e_search import SearchGraphs
 from mlime.train.key_model import KeyE2EModel, joint_evaluate, key_evaluate, letter_token_ids
 from mlime.train.key_ranking import KeyRankingModel
+from mlime.train.key_teacher import Teacher
 from mlime.train.keys import FillTowerTraining, KeyExample, KeyFrontConfig
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import Distributed, MetricLog, TrainingConfig, evaluate, train
@@ -570,6 +571,7 @@ def e2e(
     key_warm_up: bool = False,
     train_fill_tower: FillTowerTraining | None = None,
     key_ranking: KeyRankingConfig | None = None,
+    key_teacher: Path | None = None,
 ) -> RunResult:
     """Train the end-to-end model over *slices.train*; score held-out both ways.
 
@@ -612,6 +614,10 @@ def e2e(
     held-out record, with *search_graphs* replaying its candidate search.
     Its typos are the typo augmentation's, which it keeps (the refusal of
     ranking with typos is the span model's, about ``ime-segment``).
+    *key_teacher* is the character LM checkpoint the stage's teacher term
+    (``teacher_weight``, S5, #298) scores the list with: given exactly when
+    the term is on, on every leg, because the options a checkpoint records
+    are the term's weights and a leg that names none is refused on resume.
     """
     world = Distributed.from_environment()
     starts = (
@@ -648,6 +654,12 @@ def e2e(
     if train_fill_tower is not None and not key_warm_up:
         raise ValueError(
             "--train-fill-tower trains the tower in the key warm-up; add --key-warm-up"
+        )
+    teaching = key_ranking is not None and key_ranking.teacher_weight > 0.0
+    if teaching != (key_teacher is not None):
+        raise ValueError(
+            "a key ranking teacher and its checkpoint come together: --key-rank-teacher "
+            "with a positive --key-rank-teacher-weight, and neither otherwise"
         )
     source = init_e2e if init_e2e is not None else resume
     if source is not None:
@@ -701,6 +713,10 @@ def e2e(
             raise TypeError(f"--tower-graphs replays Qwen's tower, not a {type(tower).__name__}")
         tower.graphs = TowerGraphs()
     lexicon, tokenizer = vocabularies.lexicon, vocabularies.tokenizer
+    if key_teacher is not None:
+        if not isinstance(model, KeyRankingModel):
+            raise TypeError(f"a teacher scores a key ranking list, not a {type(model).__name__}'s")
+        model.teacher = Teacher.load(key_teacher, lexicon.characters, world.device)
 
     # One lane per rank this process stands for: lane j of a process takes
     # the shard deal of world rank `rank * virtual + j`, and every lane's
@@ -726,6 +742,7 @@ def e2e(
             context=context,
             keys=keys,
             key_ranking=key_ranking,
+            key_teacher=key_teacher,
         )
         for index in range(virtual)
     ]
@@ -774,6 +791,7 @@ def e2e(
                 init_encoder=None if init_encoder is None else str(init_encoder),
                 init_decoder=None if init_decoder is None else str(init_decoder),
                 init_e2e=None if init_e2e is None else str(init_e2e),
+                key_teacher=None if key_teacher is None else str(key_teacher),
                 emittable_characters=lexicon.size,
                 typed_spans=lexicon.spans,
                 resume=str(resume) if resume is not None else None,

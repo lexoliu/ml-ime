@@ -99,7 +99,17 @@ FILL_TOWER_FIELDS = frozenset({"cross_attention"})
 #: What a stamped ``KEY_RANKING`` holds: the kernel's ``--key-rank-*`` options,
 #: the key-level model's sequence-level term and the search behind it (#278).
 KEY_RANKING_FIELDS = frozenset(
-    {"beam", "negatives", "other_lengths", "weight", "beta", "gamma", "objective"}
+    {
+        "beam",
+        "negatives",
+        "other_lengths",
+        "weight",
+        "beta",
+        "gamma",
+        "objective",
+        "teacher_weight",
+        "teacher_scale",
+    }
 )
 
 

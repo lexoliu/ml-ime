@@ -554,6 +554,8 @@ def test_a_key_ranking_stage_stamps_its_term_over_a_finished_joint_run(tmp_path:
         "beta": 2.0,
         "gamma": 1.0,
         "objective": "risk",
+        "teacher_weight": 0.0,
+        "teacher_scale": 0.6,
     }
     keys = {"layers": 2, "transition_weight": 1.0, "correct_syllables": True}
     assert sorted(changed_lines(template, kernel)) == sorted(

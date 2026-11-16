@@ -35,6 +35,7 @@ from mlime.logging import log
 from mlime.train.arbitration import ReadingArbitration
 from mlime.train.e2e_model import KeyRankingConfig, RankingConfig
 from mlime.train.key_ranking import KeyRankCollator
+from mlime.train.key_teacher import TeacherVocab
 from mlime.train.keys import KeyCollator, KeyFrontConfig, KeySampleBuilder
 from mlime.train.lexicon import CandidateSpace, Lexicon, build_lexicon, read_char_readings
 from mlime.train.loop import (
@@ -375,17 +376,20 @@ class Vocabularies:
         context_dropout: float = 0.3,
         max_context_tokens: int = DEFAULT_CONTEXT_TOKENS,
         seed: int = 0,
+        teacher: TeacherVocab | None = None,
     ) -> KeyRankCollator:
         """The collator a key ranking run (S4, #278) pads its batches with.
 
         It also ships the legal spans of each batch's keys, under the
-        automaton the run's examples are built with.
+        automaton the run's examples are built with, and with a *teacher*
+        (S5, #298) each example's context as that LM reads it.
         """
         return KeyRankCollator(
             self.key_collator(context_dropout, max_context_tokens, seed),
             self.legality(),
             keys.options,
             ranking,
+            teacher,
         )
 
     def collator(
@@ -443,6 +447,9 @@ class CorpusLane:
     #: The sequence-level term a key-level lane's batches carry the legal spans
     #: for (S4, #278).
     key_ranking: KeyRankingConfig | None = None
+    #: The character LM whose alphabet the lane's batches ship contexts in, for
+    #: a key ranking stage with a teacher (S5, #298).
+    key_teacher: Path | None = None
 
     def open(self) -> tuple[CorpusStream, BatchCollator]:
         """Load the tables, then build this lane's stream and collator over them."""
@@ -464,6 +471,7 @@ class CorpusLane:
                 self.context_dropout,
                 self.max_context_tokens,
                 self.seed,
+                None if self.key_teacher is None else TeacherVocab.read(self.key_teacher),
             )
         if self.key_ranking is not None:
             raise ValueError("the key ranking term needs a key front")
