@@ -1,0 +1,9 @@
+# Core ML keeps its compiled-bundle cache per process name. Two processes of one
+# test binary that load the same model while that cache is cold race on it, and
+# one of them fails to load; a fresh runner's cache is always cold.
+[test-groups]
+coreml = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'package(ime-session) & binary(coreml)'
+test-group = 'coreml'

@@ -44,8 +44,8 @@ jobs:
               echo "$1=false"
             fi >> "$GITHUB_OUTPUT"
           }
-          # Rust reads nothing outside crates/.
-          area rust 'crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$'
+          # Rust reads nothing outside crates/ but its manifests and the test runner's settings.
+          area rust 'crates/|Cargo\.(toml|lock)$|rust-toolchain\.toml$|\.config/nextest\.toml$'
           # The Python tests read the Rust side's tables and fixtures.
           area python 'python/|colab/|kaggle/|crates/[^/]+/data/|crates/[^/]+/tests/fixtures/'
           # The generator and what it writes.

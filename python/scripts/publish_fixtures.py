@@ -1,13 +1,17 @@
 """Publish the test fixtures' graphs and weights, and pin them.
 
-Run from the repository root once `charlm_fixtures.py` or `routea_fixtures.py`
-has rewritten a set's directory:
+Run from the repository root once `charlm_fixtures.py`, `routea_fixtures.py` or
+`keys_fixtures.py` has rewritten a set's directory:
 
-    uv run --project python python/scripts/publish_fixtures.py
+    uv run --project python python/scripts/publish_fixtures.py [SET ...]
+
+With set names, only those sets are uploaded and re-pinned; the others keep their
+files, which the new revision still holds.
 
 `crates/ime-fixtures/fixtures.json` names each set's committed directory and
 the public Hugging Face dataset repository. Every `.onnx` and `.weights` file
-under those directories -- git ignores them -- goes up in one commit, at
+under those directories -- git ignores them -- and every file under a set's `fetched`
+directories (a compiled Core ML model) goes up in one commit, at
 `<set>/<path>`, and the manifest is rewritten with that commit and each file's
 SHA-256: the pin the `ime-fixtures` build script fetches and verifies. Commit
 the manifest with the text files the generator rewrote. Needs `hf auth login`.
@@ -15,6 +19,7 @@ the manifest with the text files the generator rewrote. Needs `hf auth login`.
 
 import hashlib
 import json
+import sys
 from pathlib import Path
 
 from huggingface_hub import CommitOperationAdd, HfApi
@@ -32,10 +37,17 @@ SUFFIXES = (".onnx", ".weights")
 def main() -> None:
     """Upload every set's graphs and weights and rewrite the pin."""
     manifest = json.loads(MANIFEST.read_text(encoding="utf-8"))
+    names = sys.argv[1:] or list(manifest["sets"])
+    unknown = sorted(set(names) - set(manifest["sets"]))
+    if unknown:
+        raise SystemExit(f"fixtures.json has no set {', '.join(unknown)}")
     operations = []
-    for name, entry in manifest["sets"].items():
+    for name in names:
+        entry = manifest["sets"][name]
         committed = REPO / entry["committed"]
         files = sorted(path for path in committed.rglob("*") if path.suffix in SUFFIXES)
+        for directory in entry.get("fetched", []):
+            files += sorted(path for path in (committed / directory).rglob("*") if path.is_file())
         if not files:
             raise SystemExit(f"{committed} holds no graphs or weights; run its generator first")
         entry["files"] = {

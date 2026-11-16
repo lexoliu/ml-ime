@@ -31,6 +31,13 @@ struct Manifest {
 struct Set {
     /// The set's committed directory, relative to the workspace root.
     committed: PathBuf,
+    /// Directories of the set, relative to it, whose whole content is pinned
+    /// whatever the extensions: a compiled Core ML model is a directory of
+    /// files with no suffix of their own to tell them by. They are never
+    /// copied from the committed directory, so a file the manifest does not
+    /// pin is missing rather than silently local.
+    #[serde(default)]
+    fetched: Vec<PathBuf>,
     /// Each pinned file's path within the set, to its SHA-256.
     files: BTreeMap<String, String>,
 }
@@ -38,7 +45,8 @@ struct Set {
 /// The extensions of the files that leave the tree: a committed directory's
 /// files with these are the generator's local output, never copied, so a
 /// graph the manifest does not pin is missing rather than silently local.
-/// `publish_fixtures.py` uploads the same ones.
+/// `publish_fixtures.py` uploads the same ones, and every file of a set's
+/// `fetched` directories.
 const FETCHED: [&str; 2] = ["onnx", "weights"];
 
 /// One request's bound; the largest fixture is a few hundred kilobytes.
@@ -98,7 +106,8 @@ fn main() {
         if assembled.exists() {
             fs::remove_dir_all(&assembled).expect("the previous assembly is removed");
         }
-        copy_committed(&committed, &assembled);
+        let fetched: Vec<PathBuf> = set.fetched.iter().map(|dir| committed.join(dir)).collect();
+        copy_committed(&committed, &assembled, &fetched);
         for (file, sha256) in &set.files {
             let path = assembled.join(file);
             fs::create_dir_all(path.parent().expect("a fixture file has a directory"))
@@ -173,14 +182,17 @@ fn fetch(agent: &Agent, url: &str, sha256: &str, blob: &Path) {
 }
 
 /// Copy every file under *from* to the same path under *to*, but the
-/// extensions in [`FETCHED`].
-fn copy_committed(from: &Path, to: &Path) {
+/// extensions in [`FETCHED`] and the directories in *fetched*.
+fn copy_committed(from: &Path, to: &Path, fetched: &[PathBuf]) {
     fs::create_dir_all(to).expect("the set directory is created");
     for entry in fs::read_dir(from).expect("the committed fixture directory reads") {
         let path = entry.expect("a directory entry reads").path();
+        if fetched.contains(&path) {
+            continue;
+        }
         let destination = to.join(path.file_name().expect("an entry has a name"));
         if path.is_dir() {
-            copy_committed(&path, &destination);
+            copy_committed(&path, &destination, fetched);
         } else if !path
             .extension()
             .and_then(|extension| extension.to_str())

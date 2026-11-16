@@ -19,6 +19,8 @@ thiserror.workspace = true
 [dev-dependencies]
 ime-fixtures.workspace = true
 ort.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
