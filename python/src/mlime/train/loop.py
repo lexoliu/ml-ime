@@ -227,6 +227,29 @@ class Distributed:
             torch.distributed.destroy_process_group()
 
 
+def device_memory(device: torch.device) -> dict[str, int]:
+    """Where the card's memory is, in bytes, as a step record's fields (#304).
+
+    ``allocated`` is live tensors; ``reserved`` adds the caching allocator's
+    free blocks, of which ``inactive_split`` are the fragments of split blocks
+    no request has reused; ``outside`` is what the card holds beyond the
+    allocator's reservation -- the CUDA context, the libraries' workspaces and
+    any mapping made around the allocator. A rise in one of them over a leg
+    names the pool that grows.
+    """
+    stats = torch.cuda.memory_stats(device)
+    free, total = torch.cuda.mem_get_info(device)
+    reserved = stats["reserved_bytes.all.current"]
+    return {
+        "memory_allocated": stats["allocated_bytes.all.current"],
+        "memory_reserved": reserved,
+        "memory_inactive_split": stats["inactive_split_bytes.all.current"],
+        "memory_segments": stats["segment.all.current"],
+        "memory_alloc_retries": stats["num_alloc_retries"],
+        "memory_outside": total - free - reserved,
+    }
+
+
 def seed_everything(seed: int, rank: int = 0) -> None:
     """Seed the generators this run draws from.
 
@@ -1081,6 +1104,8 @@ def train(
                 }
                 first_logged_loss = loss_now if first_logged_loss is None else first_logged_loss
                 last_logged_loss = loss_now
+                if device.type == "cuda":
+                    record.update(device_memory(device))
                 if config.compile:
                     # Compiles belong to the step that caused them: all of a
                     # step's dynamo work sits in its forward/backward, ahead
