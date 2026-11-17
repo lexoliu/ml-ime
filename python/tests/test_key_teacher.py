@@ -9,6 +9,8 @@ and a resumed leg that drops it is refused.
 from __future__ import annotations
 
 import math
+import subprocess
+import sys
 from collections.abc import Callable
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -187,6 +189,25 @@ def test_the_lm_scores_each_sentence_under_its_context_as_ime_lm_conditions_it(
     read = TeacherVocab.read(path)
     assert read.index == index and read.context_chars == CONTEXT_CHARS
     assert not any(p.requires_grad for p in loaded.model.parameters()) and not loaded.model.training
+
+
+def test_the_teacher_loads_on_a_runtime_without_onnx(tmp_path: Path) -> None:
+    vocab = CharVocab(chars=SPECIALS + tuple(sorted(CHARACTERS)))
+    path = checkpoint_of(tiny_lm(len(vocab)), vocab.chars, tmp_path / "charlm.pt")
+    # A training runtime has no onnx; a `None` entry makes its import fail in the child.
+    script = (
+        "import sys; sys.modules['onnx'] = None\n"
+        "import torch\n"
+        "from mlime.train.key_teacher import Teacher\n"
+        "Teacher.load(sys.argv[1], tuple(sys.argv[2]), torch.device('cpu'))\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", script, str(path), "".join(SENTENCE_CHARACTERS)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr[-2000:]
 
 
 def test_a_character_the_lm_cannot_score_fails_when_the_teacher_loads(tmp_path: Path) -> None:

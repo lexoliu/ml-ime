@@ -35,8 +35,8 @@ import torch
 import torch.nn.functional as functional
 
 from mlime.logging import log
-from mlime.train.charlm_model import CharLm, CharLmConfig
-from mlime.train.charlm_vocab import BOS, EOS, PAD, SEP, UNK
+from mlime.train.charlm_model import CharLm, CharLmConfig, build
+from mlime.train.charlm_vocab import BOS, EOS, PAD, SEP, UNK, CharVocab
 
 #: Positions of LM input one chunk of sentences holds, padding included. The
 #: chunk's logits are ``sentences * (span + 1) * alphabet`` floats, so this
@@ -166,10 +166,13 @@ class Teacher:
     @classmethod
     def load(cls, path: Path, characters: Sequence[str], device: torch.device) -> Teacher:
         """The LM checkpoint at *path* on *device*, mapped onto the emittable *characters*."""
-        # Imported here: `charlm` reads `mlime.train.run`, which reads the ranking stage.
-        from mlime.train.charlm import load_model
-
-        model, vocab, step = load_model(path, torch.device("cpu"))
+        # The checkpoint is read here, not through `mlime.train.charlm`: that module is the LM's
+        # trainer and exporter and imports onnx, which a training runtime does not have.
+        state = torch.load(path, map_location="cpu", weights_only=False)
+        vocab = CharVocab(chars=tuple(state["vocab"]))
+        model = build(len(vocab), CharLmConfig(**state["config"]))
+        model.load_state_dict(state["model"])
+        step = int(state["step"])
         index = vocab.index
         missing = [character for character in characters if character not in index]
         if missing:
