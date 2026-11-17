@@ -30,6 +30,22 @@ Top-8 with context: S5 91.05 / 45.35 / 57.67 / 70.30, S4 90.69 / 44.93 / 57.23 /
 
 It passes, on full pinyin by three and four records.
 
+**The knowledge slice** (test, with context; slice top-1, then entity exact for idioms):
+
+| | S5 | S4 | fused |
+|---|---|---|---|
+| full, all entities | 76.83% | 76.83% | 80.12% |
+| abbreviated, all | 28.12% | 27.73% | 25.59% |
+| mixed, all | 38.89% | 37.74% | 37.36% |
+| abbreviated, idiom entity exact | 47.12% | 43.27% | 52.88% |
+| mixed, idiom entity exact | 55.45% | 54.55% | 58.18% |
+
+The slice does not move: 19 records gained and 19 lost on full pinyin, 15 and 13 abbreviated, 16 and 10 mixed (|z| ≤ 1.2). Idiom entities gain 5 and lose 1 on full pinyin (z 1.63) and 6 and 2 abbreviated (z 1.41). Two differences separate on mixed, in opposite directions: internet entities gain 5 and lose none (z 2.24), and the characters of person names fall from 82.07% to 79.75% right (7 gained, 22 lost, z −2.79).
+
+Without context the slice top-1 is 70.27% / 14.06% / 28.93% against S4's 69.69% / 13.67% / 28.74%, no difference separating. The same two movements show on abbreviated input: idiom entities gain 8 and lose none (32.69% to 40.38% exact, z 2.83), and person-name characters fall from 49.76% to 46.40% (22 gained, 43 lost, z −2.60). Person names are the one cost the stage shows.
+
+**The ambiguity slice** (test, with context; S5 then S4): sentence top-1 76.06% / 75.64% full, 29.71% / 28.92% abbreviated, 39.64% / 39.33% mixed; the confusable characters themselves 95.68% / 95.77%, 82.04% / 81.91%, 86.65% / 85.49%, the last the only one that separates (66 gained, 39 lost, z 2.63). 他/她/它 on full pinyin is 83.79% against 81.82% (212 against 207 of 253).
+
 **Against #216 §8.** Abbreviated and mixed are now above the fused decoder on both context settings and above #132 with context. Full pinyin is not: 2.36 and 2.70 under the fused decoder, 1.07 under #132.
 
 **What the teacher did.** Through training the model's distribution over the list sat about 0.2 nats from the teacher's (0.22, 0.18 and 0.22 over the leg's thirds), and the teacher's first choice differed from the model's on 10% to 14% of lists, the gold being the teacher's first on 54% to 65%. The term did not shrink over the epoch. On clean full pinyin the test gain is 11 and 29 records of 5,027; the LM's ordering of S4's finished top-8 was worth several times that, so most of what the LM knows about those lists did not reach the transition in one epoch at this weight.
@@ -51,7 +67,7 @@ colab/e2e.sh DIR start --session-hours 6 --gpu A100
 colab/e2e.sh DIR wait && colab/e2e.sh DIR fetch && colab/e2e.sh DIR stop
 ```
 
-The logs, selections and each section's dev and test dumps are in the `lexoliu/mlime-resume` bucket under `final/mlime-e2e-keys-s5/`.
+The logs, selections and each section's dev and test dumps are in the `lexoliu/mlime-resume` bucket under `final/mlime-e2e-keys-s5/`. The slice rows are `ime-knowledge --slice test` and `ime-ambiguity --slice test` over the decompressed test dumps, S4's dump the baseline.
 
 ## Next
 
