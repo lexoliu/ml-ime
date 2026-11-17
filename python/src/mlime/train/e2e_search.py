@@ -10,6 +10,7 @@ log-probability over the whole emittable set, restricted afterwards.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
@@ -360,15 +361,27 @@ class SearchGraphs:
     baked the old addresses), and every live graph's working memory comes from
     one shared pool: searches never overlap, so neither costs more than the
     largest search alone.
+
+    An instantiated graph also holds driver memory outside PyTorch's
+    allocator, in proportion to its kernels: about 100 MB for a key-level
+    search on an A100, and the shapes keep arriving for a whole epoch (#304).
+    So at most *limit* graphs live at once, and a capture past it releases the
+    graph replayed longest ago. The driver keeps a released graph's memory and
+    gives it to the next capture, so the card holds what *limit* graphs need,
+    not what the run ever captured.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, limit: int) -> None:
+        if limit < 1:
+            raise ValueError(f"a search graph cache holds at least one graph, got {limit}")
+        self.limit = limit
+        self.evicted = 0
         self.pool = torch.cuda.graph_pool_handle()
         self.flat: dict[str, torch.Tensor] = {}
-        self.captured: dict[
+        self.captured: OrderedDict[
             tuple[object, ...],
             tuple[torch.cuda.CUDAGraph, Any, dict[str, torch.Tensor], tuple[torch.Tensor, ...]],
-        ] = {}
+        ] = OrderedDict()
 
     def _view(self, name: str, like: torch.Tensor) -> torch.Tensor:
         """A view shaped like *like* into the flat buffer *name*, grown when too small."""
@@ -475,15 +488,26 @@ class SearchGraphs:
             views = {name: self._view(name, tensor) for name, tensor in given.items()}
             static = build(views)
         else:
+            self.captured.move_to_end(key)
             _, static, views, _ = captured
         for name, tensor in given.items():
             views[name].copy_(tensor)
         if captured is None:
+            if len(self.captured) == self.limit:
+                # Released before the capture, so the driver hands its
+                # memory to the new graph instead of growing.
+                self.captured.popitem(last=False)
+                self.evicted += 1
             graph, outputs = self._capture(search, static, autocast)
             captured = self.captured[key] = (graph, static, views, outputs)
             # Each capture costs a search run eagerly and once more under
             # capture; a measured span starts after the last of them.
-            log.info("search graph captured", shape=str(key[:3]), graphs=len(self.captured))
+            log.info(
+                "search graph captured",
+                shape=str(key[:3]),
+                graphs=len(self.captured),
+                evicted=self.evicted,
+            )
         graph, _, _, outputs = captured
         graph.replay()
         sequences, scores = outputs

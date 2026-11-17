@@ -307,7 +307,7 @@ class E2EV2Run:
     trace_steps: int = 3
     train_shards: tuple[str, ...] | None = None
     stage: E2EV2Stage | None = None
-    search_graphs: bool = False
+    search_graphs: int | None = None
     tower_graphs: bool = False
     key_arcs: str | None = None
 
@@ -326,7 +326,7 @@ class E2EV2Run:
             raise ValueError(
                 f"{self.run}: a key-level run is named {E2E_KEYS_RUN}*, and only a key-level run is"
             )
-        if self.search_graphs and (
+        if self.search_graphs is not None and (
             self.stage is None or (self.stage.ranking is None and self.stage.key_ranking is None)
         ):
             raise ValueError("only a ranking stage has a search to replay from CUDA graphs")
