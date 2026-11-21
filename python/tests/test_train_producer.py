@@ -22,6 +22,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 import torch
@@ -84,10 +85,11 @@ class BrokenCollator:
 
 
 def assert_same_items(got: Sequence[Produced], wanted: Sequence[Produced]) -> None:
-    """Item for item: the position, the collator's generator, the ids and every tensor."""
+    """Item for item: the position, cursor, collator generator, ids and every tensor."""
     assert len(got) == len(wanted)
     for index, (item, reference) in enumerate(zip(got, wanted, strict=True)):
         assert (item.epoch, item.index) == (reference.epoch, reference.index), index
+        assert item.cursor is not None and item.cursor == reference.cursor, index
         assert item.collator_rng == reference.collator_rng, index
         assert item.batch.ids == reference.batch.ids, index
         tensors = [name for name in vars(reference.batch) if name != "ids"]
@@ -170,7 +172,8 @@ def test_a_resumed_producer_process_continues_the_in_process_batches(
         TAKEN,
     )
     consumed = wanted[after]
-    start = StreamPosition(consumed.epoch, consumed.index, consumed.collator_rng)
+    assert consumed.cursor is not None
+    start = StreamPosition(consumed.epoch, consumed.index, consumed.collator_rng, consumed.cursor)
     got, _ = process_items(
         BuiltLane(*stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)),
         TAKEN - after - 1,
@@ -184,6 +187,88 @@ def test_a_resumed_producer_process_continues_the_in_process_batches(
         start,
     )
     assert_same_items(resumed, wanted[after + 1 :])
+
+
+def test_seeking_reads_no_shard_before_the_cursor(
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cursor resume jumps straight to the saved shard and row without reading prior shards."""
+    from mlime.train import samples
+    from mlime.train.lexicon import CandidateSpace
+    from mlime.train.samples import CorpusStream, SampleBuilder, StreamCursor
+
+    samples_dir, labels_dir = corpus
+
+    def make_lane(rank: int = 1, world_size: int = 2) -> BuiltLane:
+        return BuiltLane(
+            CorpusStream(
+                samples_dir,
+                labels_dir,
+                SampleBuilder(lexicon, spans, arbitration, seed=1),
+                rank=rank,
+                world_size=world_size,
+            ),
+            Collator(tokenizer, tokenizer, CandidateSpace(spans, lexicon.candidate_mask)),
+        )
+
+    wanted = local_items(make_lane(), 36)
+    # Pick a batch well into the second shard.
+    in_second_shard = next(
+        index
+        for index, item in enumerate(wanted[:-2])
+        if item.cursor is not None and item.cursor.shard == 1
+    )
+
+    real_read_pair = samples.read_pair
+    opened_shards: list[tuple[str, int, int]] = []
+
+    def tracked_read_pair(sample_shard: Path, labels: Path, first: int = 0, step: int = 1) -> Any:
+        opened_shards.append((sample_shard.name, first, step))
+        return real_read_pair(sample_shard, labels, first, step)
+
+    monkeypatch.setattr(samples, "read_pair", tracked_read_pair)
+
+    consumed = wanted[in_second_shard]
+    assert consumed.cursor is not None
+    opened_shards.clear()
+    resumed = local_items(
+        make_lane(),
+        len(wanted) - in_second_shard - 1,
+        StreamPosition(consumed.epoch, consumed.index, consumed.collator_rng, consumed.cursor),
+    )
+    assert_same_items(resumed, wanted[in_second_shard + 1 :])
+    # Shard 0 (test-00000.parquet) was never opened at all, and shard 1 started past cursor.row.
+    assert opened_shards[0] == ("test-00001.parquet", consumed.cursor.row + 2, 2)
+
+    # When the cursor sits on rank 1's last row of shard 0 (row 63), shard 0 is not read at all.
+    opened_shards.clear()
+    next(
+        LocalProducer(
+            make_lane(),
+            RESUMABLE.token_budget,
+            StreamPosition(0, 1, consumed.collator_rng, StreamCursor(shard=0, row=63)),
+        )
+    )
+    assert opened_shards[0] == ("test-00001.parquet", 1, 2)
+
+    # Cursors outside the corpus or belonging to the other rank fail immediately on open.
+    with pytest.raises(RuntimeError, match="outside the 2 shards"):
+        LocalProducer(
+            make_lane(),
+            RESUMABLE.token_budget,
+            StreamPosition(0, 1, consumed.collator_rng, StreamCursor(shard=2, row=1)),
+        )
+    with pytest.raises(RuntimeError, match="belongs to reader 0 of 2, not reader 1"):
+        LocalProducer(
+            make_lane(rank=1, world_size=2),
+            RESUMABLE.token_budget,
+            StreamPosition(0, 1, consumed.collator_rng, StreamCursor(shard=0, row=0)),
+        )
 
 
 def test_a_failure_in_the_child_is_raised_at_the_next_batch(

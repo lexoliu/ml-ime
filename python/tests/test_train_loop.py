@@ -1281,9 +1281,12 @@ def test_a_measured_world_trains_past_windows_that_fill_on_different_steps(
 
 
 def _positions(path: Path) -> list[dict[str, object]]:
-    """Every rank's (epoch, index) in a checkpoint, in rank order."""
+    """Every rank's (epoch, index, cursor) in a checkpoint, in rank order."""
     state = torch.load(path, weights_only=False)
-    return [{"epoch": p["epoch"], "index": p["index"]} for p in state["positions"]]
+    return [
+        {"epoch": p["epoch"], "index": p["index"], "cursor": p.get("cursor")}
+        for p in state["positions"]
+    ]
 
 
 def test_two_virtual_ranks_match_a_two_process_world(
@@ -1492,3 +1495,91 @@ def test_a_lane_count_mismatch_refuses(
             replace(RESUMABLE, virtual_ranks=2),
             tmp_path,
         )
+
+
+def test_a_legacy_checkpoint_without_cursors_falls_back_to_skipping(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+) -> None:
+    """Checkpoints written before #271 carry no cursor; resuming them still lands identically."""
+    whole_dir = tmp_path / "whole"
+    uninterrupted = tiny_model(lexicon)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    whole = train(uninterrupted, [BuiltLane(stream, collator)], RESUMABLE, whole_dir)
+
+    checkpoint = whole_dir / "checkpoint-000003.pt"
+    saved = torch.load(checkpoint, weights_only=False)
+    assert "cursor" in saved["positions"][0]
+    for position in saved["positions"]:
+        del position["cursor"]
+    legacy = tmp_path / "legacy-000003.pt"
+    torch.save(saved, legacy)
+
+    resumed_model = tiny_model(lexicon)
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    resumed = train(
+        resumed_model,
+        [BuiltLane(stream, collator)],
+        RESUMABLE,
+        tmp_path / "resumed",
+        resume=legacy,
+    )
+    assert step_losses(resumed.metrics) == step_losses(whole.metrics)[3:]
+    weights = uninterrupted.state_dict()
+    for name, tensor in resumed_model.state_dict().items():
+        assert torch.equal(tensor, weights[name]), name
+
+
+def test_stepping_seconds_excludes_first_batch_wait_and_checkpoint_writes(
+    short_corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    arbitration: ReadingArbitration,
+    tokenizer: BaseTokenizer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Startup/skip before the first window and checkpoint disk writes stay out of stepping time."""
+    import time as time_module
+
+    delayed_producer = False
+    real_produce = EpochBatches.produce
+
+    def slow_first_produce(self: EpochBatches) -> Any:
+        nonlocal delayed_producer
+        if not delayed_producer:
+            delayed_producer = True
+            time_module.sleep(0.25)
+        return real_produce(self)
+
+    real_save = loop.save_checkpoint
+
+    def slow_save(*args: Any, **kwargs: Any) -> None:
+        time_module.sleep(0.20)
+        real_save(*args, **kwargs)
+
+    monkeypatch.setattr(EpochBatches, "produce", slow_first_produce)
+    monkeypatch.setattr(loop, "save_checkpoint", slow_save)
+
+    run_config = tmp_path / "run-config.json"
+    run_config.write_text('{"max_steps": 6, "epochs": 1, "segment": 0}\n')
+    stream, collator = stream_and_collator(short_corpus, lexicon, spans, arbitration, tokenizer)
+    segment = train(
+        tiny_model(lexicon),
+        [BuiltLane(stream, collator)],
+        replace(RESUMABLE, segment_steps=2, checkpoint_minutes=1e-9),
+        tmp_path / "run",
+        run_config=run_config,
+    )
+    paused_record: dict[str, Any] = records(segment.metrics, "paused")[0]
+    assert float(paused_record["seconds"]) >= 0.4
+    assert 0.0 < segment.stepping_seconds < 0.20
+    assert paused_record["stepping_seconds"] == round(segment.stepping_seconds, 3)
+    interval_summary = json.loads(
+        (tmp_path / "run" / "interval-000001" / "run-summary.json").read_text()
+    )
+    assert 0.0 < interval_summary["stepping_seconds"] <= paused_record["stepping_seconds"]

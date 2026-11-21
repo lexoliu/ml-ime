@@ -36,10 +36,12 @@ import torch.multiprocessing
 from mlime.logging import configure, log
 from mlime.train.samples import (
     BatchCollator,
+    BudgetPacker,
     CorpusStream,
     StepBatch,
+    StreamCursor,
     TrainingExample,
-    token_budget_batches,
+    example_shape,
 )
 
 #: How long a blocked queue operation waits before it looks again at whether
@@ -52,6 +54,35 @@ POLL_SECONDS = 0.1
 CLOSE_SECONDS = 30.0
 
 
+def positioned_groups(
+    stream: CorpusStream,
+    collator: BatchCollator,
+    budget: int,
+    epoch: int,
+    after: StreamCursor | None = None,
+) -> Iterator[tuple[list[TrainingExample], StreamCursor]]:
+    """The groups of *epoch* strictly after *after*, each with its last example's cursor."""
+    stream.set_epoch(epoch)
+    packer = BudgetPacker(budget)
+    rows = collator.rows
+    max_context = collator.max_context_tokens
+    batch: list[TrainingExample] = []
+    last: StreamCursor | None = None
+    for example, cursor in stream.positioned(after):
+        fill, context = example_shape(example, max_context)
+        if packer.add(fill, context, rows(example)):
+            if last is None:
+                raise RuntimeError("budget packer closed an empty batch")
+            yield batch, last
+            batch = []
+        batch.append(example)
+        last = cursor
+    if batch:
+        if last is None:
+            raise RuntimeError("non-empty batch has no stream cursor")
+        yield batch, last
+
+
 def epoch_groups(
     stream: CorpusStream, collator: BatchCollator, budget: int, epoch: int
 ) -> Iterator[list[TrainingExample]]:
@@ -59,46 +90,51 @@ def epoch_groups(
 
     Grouping is not collation, and the two are separated here because three
     things need the boundaries and none of them needs the tensors: the loop, on
-    its way to collating each group; :meth:`EpochBatches.skip`, walking a resumed
-    stream back to a saved position; and counting how many steps an epoch is
-    worth before a run fixes its schedule.
+    its way to collating each group; :meth:`EpochBatches.skip`, walking a legacy
+    resumed stream back to a saved position; and counting how many steps an epoch
+    is worth before a run fixes its schedule.
 
     The epoch is an argument rather than a detail because it decides what the
     examples *are*: the augmentation re-samples every epoch, an abbreviated
     sentence is shorter than a typed-out one, and a batch boundary is a function
     of the lengths. Counting epoch 0 twice is not counting two epochs.
     """
-    stream.set_epoch(epoch)
-    return token_budget_batches(iter(stream), budget, collator.max_context_tokens, collator.rows)
+    for group, _ in positioned_groups(stream, collator, budget, epoch):
+        yield group
 
 
 @dataclass(frozen=True)
 class Produced:
     """A collated batch, and where the stream stood when it was made.
 
-    ``epoch``/``index`` count the batches produced so far and ``collator_rng``
-    is the collator's generator state just after this batch was collated. A
-    checkpoint taken on this item resumes exactly after it: the batch a
-    re-opened stream produces next is the one an uninterrupted run would have
-    consumed. A prefetching producer carries this per item because the queue
-    may already hold batches a pause never reaches -- the position a checkpoint
-    writes is the last batch *consumed*, not the last one produced.
+    ``epoch``/``index`` count the batches produced so far, ``cursor`` is the
+    shard and row of the last example in the batch, and ``collator_rng`` is the
+    collator's generator state just after this batch was collated. A checkpoint
+    taken on this item resumes right after ``cursor`` without re-reading the
+    shards before it: the batch a re-opened stream produces next is the one an
+    uninterrupted run would have consumed. A prefetching producer carries this
+    per item because the queue may already hold batches a pause never reaches --
+    the position a checkpoint writes is the last batch *consumed*, not the last
+    one produced.
     """
 
     batch: StepBatch
     epoch: int
     index: int
     collator_rng: tuple[Any, ...]
+    cursor: StreamCursor | None = None
 
 
 class EpochBatches(Iterator[StepBatch]):
     """The stream as collated batches, epoch after epoch, and where in it we are.
 
     The position is what makes a run resumable. A rank's batches are its own --
-    it owns its own shards, and how many batches an epoch holds depends on the
+    it owns its own rows, and how many batches an epoch holds depends on the
     lengths of the sentences in them -- so "step 4000" says nothing about where
-    to start reading. The epoch and the count of batches taken from it do, and
-    :meth:`skip` walks a fresh stream back to exactly there.
+    to start reading. Each batch ends at a :class:`~mlime.train.samples.StreamCursor`
+    and closes its :class:`~mlime.train.samples.BudgetPacker`, so :meth:`seek`
+    re-opens the stream right after that row with an empty packer; :meth:`skip`
+    stays for checkpoints written before cursors were recorded.
     """
 
     def __init__(self, stream: CorpusStream, collator: BatchCollator, budget: int):
@@ -109,6 +145,8 @@ class EpochBatches(Iterator[StepBatch]):
         self.epoch = stream.epoch
         #: How many batches of that epoch have been yielded.
         self.index = 0
+        #: The shard and row of the last example in the batch last yielded.
+        self.cursor: StreamCursor | None = None
         self._groups = self._open_epoch()
 
     def __next__(self) -> StepBatch:
@@ -122,16 +160,20 @@ class EpochBatches(Iterator[StepBatch]):
             epoch=self.epoch,
             index=self.index,
             collator_rng=self.collator.rng.getstate(),
+            cursor=self.cursor,
         )
 
-    def _open_epoch(self) -> Iterator[list[TrainingExample]]:
-        """Start reading :attr:`epoch`, grouped to the budget but not collated."""
-        return epoch_groups(self.stream, self.collator, self.budget, self.epoch)
+    def _open_epoch(
+        self, after: StreamCursor | None = None
+    ) -> Iterator[tuple[list[TrainingExample], StreamCursor]]:
+        """Start reading :attr:`epoch` after *after*, grouped to the budget."""
+        return positioned_groups(self.stream, self.collator, self.budget, self.epoch, after)
 
     def _next_group(self) -> list[TrainingExample]:
         """The next group of examples, rolling into the next epoch at the end of one."""
-        group = next(self._groups, None)
-        if group is not None:
+        item = next(self._groups, None)
+        if item is not None:
+            group, self.cursor = item
             self.index += 1
             return group
         if self.index == 0:
@@ -139,22 +181,51 @@ class EpochBatches(Iterator[StepBatch]):
         self.epoch += 1
         log.info("epoch finished", epoch=self.epoch, **self.stream.builder.counts.as_dict())
         self.index = 0
+        self.cursor = None
         self._groups = self._open_epoch()
         return self._next_group()
+
+    def seek(self, epoch: int, index: int, cursor: StreamCursor) -> None:
+        """Position the stream right after *cursor* at batch *index* of *epoch*.
+
+        A yielded batch was closed either by the next example overflowing the
+        token budget or by the epoch ending, and each example is built from its
+        own ``(seed, epoch, sample_id)`` generator, so opening *epoch* strictly
+        after *cursor* with a fresh packer yields the exact batches that came
+        next without reading any earlier shard.
+        """
+        if epoch < 0 or index < 1:
+            raise ValueError(
+                "a stream cursor marks the end of a consumed batch "
+                f"(epoch >= 0, index >= 1), got epoch {epoch} index {index}"
+            )
+        self.stream.validate_cursor(cursor)
+        self.epoch = epoch
+        self.index = index
+        self.cursor = cursor
+        self._groups = self._open_epoch(after=cursor)
+        log.info(
+            "batch stream positioned",
+            epoch=epoch,
+            index=index,
+            shard=self.stream.shards[cursor.shard].name,
+            shard_index=cursor.shard,
+            row=cursor.row,
+        )
 
     def skip(self, epoch: int, index: int) -> None:
         """Read forward to *index* batches into *epoch*, building no tensors.
 
-        The examples still have to be built, because building them is what walks
-        the stream, and they are grouped because a group boundary depends on the
-        examples before it. They are not collated: collation is where the padding
-        and the tensors are, and none of it would be looked at.
+        Used when resuming a checkpoint written before stream cursors were
+        saved. The examples have to be built and grouped because without a
+        saved cursor a group boundary depends on the examples before it.
         """
         if epoch < 0 or index < 0:
             raise ValueError(f"a stream position is not negative, got epoch {epoch} index {index}")
         started = time.monotonic()
         self.epoch = epoch
         self.index = 0
+        self.cursor = None
         self._groups = self._open_epoch()
         for _ in range(index):
             self._next_group()
@@ -181,19 +252,23 @@ class LaneSource(Protocol):
 
 @dataclass(frozen=True)
 class StreamPosition:
-    """Where a resumed lane reads on from: a batch count into an epoch, and the coin's state."""
+    """Where a resumed lane reads on from: its batch count, coin state, and stream cursor."""
 
     epoch: int
     index: int
     collator_rng: tuple[Any, ...]
+    cursor: StreamCursor | None = None
 
 
 def open_batches(source: LaneSource, budget: int, start: StreamPosition | None) -> EpochBatches:
-    """Open *source* as batches, walked forward to *start* when the lane is resumed."""
+    """Open *source* as batches, positioned at *start* when the lane is resumed."""
     stream, collator = source.open()
     batches = EpochBatches(stream, collator, budget)
     if start is not None:
-        batches.skip(start.epoch, start.index)
+        if start.cursor is not None:
+            batches.seek(start.epoch, start.index, start.cursor)
+        else:
+            batches.skip(start.epoch, start.index)
         collator.rng.setstate(start.collator_rng)
     return batches
 

@@ -53,6 +53,7 @@ from mlime.train.samples import (
     BaseTokenizer,
     Collator,
     ContextTokenizer,
+    StreamCursor,
     TrainingExample,
     token_budget_batches,
 )
@@ -292,6 +293,7 @@ class Segment:
     step: int
     finished: bool
     build_counts: dict[str, int]
+    stepping_seconds: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -639,16 +641,17 @@ class RankState:
     epoch: int
     index: int
     random: RandomState
+    cursor: StreamCursor | None = None
 
     @classmethod
     def capture(cls, consumed: Produced, generators: Generators) -> RankState:
         """Where this rank is, ready to be gathered onto rank 0.
 
-        The collator's state is carried in from the last *consumed* batch
-        rather than read live -- a prefetching producer may have moved the real
-        generator ahead of what training has seen -- and the process-level
-        generators come from the lane's own snapshot, not whatever rank ran
-        most recently in this process.
+        The collator's state and the stream cursor come from the last
+        *consumed* batch rather than live -- a prefetching producer may have
+        moved the real generator and stream ahead of what training has seen --
+        and the process-level generators come from the lane's own snapshot, not
+        whatever rank ran most recently in this process.
         """
         return cls(
             epoch=consumed.epoch,
@@ -659,19 +662,29 @@ class RankState:
                 torch_cuda=generators.torch_cuda,
                 collator=consumed.collator_rng,
             ),
+            cursor=consumed.cursor,
         )
 
     def as_record(self) -> dict[str, Any]:
         """The plain form that goes in the checkpoint."""
-        return {"epoch": self.epoch, "index": self.index, "random": self.random.as_record()}
+        record: dict[str, Any] = {
+            "epoch": self.epoch,
+            "index": self.index,
+            "random": self.random.as_record(),
+        }
+        if self.cursor is not None:
+            record["cursor"] = self.cursor.as_record()
+        return record
 
     @classmethod
     def from_record(cls, record: Mapping[str, Any]) -> RankState:
-        """Read back what :meth:`as_record` wrote."""
+        """Read back what :meth:`as_record` wrote, with or without a saved cursor."""
+        raw_cursor = record.get("cursor")
         return cls(
             epoch=int(record["epoch"]),
             index=int(record["index"]),
             random=RandomState.from_record(record["random"]),
+            cursor=None if raw_cursor is None else StreamCursor.from_record(raw_cursor),
         )
 
 
@@ -707,7 +720,12 @@ def open_lane(
     generators from the checkpoint's *resumed* state.
     """
     start = (
-        StreamPosition(resumed.epoch, resumed.index, resumed.random.collator)
+        StreamPosition(
+            resumed.epoch,
+            resumed.index,
+            resumed.random.collator,
+            resumed.cursor,
+        )
         if resumed is not None
         else None
     )
@@ -940,6 +958,7 @@ def train(
 
     trained.train()
     started = time.monotonic()
+    stepping_seconds = 0.0
     # A segment logs its own first step whatever the interval, so the first loss
     # in a metrics file is always the first step that file's segment ran.
     first_step = step + 1
@@ -972,6 +991,7 @@ def train(
             "first_loss": first_logged_loss,
             "last_loss": last_logged_loss,
             "train_seconds": round(elapsed, 1),
+            "stepping_seconds": round(stepping_seconds, 3),
             "finished": False,
             "world_size": total_world,
             "processes": world.world_size,
@@ -980,11 +1000,16 @@ def train(
 
     try:
         while True:
+            step_started = time.monotonic()
             profiler.begin(step - first_step + 2, step + 1)
             windows = [
                 [next(lane.producer) for _ in range(config.accumulate)] for lane in rank_lanes
             ]
             profiler.mark("batch_wait")
+            if step + 1 == first_step:
+                # The first window waits for spawned producers to import, load
+                # tables and position the stream; stepping starts once it arrives.
+                step_started = time.monotonic()
             step_loss: torch.Tensor | None = None
             step_extras: dict[str, torch.Tensor] = {}
             for lane_index, (lane, items) in enumerate(zip(rank_lanes, windows, strict=True)):
@@ -1091,6 +1116,7 @@ def train(
                     record["graph_breaks"] = graph_breaks
                 metrics.write(**record)
                 log.info("step", **{k: v for k, v in record.items() if k != "event"})
+            stepping_seconds += time.monotonic() - step_started
             if step % config.checkpoint_every == 0:
                 checkpoints.numbered(step, states())
             # Ranks cannot leave a collective on different steps, so with more
@@ -1118,8 +1144,18 @@ def train(
             if verdict == 2:
                 checkpoints.paused(step, states())
                 if world.is_main:
-                    metrics.write(event="paused", step=step, seconds=round(elapsed, 1))
-                log.info("segment paused", step=step, seconds=round(elapsed, 1))
+                    metrics.write(
+                        event="paused",
+                        step=step,
+                        seconds=round(elapsed, 1),
+                        stepping_seconds=round(stepping_seconds, 3),
+                    )
+                log.info(
+                    "segment paused",
+                    step=step,
+                    seconds=round(elapsed, 1),
+                    stepping_seconds=round(stepping_seconds, 3),
+                )
                 break
             if verdict == 1:
                 checkpoints.interval(step, states(), interval_summary(step, elapsed))
@@ -1159,7 +1195,11 @@ def train(
     for lane in rank_lanes:
         build_counts.update(lane.producer.counts())
     return Segment(
-        metrics=metrics.path, step=step, finished=finished, build_counts=dict(build_counts)
+        metrics=metrics.path,
+        step=step,
+        finished=finished,
+        build_counts=dict(build_counts),
+        stepping_seconds=stepping_seconds,
     )
 
 

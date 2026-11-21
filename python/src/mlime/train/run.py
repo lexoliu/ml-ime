@@ -614,6 +614,7 @@ def route_a(
                 first_loss=result.first_loss,
                 last_loss=result.last_loss,
                 logged_steps=result.steps,
+                stepping_seconds=round(segment.stepping_seconds, 3),
                 held_out_examples=len(evaluation),
                 accuracy_with_context=with_context.rate,
                 accuracy_without_context=without_context.rate,
@@ -656,6 +657,7 @@ def paused_run(
                 first_loss=losses[0],
                 last_loss=losses[-1],
                 logged_steps=len(losses),
+                stepping_seconds=round(segment.stepping_seconds, 3),
                 gates=gates,
                 build_counts=segment.build_counts,
             )

@@ -113,7 +113,9 @@ def directories(root, depth=MAX_DEPTH):
     found = [root]
     frontier = [root]
     for _ in range(depth):
-        children = [child for parent in frontier for child in parent.iterdir() if child.is_dir()]
+        children = [
+            child for parent in frontier for child in parent.iterdir() if child.is_dir()
+        ]
         found.extend(children)
         frontier = children
         if not frontier:
@@ -134,11 +136,15 @@ def describe():
 def locate(*markers):
     """The mounted directory holding every one of *markers*."""
     if not INPUTS.is_dir():
-        raise FileNotFoundError(f"{INPUTS} does not exist; the kernel has no inputs at all")
+        raise FileNotFoundError(
+            f"{INPUTS} does not exist; the kernel has no inputs at all"
+        )
     for directory in directories(INPUTS):
         if all((directory / marker).exists() for marker in markers):
             return directory
-    raise FileNotFoundError(f"no mounted directory holds {markers}; mounts hold {describe()}")
+    raise FileNotFoundError(
+        f"no mounted directory holds {markers}; mounts hold {describe()}"
+    )
 
 
 def parquet_mounts(marker):
@@ -183,7 +189,9 @@ def importable_package():
 
 def install():
     """Install what the image does not ship."""
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", *REQUIREMENTS], check=True)
+    subprocess.run(
+        [sys.executable, "-m", "pip", "install", "-q", *REQUIREMENTS], check=True
+    )
 
 
 def stage_data(mounts):
@@ -200,9 +208,14 @@ def stage_data(mounts):
             for shard in sorted(source.glob("*.parquet")):
                 link = target / shard.name
                 if link.exists():
-                    raise FileExistsError(f"{shard.name} is staged twice under {target}")
+                    raise FileExistsError(
+                        f"{shard.name} is staged twice under {target}"
+                    )
                 link.symlink_to(shard)
-        print(f"{kind}: {sum(1 for _ in target.glob('*.parquet'))} shards staged", flush=True)
+        print(
+            f"{kind}: {sum(1 for _ in target.glob('*.parquet'))} shards staged",
+            flush=True,
+        )
     return DATA
 
 
@@ -309,7 +322,9 @@ def emit_argv(checkpoint, lattice, out, char_table, context):
 
 def gpus():
     """The GPUs this session has, one `nvidia-smi -L` line each."""
-    listing = subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, check=True)
+    listing = subprocess.run(
+        ["nvidia-smi", "-L"], capture_output=True, text=True, check=True
+    )
     found = [line for line in listing.stdout.splitlines() if line.startswith("GPU ")]
     print("\n".join(found), flush=True)
     if not found:
@@ -359,7 +374,9 @@ def score_lattices(checkpoint, assets, char_table, env, devices):
             )
             if code != 0:
                 failed.set()
-                raise RuntimeError(f"scoring {name} failed; its log is in the kernel output")
+                raise RuntimeError(
+                    f"scoring {name} failed; its log is in the kernel output"
+                )
             scored[name] = {
                 "bytes": scores.stat().st_size,
                 "seconds": round(elapsed, 1),
@@ -375,14 +392,18 @@ def score_lattices(checkpoint, assets, char_table, env, devices):
 def finished_run():
     """`RESCORE_FROM`'s final checkpoint and run summary, from its mounted output."""
     holder = locate("checkpoint-final.pt")
-    root = next((path for path in (holder, *holder.parents) if path.name == RESCORE_FROM), None)
+    root = next(
+        (path for path in (holder, *holder.parents) if path.name == RESCORE_FROM), None
+    )
     if root is None:
         raise FileNotFoundError(
             f"the mounted checkpoint-final.pt is not {RESCORE_FROM}'s; mounts hold {describe()}"
         )
     summary = json.loads((root / "run-summary.json").read_text())
     if summary.get("finished") is not True:
-        raise RuntimeError(f"{RESCORE_FROM} did not finish its run; its summary is {summary}")
+        raise RuntimeError(
+            f"{RESCORE_FROM} did not finish its run; its summary is {summary}"
+        )
     return holder / "checkpoint-final.pt", summary
 
 
@@ -390,7 +411,9 @@ def rescore(assets, env, devices):
     """Score the mounted lattices with `RESCORE_FROM`'s final checkpoint."""
     started = time.monotonic()
     checkpoint, source = finished_run()
-    scored = score_lattices(checkpoint, assets, assets / "char_pinyin.tsv", env, devices)
+    scored = score_lattices(
+        checkpoint, assets, assets / "char_pinyin.tsv", env, devices
+    )
     summary = {
         "rescored_from": RESCORE_FROM,
         "checkpoint": str(checkpoint),
@@ -409,11 +432,18 @@ def run(argv, env, log):
     """Run *argv*, tee its output to *log*, and return (exit code, seconds)."""
     started = time.monotonic()
     finished = subprocess.run(
-        argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False
+        argv,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
     )
     elapsed = time.monotonic() - started
     Path(log).write_text(finished.stdout, encoding="utf-8")
-    print(f"--- {log} exited {finished.returncode} after {elapsed:.1f}s ---", flush=True)
+    print(
+        f"--- {log} exited {finished.returncode} after {elapsed:.1f}s ---", flush=True
+    )
     print(finished.stdout[-4000:], flush=True)
     return finished.returncode, elapsed
 
@@ -422,7 +452,9 @@ def records_of(metrics, event):
     """Every record of *event* in a metrics file, in order."""
     return [
         record
-        for record in (json.loads(line) for line in Path(metrics).read_text().splitlines())
+        for record in (
+            json.loads(line) for line in Path(metrics).read_text().splitlines()
+        )
         if record.get("event") == event
     ]
 
@@ -443,17 +475,26 @@ def training_budget(elapsed, max_steps, previous):
     """How long this segment may train.
 
     The session minus what came before it and what has to come after it. If
-    the previous segment's rate says the run would reach `max_steps` in this
-    session but the scoring would not fit behind it, the budget is cut by the
-    scoring reserve so the segment pauses and the next one finishes.
+    the previous segment's stepping rate says the run would reach `max_steps`
+    in this session but the scoring would not fit behind it, the budget is cut
+    by the scoring reserve so the segment pauses and the next one finishes.
     """
     budget = SESSION_SECONDS - RESERVE_SECONDS - elapsed
     if previous is None:
         return budget
     summary = previous[2]
-    steps = summary["last_step"] - summary["first_step"] + 1
-    rate = steps / summary["train_seconds"]
-    predicted = (max_steps - summary["last_step"]) / rate
+    stepping = summary.get("stepping_seconds")
+    if stepping is None or stepping <= 0:
+        print(
+            f"the last leg recorded stepping_seconds={stepping!r}; "
+            "its rate cannot be separated from startup, using the plain budget",
+            flush=True,
+        )
+        return budget
+    last_step = summary.get("checkpoint_step", summary["last_step"])
+    steps = last_step - summary["first_step"] + 1
+    rate = steps / stepping
+    predicted = (max_steps - last_step) / rate
     if predicted <= budget < predicted + SCORING_RESERVE_SECONDS:
         print(
             f"finishing here would take {predicted:.0f}s of {budget:.0f}s and leave no room to "
@@ -483,7 +524,9 @@ def main():
 
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)
     rest_samples, rest_labels = parquet_mounts(REST_MARKER)
-    stage_data({"samples": (v1_samples, rest_samples), "labels": (v1_labels, rest_labels)})
+    stage_data(
+        {"samples": (v1_samples, rest_samples), "labels": (v1_labels, rest_labels)}
+    )
 
     char_table = assets / "char_pinyin.tsv"
     out = WORKING / "run"
@@ -493,9 +536,13 @@ def main():
     previous = previous_segment()
     if previous is None:
         counts_path = WORKING / "batch-counts.json"
-        code, _ = run(count_argv(char_table, counts_path), env, str(WORKING / "count.log"))
+        code, _ = run(
+            count_argv(char_table, counts_path), env, str(WORKING / "count.log")
+        )
         if code != 0:
-            raise RuntimeError("counting the batches failed; its log is in the kernel output")
+            raise RuntimeError(
+                "counting the batches failed; its log is in the kernel output"
+            )
         counts = json.loads(counts_path.read_text())
         config = {"max_steps": int(counts["steps_for_epochs"]), "epochs": EPOCHS}
         resume = None
@@ -505,7 +552,9 @@ def main():
     config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(config), flush=True)
 
-    wall_budget = training_budget(time.monotonic() - started, config["max_steps"], previous)
+    wall_budget = training_budget(
+        time.monotonic() - started, config["max_steps"], previous
+    )
     if wall_budget <= 0:
         raise RuntimeError("the session was spent before training could start")
     code, seconds = run(
@@ -514,26 +563,35 @@ def main():
         str(WORKING / "train.log"),
     )
     if code != 0:
-        raise RuntimeError("the training segment failed; its log is in the kernel output")
+        raise RuntimeError(
+            "the training segment failed; its log is in the kernel output"
+        )
 
     steps = records_of(out / "metrics.jsonl", "step")
     paused = records_of(out / "metrics.jsonl", "paused")
+    trained = None if paused else records_of(out / "metrics.jsonl", "summary")[-1]
     summary = {
         "segment": SEGMENT,
         "max_steps": config["max_steps"],
         "resumed_from": None if resume is None else str(resume),
         "first_step": steps[0]["step"],
         "last_step": steps[-1]["step"],
+        "checkpoint_step": paused[-1]["step"] if paused else trained["step"],
         "first_loss": steps[0]["loss"],
         "last_loss": steps[-1]["loss"],
         "train_seconds": round(seconds, 1),
+        "stepping_seconds": paused[-1]["stepping_seconds"]
+        if paused
+        else trained["stepping_seconds"],
         "finished": not paused,
         "gates": steps[-1]["gates"],
     }
 
     if paused:
         if not (out / "checkpoint-paused.pt").is_file():
-            raise RuntimeError("the segment paused without writing checkpoint-paused.pt")
+            raise RuntimeError(
+                "the segment paused without writing checkpoint-paused.pt"
+            )
         shutil.move(out / "checkpoint-paused.pt", WORKING / "checkpoint-paused.pt")
         print(
             f"segment {SEGMENT} paused at step {summary['last_step']} of {config['max_steps']}; "
@@ -547,7 +605,9 @@ def main():
         summary["scores"] = score_lattices(checkpoint, assets, char_table, env, devices)
         summary["held_out"] = records_of(out / "metrics.jsonl", "summary")[-1]
 
-    (WORKING / "run-summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    (WORKING / "run-summary.json").write_text(
+        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
+    )
     print(json.dumps(summary, indent=2), flush=True)
 
 
