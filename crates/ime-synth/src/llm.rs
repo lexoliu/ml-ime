@@ -16,6 +16,7 @@
 
 use crate::error::{Error, Result};
 use crate::seed::Seed;
+use crate::source::UNGROUNDED;
 use askama::Template;
 use async_openai::Client;
 use async_openai::config::OpenAIConfig;
@@ -23,7 +24,7 @@ use async_openai::types::chat::{
     ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs, ReasoningEffort,
 };
 use ime_corpus::filter::{MAX_CHARACTERS, MIN_CHARACTERS, MIN_HAN_RATIO};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 /// How many usage examples one term is asked for when nothing else is asked.
@@ -32,7 +33,33 @@ pub const DEFAULT_PER_TERM: usize = 5;
 /// How many requests are allowed in flight at once when nothing else is asked.
 pub const DEFAULT_CONCURRENCY: usize = 32;
 
-/// The synthesis prompt, kept in a file so it can be diffed and reviewed.
+/// Reasoning effort requested from an OpenAI-compatible chat endpoint.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Effort {
+    /// Omit `reasoning_effort` from the request payload (for endpoints that reject it).
+    None,
+    /// Low reasoning budget.
+    Low,
+    /// Medium reasoning budget.
+    Medium,
+    /// High reasoning budget (the default Luna was measured under).
+    #[default]
+    High,
+}
+
+impl Effort {
+    fn into_openai(self) -> Option<ReasoningEffort> {
+        match self {
+            Self::None => None,
+            Self::Low => Some(ReasoningEffort::Low),
+            Self::Medium => Some(ReasoningEffort::Medium),
+            Self::High => Some(ReasoningEffort::High),
+        }
+    }
+}
+
+/// The grounded synthesis prompt, kept in a file so it can be diffed and reviewed.
 #[derive(Template)]
 #[template(path = "synth_prompt.txt", ext = "txt")]
 pub struct Prompt<'a> {
@@ -51,7 +78,7 @@ pub struct Prompt<'a> {
 }
 
 impl<'a> Prompt<'a> {
-    /// The prompt for one seed, asking for `count` examples.
+    /// The grounded prompt for one seed, asking for `count` examples.
     #[must_use]
     pub fn new(seed: &'a Seed, count: usize) -> Self {
         Self {
@@ -63,6 +90,76 @@ impl<'a> Prompt<'a> {
             han_per_mark: han_per_mark(),
         }
     }
+}
+
+/// Prompt for an ungrounded lexicon entry with an explicit `ABSTAIN` escape.
+#[derive(Template)]
+#[template(path = "ungrounded_prompt.txt", ext = "txt")]
+pub struct UngroundedPrompt<'a> {
+    /// The lexicon term to use or abstain on.
+    pub term: &'a str,
+    /// How many examples a non-abstaining reply must carry.
+    pub count: usize,
+    /// The shortest sentence the corpus filter keeps.
+    pub minimum: usize,
+    /// The longest sentence the corpus filter keeps.
+    pub maximum: usize,
+    /// How many Han characters the filter's script ratio buys per punctuation mark.
+    pub han_per_mark: usize,
+}
+
+/// Prompt for contrastive context disambiguation between `term` and homophone `foil`.
+#[derive(Template)]
+#[template(path = "contrastive_prompt.txt", ext = "txt")]
+pub struct ContrastivePrompt<'a> {
+    /// Target word that must appear in `text`.
+    pub term: &'a str,
+    /// Homophone competitor that `context` must rule out.
+    pub foil: &'a str,
+    /// Optional disambiguation hint.
+    pub explanation: &'a str,
+    /// How many examples a non-abstaining reply must carry.
+    pub count: usize,
+    /// The shortest sentence the corpus filter keeps.
+    pub minimum: usize,
+    /// The longest sentence the corpus filter keeps.
+    pub maximum: usize,
+    /// How many Han characters the filter's script ratio buys per punctuation mark.
+    pub han_per_mark: usize,
+}
+
+/// Render whichever prompt template `seed` calls for.
+///
+/// # Errors
+///
+/// If the compiled template fails to render.
+pub fn render_seed_prompt(seed: &Seed, count: usize) -> Result<String> {
+    let rendered = if let Some(foil) = &seed.foil {
+        ContrastivePrompt {
+            term: &seed.term,
+            foil,
+            explanation: &seed.explanation,
+            count,
+            minimum: MIN_CHARACTERS,
+            maximum: MAX_CHARACTERS,
+            han_per_mark: han_per_mark(),
+        }
+        .render()
+    } else if seed.grounding == UNGROUNDED {
+        UngroundedPrompt {
+            term: &seed.term,
+            count,
+            minimum: MIN_CHARACTERS,
+            maximum: MAX_CHARACTERS,
+            han_per_mark: han_per_mark(),
+        }
+        .render()
+    } else {
+        Prompt::new(seed, count).render()
+    };
+    rendered.map_err(|error| {
+        Error::Invariant(format!("the synthesis prompt would not render: {error}"))
+    })
 }
 
 /// How many Han characters a sentence must carry for each non-Han character.
@@ -83,7 +180,7 @@ pub fn han_per_mark() -> usize {
 }
 
 /// One generated usage example, exactly as the reply carries it.
-#[derive(Clone, PartialEq, Eq, Debug, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Example {
     /// The turn before it, empty when the speaker opened the exchange.
     pub context: String,
@@ -91,11 +188,22 @@ pub struct Example {
     pub text: String,
 }
 
+/// Parsed model response: either the requested examples or an explicit `ABSTAIN`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Reply {
+    /// Exactly `per_term` parsed turn pairs.
+    Examples(Vec<Example>),
+    /// Model opted out because it is unsure of the term or pair.
+    Abstained,
+}
+
 /// Why one reply could not be turned into examples.
 #[derive(Debug, thiserror::Error)]
 enum ReplyError {
     #[error("reply is not the expected JSON array: {0:?}")]
     NotJson(String),
+    #[error("model answered ABSTAIN on a grounded term whose explanation was given")]
+    UnexpectedAbstain,
     #[error("got {got} examples where {expected} were asked for")]
     WrongLength {
         /// How many the reply carried.
@@ -119,10 +227,32 @@ fn unfence(reply: &str) -> Option<&str> {
         .and_then(|body| body.strip_suffix('\n'))
 }
 
-/// Parse a reply into exactly `expected` examples, refusing any deviation.
-fn parse_examples(content: &str, expected: usize) -> std::result::Result<Vec<Example>, ReplyError> {
+/// Parse a reply into `expected` examples or `Reply::Abstained` when `allow_abstain` is set.
+///
+/// # Errors
+///
+/// If the reply is neither `ABSTAIN` (when allowed) nor a JSON array of `expected` examples.
+pub fn parse_reply(
+    content: &str,
+    expected: usize,
+    allow_abstain: bool,
+) -> std::result::Result<Reply, String> {
+    parse_reply_inner(content, expected, allow_abstain).map_err(|error| error.to_string())
+}
+
+fn parse_reply_inner(
+    content: &str,
+    expected: usize,
+    allow_abstain: bool,
+) -> std::result::Result<Reply, ReplyError> {
     let trimmed = content.trim();
-    let body = unfence(trimmed).unwrap_or(trimmed);
+    let body = unfence(trimmed).unwrap_or(trimmed).trim();
+    if body == "ABSTAIN" {
+        if allow_abstain {
+            return Ok(Reply::Abstained);
+        }
+        return Err(ReplyError::UnexpectedAbstain);
+    }
     let examples: Vec<Example> = serde_json::from_str(body)
         .map_err(|_| ReplyError::NotJson(body.chars().take(200).collect()))?;
     if examples.len() != expected {
@@ -131,7 +261,16 @@ fn parse_examples(content: &str, expected: usize) -> std::result::Result<Vec<Exa
             expected,
         });
     }
-    Ok(examples)
+    Ok(Reply::Examples(examples))
+}
+
+/// Parse a reply into `expected` examples, disallowing `ABSTAIN`.
+#[cfg(test)]
+fn parse_examples(content: &str, expected: usize) -> std::result::Result<Vec<Example>, ReplyError> {
+    match parse_reply_inner(content, expected, false)? {
+        Reply::Examples(examples) => Ok(examples),
+        Reply::Abstained => Err(ReplyError::UnexpectedAbstain),
+    }
 }
 
 /// Generates usage examples for one seed term at a time.
@@ -141,7 +280,7 @@ pub struct Synthesizer {
     model: String,
     per_term: usize,
     retries: usize,
-    effort: ReasoningEffort,
+    effort: Effort,
 }
 
 impl Synthesizer {
@@ -156,8 +295,15 @@ impl Synthesizer {
             model: settings.model.clone(),
             per_term: per_term.max(1),
             retries: 1,
-            effort: ReasoningEffort::High,
+            effort: Effort::High,
         }
+    }
+
+    /// Override the reasoning effort sent with each completion request.
+    #[must_use]
+    pub fn with_effort(mut self, effort: Effort) -> Self {
+        self.effort = effort;
+        self
     }
 
     /// Which model the requests name, for the run summary.
@@ -176,25 +322,23 @@ impl Synthesizer {
     ///
     /// # Errors
     ///
-    /// If the compiled template refuses the seed, which it does not.
+    /// If the compiled template refuses the seed.
     pub fn prompt(&self, seed: &Seed) -> Result<String> {
-        Prompt::new(seed, self.per_term).render().map_err(|error| {
-            Error::Invariant(format!("the synthesis prompt would not render: {error}"))
-        })
+        render_seed_prompt(seed, self.per_term)
     }
 
-    /// Generate one term's examples, retrying once before recording a refusal.
+    /// Generate one seed's reply (`Examples` or `Abstained`), retrying once on parse/API failure.
     ///
     /// # Errors
     ///
-    /// The refusal reason, which is stored rather than raised so that one bad
-    /// term cannot end a run over thousands of them.
-    pub async fn examples(&self, seed: &Seed) -> std::result::Result<Vec<Example>, String> {
+    /// Diagnostic refusal reason if all attempts fail.
+    pub async fn reply(&self, seed: &Seed) -> std::result::Result<Reply, String> {
         let mut last = String::new();
+        let allow_abstain = seed.allows_abstain();
         for attempt in 0..=self.retries {
             match self.complete(seed).await {
-                Ok(content) => match parse_examples(&content, self.per_term) {
-                    Ok(examples) => return Ok(examples),
+                Ok(content) => match parse_reply_inner(&content, self.per_term, allow_abstain) {
+                    Ok(reply) => return Ok(reply),
                     Err(error) => last = format!("ValueError: {error}"),
                 },
                 Err(error) => last = format!("OpenAIError: {error}"),
@@ -204,7 +348,19 @@ impl Synthesizer {
         Err(last)
     }
 
-    /// One chat completion, at the pinned reasoning effort.
+    /// Generate one grounded term's examples, retrying once before recording a refusal.
+    ///
+    /// # Errors
+    ///
+    /// The refusal reason, or if the model abstained where examples were required.
+    pub async fn examples(&self, seed: &Seed) -> std::result::Result<Vec<Example>, String> {
+        match self.reply(seed).await? {
+            Reply::Examples(examples) => Ok(examples),
+            Reply::Abstained => Err("ValueError: unexpected ABSTAIN".to_owned()),
+        }
+    }
+
+    /// One chat completion, at the configured reasoning effort.
     async fn complete(
         &self,
         seed: &Seed,
@@ -212,11 +368,14 @@ impl Synthesizer {
         let message = ChatCompletionRequestUserMessageArgs::default()
             .content(self.prompt(seed)?)
             .build()?;
-        let request = CreateChatCompletionRequestArgs::default()
+        let mut builder = CreateChatCompletionRequestArgs::default();
+        builder
             .model(self.model.clone())
-            .messages(vec![message.into()])
-            .reasoning_effort(self.effort.clone())
-            .build()?;
+            .messages(vec![message.into()]);
+        if let Some(effort) = self.effort.into_openai() {
+            builder.reasoning_effort(effort);
+        }
+        let request = builder.build()?;
         let response = self.client.chat().create(request).await?;
         let content = response
             .choices
@@ -235,12 +394,12 @@ mod tests {
     use crate::source::WIKI_SLANG;
 
     fn seed() -> Seed {
-        Seed {
-            term: "爷青结".to_owned(),
-            explanation: "爷的青春结束了。感慨自己的青春不再。".to_owned(),
-            source: WIKI_SLANG,
-            grounding: WIKI_SLANG,
-        }
+        Seed::grounded(
+            "爷青结".to_owned(),
+            "爷的青春结束了。感慨自己的青春不再。".to_owned(),
+            WIKI_SLANG,
+            WIKI_SLANG,
+        )
     }
 
     #[test]
@@ -303,5 +462,29 @@ mod tests {
         assert_eq!(unfence("[]"), None);
         assert_eq!(unfence("```\n[]\n```"), Some("[]"));
         assert_eq!(unfence("```JSON\n[]\n```"), None);
+    }
+
+    #[test]
+    fn abstain_is_accepted_on_ungrounded_and_contrastive_seeds_and_refused_on_grounded_ones() {
+        assert_eq!(
+            parse_reply("  ABSTAIN \n", 5, true).expect("ungrounded seeds may abstain"),
+            Reply::Abstained
+        );
+        assert!(parse_reply("ABSTAIN", 5, false).is_err());
+
+        let ungrounded = Seed::ungrounded("尊嘟假嘟".to_owned(), WIKI_SLANG);
+        let rendered_ungrounded = render_seed_prompt(&ungrounded, 3).expect("renders");
+        assert!(rendered_ungrounded.contains("ABSTAIN"));
+        assert!(rendered_ungrounded.contains("尊嘟假嘟"));
+
+        let contrastive = Seed::contrastive(
+            "公式".to_owned(),
+            "公事".to_owned(),
+            "数学表达式与公务的区别".to_owned(),
+        );
+        let rendered_contrastive = render_seed_prompt(&contrastive, 3).expect("renders");
+        assert!(rendered_contrastive.contains("公式"));
+        assert!(rendered_contrastive.contains("公事"));
+        assert!(rendered_contrastive.contains("数学表达式与公务的区别"));
     }
 }

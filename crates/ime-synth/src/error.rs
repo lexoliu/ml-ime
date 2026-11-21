@@ -82,6 +82,16 @@ pub enum Error {
         #[source]
         source: serde_json::Error,
     },
+    /// A line of the synthesis journal or contrastive seed file is malformed.
+    #[error("line {line} of {} is malformed: {reason}", path.display())]
+    Journal {
+        /// The file involved.
+        path: PathBuf,
+        /// One-based line number.
+        line: usize,
+        /// Diagnostic message.
+        reason: String,
+    },
     /// A shard could not be read or written.
     #[error(transparent)]
     Shard(#[from] ime_g2p::Error),
