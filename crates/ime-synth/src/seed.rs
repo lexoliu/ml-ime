@@ -24,8 +24,8 @@
 use crate::error::{Error, Result};
 use crate::gengbaike;
 use crate::source::{
-    GENGBAIKE, GROUNDING_SOURCES, SEED_SOURCES, SOGOU_BILIBILI, SOGOU_PREMIUM, SeedSource,
-    WIKI_SLANG,
+    CONTRASTIVE, GENGBAIKE, GROUNDING_SOURCES, SEED_SOURCES, SOGOU_BILIBILI, SOGOU_PREMIUM,
+    SeedSource, UNGROUNDED, WIKI_SLANG,
 };
 use crate::wiki;
 use ime_corpus::Normalizer;
@@ -34,21 +34,102 @@ use ime_g2p::text::is_han;
 use ime_pinyin::Lexicon;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::io::BufRead as _;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
-/// One term to generate from, and the explanation that grounds it.
+/// One term to generate from, and the explanation or contrastive foil that shapes its prompt.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Seed {
     /// The term itself, normalised the way the corpus normalises text.
     pub term: String,
-    /// The prose that tells the model what the term means.
+    /// The prose that tells the model what the term means; empty when ungrounded.
     pub explanation: String,
+    /// A homophone competitor to disambiguate against, for contrastive prompts.
+    pub foil: Option<String>,
     /// Which seed lexicon it is attributed to.
     pub source: SeedSource,
-    /// Which source the explanation came from, which is the same as `source`
-    /// for the two that carry their own.
+    /// Which source the explanation came from (`UNGROUNDED` when none).
     pub grounding: SeedSource,
+}
+
+impl Seed {
+    /// A seed grounded on encyclopaedic prose.
+    #[must_use]
+    pub fn grounded(
+        term: String,
+        explanation: String,
+        source: SeedSource,
+        grounding: SeedSource,
+    ) -> Self {
+        Self {
+            term,
+            explanation,
+            foil: None,
+            source,
+            grounding,
+        }
+    }
+
+    /// A lexicon seed without an encyclopaedia article, allowed to `ABSTAIN`.
+    #[must_use]
+    pub fn ungrounded(term: String, source: SeedSource) -> Self {
+        Self {
+            term,
+            explanation: String::new(),
+            foil: None,
+            source,
+            grounding: UNGROUNDED,
+        }
+    }
+
+    /// A contrastive homophone seed whose prompt asks for context that rules out `foil`.
+    #[must_use]
+    pub fn contrastive(term: String, foil: String, explanation: String) -> Self {
+        Self {
+            term,
+            explanation,
+            foil: Some(foil),
+            source: CONTRASTIVE,
+            grounding: CONTRASTIVE,
+        }
+    }
+
+    /// Stable tag naming which prompt template this seed renders.
+    #[must_use]
+    pub fn mode_tag(&self) -> &'static str {
+        if self.foil.is_some() {
+            "contrastive"
+        } else if self.grounding == UNGROUNDED {
+            "ungrounded"
+        } else {
+            "grounded"
+        }
+    }
+
+    /// Whether the model is allowed to answer `ABSTAIN` on this seed.
+    #[must_use]
+    pub fn allows_abstain(&self) -> bool {
+        self.foil.is_some() || self.grounding == UNGROUNDED
+    }
+}
+
+/// Which extra seed classes `load_with` admits beyond grounded lexicon terms.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct SeedOptions {
+    /// Prompt typable lexicon entries lacking an encyclopaedia article with an `ABSTAIN` escape.
+    pub allow_ungrounded: bool,
+    /// Optional JSON Lines file of `{"term", "foil", "explanation"?}` contrastive pairs.
+    pub contrastive_seeds: Option<PathBuf>,
+}
+
+/// One line of a contrastive seed JSON Lines file.
+#[derive(Debug, Deserialize)]
+struct ContrastiveRecord {
+    term: String,
+    foil: String,
+    #[serde(default)]
+    explanation: String,
 }
 
 /// How one seed source fared, in the numbers the report prints.
@@ -244,18 +325,93 @@ fn ground<'a>(explanations: &'a [Explanations], term: &str) -> Option<(&'a str, 
         .find_map(|(source, written)| written.get(term).map(|prose| (prose.as_str(), *source)))
 }
 
-/// Load every seed source, ground each term, and attribute it to one source.
-///
-/// The sources are walked in [`SEED_SOURCES`] order, so a term carried by more
-/// than one is attributed to the highest-priority source that has it and
-/// generated from exactly once. Grounding is a separate walk, in
-/// [`GROUNDING_SOURCES`] order, so a Sogou word explained by 梗百科 is still a
-/// Sogou seed and carries 梗百科 as its grounding.
+/// Load every grounded seed source, skipping ungrounded entries.
 ///
 /// # Errors
 ///
 /// If a seed file is missing or malformed, or if the normaliser refuses a term.
 pub fn load(root: &Path, normalizer: &Normalizer, lexicon: &Lexicon) -> Result<SeedLoad> {
+    load_with(root, normalizer, lexicon, &SeedOptions::default())
+}
+
+/// Load contrastive homophone pairs from a JSON Lines file.
+///
+/// # Errors
+///
+/// If `path` cannot be read, a line is invalid JSON, or the normaliser fails.
+pub fn read_contrastive_seeds(
+    path: &Path,
+    normalizer: &Normalizer,
+    lexicon: &Lexicon,
+) -> Result<(Vec<Seed>, SeedCounts)> {
+    let file = std::fs::File::open(path).map_err(|source| Error::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    let mut seeds = Vec::new();
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    let mut counts = SeedCounts {
+        source: CONTRASTIVE.name.to_owned(),
+        ..SeedCounts::default()
+    };
+    for (index, line) in std::io::BufReader::new(file).lines().enumerate() {
+        let line = line.map_err(|source| Error::Read {
+            path: path.to_owned(),
+            source,
+        })?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        counts.loaded += 1;
+        let record: ContrastiveRecord =
+            serde_json::from_str(&line).map_err(|error| Error::Journal {
+                path: path.to_owned(),
+                line: index + 1,
+                reason: error.to_string(),
+            })?;
+        let term = normalizer.normalize(&record.term)?;
+        let foil = normalizer.normalize(&record.foil)?;
+        let explanation = normalizer.normalize(&record.explanation)?;
+        if term == foil || !is_typable(&term, lexicon) || !is_typable(&foil, lexicon) {
+            counts.skipped_unusable_term += 1;
+            continue;
+        }
+        if !seen.insert((term.clone(), foil.clone())) {
+            counts.skipped_duplicate += 1;
+            continue;
+        }
+        counts.grounded += 1;
+        seeds.push(Seed::contrastive(term, foil, explanation));
+    }
+    Ok((seeds, counts))
+}
+
+/// Load seed sources under `options` (grounded, optional ungrounded lexicon, and/or contrastive).
+///
+/// When `options.contrastive_seeds` is set and `root` has no slang/lexicon tree,
+/// contrastive seeds alone are loaded; when `root` holds the standard seed tree,
+/// standard sources come first in [`SEED_SOURCES`] order followed by contrastive pairs.
+///
+/// # Errors
+///
+/// If a required seed file is missing or malformed, or if the normaliser refuses a term.
+pub fn load_with(
+    root: &Path,
+    normalizer: &Normalizer,
+    lexicon: &Lexicon,
+    options: &SeedOptions,
+) -> Result<SeedLoad> {
+    if let Some(contrastive_path) = &options.contrastive_seeds
+        && !wiki_path(root).exists()
+        && !lexicon_dir(root).exists()
+    {
+        let (seeds, count) = read_contrastive_seeds(contrastive_path, normalizer, lexicon)?;
+        return Ok(SeedLoad {
+            seeds,
+            counts: vec![count],
+        });
+    }
+
     let (wiki_terms, wiki_explanations) = wiki_seeds(root, normalizer)?;
     let (gengbaike_terms, gengbaike_explanations) = gengbaike_seeds(root, normalizer)?;
     let explanations = [gengbaike_explanations, wiki_explanations];
@@ -289,24 +445,49 @@ pub fn load(root: &Path, normalizer: &Normalizer, lexicon: &Lexicon) -> Result<S
     )?;
 
     let mut seeds = Vec::new();
-    let mut counts = Vec::with_capacity(SEED_SOURCES.len());
+    let mut counts = Vec::with_capacity(SEED_SOURCES.len() + 1);
     let mut claimed: HashSet<String> = HashSet::new();
     for (source, terms) in listings {
-        let mut count = SeedCounts {
-            source: source.name.to_owned(),
-            loaded: terms.len(),
-            ..SeedCounts::default()
-        };
-        let mut by_grounding: HashMap<&'static str, usize> = HashMap::new();
-        for term in terms {
-            if claimed.contains(&term) {
-                count.skipped_duplicate += 1;
-                continue;
-            }
-            let Some((explanation, grounding)) = ground(&explanations, &term) else {
-                count.skipped_ungrounded += 1;
-                continue;
-            };
+        counts.push(collect_source_seeds(
+            source,
+            terms,
+            &explanations,
+            lexicon,
+            options.allow_ungrounded,
+            &mut claimed,
+            &mut seeds,
+        ));
+    }
+    if let Some(contrastive_path) = &options.contrastive_seeds {
+        let (contrastive_seeds, contrastive_counts) =
+            read_contrastive_seeds(contrastive_path, normalizer, lexicon)?;
+        seeds.extend(contrastive_seeds);
+        counts.push(contrastive_counts);
+    }
+    Ok(SeedLoad { seeds, counts })
+}
+
+fn collect_source_seeds(
+    source: SeedSource,
+    terms: Vec<String>,
+    explanations: &[Explanations],
+    lexicon: &Lexicon,
+    allow_ungrounded: bool,
+    claimed: &mut HashSet<String>,
+    seeds: &mut Vec<Seed>,
+) -> SeedCounts {
+    let mut count = SeedCounts {
+        source: source.name.to_owned(),
+        loaded: terms.len(),
+        ..SeedCounts::default()
+    };
+    let mut by_grounding: HashMap<&'static str, usize> = HashMap::new();
+    for term in terms {
+        if claimed.contains(&term) {
+            count.skipped_duplicate += 1;
+            continue;
+        }
+        if let Some((explanation, grounding)) = ground(explanations, &term) {
             if !is_typable(&term, lexicon) {
                 count.skipped_unusable_term += 1;
                 continue;
@@ -314,27 +495,38 @@ pub fn load(root: &Path, normalizer: &Normalizer, lexicon: &Lexicon) -> Result<S
             claimed.insert(term.clone());
             count.grounded += 1;
             *by_grounding.entry(grounding.name).or_default() += 1;
-            seeds.push(Seed {
+            seeds.push(Seed::grounded(
                 term,
-                explanation: explanation.to_owned(),
+                explanation.to_owned(),
                 source,
                 grounding,
-            });
+            ));
+        } else if allow_ungrounded {
+            if !is_typable(&term, lexicon) {
+                count.skipped_unusable_term += 1;
+                continue;
+            }
+            claimed.insert(term.clone());
+            count.grounded += 1;
+            *by_grounding.entry(UNGROUNDED.name).or_default() += 1;
+            seeds.push(Seed::ungrounded(term, source));
+        } else {
+            count.skipped_ungrounded += 1;
         }
-        info!(
-            source = source.name,
-            loaded = count.loaded,
-            grounded = count.grounded,
-            by_gengbaike = by_grounding.get(GENGBAIKE.name).copied().unwrap_or(0),
-            by_wiki = by_grounding.get(WIKI_SLANG.name).copied().unwrap_or(0),
-            ungrounded = count.skipped_ungrounded,
-            unusable = count.skipped_unusable_term,
-            duplicate = count.skipped_duplicate,
-            "seed source loaded"
-        );
-        counts.push(count);
     }
-    Ok(SeedLoad { seeds, counts })
+    info!(
+        source = source.name,
+        loaded = count.loaded,
+        grounded = count.grounded,
+        by_gengbaike = by_grounding.get(GENGBAIKE.name).copied().unwrap_or(0),
+        by_wiki = by_grounding.get(WIKI_SLANG.name).copied().unwrap_or(0),
+        by_ungrounded = by_grounding.get(UNGROUNDED.name).copied().unwrap_or(0),
+        ungrounded = count.skipped_ungrounded,
+        unusable = count.skipped_unusable_term,
+        duplicate = count.skipped_duplicate,
+        "seed source loaded"
+    );
+    count
 }
 
 #[cfg(test)]

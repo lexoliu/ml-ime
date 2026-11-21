@@ -67,6 +67,21 @@ pub const WIKI_SLANG: SeedSource = SeedSource {
     slug: None,
 };
 
+/// Sentinel grounding recorded when a lexicon seed is prompted without an
+/// encyclopaedia article and permitted to `ABSTAIN`.
+pub const UNGROUNDED: SeedSource = SeedSource {
+    name: "ungrounded",
+    dict_id: None,
+    slug: None,
+};
+
+/// Contrastive homophone-pair seed source for context-disambiguation synthesis.
+pub const CONTRASTIVE: SeedSource = SeedSource {
+    name: "contrastive",
+    dict_id: None,
+    slug: None,
+};
+
 /// Every seed source, in the priority order a term is attributed by.
 pub const SEED_SOURCES: [SeedSource; 4] = [SOGOU_PREMIUM, SOGOU_BILIBILI, GENGBAIKE, WIKI_SLANG];
 

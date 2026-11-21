@@ -10,14 +10,39 @@
 
 use anyhow::{Context as _, Result};
 use askama::Template;
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use ime_g2p::llm::LlmSettings;
 use ime_synth::llm::{DEFAULT_CONCURRENCY, DEFAULT_PER_TERM};
 use ime_synth::report::Shown;
 use ime_synth::summary::RunSummary;
-use ime_synth::{Options, generate};
+use ime_synth::{DEFAULT_MAX_PREFIX_REPEATS, Effort, Options, SYNTHETIC, SeedOptions, generate};
 use std::io::Write as _;
 use std::path::PathBuf;
+
+/// CLI value for `--reasoning-effort`.
+#[derive(Clone, Copy, Debug, Default, ValueEnum)]
+pub enum EffortArg {
+    /// Omit `reasoning_effort` from chat requests.
+    None,
+    /// Low reasoning budget.
+    Low,
+    /// Medium reasoning budget.
+    Medium,
+    /// High reasoning budget.
+    #[default]
+    High,
+}
+
+impl From<EffortArg> for Effort {
+    fn from(value: EffortArg) -> Self {
+        match value {
+            EffortArg::None => Self::None,
+            EffortArg::Low => Self::Low,
+            EffortArg::Medium => Self::Medium,
+            EffortArg::High => Self::High,
+        }
+    }
+}
 
 /// How many samples the report prints in full.
 const SHOWN_SAMPLES: usize = 10;
@@ -28,16 +53,15 @@ const SHOWN_SEED: u64 = 0;
 /// Generate grounded slang usage sentences, and report on what a run produced.
 #[derive(Debug, Subcommand)]
 pub enum SynthCommand {
-    /// Generate usage sentences for every grounded seed term.
+    /// Generate usage sentences for seed terms, journaling progress for resume.
     Generate {
         /// Root the seed lexicons are read from.
         #[arg(long, default_value = "data")]
         data_dir: PathBuf,
-        /// Root the samples, provenance and summary are written to. Defaults to
-        /// `--data-dir`, but a training-only batch belongs in its own root.
+        /// Root the samples, provenance, journal and summary are written to.
         #[arg(long)]
         out_dir: Option<PathBuf>,
-        /// Stop after this many grounded seed terms.
+        /// Stop after this many seed prompts.
         #[arg(long)]
         terms_limit: Option<usize>,
         /// How many usage examples each term is asked for.
@@ -46,6 +70,27 @@ pub enum SynthCommand {
         /// Simultaneous requests in flight to the LLM.
         #[arg(long, default_value_t = DEFAULT_CONCURRENCY)]
         concurrency: usize,
+        /// Reasoning effort requested from the chat endpoint.
+        #[arg(long, value_enum, default_value_t = EffortArg::High)]
+        reasoning_effort: EffortArg,
+        /// Value written into `Sample.source` and used as the sample shard prefix.
+        #[arg(long, default_value = SYNTHETIC)]
+        source: String,
+        /// Also prompt typable lexicon words lacking an encyclopaedia entry (`ABSTAIN` enabled).
+        #[arg(long)]
+        allow_ungrounded: bool,
+        /// Optional JSONL file of `{"term", "foil", "explanation"?}` contrastive pairs.
+        #[arg(long)]
+        contrastive_seeds: Option<PathBuf>,
+        /// Protected evaluation JSONL file(s) checked for exact and 13-Han-window leaks.
+        #[arg(long)]
+        eval_guard: Vec<PathBuf>,
+        /// Maximum times a non-seed 4-Han opening prefix may appear across the batch (`0` disables).
+        #[arg(long, default_value_t = DEFAULT_MAX_PREFIX_REPEATS)]
+        max_prefix_repeats: usize,
+        /// Re-request prompts whose previous journal entry was a refusal.
+        #[arg(long)]
+        retry_refused: bool,
     },
     /// Print what the last generation run under a root produced.
     Report {
@@ -105,6 +150,7 @@ struct ReportTable {
     terms: String,
     requested: String,
     parsed: String,
+    abstained: String,
     refusals: String,
     written: String,
     per_minute: String,
@@ -129,6 +175,13 @@ pub async fn run(command: SynthCommand) -> Result<()> {
             terms_limit,
             per_term,
             concurrency,
+            reasoning_effort,
+            source,
+            allow_ungrounded,
+            contrastive_seeds,
+            eval_guard,
+            max_prefix_repeats,
+            retry_refused,
         } => {
             let out_dir = out_dir.unwrap_or_else(|| data_dir.clone());
             let settings =
@@ -141,6 +194,15 @@ pub async fn run(command: SynthCommand) -> Result<()> {
                     terms_limit,
                     per_term,
                     concurrency,
+                    effort: reasoning_effort.into(),
+                    source,
+                    seeds: SeedOptions {
+                        allow_ungrounded,
+                        contrastive_seeds,
+                    },
+                    eval_guard,
+                    max_prefix_repeats,
+                    retry_refused,
                 },
             )
             .await
@@ -178,6 +240,7 @@ fn print_report(summary: &RunSummary, shown: &[Shown]) -> Result<()> {
         terms: summary.terms.to_string(),
         requested: summary.examples_requested.to_string(),
         parsed: summary.examples_parsed.to_string(),
+        abstained: summary.abstained.to_string(),
         refusals: summary.refusals.to_string(),
         written: summary.written.to_string(),
         per_minute: format!("{:.1}", summary.terms_per_minute()),
@@ -275,6 +338,7 @@ mod tests {
             terms: 30,
             examples_requested: 150,
             examples_parsed: 145,
+            abstained: 2,
             refusals: 1,
             refusal_reasons: vec![RefusalCount {
                 reason: "ValueError: got 4 examples where 5 were asked for".to_owned(),

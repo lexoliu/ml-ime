@@ -41,6 +41,7 @@
 pub mod error;
 pub mod generate;
 pub mod gengbaike;
+pub mod journal;
 pub mod llm;
 pub mod provenance;
 pub mod report;
@@ -51,11 +52,13 @@ pub mod validate;
 pub mod wiki;
 
 pub use error::{Error, Result};
-pub use generate::{MAX_DROP_RATE, Options, generate};
+pub use generate::{MAX_DROP_RATE, Options, PromptRunner, generate, generate_with};
 pub use gengbaike::Entry as GengbaikeEntry;
+pub use journal::{JOURNAL_FILE, Journal, JournalEntry, PromptOutcome};
+pub use llm::{Effort, Reply};
 pub use provenance::Provenance;
-pub use seed::{Seed, SeedCounts, SeedLoad};
-pub use source::{GROUNDING_SOURCES, SEED_SOURCES, SYNTHETIC, SeedSource};
+pub use seed::{Seed, SeedCounts, SeedLoad, SeedOptions};
+pub use source::{CONTRASTIVE, GROUNDING_SOURCES, SEED_SOURCES, SYNTHETIC, SeedSource, UNGROUNDED};
 pub use summary::RunSummary;
-pub use validate::DropCounts;
+pub use validate::{DEFAULT_MAX_PREFIX_REPEATS, DropCounts};
 pub use wiki::WikiEntry;
