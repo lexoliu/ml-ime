@@ -58,6 +58,9 @@ pub struct RunSummary {
     pub examples_requested: usize,
     /// How many examples came back parsed.
     pub examples_parsed: usize,
+    /// How many prompts explicitly answered `ABSTAIN`.
+    #[serde(default)]
+    pub abstained: usize,
     /// How many terms produced nothing usable at all.
     pub refusals: usize,
     /// The refusal reasons, most frequent first.
@@ -143,6 +146,7 @@ mod tests {
             terms: 30,
             examples_requested: 150,
             examples_parsed: 145,
+            abstained: 0,
             refusals: 1,
             refusal_reasons: vec![RefusalCount {
                 reason: "ValueError: got 4 examples where 5 were asked for".to_owned(),

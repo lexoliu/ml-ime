@@ -404,7 +404,9 @@ def directories(root, depth=MAX_DEPTH):
     found = [root]
     frontier = [root]
     for _ in range(depth):
-        children = [child for parent in frontier for child in parent.iterdir() if child.is_dir()]
+        children = [
+            child for parent in frontier for child in parent.iterdir() if child.is_dir()
+        ]
         found.extend(children)
         frontier = children
         if not frontier:
@@ -429,7 +431,9 @@ def locate_all(*markers):
     is a directory of that name, which must not make its parent the match.
     """
     if not INPUTS.is_dir():
-        raise FileNotFoundError(f"{INPUTS} does not exist; the kernel has no inputs at all")
+        raise FileNotFoundError(
+            f"{INPUTS} does not exist; the kernel has no inputs at all"
+        )
     return [
         directory
         for directory in directories(INPUTS)
@@ -447,7 +451,9 @@ def locate(*markers):
     """
     found = locate_all(*markers)
     if not found:
-        raise FileNotFoundError(f"no mounted directory holds {markers}; mounts hold {describe()}")
+        raise FileNotFoundError(
+            f"no mounted directory holds {markers}; mounts hold {describe()}"
+        )
     return found[0]
 
 
@@ -504,7 +510,9 @@ def checkout(commit, directory=CHECKOUT, repository=REPOSITORY):
     staging -- must have *commit* as its HEAD and no tracked file changed.
     """
     if commit is None:
-        raise RuntimeError("no COMMIT is stamped; a leg runs one commit of the repository")
+        raise RuntimeError(
+            "no COMMIT is stamped; a leg runs one commit of the repository"
+        )
     if not (directory / ".git").exists():
         directory.mkdir(parents=True)
         git(directory, "init", "--quiet")
@@ -513,7 +521,9 @@ def checkout(commit, directory=CHECKOUT, repository=REPOSITORY):
         git(directory, "checkout", "--quiet", "--detach", "FETCH_HEAD")
     head = git(directory, "rev-parse", "HEAD")
     if head != commit:
-        raise RuntimeError(f"the checkout at {directory} is at {head}, not the leg's {commit}")
+        raise RuntimeError(
+            f"the checkout at {directory} is at {head}, not the leg's {commit}"
+        )
     changed = git(directory, "status", "--porcelain", "--untracked-files=no")
     if changed:
         raise RuntimeError(f"the checkout at {directory} has changed files:\n{changed}")
@@ -539,7 +549,9 @@ def refuse_commit_change(config):
                 f"the run recorded commit {recorded}, this leg runs {COMMIT}; a code change "
                 "inside a run is refused unless the leg is stamped ALLOW_COMMIT_CHANGE"
             )
-        print(f"the run moves from commit {recorded} to {COMMIT}, as allowed", flush=True)
+        print(
+            f"the run moves from commit {recorded} to {COMMIT}, as allowed", flush=True
+        )
 
 
 def libcuda_link_dir():
@@ -565,7 +577,8 @@ def libcuda_link_dir():
 def install():
     """Install the pinned requirements, exactly them and nothing they would pull in."""
     subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-q", "--no-deps", *REQUIREMENTS], check=True
+        [sys.executable, "-m", "pip", "install", "-q", "--no-deps", *REQUIREMENTS],
+        check=True,
     )
 
 
@@ -578,9 +591,14 @@ def stage_data(mounts):
             for shard in sorted(source.glob("*.parquet")):
                 link = target / shard.name
                 if link.exists():
-                    raise FileExistsError(f"{shard.name} is staged twice under {target}")
+                    raise FileExistsError(
+                        f"{shard.name} is staged twice under {target}"
+                    )
                 link.symlink_to(shard)
-        print(f"{kind}: {sum(1 for _ in target.glob('*.parquet'))} shards staged", flush=True)
+        print(
+            f"{kind}: {sum(1 for _ in target.glob('*.parquet'))} shards staged",
+            flush=True,
+        )
     return DATA
 
 
@@ -606,7 +624,9 @@ def stage_enrichment(names):
         for name in names:
             shard = source / name
             if not shard.is_file():
-                raise FileNotFoundError(f"{name} is not in the enrichment {kind} mount {source}")
+                raise FileNotFoundError(
+                    f"{name} is not in the enrichment {kind} mount {source}"
+                )
             link = target / name
             if link.exists():
                 raise FileExistsError(f"{name} is staged twice under {target}")
@@ -826,7 +846,9 @@ def typing_argv(char_table):
     if UNIT_INITIALS > 0:
         lexicon = char_table.parent / UNIT_LEXICON
         if not lexicon.is_file():
-            raise FileNotFoundError(f"the assets mount holds no unit lexicon {lexicon.name}")
+            raise FileNotFoundError(
+                f"the assets mount holds no unit lexicon {lexicon.name}"
+            )
         argv += ["--unit-initials", str(UNIT_INITIALS), "--unit-lexicon", str(lexicon)]
     return argv
 
@@ -924,7 +946,12 @@ def train_argv(
     if start is not None:
         argv += start
     if LEARNING_RATES is not None:
-        argv += ["--base-lr", str(LEARNING_RATES[0]), "--new-lr", str(LEARNING_RATES[1])]
+        argv += [
+            "--base-lr",
+            str(LEARNING_RATES[0]),
+            "--new-lr",
+            str(LEARNING_RATES[1]),
+        ]
     argv += ranking_argv(segmenter)
     # The trainer's alone: the count shares `ranking_argv` and has no search.
     if SEARCH_GRAPHS is not None:
@@ -974,11 +1001,18 @@ def run(argv, env, log):
     """Run *argv*, tee its output to *log*, and return (exit code, seconds)."""
     started = time.monotonic()
     finished = subprocess.run(
-        argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, check=False
+        argv,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
     )
     elapsed = time.monotonic() - started
     Path(log).write_text(finished.stdout, encoding="utf-8")
-    print(f"--- {log} exited {finished.returncode} after {elapsed:.1f}s ---", flush=True)
+    print(
+        f"--- {log} exited {finished.returncode} after {elapsed:.1f}s ---", flush=True
+    )
     print(finished.stdout[-4000:], flush=True)
     return finished.returncode, elapsed
 
@@ -987,7 +1021,9 @@ def records_of(metrics, event):
     """Every record of *event* in a metrics file, in order."""
     return [
         record
-        for record in (json.loads(line) for line in Path(metrics).read_text().splitlines())
+        for record in (
+            json.loads(line) for line in Path(metrics).read_text().splitlines()
+        )
         if record.get("event") == event
     ]
 
@@ -1137,7 +1173,9 @@ def evaluate_lattices(checkpoint, assets, char_table, env):
             dump = WORKING / f"e2e-{name}.jsonl"
             report = WORKING / f"e2e-{name}-report.txt"
             code, elapsed = run(
-                eval_argv(checkpoint, lattice, eval_set, dump, report, char_table, context),
+                eval_argv(
+                    checkpoint, lattice, eval_set, dump, report, char_table, context
+                ),
                 worker_env,
                 str(WORKING / f"eval-{name}.log"),
             )
@@ -1209,7 +1247,9 @@ def key_eval_argv(
     ]
     if any(prior > 0 for prior in priors):
         if KEY_ARCS is None:
-            raise RuntimeError("a prior above 0 proposes the arcs lexicon; stamp KEY_ARCS")
+            raise RuntimeError(
+                "a prior above 0 proposes the arcs lexicon; stamp KEY_ARCS"
+            )
         argv += ["--arcs", str(Path(char_table).parent / KEY_ARCS)]
         argv += [item for prior in priors for item in ("--arc-prior", str(prior))]
     if not test:
@@ -1236,13 +1276,19 @@ def key_sections(assets):
     ones out before the short.
     """
     if KEY_ARCS is not None and not (assets / KEY_ARCS).is_file():
-        raise FileNotFoundError(f"no arcs lexicon at {assets / KEY_ARCS}; mounts hold {describe()}")
+        raise FileNotFoundError(
+            f"no arcs lexicon at {assets / KEY_ARCS}; mounts hold {describe()}"
+        )
     sections = []
-    twins = sorted(KEY_TWINS.items(), key=lambda twin: -len(twin[1]) * len(key_priors(twin[0])))
+    twins = sorted(
+        KEY_TWINS.items(), key=lambda twin: -len(twin[1]) * len(key_priors(twin[0]))
+    )
     for suffix, gammas in twins:
         eval_set = assets / f"eval3{suffix}.jsonl"
         if not eval_set.is_file():
-            raise FileNotFoundError(f"no eval set at {eval_set}; mounts hold {describe()}")
+            raise FileNotFoundError(
+                f"no eval set at {eval_set}; mounts hold {describe()}"
+            )
         for context in (True, False):
             sections.append(
                 (
@@ -1302,7 +1348,9 @@ def publish_key_dumps(outcome):
         directory = WORKING / f"keys-{name}"
         chosen = section["chosen"]
         weights = KeyWeights.from_record(chosen)
-        shutil.copyfile(directory / "selection.json", WORKING / f"e2e-keys-{name}-selection.json")
+        shutil.copyfile(
+            directory / "selection.json", WORKING / f"e2e-keys-{name}-selection.json"
+        )
         slices = ("dev", "test") if outcome["test"] == "decoded" else ("dev",)
         for slice_ in slices:
             with (
@@ -1384,11 +1432,15 @@ def decode_keys(checkpoint, assets, char_table, repository, env, started):
     dev = sweep(test=False)
     evaluated = {}
     for name, *_ in sections:
-        selection = json.loads((WORKING / f"keys-{name}" / "selection.json").read_text())
+        selection = json.loads(
+            (WORKING / f"keys-{name}" / "selection.json").read_text()
+        )
         # A selection from before the arcs has no prior in its rows: 0.
         picked = KeyWeights.from_record(selection["chosen"])
         chosen = next(
-            point for point in selection["grid"] if KeyWeights.from_record(point) == picked
+            point
+            for point in selection["grid"]
+            if KeyWeights.from_record(point) == picked
         )
         evaluated[name] = {
             "dev_seconds": dev[name]["seconds"],
@@ -1442,11 +1494,15 @@ def previous_segment():
         raise FileNotFoundError(
             f"segment {SEGMENT} found no resumable trio mounted; mounts hold {describe()}"
         )
-    shared = set.intersection(*(set(c["config"]) for c in candidates)) - {"segment", "commit"}
+    shared = set.intersection(*(set(c["config"]) for c in candidates)) - {
+        "segment",
+        "commit",
+    }
     differing = sorted(
         key
         for key in shared
-        if len({json.dumps(c["config"].get(key), sort_keys=True) for c in candidates}) > 1
+        if len({json.dumps(c["config"].get(key), sort_keys=True) for c in candidates})
+        > 1
     )
     if differing:
         raise ValueError(
@@ -1475,10 +1531,12 @@ def gpu_count():
 def training_budget(elapsed, max_steps, previous, processes):
     """How long this segment may train.
 
-    The rate the previous leg measured holds only for a leg on the same
-    number of devices -- a Colab T4 runs at half the Kaggle pair's rate.
-    A summary without the field, or one from a different process count,
-    leaves the plain session budget in place with a line in the log.
+    The rate is measured over the previous leg's stepping time alone, excluding
+    process startup, checkpoint loading, stream positioning and checkpoint
+    writes, and holds only for a leg on the same number of devices -- a Colab
+    T4 runs at half the Kaggle pair's rate. A summary without ``stepping_seconds``
+    or from a different process count leaves the plain session budget in place
+    with a line in the log.
     """
     budget = SESSION_SECONDS - RESERVE_SECONDS - elapsed
     if previous is None:
@@ -1491,9 +1549,18 @@ def training_budget(elapsed, max_steps, previous, processes):
             flush=True,
         )
         return budget
-    steps = summary["last_step"] - summary["first_step"] + 1
-    rate = steps / summary["train_seconds"]
-    predicted = (max_steps - summary["last_step"]) / rate
+    stepping = summary.get("stepping_seconds")
+    if stepping is None or stepping <= 0:
+        print(
+            f"the last leg recorded stepping_seconds={stepping!r}; "
+            "its rate cannot be separated from startup, using the plain budget",
+            flush=True,
+        )
+        return budget
+    last_step = summary.get("checkpoint_step", summary["last_step"])
+    steps = last_step - summary["first_step"] + 1
+    rate = steps / stepping
+    predicted = (max_steps - last_step) / rate
     if predicted <= budget < predicted + SCORING_RESERVE_SECONDS:
         print(
             f"finishing here would take {predicted:.0f}s of {budget:.0f}s and leave no room to "
@@ -1507,27 +1574,37 @@ def training_budget(elapsed, max_steps, previous, processes):
 def main():
     started = time.monotonic()
     if RANKING is not None and INIT_FROM is None:
-        raise RuntimeError("a ranking stage starts from a finished run; stamp INIT_FROM")
+        raise RuntimeError(
+            "a ranking stage starts from a finished run; stamp INIT_FROM"
+        )
     if SEARCH_GRAPHS is not None and RANKING is None and KEY_RANKING is None:
         raise RuntimeError(
             "only a ranking stage has a search to replay; stamp RANKING or KEY_RANKING"
         )
     if (CONTEXT_TOWER is not None or CONTEXT_WARM_UP) and INIT_FROM is None:
-        raise RuntimeError("a context tower is swapped into a finished run; stamp INIT_FROM")
+        raise RuntimeError(
+            "a context tower is swapped into a finished run; stamp INIT_FROM"
+        )
     if TOWER_GRAPHS and (CONTEXT_TOWER is None or CONTEXT_TOWER["lora_rank"]):
-        raise RuntimeError("only a frozen Qwen tower is replayed from graphs; stamp CONTEXT_TOWER")
+        raise RuntimeError(
+            "only a frozen Qwen tower is replayed from graphs; stamp CONTEXT_TOWER"
+        )
     if KEYS is not None and INIT_FROM is None:
         raise RuntimeError("a key front is built over a finished run; stamp INIT_FROM")
     if KEY_WARM_UP and KEYS is None:
         raise RuntimeError("the key warm-up trains a key front; stamp KEYS")
     if TRAIN_FILL_TOWER is not None and not KEY_WARM_UP:
-        raise RuntimeError("the fill tower trains in the key warm-up; stamp KEY_WARM_UP")
+        raise RuntimeError(
+            "the fill tower trains in the key warm-up; stamp KEY_WARM_UP"
+        )
     if KEY_RANKING is not None and (KEYS is None or KEY_WARM_UP):
         raise RuntimeError(
             "the key ranking term follows the joint stage; stamp KEYS, not KEY_WARM_UP"
         )
     if (UNIT_INITIALS > 0) != (UNIT_LEXICON is not None):
-        raise RuntimeError("the unit initials and their lexicon come together; stamp both")
+        raise RuntimeError(
+            "the unit initials and their lexicon come together; stamp both"
+        )
     if KEY_ARCS is not None and KEYS is None:
         raise RuntimeError("the arcs lexicon is read by the key evaluation; stamp KEYS")
     install()
@@ -1535,10 +1612,14 @@ def main():
     v1_samples, v1_labels = parquet_mounts(V1_MARKER)
     rest_samples, rest_labels = parquet_mounts(REST_MARKER)
     assets = locate("char_pinyin.tsv", "lattice.jsonl")
-    stage_data({"samples": (v1_samples, rest_samples), "labels": (v1_labels, rest_labels)})
+    stage_data(
+        {"samples": (v1_samples, rest_samples), "labels": (v1_labels, rest_labels)}
+    )
     stage_enrichment(enrichment_shards(TRAIN_SHARDS))
     print(
-        subprocess.run(["nvidia-smi", "-L"], capture_output=True, text=True, check=True).stdout,
+        subprocess.run(
+            ["nvidia-smi", "-L"], capture_output=True, text=True, check=True
+        ).stdout,
         flush=True,
     )
 
@@ -1597,7 +1678,9 @@ def main():
             str(WORKING / "count.log"),
         )
         if code != 0:
-            raise RuntimeError("counting the batches failed; its log is in the kernel output")
+            raise RuntimeError(
+                "counting the batches failed; its log is in the kernel output"
+            )
         counts = json.loads(counts_path.read_text())
         config = {
             "max_steps": int(counts["steps_for_epochs"]),
@@ -1623,11 +1706,15 @@ def main():
     world = WORLD if previous is None else previous["world"]
     nproc = min(gpu_count(), world)
     if world % nproc:
-        raise RuntimeError(f"a world of {world} ranks does not split evenly over {nproc} processes")
+        raise RuntimeError(
+            f"a world of {world} ranks does not split evenly over {nproc} processes"
+        )
     virtual = world // nproc
     print(f"world of {world}: {nproc} processes x {virtual} virtual ranks", flush=True)
 
-    wall_budget = training_budget(time.monotonic() - started, config["max_steps"], previous, nproc)
+    wall_budget = training_budget(
+        time.monotonic() - started, config["max_steps"], previous, nproc
+    )
     if wall_budget <= 0:
         raise RuntimeError("the session was spent before training could start")
     # The package is importable from here on (`sys.path` above); its samplers
@@ -1659,7 +1746,9 @@ def main():
             str(WORKING / "train.log"),
         )
     if code != 0:
-        raise RuntimeError("the training segment failed; its log is in the kernel output")
+        raise RuntimeError(
+            "the training segment failed; its log is in the kernel output"
+        )
 
     steps = records_of(out / "metrics.jsonl", "step")
     paused = records_of(out / "metrics.jsonl", "paused")
@@ -1678,6 +1767,9 @@ def main():
         "first_loss": steps[0]["loss"],
         "last_loss": steps[-1]["loss"],
         "train_seconds": round(seconds, 1),
+        "stepping_seconds": paused[-1]["stepping_seconds"]
+        if paused
+        else trained["stepping_seconds"],
         "finished": not paused,
         "world_size": world,
         "processes": nproc,
@@ -1687,7 +1779,9 @@ def main():
 
     if paused:
         if not (out / "checkpoint-paused.pt").is_file():
-            raise RuntimeError("the segment paused without writing checkpoint-paused.pt")
+            raise RuntimeError(
+                "the segment paused without writing checkpoint-paused.pt"
+            )
         shutil.move(out / "checkpoint-paused.pt", WORKING / "checkpoint-paused.pt")
         print(
             f"segment {SEGMENT} paused at step {summary['last_step']} of {config['max_steps']}; "
@@ -1703,7 +1797,9 @@ def main():
         # keys a joint-stage key run; a warm-up's gate is the trainer's
         # held-out record alone.
         if KEYS is None:
-            summary["evaluated"] = evaluate_lattices(checkpoint, assets, char_table, env)
+            summary["evaluated"] = evaluate_lattices(
+                checkpoint, assets, char_table, env
+            )
         elif not KEY_WARM_UP:
             summary["key_evaluation"] = evaluate_keys(
                 checkpoint, assets, char_table, packages.parents[1], env, started

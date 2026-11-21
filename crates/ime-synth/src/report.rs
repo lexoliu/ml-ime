@@ -10,6 +10,7 @@
 use crate::error::{Error, Result};
 use crate::provenance::{self, Provenance};
 use crate::source::SYNTHETIC;
+use crate::summary::RunSummary;
 use ime_g2p::DataLayout;
 use ime_g2p::annotate::Sample;
 use ime_g2p::shards::read_shards;
@@ -32,13 +33,16 @@ pub struct Shown {
     pub text: String,
 }
 
-/// Read the synthetic sample shards a run wrote under `root`.
+/// Read the synthetic sample shards a run wrote under `root`, using the summary's
+/// `source` prefix when `synth-summary.json` exists and [`SYNTHETIC`] otherwise.
 ///
 /// # Errors
 ///
 /// If no run has written any, or a shard cannot be read.
 pub fn samples(root: &Path) -> Result<Vec<Sample>> {
-    Ok(read_shards(&DataLayout::new(root).samples(), SYNTHETIC)?)
+    let prefix =
+        RunSummary::read(root).map_or_else(|_| SYNTHETIC.to_owned(), |summary| summary.source);
+    Ok(read_shards(&DataLayout::new(root).samples(), &prefix)?)
 }
 
 /// How a sample's origin is labelled: the lexicon that proposed the term, and

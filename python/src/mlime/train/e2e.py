@@ -873,6 +873,7 @@ def e2e(
                 first_loss=result.first_loss,
                 last_loss=result.last_loss,
                 logged_steps=result.steps,
+                stepping_seconds=round(segment.stepping_seconds, 3),
                 held_out_examples=evaluated,
                 accuracy_with_context=with_context.rate,
                 accuracy_without_context=without_context.rate,

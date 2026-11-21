@@ -5,7 +5,7 @@ seeds
 {% for row in seeds %}  {{ row.source }}  {{ row.loaded }}  {{ row.grounded }}  {{ row.ungrounded }}  {{ row.unusable }}  {{ row.duplicate }}
 {% endfor %}
 generation
-  terms {{ terms }}  asked for {{ requested }}  parsed {{ parsed }}  refused terms {{ refusals }}
+  terms {{ terms }}  asked for {{ requested }}  parsed {{ parsed }}  abstained {{ abstained }}  refused terms {{ refusals }}
   written {{ written }}  {{ per_minute }} terms/min over {{ seconds }}s
 
 validation
