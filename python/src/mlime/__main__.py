@@ -948,10 +948,11 @@ def train_e2e(
         help="Normalise the decoder's per-position loss over every emittable character "
         "rather than the position's candidates",
     ),
-    search_graphs: bool = typer.Option(
-        False,
-        "--search-graphs/--no-search-graphs",
-        help="Replay the ranking loss's beam search from captured CUDA graphs",
+    search_graphs: int | None = typer.Option(
+        None,
+        "--search-graphs",
+        help="Replay the ranking loss's beam search from captured CUDA graphs, at most this "
+        "many alive at once (each holds about 100 MB of driver memory on an A100, #304)",
     ),
     typos: bool = typer.Option(
         False,
@@ -1692,10 +1693,11 @@ def e2e_stamp(
     accumulate: int | None = typer.Option(
         None, help="A stage's micro-batches per optimiser step; v1's by default"
     ),
-    search_graphs: bool = typer.Option(
-        False,
-        "--search-graphs/--no-search-graphs",
-        help="Replay a ranking stage's search from captured CUDA graphs (SEARCH_GRAPHS)",
+    search_graphs: int | None = typer.Option(
+        None,
+        "--search-graphs",
+        help="Replay a ranking stage's search from captured CUDA graphs, at most this many "
+        "alive at once (SEARCH_GRAPHS)",
     ),
     context_tower: str | None = CONTEXT_TOWER,
     context_revision: str | None = CONTEXT_REVISION,

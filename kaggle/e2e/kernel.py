@@ -238,10 +238,11 @@ INIT_FROM = None
 #: rather than the span's candidates (#121). Stamped per push.
 WHOLE_ALPHABET = False
 
-#: Replay the ranking loss's beam search from captured CUDA graphs (#137);
-#: the search answers as the eager one does, so it is how the stage runs, not
-#: what it trains. Only a ranking stage has the search. Stamped per push.
-SEARCH_GRAPHS = False
+#: How many captured CUDA graphs the ranking loss's beam search replays from
+#: at most at once (#137, #304), or None for the eager search; the search
+#: answers as the eager one does, so it is how the stage runs, not what it
+#: trains. Only a ranking stage has the search. Stamped per push.
+SEARCH_GRAPHS = None
 
 #: The training shards a run makes its epoch over; None trains on every
 #: staged shard but the held-out ones, which never includes an enrichment shard:
@@ -953,8 +954,8 @@ def train_argv(
         ]
     argv += ranking_argv(segmenter)
     # The trainer's alone: the count shares `ranking_argv` and has no search.
-    if SEARCH_GRAPHS:
-        argv.append("--search-graphs")
+    if SEARCH_GRAPHS is not None:
+        argv += ["--search-graphs", str(SEARCH_GRAPHS)]
     if WHOLE_ALPHABET:
         argv.append("--whole-alphabet")
     argv += context_argv()
@@ -1576,7 +1577,7 @@ def main():
         raise RuntimeError(
             "a ranking stage starts from a finished run; stamp INIT_FROM"
         )
-    if SEARCH_GRAPHS and RANKING is None and KEY_RANKING is None:
+    if SEARCH_GRAPHS is not None and RANKING is None and KEY_RANKING is None:
         raise RuntimeError(
             "only a ranking stage has a search to replay; stamp RANKING or KEY_RANKING"
         )

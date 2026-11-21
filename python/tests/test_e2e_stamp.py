@@ -223,6 +223,7 @@ def test_a_ranking_stage_stamps_its_search_graphs_beside_its_recipe(tmp_path: Pa
         str(out),
         *STAGE_ARGV,
         "--search-graphs",
+        "128",
     ]
     result = CliRunner().invoke(app, argv)
     assert result.exit_code == 0, result.output
@@ -230,7 +231,7 @@ def test_a_ranking_stage_stamps_its_search_graphs_beside_its_recipe(tmp_path: Pa
     eager = ["e2e", "stamp", "mlime-e2e-v2-g4-graphs", "--out", str(plain), *STAGE_ARGV]
     assert CliRunner().invoke(app, eager).exit_code == 0
     assert changed_lines((plain / "kernel.py").read_text(), (out / "kernel.py").read_text()) == [
-        "SEARCH_GRAPHS = True"
+        "SEARCH_GRAPHS = 128"
     ]
 
 
@@ -239,10 +240,10 @@ def test_search_graphs_without_a_ranking_stage_are_refused(tmp_path: Path) -> No
         E2EV2Run(
             run="mlime-e2e-v2-g4-control",
             stage=E2EV2Stage(init_from="mlime-e2e-v2-g4"),
-            search_graphs=True,
+            search_graphs=128,
         )
     with pytest.raises(ValueError, match="only a ranking stage"):
-        E2EV2Run(run="mlime-e2e-v2-a100", search_graphs=True)
+        E2EV2Run(run="mlime-e2e-v2-a100", search_graphs=128)
 
 
 def test_a_context_warm_up_stamps_its_tower_and_its_graphs(tmp_path: Path) -> None:
@@ -541,7 +542,7 @@ def test_a_key_ranking_stage_stamps_its_term_over_a_finished_joint_run(tmp_path:
     out = tmp_path / "ranking"
     argv = ["e2e", "stamp", "mlime-e2e-keys-s4-check", "--out", str(out)]
     stage = ["--init-from", "mlime-e2e-keys-s3-check", "--keys", "--typos", "--key-ranking"]
-    knobs = ["--key-rank-weight", "0.1", "--key-rank-objective", "risk", "--search-graphs"]
+    knobs = ["--key-rank-weight", "0.1", "--key-rank-objective", "risk", "--search-graphs", "128"]
     result = CliRunner().invoke(app, [*argv, *stage, *knobs])
     assert result.exit_code == 0, result.output
     template = (TEMPLATE / "kernel.py").read_text()
@@ -565,7 +566,7 @@ def test_a_key_ranking_stage_stamps_its_term_over_a_finished_joint_run(tmp_path:
             "KEYS": keys,
             "KEY_RANKING": ranking,
             "TYPOS": True,
-            "SEARCH_GRAPHS": True,
+            "SEARCH_GRAPHS": 128,
             "PROFILE_STEPS": 30,
             "TRACE_STEPS": 3,
         }.items()

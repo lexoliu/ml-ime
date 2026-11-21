@@ -558,7 +558,7 @@ def test_a_bucketed_search_finds_what_the_exact_one_finds(
 def test_a_replayed_search_is_the_search_it_captured(lexicon: Lexicon, spans: SpanVocab) -> None:
     """The graph replays the bucketed search bit for bit, for new inputs of its shape too."""
     model = ranking_model(lexicon).cuda().eval()
-    graphs = SearchGraphs()
+    graphs = SearchGraphs(8)
     first = search_lanes(lexicon, spans)
     second = [replace(lane, vectors=lane.vectors.flip(0)) for lane in reversed(first)]
     with torch.no_grad():
@@ -582,7 +582,7 @@ def test_a_search_past_the_buffers_is_captured_anew(lexicon: Lexicon, spans: Spa
     graph that used it.
     """
     model = ranking_model(lexicon).cuda().eval()
-    graphs = SearchGraphs()
+    graphs = SearchGraphs(8)
     small = search_lanes(lexicon, spans)
     torch.manual_seed(2)
     reading = ("wo", "ai", "bei", "jing", "zhong", "ai", "wo", "ai", "bei", "jing")
@@ -600,6 +600,33 @@ def test_a_search_past_the_buffers_is_captured_anew(lexicon: Lexicon, spans: Spa
     for expected, found in zip(eager, replayed, strict=True):
         assert torch.equal(expected, found)
     assert len(graphs.captured) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs need a CUDA device")
+def test_a_capture_past_the_limit_releases_the_graph_replayed_longest_ago(
+    lexicon: Lexicon, spans: SpanVocab
+) -> None:
+    """At most *limit* graphs live, and a shape released and seen again is captured anew (#304)."""
+    model = ranking_model(lexicon).cuda().eval()
+    graphs = SearchGraphs(1)
+    every = search_lanes(lexicon, spans)
+    assert len(every) > 1
+    shapes = (every, every[:1], every)
+
+    with torch.no_grad():
+        for lanes in shapes:
+            inputs = search_inputs(lanes, 4, torch.device("cuda"), bucketed=True)
+            eager = run_search(model.decoder, inputs)
+            replayed = graphs.run(model.decoder, inputs)
+            for expected, found in zip(eager, replayed, strict=True):
+                assert torch.equal(expected, found)
+            assert len(graphs.captured) == 1
+    assert graphs.evicted == 2
+
+
+def test_a_search_graph_cache_holds_at_least_one_graph() -> None:
+    with pytest.raises(ValueError, match="at least one graph"):
+        SearchGraphs(0)
 
 
 def test_a_compiled_step_stops_compiling_once_warm(lexicon: Lexicon, spans: SpanVocab) -> None:
@@ -1030,7 +1057,7 @@ def test_a_ranking_step_never_waits_on_the_device(
     device = torch.device("cuda")
     model = forward_model(lexicon, 0).to(device).train()
     if graphs:
-        model.search_graphs = SearchGraphs()
+        model.search_graphs = SearchGraphs(8)
     held = colliding_batch(lexicon, spans, tokenizer).pin_memory()
     optimiser = torch.optim.AdamW(model.parameter_groups(1e-3, 3e-3), fused=True)
     scaler = torch.amp.GradScaler("cuda")

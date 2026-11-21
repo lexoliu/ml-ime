@@ -563,7 +563,7 @@ def e2e(
     ranking: RankingConfig | None = None,
     segmenter: Path | None = None,
     whole_alphabet: bool = False,
-    search_graphs: bool = False,
+    search_graphs: int | None = None,
     context: QwenContextConfig | None = None,
     context_warm_up: bool = False,
     tower_graphs: bool = False,
@@ -586,7 +586,8 @@ def e2e(
     example's other segmentations through the ``ime-segment`` binary at
     *segmenter*. *whole_alphabet* normalises the decoder's per-position term
     over the whole emittable set (#121). *search_graphs* replays the
-    ranking loss's search from captured CUDA graphs (#137). *run_config* is
+    ranking loss's search from captured CUDA graphs (#137), at most that many
+    alive at once (#304). *run_config* is
     the kernel's own run-config file, copied into each interval trio
     verbatim; the loop refuses ``checkpoint_minutes`` without it.
 
@@ -699,14 +700,14 @@ def e2e(
         log.info("encoder activation checkpointing on", trade="memory for one extra forward")
     if training.compile:
         compile_modules(model, training.compile_mode)
-    if search_graphs:
+    if search_graphs is not None:
         if not isinstance(model, RankingE2EModel | KeyRankingModel):
             raise ValueError(
                 "--search-graphs captures the ranking loss's search; add --ranking or --key-ranking"
             )
         if not torch.cuda.is_available():
             raise ValueError("--search-graphs replays CUDA graphs and this run has no CUDA device")
-        model.search_graphs = SearchGraphs()
+        model.search_graphs = SearchGraphs(search_graphs)
     if tower_graphs:
         tower = model.context
         if not isinstance(tower, QwenContextTower):

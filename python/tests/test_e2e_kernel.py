@@ -240,7 +240,7 @@ def test_every_switch_the_kernel_passes_is_an_option_of_train_e2e(
     monkeypatch.setattr(kernel, "TYPOS", True)
     monkeypatch.setattr(kernel, "ACTIVATION_CHECKPOINTING", True)
     monkeypatch.setattr(kernel, "SEGMENT_STEPS", 70)
-    monkeypatch.setattr(kernel, "SEARCH_GRAPHS", True)
+    monkeypatch.setattr(kernel, "SEARCH_GRAPHS", 128)
     monkeypatch.setattr(
         kernel,
         "CONTEXT_TOWER",
@@ -396,7 +396,7 @@ def test_a_ranking_stage_replays_its_search_from_graphs_when_stamped(
     kernel = load_kernel(monkeypatch, tmp_path, segment=0)
     monkeypatch.setattr(kernel, "RANKING", {"weight": 0.05})
     monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-v2-g4")
-    monkeypatch.setattr(kernel, "SEARCH_GRAPHS", True)
+    monkeypatch.setattr(kernel, "SEARCH_GRAPHS", 128)
     segmenter = tmp_path / "ime-segment"
     count = kernel.count_argv(tmp_path / "char_pinyin.tsv", tmp_path / "counts.json", segmenter)
     assert "--ranking" in count
@@ -411,7 +411,8 @@ def test_a_ranking_stage_replays_its_search_from_graphs_when_stamped(
         token_budget=12288,
         segmenter=segmenter,
     )
-    assert "--search-graphs" in train
+    graphs = train.index("--search-graphs")
+    assert train[graphs + 1] == "128"
 
 
 def test_the_segmenter_is_found_in_the_directory_named_after_it(
@@ -1052,7 +1053,7 @@ def test_a_key_ranking_stage_passes_its_term_to_the_count_and_the_trainer(
         "objective": "rank",
     }
     monkeypatch.setattr(kernel, "KEY_RANKING", ranking)
-    monkeypatch.setattr(kernel, "SEARCH_GRAPHS", True)
+    monkeypatch.setattr(kernel, "SEARCH_GRAPHS", 128)
     assert kernel.stage()["key_ranking"] == ranking
     assert kernel.stage_of({"keys": kernel.KEYS})["key_ranking"] is None
     group = typer.main.get_command(cli.app)
