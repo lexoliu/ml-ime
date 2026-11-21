@@ -468,6 +468,33 @@ def first_row(offset: int, reader: int, readers: int) -> int:
     return (reader - offset) % readers
 
 
+@dataclass(frozen=True)
+class StreamCursor:
+    """Where in :class:`CorpusStream` an example came from: shard index and row."""
+
+    shard: int
+    row: int
+
+    def __post_init__(self) -> None:
+        if self.shard < 0 or self.row < 0:
+            raise ValueError(
+                f"a stream cursor is not negative, got shard {self.shard} row {self.row}"
+            )
+
+    def as_record(self) -> dict[str, int]:
+        """The plain form a checkpoint stores."""
+        return {"shard": self.shard, "row": self.row}
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, object]) -> StreamCursor:
+        """Read back what :meth:`as_record` wrote."""
+        shard = record["shard"]
+        row = record["row"]
+        if not isinstance(shard, int) or not isinstance(row, int):
+            raise TypeError(f"stream cursor fields must be ints, got {record!r}")
+        return cls(shard=shard, row=row)
+
+
 class CorpusStream(IterableDataset[TrainingExample]):
     """The corpus as an epoch-reaugmented stream of examples.
 
@@ -529,17 +556,61 @@ class CorpusStream(IterableDataset[TrainingExample]):
         worker = info.id if info is not None else 0
         return self.rank * workers + worker, self.world_size * workers
 
-    def __iter__(self) -> Iterator[TrainingExample]:
+    def validate_cursor(self, cursor: StreamCursor) -> None:
+        """Refuse *cursor* when it lies outside this corpus or on another reader's stride."""
+        if cursor.shard >= len(self.shards):
+            raise RuntimeError(
+                f"stream cursor shard {cursor.shard} is outside the {len(self.shards)} shards "
+                "of this corpus; this is not the corpus the checkpoint was written from"
+            )
+        rows = self.rows[cursor.shard]
+        if cursor.row >= rows:
+            shard = self.shards[cursor.shard].name
+            raise RuntimeError(
+                f"stream cursor row {cursor.row} is outside {shard} ({rows} rows); "
+                "this is not the corpus the checkpoint was written from"
+            )
         index, readers = self._reader()
-        for shard, rows, offset in zip(self.shards, self.rows, self.offsets, strict=True):
-            first = first_row(offset, index, readers)
+        owner = (self.offsets[cursor.shard] + cursor.row) % readers
+        if owner != index:
+            shard = self.shards[cursor.shard].name
+            raise RuntimeError(
+                f"stream cursor {shard}:{cursor.row} belongs to reader {owner} of {readers}, "
+                f"not reader {index}"
+            )
+
+    def positioned(
+        self, after: StreamCursor | None = None
+    ) -> Iterator[tuple[TrainingExample, StreamCursor]]:
+        """Each kept example with its shard and row, strictly after *after* when given."""
+        if after is not None:
+            self.validate_cursor(after)
+        index, readers = self._reader()
+        start_shard = 0 if after is None else after.shard
+        offsets = self.offsets
+        for shard_index in range(start_shard, len(self.shards)):
+            shard = self.shards[shard_index]
+            rows = self.rows[shard_index]
+            if after is not None and shard_index == after.shard:
+                first = after.row + readers
+            else:
+                first = first_row(offsets[shard_index], index, readers)
             if first >= rows:
                 continue
-            for sample, syllables in read_pair(shard, self.labels_dir, first, readers):
+            for step_index, (sample, syllables) in enumerate(
+                read_pair(shard, self.labels_dir, first, readers)
+            ):
                 example = self.builder.build(sample, syllables, self.epoch)
                 if example is not None:
-                    yield example
+                    yield (
+                        example,
+                        StreamCursor(shard=shard_index, row=first + step_index * readers),
+                    )
             log.debug("shard streamed", shard=shard.name, **self.builder.counts.as_dict())
+
+    def __iter__(self) -> Iterator[TrainingExample]:
+        for example, _ in self.positioned():
+            yield example
 
 
 class ContextTokenizer(Protocol):

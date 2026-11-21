@@ -1101,3 +1101,49 @@ def test_the_key_evaluation_decodes_the_sum_combination_only(
         False,
     )
     assert "--sum" in argv and "--viterbi" not in argv
+
+
+def test_training_budget_rates_the_leg_on_stepping_seconds_alone(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Startup, stream skips and checkpoint writes in train_seconds do not skew the rate (#271)."""
+    kernel = load_kernel(monkeypatch, tmp_path, segment=1)
+    monkeypatch.setattr(kernel, "SESSION_SECONDS", 15_000)
+    monkeypatch.setattr(kernel, "RESERVE_SECONDS", 2_000)
+    monkeypatch.setattr(kernel, "SCORING_RESERVE_SECONDS", 3_000)
+    # Budget before reserve check is 15000 - 2000 - 1000 = 12000s.
+    # Suppose 10,000 steps took 5,000s of stepping (2 steps/s), plus 3,000s of legacy skip
+    # (train_seconds = 8,000s). With 16,000 steps left (max_steps = 26,000):
+    # - Under train_seconds (1.25 steps/s), predicted = 12,800s > 12,000s (no cut), OR with
+    #   14,000 steps left (max_steps = 24,000): train_seconds predicts 11,200s (falsely inside
+    #   [9000, 12000), cutting 3,000s!), whereas true stepping rate (2.0 steps/s) predicts
+    #   7,000s, leaving 5,000s >= 3,000s for scoring so the run finishes and scores in one leg!
+    previous = {
+        "summary": {
+            "processes": 2,
+            "first_step": 1,
+            "last_step": 9990,
+            "checkpoint_step": 10000,
+            "train_seconds": 8000.0,
+            "stepping_seconds": 5000.0,
+        }
+    }
+    assert kernel.training_budget(1_000, 24_000, previous, processes=2) == 12_000
+
+    # Conversely, when true stepping time (2.0 steps/s on 20,000 remaining steps = 10,000s)
+    # lands inside [9000, 12000), the scoring reserve is held back so scoring is not starved.
+    assert kernel.training_budget(1_000, 30_000, previous, processes=2) == 9_000
+
+    # A legacy summary without stepping_seconds (or non-positive) keeps the plain session budget
+    # rather than trusting a skip-polluted train_seconds.
+    legacy = {
+        "summary": {
+            "processes": 2,
+            "first_step": 33075,
+            "last_step": 33075,
+            "train_seconds": 3135.0,
+        }
+    }
+    assert kernel.training_budget(1_000, 40_000, legacy, processes=2) == 12_000
+    zero_stepping = {"summary": {**legacy["summary"], "stepping_seconds": 0.0}}
+    assert kernel.training_budget(1_000, 40_000, zero_stepping, processes=2) == 12_000
