@@ -23,6 +23,7 @@ from pydantic import ConfigDict, TypeAdapter
 from pydantic.dataclasses import dataclass
 
 from mlime.legality import Legality, LegalityOptions, lattice_digest
+from mlime.train.charlm_vocab import EOS, SEP, UNK
 from mlime.train.key_tree import POLICY_VERSION, TREE_BUCKETS, Prefix
 from mlime.train.lexicon import Lexicon
 
@@ -37,6 +38,9 @@ REFERENCE = "reference.npz"
 
 #: The context function's static length: the context tower's tokens, sentinels included.
 CONTEXT_BUCKETS: tuple[int, ...] = (64,)
+
+#: The decoder prelude function's static length: ``<bos>``, up to 62 context chars, padding.
+PRELUDE_BUCKETS: tuple[int, ...] = (64,)
 
 #: The keys functions' static widths. A width holds ``width - KEY_SENTINELS`` keys.
 KEYS_WIDTHS: tuple[int, ...] = (16, 32, 64, 128)
@@ -108,27 +112,35 @@ class Function:
     capacity: int
 
 
+FamilyName = Literal["context", "prelude", "keys", "tree"]
+
+
 @dataclass(config=_RECORD)
 class Family:
     """A function family: one multifunction Core ML model, its functions smallest first."""
 
-    name: Literal["context", "keys", "tree"]
+    name: FamilyName
     functions: tuple[Function, ...]
 
 
-def families() -> tuple[Family, ...]:
+def families(decoder_prelude: bool = False) -> tuple[Family, ...]:
     """The function families and their buckets: what the conversion builds, the host picks from."""
-    return (
-        Family(
-            "context",
-            tuple(Function(f"ctx_{size}", size, size - KEY_SENTINELS) for size in CONTEXT_BUCKETS),
-        ),
-        Family(
-            "keys",
-            tuple(Function(f"keys_{size}", size, size - KEY_SENTINELS) for size in KEYS_WIDTHS),
-        ),
-        Family("tree", tuple(Function(f"tree_{size}", size, size) for size in TREE_BUCKETS)),
+    context = Family(
+        "context",
+        tuple(Function(f"ctx_{size}", size, size - KEY_SENTINELS) for size in CONTEXT_BUCKETS),
     )
+    keys = Family(
+        "keys",
+        tuple(Function(f"keys_{size}", size, size - KEY_SENTINELS) for size in KEYS_WIDTHS),
+    )
+    tree = Family("tree", tuple(Function(f"tree_{size}", size, size) for size in TREE_BUCKETS))
+    if not decoder_prelude:
+        return (context, keys, tree)
+    prelude = Family(
+        "prelude",
+        tuple(Function(f"prelude_{size}", size, size - KEY_SENTINELS) for size in PRELUDE_BUCKETS),
+    )
+    return (context, prelude, keys, tree)
 
 
 @dataclass(config=_RECORD)
@@ -203,7 +215,7 @@ class TensorEntry:
     name: str
     shape: tuple[int, ...]
     dtype: str
-    families: tuple[Literal["context", "keys", "tree"], ...]
+    families: tuple[FamilyName, ...]
 
 
 @dataclass(config=_RECORD)
@@ -242,6 +254,11 @@ class KeyManifest:
     families: tuple[Family, ...]
     tensors: tuple[TensorEntry, ...]
     reference: tuple[ReferenceProbe, ...]
+    decoder_prelude: bool = False
+    score_eos: bool = False
+    reader_eos: int = EOS
+    reader_sep: int = SEP
+    reader_unk: int = UNK
 
     def __post_init__(self) -> None:
         if len(self.reader_ids) != len(self.characters):
@@ -264,7 +281,7 @@ class KeyManifest:
                 f"{path} was written for packing policy {manifest.policy_version}; this code "
                 f"implements {POLICY_VERSION}"
             )
-        if manifest.families != families():
+        if manifest.families != families(manifest.decoder_prelude):
             raise ValueError(f"{path} lists function families other than this code's buckets")
         return manifest
 

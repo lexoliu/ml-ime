@@ -827,6 +827,9 @@ def key_training_argv():
     for name in ("distill_weight", "frame_weight", "transition_weight"):
         if name in KEYS:
             argv += ["--" + name.replace("_", "-"), str(KEYS[name])]
+    for flag in ("decoder_prelude", "score_eos"):
+        if KEYS.get(flag):
+            argv.append("--" + flag.replace("_", "-"))
     if KEY_WARM_UP:
         argv.append("--key-warm-up")
     if TRAIN_FILL_TOWER is not None:

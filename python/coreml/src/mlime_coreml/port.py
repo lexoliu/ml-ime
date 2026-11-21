@@ -24,10 +24,13 @@ from mlime_coreml.feeds import (
     Array,
     ContextFeed,
     CrossFeed,
+    PreludeFeed,
     context_row,
     key_row,
+    prelude_row,
     random_context_ids,
     random_letters,
+    random_prelude_ids,
     random_tree,
     tree_row,
 )
@@ -83,6 +86,16 @@ def run_context(module: nn.Module, feed: Mapping[str, Array]) -> Float:
     return np.array(out[0].numpy(), dtype=np.float32)
 
 
+def run_prelude(module: nn.Module, feed: Mapping[str, Array]) -> tuple[Float, Float]:
+    """The prelude function over *feed*: ``[layers, heads, P, head_dim]`` keys and values."""
+    with torch.no_grad():
+        keys, values = module(_tensor(feed["prelude_tokens"]))
+    return (
+        np.array(keys.numpy(), dtype=np.float32),
+        np.array(values.numpy(), dtype=np.float32),
+    )
+
+
 def run_keys(
     module: nn.Module, feed: Mapping[str, Array], context: ContextFeed
 ) -> tuple[Float, Float, Float]:
@@ -102,17 +115,30 @@ def run_keys(
     )
 
 
-def run_tree(module: nn.Module, feed: Mapping[str, Array], cross: CrossFeed) -> Float:
-    """The tree function: ``[S, E]`` logits."""
-    with torch.no_grad():
-        out = module(
-            _tensor(feed["reader_ids"]),
-            _tensor(feed["positions"]),
-            _tensor(feed["tree_bias"]),
-            _tensor(cross.keys),
-            _tensor(cross.values),
-            _tensor(cross.bias),
+def run_tree(
+    module: nn.Module,
+    feed: Mapping[str, Array],
+    cross: CrossFeed,
+    prelude: PreludeFeed | None = None,
+) -> Float:
+    """The tree function: ``[S, E (+ 1)]`` logits."""
+    args: tuple[torch.Tensor, ...] = (
+        _tensor(feed["reader_ids"]),
+        _tensor(feed["positions"]),
+        _tensor(feed["tree_bias"]),
+        _tensor(cross.keys),
+        _tensor(cross.values),
+        _tensor(cross.bias),
+    )
+    if prelude is not None:
+        args = (
+            *args,
+            _tensor(prelude.keys),
+            _tensor(prelude.values),
+            _tensor(prelude.bias),
         )
+    with torch.no_grad():
+        out = module(*args)
     return np.array(out[0].numpy(), dtype=np.float32)
 
 
@@ -122,6 +148,16 @@ def cross_of(reference: Mapping[str, Array], probe: str) -> CrossFeed:
         np.asarray(reference[f"{probe}.cross_keys"], dtype=np.float32),
         np.asarray(reference[f"{probe}.cross_values"], dtype=np.float32),
         np.asarray(reference[f"{probe}.cross_bias"], dtype=np.float32),
+    )
+
+
+def prelude_of(reference: Mapping[str, Array], probe: str) -> PreludeFeed:
+    """A probe's prelude keys, values, bias and token count, as the reference recorded them."""
+    return PreludeFeed(
+        np.asarray(reference[f"{probe}.prelude_keys"], dtype=np.float32),
+        np.asarray(reference[f"{probe}.prelude_values"], dtype=np.float32),
+        np.asarray(reference[f"{probe}.prelude_bias"], dtype=np.float32),
+        int(reference[f"{probe}.prelude_length"]),
     )
 
 
@@ -151,6 +187,11 @@ def check_port(bundle: Bundle) -> list[Check]:
     reference = bundle.reference()
     manifest = bundle.manifest
     context = build_module(bundle, "context", manifest.context_tokens)
+    prelude_mod = (
+        build_module(bundle, "prelude", manifest.context_tokens)
+        if manifest.decoder_prelude
+        else None
+    )
     checks: list[Check] = []
     tree = build_module(bundle, "tree", 0)
     for probe in manifest.reference:
@@ -165,6 +206,21 @@ def check_port(bundle: Bundle) -> list[Check]:
             rows = run_context(context, feed)
             want = np.asarray(reference[f"{name}.context"], dtype=np.float32)
             checks.append(Check(f"{name}.context", _gap(rows[:real], want[:real]), spec.PORT_ATOL))
+        if prelude_mod is not None:
+            pre_len = int(reference[f"{name}.prelude_length"])
+            pre_keys, pre_values = run_prelude(
+                prelude_mod,
+                {"prelude_tokens": np.asarray(reference[f"{name}.prelude_tokens"])[None]},
+            )
+            for what, got in (("prelude_keys", pre_keys), ("prelude_values", pre_values)):
+                want = np.asarray(reference[f"{name}.{what}"], dtype=np.float32)
+                checks.append(
+                    Check(
+                        f"{name}.{what}",
+                        _gap(got[:, :, :pre_len], want[:, :, :pre_len]),
+                        spec.PORT_ATOL,
+                    )
+                )
         ids = np.asarray(reference[f"{name}.input_ids"])
         keys = build_module(bundle, "keys", len(ids))
         feed = {
@@ -188,6 +244,7 @@ def check_port(bundle: Bundle) -> list[Check]:
             )
         del keys
         cross = cross_of(reference, name)
+        prelude = prelude_of(reference, name) if manifest.decoder_prelude else None
         for call in tree_calls(reference, name):
             feed = {
                 "reader_ids": np.asarray(reference[f"{call}.reader_ids"])[None],
@@ -196,7 +253,7 @@ def check_port(bundle: Bundle) -> list[Check]:
                     None, None
                 ],
             }
-            got = run_tree(tree, feed, cross)
+            got = run_tree(tree, feed, cross, prelude)
             checks.append(
                 Check(
                     f"{call}.logits",
@@ -234,12 +291,12 @@ def edges(bundle: Bundle) -> list[Edge]:
     """
     manifest = bundle.manifest
     found: list[Edge] = []
-    for family in spec.FAMILIES:
+    for family in spec.families_for(manifest.decoder_prelude):
         previous = 0
         for function in manifest.family(family).functions:
-            # A context's real count includes its two sentinels; the manifest's capacity does not.
-            capacity = function.length if family == "context" else function.capacity
-            least = {"context": 2, "keys": 1, "tree": 1}[family]
+            # Context and prelude real counts include their sentinels; manifest capacity does not.
+            capacity = function.length if family in ("context", "prelude") else function.capacity
+            least = {"context": 2, "prelude": 1, "keys": 1, "tree": 1}[family]
             smallest = previous + 1 if previous else least
             found.append(Edge(family, function.length, capacity))
             if smallest != capacity:
@@ -258,6 +315,7 @@ class Case:
     context: ContextFeed | None
     cross: CrossFeed | None
     exact_length: int
+    prelude: PreludeFeed | None = None
 
 
 def make_case(bundle: Bundle, edge: Edge, seed: int = 0) -> Case:
@@ -277,6 +335,16 @@ def make_case(bundle: Bundle, edge: Edge, seed: int = 0) -> Case:
             None,
             edge.real,
         )
+    if edge.family == "prelude":
+        ids = random_prelude_ids(manifest, edge.real, rng)
+        return Case(
+            edge,
+            prelude_row(manifest, ids, edge.length),
+            prelude_row(manifest, ids, edge.real),
+            None,
+            None,
+            edge.real,
+        )
     if edge.family == "keys":
         letters = random_letters(manifest, edge.real, rng)
         probe = next(
@@ -292,25 +360,34 @@ def make_case(bundle: Bundle, edge: Edge, seed: int = 0) -> Case:
             edge.real + spec.KEY_SENTINELS,
         )
     nodes = random_tree(manifest, edge.real, rng)
+    prelude = prelude_of(reference, first) if manifest.decoder_prelude else None
+    pre_len = None if prelude is None else prelude.length
     return Case(
         edge,
-        tree_row(manifest, nodes, edge.length),
-        tree_row(manifest, nodes, edge.real),
+        tree_row(manifest, nodes, edge.length, pre_len),
+        tree_row(manifest, nodes, edge.real, pre_len),
         None,
         cross_of(reference, first),
         edge.real,
+        prelude,
     )
 
 
 def real_parts(family: Family, real: int, outputs: Sequence[Float]) -> dict[str, Float]:
     """A function's outputs (batch dropped) cut to what a host reads, by output name.
 
-    A context's real rows; a keys function's logits for keys ``1..n`` and its cross keys and
-    values over the ``n`` real slots; a tree's real node rows. *outputs* are in the family's
-    signature order.
+    A context's real rows; a prelude's keys and values over its real tokens; a keys function's
+    logits for keys ``1..n`` and its cross keys and values over the ``n`` real slots; a tree's
+    real node rows. *outputs* are in the family's signature order.
     """
     if family == "context":
         return {"context": outputs[0][:real]}
+    if family == "prelude":
+        keys, values = outputs
+        return {
+            "prelude_keys": keys[:, :, :real],
+            "prelude_values": values[:, :, :real],
+        }
     if family == "keys":
         logits, keys, values = outputs
         return {
@@ -328,11 +405,13 @@ def run_case(
     edge = case.edge
     if family == "context":
         return real_parts(family, edge.real, [run_context(module, feed)])
+    if family == "prelude":
+        return real_parts(family, edge.real, run_prelude(module, feed))
     if family == "keys":
         assert case.context is not None
         return real_parts(family, edge.real, run_keys(module, feed, case.context))
     assert case.cross is not None
-    return real_parts(family, edge.real, [run_tree(module, feed, case.cross)])
+    return real_parts(family, edge.real, [run_tree(module, feed, case.cross, case.prelude)])
 
 
 def check_padding(bundle: Bundle) -> list[Check]:

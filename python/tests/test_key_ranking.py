@@ -879,3 +879,94 @@ def test_a_ranking_run_trains_resumes_and_loads_for_the_search(
     model, step = load_key_model(tmp_path / "s4" / "checkpoint-000004.pt", lexicon, CPU, TINY)
     assert step == 4 and not model.training
     assert model.e2e_config.key_ranking == RANKING
+
+
+def test_ranking_with_decoder_prelude_and_score_eos_matches_joint_and_brute_force(
+    vocabularies: Vocabularies, lexicon: Lexicon, reader_vocab: CharVocab
+) -> None:
+    keys_cfg = replace(JOINT_KEYS, decoder_prelude=True, score_eos=True)
+    base = tiny_joint_model(lexicon, reader_vocab, keys=keys_cfg).eval()
+    ranked_cfg: E2EConfig = replace(base.e2e_config, key_ranking=replace(RANKING, weight=0.0))
+    zero_model = KeyRankingModel.compose(
+        TINY, lexicon, ranked_cfg, len(reader_vocab), emittable_ids(lexicon, reader_vocab)
+    )
+    assert isinstance(zero_model, KeyRankingModel)
+    zero_model.load_state_dict(base.state_dict())
+    zero_model.eval()
+    examples = build_examples(vocabularies, typos=True)[:6]
+    batch = vocabularies.key_rank_collator(keys_cfg, RANKING, context_dropout=0.0)(examples)
+    with torch.no_grad():
+        zero_rank = zero_model(batch)
+        joint = base.joint_loss(batch.keys)
+    assert zero_rank.loss is not None and joint.loss is not None
+    torch.testing.assert_close(zero_rank.loss, joint.loss)
+    torch.testing.assert_close(zero_rank.extras["transition_loss"], joint.extras["transition_loss"])
+
+    # Brute-force lane beam agreement with prelude + <eos>.
+    wide_ranking = replace(RANKING, beam=64)
+    keyed = batch.keys
+    with torch.no_grad():
+        encoded = zero_model.encode_keys(keyed, zero_model.encode_context(keyed.spans))
+        flat = zero_model.ctc_log_probs(
+            encoded.reshape(-1, encoded.shape[-1]).index_select(0, keyed.key_positions)
+        )
+        states = replace(
+            zero_model.states_at_keys(keyed.key_mask, encoded),
+            prelude=zero_model._encode_prelude(
+                keyed.prelude_chars, keyed.prelude_lengths, keyed.spans.context_rows
+            ),
+        )
+        table = dense_span_table(batch, len(lexicon.characters))
+        spans = span_rows_of(batch)
+        gain = span_gains(flat, keyed.key_index, table, spans, wide_ranking.gamma)
+        value, back = cover_dp(gain, keyed.keys, batch.cover_cap)
+        lanes = cover_lanes(
+            value,
+            back,
+            keyed.keys,
+            keyed.span_end,
+            keyed.lengths,
+            wide_ranking.other_lengths,
+            batch.cover_cap,
+        )
+        gains = lane_gains(flat, keyed.key_index, table, spans, lanes, wide_ranking.gamma)
+    search_in = padded_key_inputs(
+        KeySearchInputs(
+            states=states.states,
+            key_mask=states.mask,
+            lane_owner=lanes.owner,
+            gains=gains,
+            lane_lengths=lanes.lengths,
+            width=wide_ranking.beam,
+            beta=wide_ranking.beta,
+            prelude_chars=batch.keys.prelude_chars,
+            prelude_lengths=batch.keys.prelude_lengths,
+        ),
+        bucketed=False,
+    )
+    with torch.no_grad():
+        sequences, scores = run_key_search(base.decoder, search_in)
+        for lane in range(batch.keys.size):
+            length = int(lanes.lengths[lane])
+            expected = every_sentence(base, states, lane, gains[lane, :length], wide_ranking.beta)
+            # Add <eos> log-prob to each complete sentence in expected.
+            closed: dict[tuple[int, ...], float] = {}
+            for ids, partial in expected.items():
+                eos_lp = float(
+                    base.transition_log_probs(
+                        states,
+                        torch.tensor([lane]),
+                        torch.tensor([ids], dtype=torch.long),
+                        torch.tensor([len(ids)]),
+                    )[0, len(lexicon.characters)]
+                )
+                closed[ids] = partial + wide_ranking.beta * eos_lp
+            top = sorted(closed.items(), key=lambda item: -item[1])[: wide_ranking.beam]
+            got = {
+                tuple(sequences[lane, b, :length].tolist()): float(scores[lane, b])
+                for b in range(wide_ranking.beam)
+                if scores[lane, b] > -math.inf
+            }
+            assert got.keys() == {ids for ids, _ in top}
+            for ids, score in top:
+                assert got[ids] == pytest.approx(score, abs=1e-3)

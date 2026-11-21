@@ -38,6 +38,16 @@ class CrossFeed:
     bias: npt.NDArray[np.float32]  # [1, 1, 1, N_MAX]
 
 
+@dataclass(frozen=True)
+class PreludeFeed:
+    """The prelude function's reader keys and values, with the bias over real tokens."""
+
+    keys: npt.NDArray[np.float32]  # [layers, heads, P, head_dim]
+    values: npt.NDArray[np.float32]
+    bias: npt.NDArray[np.float32]  # [1, 1, 1, P]
+    length: int
+
+
 def key_row(manifest: Manifest, letters: Sequence[int], width: int) -> dict[str, Array]:
     """The keys function's row inputs for *letters* (ids ``0..25``) at *width*."""
     count = len(letters)
@@ -84,6 +94,20 @@ def random_context_ids(manifest: Manifest, real: int, rng: random.Random) -> lis
     return [specials.cls, *body, specials.sep]
 
 
+def prelude_row(manifest: Manifest, ids: Sequence[int], length: int) -> dict[str, Array]:
+    """The prelude function's inputs for reader *ids* (``<bos>`` first) at *length*."""
+    if len(ids) > length:
+        raise ValueError(f"{len(ids)} prelude tokens do not fit a row of {length}")
+    padded = np.zeros(length, dtype=np.int32)
+    padded[: len(ids)] = list(ids)
+    return {"prelude_tokens": padded[None]}
+
+
+def random_prelude_ids(manifest: Manifest, real: int, rng: random.Random) -> list[int]:
+    """``<bos>`` followed by ``real - 1`` random reader tokens."""
+    return [manifest.reader_bos, *(rng.choice(manifest.reader_ids) for _ in range(real - 1))]
+
+
 @dataclass(frozen=True)
 class TreeNodes:
     """A packed node set: each node's parent (``-1`` for the root) and its reader token."""
@@ -95,12 +119,15 @@ class TreeNodes:
 def random_tree(manifest: Manifest, nodes: int, rng: random.Random) -> TreeNodes:
     """A random ancestor-closed set of *nodes*: a root, then each node under an earlier one."""
     reader_ids = manifest.reader_ids
+    root = manifest.reader_sep if manifest.decoder_prelude else manifest.reader_bos
     parents = [-1, *(rng.randrange(index) for index in range(1, nodes))]
-    tokens = [manifest.reader_bos, *(rng.choice(reader_ids) for _ in range(1, nodes))]
+    tokens = [root, *(rng.choice(reader_ids) for _ in range(1, nodes))]
     return TreeNodes(tuple(parents), tuple(tokens))
 
 
-def tree_row(manifest: Manifest, nodes: TreeNodes, bucket: int) -> dict[str, Array]:
+def tree_row(
+    manifest: Manifest, nodes: TreeNodes, bucket: int, prelude_length: int | None = None
+) -> dict[str, Array]:
     """The tree function's node inputs at *bucket* nodes; the rest is padding, last.
 
     A node sees its ancestors and itself, a padding row only itself.
@@ -108,8 +135,10 @@ def tree_row(manifest: Manifest, nodes: TreeNodes, bucket: int) -> dict[str, Arr
     count = len(nodes.parents)
     if count > bucket:
         raise ValueError(f"{count} nodes do not fit a bucket of {bucket}")
-    reader_ids = np.full(bucket, manifest.reader_bos, dtype=np.int32)
-    positions = np.zeros(bucket, dtype=np.int32)
+    root = manifest.reader_bos if prelude_length is None else manifest.reader_sep
+    offset = 0 if prelude_length is None else prelude_length
+    reader_ids = np.full(bucket, root, dtype=np.int32)
+    positions = np.full(bucket, offset, dtype=np.int32)
     bias = np.full((bucket, bucket), spec.NEG, dtype=np.float32)
     for row in range(bucket):
         bias[row, row] = 0.0

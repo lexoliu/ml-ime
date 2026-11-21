@@ -230,10 +230,8 @@ impl<M: KeyModel> KeyTransition for RowCache<'_, M> {
             self.stats.miss_calls += calls;
             self.stats.miss_ns += nanos;
         }
-        for (prefix, row) in prefixes
-            .into_iter()
-            .zip(out.chunks_exact_mut(self.emittable))
-        {
+        let row_width = self.emittable + usize::from(self.model.score_eos());
+        for (prefix, row) in prefixes.into_iter().zip(out.chunks_exact_mut(row_width)) {
             let (call, node) = self.rows[&prefix];
             self.model.log_softmax(&self.outputs[call], node, row);
             if self.seen.insert(prefix.clone()) {
@@ -391,6 +389,8 @@ impl<M: KeyModel> Engine for KeyEngine<'_, M> {
         }
         rows.speculated = rows.outputs.len();
         rows.stats.speculative_rows = rows.rows.len();
+        let mut search_options = self.options.search;
+        search_options.score_eos |= rows.model.score_eos();
         let mut search = KeySearchStats::default();
         let tick = Instant::now();
         let found = key_search(
@@ -398,7 +398,7 @@ impl<M: KeyModel> Engine for KeyEngine<'_, M> {
             &log_probs,
             &[],
             &mut rows,
-            &self.options.search,
+            &search_options,
             &mut search,
         )?;
         let search_ns = elapsed_ns(tick);

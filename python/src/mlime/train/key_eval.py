@@ -289,6 +289,7 @@ def search_points(
     times: DecodeTimes,
     words: Sequence[Sequence[WordArc]] | None = None,
     arc_width: int = DEFAULT_ARC_WIDTH,
+    score_eos: bool = False,
 ) -> list[list[list[Hypothesis]]]:
     """The search at every grid point over one group's encoding: ``[point][record]``.
 
@@ -320,6 +321,7 @@ def search_points(
                 prior=weights.prior,
                 arc_width=arc_width,
                 counts=counts,
+                score_eos=score_eos,
             )
         )
         spent = time.perf_counter() - began
@@ -381,7 +383,8 @@ def build_key_collator(
             CandidateSpace(spans, lexicon.candidate_mask),
             context_dropout=0.0 if with_context else 1.0,
             max_context_tokens=max_context_tokens,
-        )
+        ),
+        lexicon,
     )
 
 
@@ -488,6 +491,7 @@ class KeyDecoder:
                     times=self.times,
                     words=words,
                     arc_width=self.arc_width,
+                    score_eos=self.model.decoder.score_eos,
                 )
             ):
                 found[point].extend(hypotheses)

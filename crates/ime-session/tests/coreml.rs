@@ -102,6 +102,10 @@ impl KeyModel for Recording<'_> {
         self.model.max_keys()
     }
 
+    fn score_eos(&self) -> bool {
+        self.model.score_eos()
+    }
+
     fn encode(
         &mut self,
         keys: &Keys,
@@ -157,6 +161,7 @@ fn options(expected: &Expected, point: &WeightsRecord) -> KeyEngineOptions {
             },
             prior: Weight::ZERO,
             arc_width: DEFAULT_ARC_WIDTH,
+            score_eos: false,
         },
     }
 }

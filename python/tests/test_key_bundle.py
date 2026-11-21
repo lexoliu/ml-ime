@@ -476,3 +476,42 @@ def test_the_fixture_command_writes_the_committed_bytes(tmp_path: Path) -> None:
         Path(__file__).resolve().parents[2] / "crates/ime-neural/tests/fixtures/key-tree.json"
     )
     assert out.read_bytes() == committed.read_bytes()
+
+
+def test_a_prelude_and_eos_bundle_packs_four_families_and_legacy_manifests_still_read(
+    lexicon: Lexicon, legality: Legality, reader_vocab: CharVocab, tmp_path: Path
+) -> None:
+    from test_keys import JOINT_KEYS
+
+    prelude_model = tiny_joint_model(
+        lexicon,
+        reader_vocab,
+        keys=replace(JOINT_KEYS, decoder_prelude=True, score_eos=True),
+    ).eval()
+    out = tmp_path / "prelude-bundle"
+    write_key_bundle(prelude_model, 19, lexicon, legality, KeyTokenizer(), out)
+    manifest = KeyManifest.read(out)
+    assert manifest.decoder_prelude is True and manifest.score_eos is True
+    assert manifest.families == families(True)
+    assert [f.name for f in manifest.families] == ["context", "prelude", "keys", "tree"]
+    names = {entry.name: entry.families for entry in manifest.tensors}
+    assert names["decoder.reader.embed.weight"] == ("prelude", "tree")
+    assert names["decoder.reader.blocks.0.qkv.weight"] == ("prelude", "tree")
+    assert names["decoder.reader.norm.weight"] == ("tree",)
+    assert names["decoder.reader.project.weight"] == ("tree",)
+    reference = read_reference(out)
+    for probe in manifest.reference:
+        assert reference[f"{probe.name}.prelude_tokens"].shape == (64,)
+        assert reference[f"{probe.name}.prelude_keys"].shape[2] == 64
+        assert reference[f"{probe.name}.tree0.call0.logits"].shape[1] == lexicon.size + 1
+
+    # A legacy manifest JSON (without the 5 defaulted #309 fields) still loads unchanged.
+    plain_out = tmp_path / "legacy-bundle"
+    plain = tiny_joint_model(lexicon, reader_vocab).eval()
+    write_key_bundle(plain, 7, lexicon, legality, KeyTokenizer(), plain_out)
+    raw = json.loads((plain_out / MANIFEST).read_text(encoding="utf-8"))
+    for field_name in ("decoder_prelude", "score_eos", "reader_eos", "reader_sep", "reader_unk"):
+        raw.pop(field_name, None)
+    (plain_out / MANIFEST).write_text(json.dumps(raw), encoding="utf-8")
+    loaded = KeyManifest.read(plain_out)
+    assert not loaded.decoder_prelude and not loaded.score_eos

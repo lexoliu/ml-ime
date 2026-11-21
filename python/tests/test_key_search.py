@@ -475,3 +475,39 @@ class StubFlat:
         self, records: Sequence[int], prefixes: Sequence[Prefix]
     ) -> npt.NDArray[np.float32]:
         return np.zeros((len(prefixes), self.width), dtype=np.float32)
+
+
+@pytest.mark.parametrize("viterbi", [False, True])
+def test_score_eos_matches_brute_force_and_queries_uncached_closers_once(
+    small: Legality, viterbi: bool
+) -> None:
+    keys_list, lattices, log_probs = small_batch(small, seed=19, options=OFFLINE, count=8)
+    emittable = len(small.characters)
+    transition = StubTransition(emittable + 1, seed=23)
+    got = search(
+        lattices,
+        log_probs,
+        transition,
+        beta=BETA,
+        gamma=GAMMA,
+        beam=None,
+        viterbi=viterbi,
+        score_eos=True,
+    )
+    host_lp = log_probs.numpy().astype(np.float64)
+    for row, (lattice, found) in enumerate(zip(lattices, got, strict=True)):
+        raw = brute_force(lattice, host_lp[row], transition, row, viterbi)
+        expected = {
+            ids: score + BETA * float(transition.row(row, ids)[emittable])
+            for ids, score in raw.items()
+        }
+        assert {h.ids for h in found} == set(expected)
+        for hyp in found:
+            assert hyp.score == pytest.approx(expected[hyp.ids], abs=1e-5), keys_list[row]
+            want_trans = sum(
+                float(transition.row(row, hyp.ids[:j])[c]) for j, c in enumerate(hyp.ids)
+            ) + float(transition.row(row, hyp.ids)[emittable])
+            assert hyp.transition == pytest.approx(want_trans, abs=1e-5)
+    # Every (record, prefix) pair was queried at most once across all rounds + <eos> close.
+    seen = [pair for call in transition.calls for pair in call]
+    assert len(seen) == len(set(seen))

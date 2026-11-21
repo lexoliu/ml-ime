@@ -37,7 +37,7 @@ from torch import nn
 from transformers import BertConfig, BertForMaskedLM
 
 from mlime.train.charlm_model import Block, CharLmConfig, TransformerCharLm
-from mlime.train.charlm_vocab import BOS, CharVocab
+from mlime.train.charlm_vocab import BOS, EOS, SEP, UNK, CharVocab
 from mlime.train.keys import FillTowerTraining, KeyFrontConfig
 from mlime.train.lexicon import Lexicon
 from mlime.train.model import (
@@ -246,6 +246,11 @@ class E2EConfig(RouteAConfig):
                         "transition_weight weighs the joint stage's term (S2); the warm-up "
                         "trains no transition"
                     )
+                if self.keys.decoder_prelude or self.keys.score_eos:
+                    raise ValueError(
+                        "decoder_prelude and score_eos configure the joint stage's transition "
+                        "(S2); the warm-up trains no transition"
+                    )
             else:
                 if (self.keys.distill_weight, self.keys.frame_weight) != (
                     default.distill_weight,
@@ -418,6 +423,31 @@ class EncoderAttention(nn.Module):
         return result
 
 
+@dataclass(frozen=True)
+class PreludeKV:
+    """The reader's cached keys and values over ``<bos> c_1 .. c_k`` (#309).
+
+    ``keys`` and ``values`` hold one ``[C, heads, P, head_dim]`` tensor per
+    reader block, ``mask [C, P]`` marks the real prelude tokens (``<bos>`` is
+    always real, so ``lengths >= 1``), and ``lengths [C]`` is each row's real
+    prelude token count: the position offset where ``<sep>`` sits.
+    """
+
+    keys: tuple[torch.Tensor, ...]
+    values: tuple[torch.Tensor, ...]
+    mask: torch.Tensor
+    lengths: torch.Tensor
+
+    def select(self, rows: torch.Tensor) -> PreludeKV:
+        """Gather the prelude rows indexed by *rows* ``[N]``."""
+        return PreludeKV(
+            keys=tuple(layer.index_select(0, rows) for layer in self.keys),
+            values=tuple(layer.index_select(0, rows) for layer in self.values),
+            mask=self.mask.index_select(0, rows),
+            lengths=self.lengths.index_select(0, rows),
+        )
+
+
 class Decoder(nn.Module):
     """The reader's transformer plus the wiring that lets it see the encoder.
 
@@ -434,7 +464,9 @@ class Decoder(nn.Module):
 
     reader: TransformerCharLm
     emit_ids: torch.Tensor
+    _specials: torch.Tensor
     span_input: nn.Linear | None
+    score_eos: bool
 
     def __init__(
         self,
@@ -442,6 +474,7 @@ class Decoder(nn.Module):
         encoder_width: int,
         emit_ids: torch.Tensor,
         span_input: bool = True,
+        score_eos: bool = False,
     ):
         super().__init__()
         if emit_ids.numel() == 0:
@@ -449,6 +482,7 @@ class Decoder(nn.Module):
         if int(emit_ids.max()) >= reader.embed.num_embeddings or int(emit_ids.min()) < 0:
             raise ValueError("emit_ids names ids outside the reader's alphabet")
         self.reader = reader
+        self.score_eos = score_eos
         if span_input:
             self.span_input = nn.Linear(encoder_width, reader.config.hidden, bias=False)
             nn.init.zeros_(self.span_input.weight)
@@ -458,10 +492,23 @@ class Decoder(nn.Module):
             EncoderAttention(reader.config, encoder_width) for _ in reader.layers()
         )
         self.register_buffer("emit_ids", emit_ids, persistent=True)
+        self.register_buffer(
+            "_specials", torch.tensor([BOS, EOS, SEP, UNK], dtype=torch.long), persistent=False
+        )
         # The per-position candidate lists the decode and the score frame
         # restrict to travel with the batch itself: a typoed span admits the
         # union of its corrections' homophones, a set no span-table row can
         # name, so the collator writes the lists and the decoder reads them.
+
+    def prelude_table(self) -> torch.Tensor:
+        """``[E + 1]``: lexicon indices ``0..E-1`` to reader ids, and ``E`` to ``<unk>``."""
+        return torch.cat([self.emit_ids, self._specials[3:4]])
+
+    def output_ids(self) -> torch.Tensor:
+        """Reader ids of the decoder's output columns: ``emit_ids``, plus ``<eos>`` if scored."""
+        if self.score_eos:
+            return torch.cat([self.emit_ids, self._specials[1:2]])
+        return self.emit_ids
 
     def gated_layers(self) -> list[EncoderAttention]:
         """The cross-attention layers, narrowed out of the untyped module list."""
@@ -480,7 +527,10 @@ class Decoder(nn.Module):
         A decoder without a span input takes no *span_vectors*, and one with
         it always does: a caller that disagrees with the decoder is refused.
         """
-        positions = torch.arange(tokens.shape[1], device=tokens.device) + first
+        offset = (
+            first.unsqueeze(1) if isinstance(first, torch.Tensor) and first.ndim == 1 else first
+        )
+        positions = torch.arange(tokens.shape[1], device=tokens.device) + offset
         embedded = self.reader.input(self.reader.embed(tokens))
         if self.span_input is not None:
             if span_vectors is None:
@@ -490,6 +540,32 @@ class Decoder(nn.Module):
             raise ValueError("this decoder reads keys and has no span input (#216 §6)")
         dropped: torch.Tensor = self.reader.dropout(embedded + self.reader.positions(positions))
         return dropped
+
+    def prelude_eager(
+        self, prelude_chars: torch.Tensor, prelude_lengths: torch.Tensor
+    ) -> PreludeKV:
+        """Encode ``<bos> c_1 .. c_k`` causally through the reader blocks alone (#309)."""
+        chars = self.prelude_table()[prelude_chars]
+        bos = self._specials[0].expand(chars.shape[0], 1)
+        tokens = torch.cat([bos, chars], dim=1)
+        lengths = prelude_lengths + 1
+        mask = torch.arange(tokens.shape[1], device=tokens.device) < lengths.unsqueeze(1)
+        x = self.embed(tokens, None, 0)
+        keys: list[torch.Tensor] = []
+        values: list[torch.Tensor] = []
+        for block in self.reader.layers():
+            q, k, v = block.split(x)
+            attended = nn.functional.scaled_dot_product_attention(
+                q, k, v, is_causal=True, dropout_p=block.dropout.p if block.training else 0.0
+            )
+            x = block.merge(x, attended)
+            keys.append(k)
+            values.append(v)
+        return PreludeKV(keys=tuple(keys), values=tuple(values), mask=mask, lengths=lengths)
+
+    def prelude(self, prelude_chars: torch.Tensor, prelude_lengths: torch.Tensor) -> PreludeKV:
+        """Encode the context prelude (:meth:`prelude_eager`, compiled when the run is)."""
+        return self.prelude_eager(prelude_chars, prelude_lengths)
 
     def forward(
         self,
@@ -517,33 +593,65 @@ class Decoder(nn.Module):
         states: torch.Tensor,
         mask: torch.Tensor,
         rows: torch.Tensor | None = None,
+        prelude: PreludeKV | None = None,
     ) -> torch.Tensor:
         """Teacher-forced features of a decoder reading keys: ``[N, T] -> [N, T, hidden]``.
 
-        ``tokens [N, T]`` are reader ids, ``<bos>`` first; ``states [R, S,
-        enc]`` are the key states every gated block cross-attends to, real
-        where ``mask [R, S]`` (bool) is. Token row ``n`` reads state row
-        ``rows[n]``, or row ``n`` itself when *rows* is None. Each block's keys
-        and values are projected once per state row and gathered per token
-        row, so a beam's hypotheses share their record's projection. No step
-        gets a span input: the decoder must have none.
+        ``tokens [N, T]`` are reader ids, ``<bos>`` first (or ``<sep>`` when
+        *prelude* is given); ``states [R, S, enc]`` are the key states every
+        gated block cross-attends to, real where ``mask [R, S]`` (bool) is.
+        Token row ``n`` reads state row ``rows[n]``, or row ``n`` itself when
+        *rows* is None. Each block's keys and values are projected once per
+        state row and gathered per token row, so a beam's hypotheses share
+        their record's projection. No step gets a span input: the decoder must
+        have none.
         """
-        x = self.embed(tokens, None, 0)
         kept = mask if rows is None else mask.index_select(0, rows)
-        for block, cross in zip(self.reader.layers(), self.gated_layers(), strict=True):
+        if prelude is None:
+            x = self.embed(tokens, None, 0)
+            for block, cross in zip(self.reader.layers(), self.gated_layers(), strict=True):
+                keys, values = cross.kv(states)
+                if rows is not None:
+                    keys, values = keys.index_select(0, rows), values.index_select(0, rows)
+                x = cross.attend(block(x), keys, values, kept)
+            normed: torch.Tensor = self.reader.norm(x)
+            return normed
+        own = prelude if rows is None else prelude.select(rows)
+        x = self.embed(tokens, None, own.lengths)
+        length = tokens.shape[1]
+        step = torch.arange(length, device=tokens.device)
+        causal = (
+            (step.unsqueeze(1) >= step.unsqueeze(0)).unsqueeze(0).expand(tokens.shape[0], -1, -1)
+        )
+        attn_mask = torch.cat(
+            [own.mask.unsqueeze(1).expand(-1, length, -1), causal], dim=2
+        ).unsqueeze(1)
+        for layer, (block, cross) in enumerate(
+            zip(self.reader.layers(), self.gated_layers(), strict=True)
+        ):
+            q, k, v = block.split(x)
+            attended = nn.functional.scaled_dot_product_attention(
+                q,
+                torch.cat([own.keys[layer], k], dim=2),
+                torch.cat([own.values[layer], v], dim=2),
+                attn_mask=attn_mask,
+                dropout_p=block.dropout.p if block.training else 0.0,
+            )
+            x = block.merge(x, attended)
             keys, values = cross.kv(states)
             if rows is not None:
                 keys, values = keys.index_select(0, rows), values.index_select(0, rows)
-            x = cross.attend(block(x), keys, values, kept)
-        normed: torch.Tensor = self.reader.norm(x)
+            x = cross.attend(x, keys, values, kept)
+        normed = self.reader.norm(x)
         return normed
 
     def emission_logits(self, features: torch.Tensor) -> torch.Tensor:
-        """``[..., hidden]`` features to logits over the whole emittable set, ``[..., E]``.
+        """``[..., hidden]`` features to logits over the output alphabet, ``[..., E (+ 1)]``.
 
-        The tied reader head's rows at ``emit_ids``, in emission order.
+        The tied reader head's rows at :meth:`output_ids`, in emission order
+        (with ``<eos>`` last when ``score_eos`` is on).
         """
-        emitted = self.reader.embed.weight.index_select(0, self.emit_ids)
+        emitted = self.reader.embed.weight.index_select(0, self.output_ids())
         scores: torch.Tensor = self.reader.project(self.reader.dropout(features)) @ emitted.T
         return scores
 
@@ -688,8 +796,12 @@ class Decoder(nn.Module):
         state: tuple[torch.Tensor, torch.Tensor],
         encoder_kv: Sequence[tuple[torch.Tensor, torch.Tensor]],
         encoder_mask: torch.Tensor,
+        prelude_kv: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        prelude_mask: torch.Tensor | None = None,
+        prelude_lengths: torch.Tensor | None = None,
+        lane_of_row: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-        """Advance a decoder that reads keys one position: logits over the whole emittable set.
+        """Advance a decoder that reads keys one position: logits over the output alphabet.
 
         :meth:`step`'s arithmetic for a decoder without a span input
         (#216 §6): ``tokens [R]`` are each row's previous reader id,
@@ -697,21 +809,33 @@ class Decoder(nn.Module):
         ``[layers, R, heads, T, head_dim]`` over the positions before it, and
         ``encoder_kv`` each block's keys and values of the record's key
         states per lane, ``[lanes, heads, S, head_dim]``, with ``encoder_mask
-        [lanes, S]`` marking the real keys. The rows are lanes of beams,
-        lane-major. Returns the position's logits ``[R, E]`` over every
-        emittable character -- the distribution the training term reads and
-        the search masks without renormalising -- and its keys and values
-        ``[layers, R, heads, 1, head_dim]``, for the caller to write in; the
-        step writes nothing it is given.
+        [lanes, S]`` marking the real keys. With *prelude_kv*, each block also
+        attends into the lane's cached prelude ``[lanes, heads, P, head_dim]``
+        under ``prelude_mask [lanes, P]`` and embeds at ``prelude_lengths +
+        position`` (#309). Returns the position's logits ``[R, E (+ 1)]`` and
+        its keys and values ``[layers, R, heads, 1, head_dim]``, for the caller
+        to write in; the step writes nothing it is given.
         """
         keys, values = state
-        x = self.embed(tokens.unsqueeze(1), None, position)
+        if prelude_lengths is not None and lane_of_row is not None:
+            pos: int | torch.Tensor = (
+                prelude_lengths.index_select(0, lane_of_row) + position
+            ).clamp(max=self.reader.config.max_positions - 1)
+        else:
+            pos = position
+        x = self.embed(tokens.unsqueeze(1), None, pos)
         before = torch.arange(keys.shape[3], device=keys.device) < position
         new_keys, new_values = [], []
         for layer, (block, cross) in enumerate(
             zip(self.reader.layers(), self.gated_layers(), strict=True)
         ):
-            x, k, v = _attend_step(block, x, keys[layer], values[layer], before)
+            if prelude_kv is None or prelude_mask is None:
+                x, k, v = _attend_step(block, x, keys[layer], values[layer], before)
+            else:
+                pre_k, pre_v = prelude_kv[layer]
+                x, k, v = _attend_step_prelude(
+                    block, x, pre_k, pre_v, prelude_mask, keys[layer], values[layer], before
+                )
             enc_keys, enc_values = encoder_kv[layer]
             x = cross.attend_beams(x, enc_keys, enc_values, encoder_mask)
             new_keys.append(k)
@@ -733,6 +857,9 @@ class Decoder(nn.Module):
         carried: torch.Tensor,
         block: torch.Tensor,
         beta: float,
+        prelude_kv: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
+        prelude_mask: torch.Tensor | None = None,
+        prelude_lengths: torch.Tensor | None = None,
     ) -> tuple[
         torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor, torch.Tensor
     ]:
@@ -744,17 +871,38 @@ class Decoder(nn.Module):
         ``gains [L, M, E]`` is the lane's emission-minus-blank-minus-cost
         row for the span it covers there, minus infinity for every character
         the span does not admit (:func:`~mlime.train.key_ranking.lane_gains`).
-        A row whose lane has ended (``lane_lengths [L]``) takes ``carried``,
-        the free step. ``encoder_mask [L, S]`` marks each lane's real keys.
-        Returns what :meth:`advance` does; like it, one graph a search shape.
+        With ``score_eos``, step ``at == lane_lengths`` adds ``beta * log
+        T(<eos> | sentence)`` on choice 0 and re-ranks the lane's beams; steps
+        past it take ``carried``, the free step. ``encoder_mask [L, S]`` marks
+        each lane's real keys. Returns what :meth:`advance` does; like it, one
+        graph a search shape.
         """
         count, width = scores.shape
         rows = count * width
-        emittable = gains.shape[-1]
-        logits, (new_keys, new_values) = self.step_keys(tokens, at, cache, encoder_kv, encoder_mask)
-        log_probs = beta * logits.float().log_softmax(dim=-1) + gains[lane_of_row, at.view(1)]
-        ended = (lane_lengths <= at)[lane_of_row]
-        log_probs = torch.where(ended.unsqueeze(1), carried, log_probs)
+        length, emittable = gains.shape[1], gains.shape[2]
+        logits, (new_keys, new_values) = self.step_keys(
+            tokens,
+            at,
+            cache,
+            encoder_kv,
+            encoder_mask,
+            prelude_kv,
+            prelude_mask,
+            prelude_lengths,
+            lane_of_row,
+        )
+        all_log_probs = logits.float().log_softmax(dim=-1)
+        step_at = at.clamp(max=length - 1).view(1)
+        log_probs = beta * all_log_probs[:, :emittable] + gains[lane_of_row, step_at]
+        if self.score_eos:
+            closing = (lane_lengths == at)[lane_of_row]
+            past = (lane_lengths < at)[lane_of_row]
+            eos_step = carried + beta * all_log_probs[:, emittable : emittable + 1]
+            log_probs = torch.where(closing.unsqueeze(1), eos_step, log_probs)
+            log_probs = torch.where(past.unsqueeze(1), carried, log_probs)
+        else:
+            ended = (lane_lengths <= at)[lane_of_row]
+            log_probs = torch.where(ended.unsqueeze(1), carried, log_probs)
         total = (scores.reshape(rows, 1) + log_probs).reshape(count, width * emittable)
         top = total.topk(width, dim=1)
         parent = top.indices // emittable
@@ -766,6 +914,48 @@ class Decoder(nn.Module):
         keys.index_copy_(3, at.view(1), new_keys.index_select(1, source))
         values.index_copy_(3, at.view(1), new_values.index_select(1, source))
         return self.emit_ids[choice.reshape(rows)], top.values, (keys, values), parent, choice
+
+
+def _attend_step_prelude(
+    block: Block,
+    x: torch.Tensor,
+    pre_keys: torch.Tensor,
+    pre_values: torch.Tensor,
+    pre_mask: torch.Tensor,
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    before: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """One position of *x* ``[L * W, 1, H]`` against lane prelude, beam cache and itself."""
+    q, k, v = block.split(x)
+    lanes = pre_keys.shape[0]
+    width = q.shape[0] // lanes
+    scale = math.sqrt(block.head_dim)
+    q_lanes = q.view(lanes, width, block.heads, block.head_dim).transpose(1, 2)
+    pre = (
+        ((q_lanes @ pre_keys.transpose(-1, -2)) / scale)
+        .masked_fill(~pre_mask[:, None, None, :], float("-inf"))
+        .transpose(1, 2)
+        .reshape(q.shape[0], block.heads, 1, -1)
+    )
+    past = ((q @ keys.transpose(-1, -2)) / scale).masked_fill(~before, float("-inf"))
+    own = (q * k).sum(dim=-1, keepdim=True) / scale
+    top = torch.maximum(
+        torch.maximum(pre.amax(dim=-1, keepdim=True), past.amax(dim=-1, keepdim=True)), own
+    )
+    pre_weights = (pre - top).exp()
+    past_weights = (past - top).exp()
+    own_weight = (own - top).exp()
+    total = (
+        pre_weights.sum(dim=-1, keepdim=True) + past_weights.sum(dim=-1, keepdim=True) + own_weight
+    )
+    pre_attended = (
+        (pre_weights.view(lanes, width, block.heads, -1).transpose(1, 2) @ pre_values)
+        .transpose(1, 2)
+        .reshape_as(v)
+    )
+    attended = (pre_attended + past_weights @ values + own_weight * v) / total
+    return block.merge(x, attended), k, v
 
 
 def _attend_step(
@@ -845,8 +1035,13 @@ class E2EModel(RouteAModel):
     ):
         super().__init__(fill, context, lexicon, config)
         self.e2e_config = config
+        score_eos = config.keys is not None and not config.key_warm_up and config.keys.score_eos
         self.decoder = Decoder(
-            reader, fill.config.hidden_size, emit_ids, span_input=config.reads_span_input
+            reader,
+            fill.config.hidden_size,
+            emit_ids,
+            span_input=config.reads_span_input,
+            score_eos=score_eos,
         )
 
     @classmethod

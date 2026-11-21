@@ -165,6 +165,16 @@ CORRECT_SYLLABLES = typer.Option(
     "--correct-syllables/--no-correct-syllables",
     help="Let corrections read spans that are themselves syllables, with --keys",
 )
+DECODER_PRELUDE = typer.Option(
+    False,
+    "--decoder-prelude/--no-decoder-prelude",
+    help="Feed the joint-stage decoder `<bos> context <sep>` before the sentence (#309)",
+)
+SCORE_EOS = typer.Option(
+    False,
+    "--score-eos/--no-score-eos",
+    help="Include `<eos>` in the joint-stage decoder's vocabulary and sentence score (#309)",
+)
 KEY_WARM_UP = typer.Option(
     False,
     "--key-warm-up/--no-key-warm-up",
@@ -770,6 +780,8 @@ def key_settings(
     transition_weight: float | None,
     correct_syllables: bool,
     key_warm_up: bool,
+    decoder_prelude: bool = False,
+    score_eos: bool = False,
 ) -> KeyFrontConfig | None:
     """The key front's settings from ``--keys`` and its knobs; None is the span model.
 
@@ -780,16 +792,22 @@ def key_settings(
     """
     if not keys:
         knobs = (layers, distill_weight, frame_weight, transition_weight)
-        if any(knob is not None for knob in knobs) or not correct_syllables:
+        if (
+            any(knob is not None for knob in knobs)
+            or not correct_syllables
+            or decoder_prelude
+            or score_eos
+        ):
             raise typer.BadParameter(
-                "--key-front-layers, --distill-weight, --frame-weight, --transition-weight "
-                "and --no-correct-syllables set the key front; pass --keys"
+                "--key-front-layers, --distill-weight, --frame-weight, --transition-weight, "
+                "--decoder-prelude, --score-eos and --no-correct-syllables set the key front; "
+                "pass --keys"
             )
         return None
-    if key_warm_up and transition_weight is not None:
+    if key_warm_up and (transition_weight is not None or decoder_prelude or score_eos):
         raise typer.BadParameter(
-            "--transition-weight weighs the joint stage's term; the warm-up (--key-warm-up) "
-            "trains no transition"
+            "--transition-weight, --decoder-prelude and --score-eos configure the joint stage's "
+            "transition; the warm-up (--key-warm-up) trains no transition"
         )
     if not key_warm_up and (distill_weight is not None or frame_weight is not None):
         raise typer.BadParameter(
@@ -807,6 +825,8 @@ def key_settings(
         if transition_weight is None
         else transition_weight,
         correct_syllables=correct_syllables,
+        decoder_prelude=decoder_prelude,
+        score_eos=score_eos,
     )
 
 
@@ -978,6 +998,8 @@ def train_e2e(
     frame_weight: float | None = FRAME_WEIGHT,
     transition_weight: float | None = TRANSITION_WEIGHT,
     correct_syllables: bool = CORRECT_SYLLABLES,
+    decoder_prelude: bool = DECODER_PRELUDE,
+    score_eos: bool = SCORE_EOS,
     key_warm_up: bool = KEY_WARM_UP,
     train_fill_tower: bool = TRAIN_FILL_TOWER,
     train_cross_attention: bool = TRAIN_CROSS_ATTENTION,
@@ -1148,6 +1170,8 @@ def train_e2e(
                 transition_weight,
                 correct_syllables,
                 key_warm_up,
+                decoder_prelude,
+                score_eos,
             ),
             key_warm_up=key_warm_up,
             train_fill_tower=fill_tower_settings(train_fill_tower, train_cross_attention),
@@ -1716,6 +1740,8 @@ def e2e_stamp(
     frame_weight: float | None = FRAME_WEIGHT,
     transition_weight: float | None = TRANSITION_WEIGHT,
     correct_syllables: bool = CORRECT_SYLLABLES,
+    decoder_prelude: bool = DECODER_PRELUDE,
+    score_eos: bool = SCORE_EOS,
     key_warm_up: bool = KEY_WARM_UP,
     train_fill_tower: bool = TRAIN_FILL_TOWER,
     train_cross_attention: bool = TRAIN_CROSS_ATTENTION,
@@ -1793,6 +1819,8 @@ def e2e_stamp(
         "--typos": typos or None,
         "--unit-initials": unit_initials or None,
         "--unit-lexicon": unit_lexicon,
+        "--decoder-prelude": decoder_prelude or None,
+        "--score-eos": score_eos or None,
     }
     check_units(unit_initials, unit_lexicon)
     if key_arcs is not None and not keys:
@@ -1808,6 +1836,8 @@ def e2e_stamp(
         transition_weight,
         correct_syllables,
         key_warm_up,
+        decoder_prelude,
+        score_eos,
     )
     fill_tower = fill_tower_settings(train_fill_tower, train_cross_attention)
     key_ranking_config = key_ranking_settings(
@@ -1863,7 +1893,11 @@ def e2e_stamp(
                 **(
                     {"distill_weight": front.distill_weight, "frame_weight": front.frame_weight}
                     if key_warm_up
-                    else {"transition_weight": front.transition_weight}
+                    else {
+                        "transition_weight": front.transition_weight,
+                        **({"decoder_prelude": True} if front.decoder_prelude else {}),
+                        **({"score_eos": True} if front.score_eos else {}),
+                    }
                 ),
                 "correct_syllables": front.correct_syllables,
             },

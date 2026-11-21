@@ -10,15 +10,31 @@ from __future__ import annotations
 from typing import Final, Literal
 
 #: The function families, as the manifest names them, and the directory each converts into.
-Family = Literal["context", "keys", "tree"]
+Family = Literal["context", "prelude", "keys", "tree"]
 FAMILIES: Final[tuple[Family, ...]] = ("context", "keys", "tree")
-DIRECTORIES: Final[dict[Family, str]] = {"context": "context", "keys": "keys", "tree": "decoder"}
+PRELUDE_FAMILIES: Final[tuple[Family, ...]] = ("context", "prelude", "keys", "tree")
+ALL_FAMILIES: Final[tuple[Family, ...]] = PRELUDE_FAMILIES
+DIRECTORIES: Final[dict[Family, str]] = {
+    "context": "context",
+    "prelude": "prelude",
+    "keys": "keys",
+    "tree": "decoder",
+}
+
+
+def families_for(decoder_prelude: bool = False) -> tuple[Family, ...]:
+    """The function families a bundle with *decoder_prelude* converts into."""
+    return PRELUDE_FAMILIES if decoder_prelude else FAMILIES
+
 
 #: The packing policy this code speaks (the bundle's ``policy_version``).
 POLICY_VERSION: Final = 1
 
 #: The context function's static length: the context tower's tokens, sentinels included.
 CONTEXT_BUCKETS: Final[tuple[int, ...]] = (64,)
+
+#: The decoder prelude function's static length: ``<bos>``, up to 62 context chars, padding.
+PRELUDE_BUCKETS: Final[tuple[int, ...]] = (64,)
 
 #: The keys functions' static widths: ``[CLS]``, up to ``width - 2`` keys, ``[SEP]``, padding.
 KEYS_WIDTHS: Final[tuple[int, ...]] = (16, 32, 64, 128)
@@ -48,8 +64,13 @@ MAX_PROJECTION_WIDTH: Final = 512
 #: which the key front's blocks, the gated context blocks and the decoder's blocks were built with.
 DEFAULT_LAYER_NORM_EPS: Final = 1e-5
 
-#: The function names' prefixes: ``ctx_64``, ``keys_16``, ``tree_32``.
-FUNCTION_PREFIX: Final[dict[Family, str]] = {"context": "ctx", "keys": "keys", "tree": "tree"}
+#: The function names' prefixes: ``ctx_64``, ``prelude_64``, ``keys_16``, ``tree_32``.
+FUNCTION_PREFIX: Final[dict[Family, str]] = {
+    "context": "ctx",
+    "prelude": "prelude",
+    "keys": "keys",
+    "tree": "tree",
+}
 
 # --- tolerances -----------------------------------------------------------------------------
 
@@ -78,6 +99,8 @@ PADDING_ATOL_FP32: Final = 2e-4
 #: or a mis-sliced weight moves a logit by far more than 0.4 at that scale.
 FP16_TOLERANCE: Final[dict[str, tuple[float, float]]] = {
     "context": (5e-2, 2e-2),
+    "prelude_keys": (1.2e-1, 2e-2),
+    "prelude_values": (1.2e-1, 2e-2),
     "ctc_logits": (1.8e-1, 2e-2),
     "cross_keys": (1.2e-1, 2e-2),
     "cross_values": (1.2e-1, 2e-2),

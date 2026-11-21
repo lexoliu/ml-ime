@@ -508,6 +508,83 @@ class ReaderBlock(nn.Module):
         x = x + self.out(attended)
         return x + cast(torch.Tensor, self.ff(self.norm2(x)))
 
+    def forward_with_prelude(
+        self,
+        x: torch.Tensor,
+        tree_bias: torch.Tensor,
+        prelude_keys: torch.Tensor,
+        prelude_values: torch.Tensor,
+        prelude_bias: torch.Tensor,
+    ) -> torch.Tensor:
+        """Self-attention over cached prelude KV ``[heads, P, d]`` and the tree's own nodes."""
+        q, k, v = self.qkv(self.norm1(x)).chunk(3, dim=-1)
+        heads = self.heads.heads
+        q_scaled = split_heads(q, heads) * self.heads.scale
+        k_pre = prelude_keys.unsqueeze(0)
+        v_pre = prelude_values.unsqueeze(0)
+        k_own = split_heads(k, heads)
+        v_own = split_heads(v, heads)
+        scores = torch.cat(
+            [
+                q_scaled @ k_pre.transpose(-1, -2) + prelude_bias,
+                q_scaled @ k_own.transpose(-1, -2) + tree_bias,
+            ],
+            dim=-1,
+        )
+        v_all = torch.cat([v_pre, v_own], dim=2)
+        attended = merge_heads(scores.softmax(dim=-1) @ v_all)
+        x = x + self.out(attended)
+        return x + cast(torch.Tensor, self.ff(self.norm2(x)))
+
+
+class PreludeReader(nn.Module):
+    """The char LM reader's prefix: embeddings, positions and blocks, without the output head."""
+
+    def __init__(self, dims: DecoderDims):
+        super().__init__()
+        self.embed = nn.Embedding(dims.vocabulary, dims.embedding)
+        self.input = nn.Linear(dims.embedding, dims.hidden)
+        self.positions = nn.Embedding(dims.positions, dims.hidden)
+        self.blocks = nn.ModuleList(ReaderBlock(dims) for _ in range(dims.layers))
+
+
+class PreludeDecoder(nn.Module):
+    """Wrapper naming ``decoder.reader.*`` as ``weights.safetensors`` stores them."""
+
+    def __init__(self, dims: DecoderDims):
+        super().__init__()
+        self.reader = PreludeReader(dims)
+
+
+class PreludeEncoder(nn.Module):
+    """``prelude_P``: causal reader over ``[1, P]`` tokens to cached keys and values."""
+
+    causal: torch.Tensor
+
+    def __init__(self, dims: DecoderDims, length: int):
+        super().__init__()
+        self.length = length
+        self.heads = dims.heads
+        self.decoder = PreludeDecoder(dims)
+        causal = torch.triu(torch.full((length, length), spec.NEG), diagonal=1)
+        self.register_buffer("causal", causal, persistent=False)
+
+    def forward(self, prelude_tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """``[1, P]`` reader ids to ``[layers, heads, P, head_dim]`` keys and values."""
+        reader = self.decoder.reader
+        x = reader.input(reader.embed(prelude_tokens)) + reader.positions.weight[: self.length]
+        keys: list[torch.Tensor] = []
+        values: list[torch.Tensor] = []
+        for block in reader.blocks:
+            rb = cast(ReaderBlock, block)
+            q, k, v = rb.qkv(rb.norm1(x)).chunk(3, dim=-1)
+            keys.append(split_heads(k, self.heads))
+            values.append(split_heads(v, self.heads))
+            attended = rb.heads.attend(q, k, v, self.causal)
+            x = x + rb.out(attended)
+            x = x + cast(torch.Tensor, rb.ff(rb.norm2(x)))
+        return torch.cat(keys, dim=0), torch.cat(values, dim=0)
+
 
 class Reader(nn.Module):
     """The char LM reader: embeddings, positions, blocks, the final norm and the tied head."""
@@ -566,10 +643,15 @@ class DecoderTree(nn.Module):
     def __init__(self, manifest: Manifest):
         super().__init__()
         self.decoder = TreeDecoder(manifest.dims.decoder, manifest.dims.emitted)
+        self.score_eos = manifest.score_eos
+        self.reader_eos = manifest.reader_eos
 
     def bake(self) -> None:
-        """Derive the emittable characters' embedding rows, the tied head's weight."""
+        """Derive the output tokens' embedding rows, the tied head's weight."""
         emit = self.decoder.emit_ids
+        if self.score_eos:
+            eos = torch.tensor([self.reader_eos], dtype=emit.dtype, device=emit.device)
+            emit = torch.cat([emit, eos])
         rows = self.decoder.reader.embed.weight.index_select(0, emit)
         self.register_buffer("emitted", rows.detach().clone(), persistent=False)
 
@@ -587,12 +669,47 @@ class DecoderTree(nn.Module):
         ``reader_ids`` and ``positions`` are ``[1, S]`` int32 (a node's last token as a reader id,
         its depth), ``tree_bias`` the additive ``[1, 1, S, S]`` (0 for a node's ancestors and
         itself), ``cross_keys`` and ``cross_values`` ``[layers, heads, N_MAX, head_dim]`` and
-        ``cross_bias`` ``[1, 1, 1, N_MAX]``. Returns the raw logits ``[1, S, E]``.
+        ``cross_bias`` ``[1, 1, 1, N_MAX]``. Returns the raw logits ``[1, S, E (+ 1)]``.
         """
         reader = self.decoder.reader
         x = reader.input(reader.embed(reader_ids)) + reader.positions(positions)
         for layer, block in enumerate(reader.blocks):
             x = block(x, tree_bias)
+            x = self.decoder.cross_attention[layer](
+                x, cross_keys[layer], cross_values[layer], cross_bias
+            )
+        return cast(torch.Tensor, reader.project(reader.norm(x)) @ self.emitted.T)
+
+
+class PreludeDecoderTree(DecoderTree):
+    """``tree_S`` conditioned on the prelude function's cached reader KV (#309)."""
+
+    def __init__(self, manifest: Manifest):
+        super().__init__(manifest)
+        dims = manifest.dims.decoder
+        if Heads.of(dims.hidden, dims.heads).groups != 1:
+            raise ValueError("the tree's prelude attention reads one block of cached heads")
+
+    def forward(  # type: ignore[override]
+        self,
+        reader_ids: torch.Tensor,
+        positions: torch.Tensor,
+        tree_bias: torch.Tensor,
+        cross_keys: torch.Tensor,
+        cross_values: torch.Tensor,
+        cross_bias: torch.Tensor,
+        prelude_keys: torch.Tensor,
+        prelude_values: torch.Tensor,
+        prelude_bias: torch.Tensor,
+    ) -> torch.Tensor:
+        """The tree function attending to ``prelude_keys`` / ``prelude_values`` before itself."""
+        reader = self.decoder.reader
+        x = reader.input(reader.embed(reader_ids)) + reader.positions(positions)
+        for layer, block in enumerate(reader.blocks):
+            rb = cast(ReaderBlock, block)
+            x = rb.forward_with_prelude(
+                x, tree_bias, prelude_keys[layer], prelude_values[layer], prelude_bias
+            )
             x = self.decoder.cross_attention[layer](
                 x, cross_keys[layer], cross_values[layer], cross_bias
             )
@@ -606,14 +723,20 @@ def build_module(bundle: Bundle, family: Family, length: int) -> nn.Module:
     """The *family* module over *bundle*'s weights, for sequences of *length*, in eval mode.
 
     For ``keys`` *length* is the row width (any width the key front has positions for, a bucket
-    or an exact length), for ``context`` the token count and for ``tree`` unused: the node count
-    is the input's. The tensors the family reads load with ``strict=True``, so a weight the
-    module lacks or a module parameter the bundle lacks is an error.
+    or an exact length), for ``context`` and ``prelude`` the token count and for ``tree`` unused:
+    the node count is the input's. The tensors the family reads load with ``strict=True``, so a
+    weight the module lacks or a module parameter the bundle lacks is an error.
     """
     manifest = bundle.manifest
     module: nn.Module
     if family == "context":
         module = ContextEncoder(manifest.dims.context, length)
+    elif family == "prelude":
+        if length > manifest.dims.decoder.positions:
+            raise ValueError(
+                f"length {length} exceeds the reader's {manifest.dims.decoder.positions} positions"
+            )
+        module = PreludeEncoder(manifest.dims.decoder, length)
     elif family == "keys":
         if length > manifest.dims.key_front.positions:
             raise ValueError(
@@ -621,6 +744,8 @@ def build_module(bundle: Bundle, family: Family, length: int) -> nn.Module:
                 "positions"
             )
         module = KeysGraph(manifest, length)
+    elif manifest.decoder_prelude:
+        module = PreludeDecoderTree(manifest)
     else:
         module = DecoderTree(manifest)
     module.load_state_dict(bundle.family_weights(family), strict=True)

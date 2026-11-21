@@ -367,7 +367,7 @@ class Vocabularies:
         Its span half reads the spans the typist meant, which a typo never
         touches, so it resolves candidates over the clean lexicon.
         """
-        return KeyCollator(self.collator(context_dropout, max_context_tokens, seed))
+        return KeyCollator(self.collator(context_dropout, max_context_tokens, seed), self.lexicon)
 
     def key_rank_collator(
         self,

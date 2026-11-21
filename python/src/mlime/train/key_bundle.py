@@ -63,7 +63,7 @@ from transformers import BertConfig
 
 from mlime.legality import Legality
 from mlime.logging import log
-from mlime.train.charlm_vocab import BOS
+from mlime.train.charlm_vocab import BOS, EOS, SEP, UNK
 from mlime.train.key_eval import DecodeTimes, ModelTransition, build_key_collator
 from mlime.train.key_manifest import (
     CONTEXT_BUCKETS,
@@ -107,22 +107,33 @@ REFERENCE_PROBES: tuple[tuple[str, str, str | None], ...] = (
 RANDOM_REQUESTS = 16
 RANDOM_DEPTH = 6
 
-Family = Literal["context", "keys", "tree"]
+Family = Literal["context", "prelude", "keys", "tree"]
 
 #: Which parameters each family reads, by name; a parameter no pattern names is
 #: not in the bundle. The derived ``key_front.letter_table`` stands for the
 #: letters and the coordinates' projection (:func:`bundle_weights`).
-_READS: dict[Family, re.Pattern[str]] = {
-    "context": re.compile(r"context\.(embeddings|encoder)\."),
-    "keys": re.compile(
-        r"(fill\.(embeddings|encoder)\.|cross_attention\.\d+\.|key_front\.(positions|blocks|"
-        r"letter_table)|head\.(transform|decoder)\.|blank\.|"
-        r"decoder\.cross_attention\.\d+\.(key|value)\.)"
-    ),
-    "tree": re.compile(
-        r"(decoder\.reader\.|decoder\.cross_attention\.\d+\.(gate|norm|query|out)\.?|decoder\.emit_ids)"
-    ),
-}
+_CONTEXT_READS = re.compile(r"context\.(embeddings|encoder)\.")
+_PRELUDE_READS = re.compile(r"decoder\.reader\.(embed|input|positions|blocks)\.")
+_KEYS_READS = re.compile(
+    r"(fill\.(embeddings|encoder)\.|cross_attention\.\d+\.|key_front\.(positions|blocks|"
+    r"letter_table)|head\.(transform|decoder)\.|blank\.|"
+    r"decoder\.cross_attention\.\d+\.(key|value)\.)"
+)
+_TREE_READS = re.compile(
+    r"(decoder\.reader\.|decoder\.cross_attention\.\d+\.(gate|norm|query|out)\.?|decoder\.emit_ids)"
+)
+
+
+def _reads(decoder_prelude: bool) -> dict[Family, re.Pattern[str]]:
+    if decoder_prelude:
+        return {
+            "context": _CONTEXT_READS,
+            "prelude": _PRELUDE_READS,
+            "keys": _KEYS_READS,
+            "tree": _TREE_READS,
+        }
+    return {"context": _CONTEXT_READS, "keys": _KEYS_READS, "tree": _TREE_READS}
+
 
 #: What the derived letter table replaces.
 _REPLACED = ("key_front.letters.", "key_front.place.")
@@ -171,14 +182,15 @@ def bundle_weights(model: KeyE2EModel) -> dict[str, tuple[torch.Tensor, tuple[Fa
         state["key_front.letter_table"] = (
             (front.letters.weight + front.place(front.coordinates)).detach().cpu()
         )
+    reads = _reads(model.keys_config.decoder_prelude)
     chosen: dict[str, tuple[torch.Tensor, tuple[Family, ...]]] = {}
     for name in sorted(state):
         if name.startswith(_REPLACED):
             continue
-        reading = tuple(family for family, pattern in _READS.items() if pattern.match(name))
+        reading = tuple(family for family, pattern in reads.items() if pattern.match(name))
         if reading:
             chosen[name] = (state[name].clone().contiguous(), reading)
-    for family, pattern in _READS.items():
+    for family, pattern in reads.items():
         if not any(pattern.match(name) for name in chosen):
             raise ValueError(f"no parameter is read by the {family} family; the names have moved")
     return chosen
@@ -288,14 +300,22 @@ def reference_arrays(
             arrays[f"{name}.cross_keys"] = _float32(cross.keys)
             arrays[f"{name}.cross_values"] = _float32(cross.values)
             arrays[f"{name}.cross_bias"] = _float32(cross.bias)
+            prelude = None
+            if model.keys_config.decoder_prelude:
+                prelude = model.prelude_memory(inputs, length=context_tokens)
+                arrays[f"{name}.prelude_tokens"] = _int32(prelude.tokens[0])
+                arrays[f"{name}.prelude_length"] = np.array(prelude.length, dtype=np.int32)
+                arrays[f"{name}.prelude_keys"] = _float32(prelude.keys)
+                arrays[f"{name}.prelude_values"] = _float32(prelude.values)
+                arrays[f"{name}.prelude_bias"] = _float32(prelude.bias)
             transition = ModelTransition(model, states, DecodeTimes())
             sets = reference_requests(emitted, index)
             for number, requests in enumerate(sets):
                 for position, call in enumerate(plan(requests)):
                     prefix = f"{name}.tree{number}.call{position}"
-                    feeds = model.tree_feeds(call)
+                    feeds = model.tree_feeds(call, None if prelude is None else prelude.length)
                     logits = model.tree_logits(
-                        feeds.reader_ids, feeds.positions, feeds.tree_bias, cross
+                        feeds.reader_ids, feeds.positions, feeds.tree_bias, cross, prelude
                     )[0]
                     answers = list(call.answers)
                     expected = transition([0] * len(answers), [requests[a] for a, _ in answers])
@@ -377,7 +397,7 @@ def write_key_bundle(
         dims=model_dims(model),
         correct_syllables=keys.correct_syllables,
         probes=tuple(legality_probes(legality, keys.correct_syllables)),
-        families=families(),
+        families=families(keys.decoder_prelude),
         tensors=tuple(
             TensorEntry(
                 name=name,
@@ -388,6 +408,11 @@ def write_key_bundle(
             for name, (tensor, reading) in weights.items()
         ),
         reference=reference.probes,
+        decoder_prelude=keys.decoder_prelude,
+        score_eos=keys.score_eos,
+        reader_eos=EOS,
+        reader_sep=SEP,
+        reader_unk=UNK,
     )
     path = manifest.write(out_dir)
     log.info(

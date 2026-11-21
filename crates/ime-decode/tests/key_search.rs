@@ -82,6 +82,8 @@ struct Setting {
     #[serde(default)]
     prior: f64,
     arc_width: Option<usize>,
+    #[serde(default)]
+    score_eos: bool,
     hypotheses: Vec<Expected>,
     calls: Vec<Vec<Vec<usize>>>,
     counts: Option<ArcCounts>,
@@ -152,6 +154,7 @@ struct Hashed {
     seed: u64,
     flat: bool,
     emittable: usize,
+    score_eos: bool,
     calls: Vec<Vec<Vec<usize>>>,
 }
 
@@ -166,7 +169,8 @@ impl KeyTransition for Hashed {
     ) -> Result<(), Infallible> {
         let mut call = Vec::with_capacity(queries.len());
         let mut ids: Vec<EmitId> = Vec::new();
-        for (&query, row) in queries.iter().zip(out.chunks_exact_mut(self.emittable)) {
+        let width = self.emittable + usize::from(self.score_eos);
+        for (&query, row) in queries.iter().zip(out.chunks_exact_mut(width)) {
             trie.ids_into(query, &mut ids);
             call.push(ids.iter().map(|id| id.index()).collect());
             let hash = ids
@@ -219,6 +223,7 @@ fn the_rust_search_reproduces_the_python_search() {
         .collect();
     let mut runs = 0;
     let mut arc_runs = 0;
+    let mut eos_runs = 0;
     for record in &fixture.records {
         let legality = &automata[record.alphabet.as_str()];
         let emittable = legality.emittable().len();
@@ -259,11 +264,13 @@ fn the_rust_search_reproduces_the_python_search() {
         };
         for setting in &record.settings {
             arc_runs += usize::from(check_setting(record, setting, beta, &record_inputs));
+            eos_runs += usize::from(setting.score_eos);
             runs += 1;
         }
     }
     assert!(runs > 0);
     assert!(arc_runs > 0, "the fixture holds settings with arcs");
+    assert!(eos_runs > 0, "the fixture holds settings with score_eos");
 }
 
 /// What one record is searched over.
@@ -278,8 +285,14 @@ struct Inputs<'a> {
 /// result; whether the setting is one with arcs.
 fn check_setting(record: &Record, setting: &Setting, beta: Weight, inputs: &Inputs<'_>) -> bool {
     let context = format!(
-        "{} {} beam {:?} gamma {} prior {} arc width {:?}",
-        record.name, setting.combine, setting.beam, setting.gamma, setting.prior, setting.arc_width
+        "{} {} beam {:?} gamma {} prior {} arc width {:?} eos {}",
+        record.name,
+        setting.combine,
+        setting.beam,
+        setting.gamma,
+        setting.prior,
+        setting.arc_width,
+        setting.score_eos,
     );
     let options = KeySearchOptions {
         beta,
@@ -295,11 +308,13 @@ fn check_setting(record: &Record, setting: &Setting, beta: Weight, inputs: &Inpu
         arc_width: setting.arc_width.map_or(DEFAULT_ARC_WIDTH, |width| {
             NonZeroUsize::new(width).expect("an arc width is not zero")
         }),
+        score_eos: setting.score_eos,
     };
     let mut transition = Hashed {
         seed: seed(&record.transition_seed),
         flat: record.transition == "flat",
         emittable: inputs.emittable,
+        score_eos: setting.score_eos,
         calls: Vec::new(),
     };
     let mut stats = KeySearchStats::default();

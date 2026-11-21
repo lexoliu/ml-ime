@@ -35,7 +35,7 @@ from coremltools.models.compute_plan import MLComputePlan
 from mlime_coreml import spec
 from mlime_coreml.bundle import Bundle, Function
 from mlime_coreml.convert import ConvertedFamily, compile_plan_variant
-from mlime_coreml.feeds import Array, ContextFeed, CrossFeed
+from mlime_coreml.feeds import Array, ContextFeed, CrossFeed, PreludeFeed
 from mlime_coreml.modules import build_module
 from mlime_coreml.port import (
     Check,
@@ -47,6 +47,7 @@ from mlime_coreml.port import (
     cross_of,
     edges,
     make_case,
+    prelude_of,
     real_parts,
     run_case,
     tree_calls,
@@ -190,6 +191,21 @@ def reference_checks(
             checks.append(
                 fp16_check(f"reference.{name}.context", "context", rows[:real], want[:real])
             )
+        elif family == "prelude":
+            pre_len = int(reference[f"{name}.prelude_length"])
+            pre_keys, pre_values = runner.outputs(
+                {"prelude_tokens": np.asarray(reference[f"{name}.prelude_tokens"])[None]}
+            )
+            for part, got_part in (("prelude_keys", pre_keys), ("prelude_values", pre_values)):
+                want = np.asarray(reference[f"{name}.{part}"], dtype=np.float32)
+                checks.append(
+                    fp16_check(
+                        f"reference.{name}.{part}",
+                        part,
+                        got_part[:, :, :pre_len],
+                        want[:, :, :pre_len],
+                    )
+                )
         elif family == "keys":
             ids = np.asarray(reference[f"{name}.input_ids"])
             if min(width for width in widths if width >= len(ids)) != function.length:
@@ -229,20 +245,24 @@ def reference_checks(
                 )
         else:
             cross = cross_of(reference, name)
+            prelude = prelude_of(reference, name) if manifest.decoder_prelude else None
             for call in tree_calls(reference, name):
                 ids = np.asarray(reference[f"{call}.reader_ids"])
                 if len(ids) != function.length:
                     continue
-                [logits] = runner.outputs(
-                    {
-                        "reader_ids": ids[None],
-                        "positions": np.asarray(reference[f"{call}.positions"])[None],
-                        "tree_bias": np.asarray(reference[f"{call}.tree_bias"])[None, None],
-                        "cross_keys": cross.keys,
-                        "cross_values": cross.values,
-                        "cross_bias": cross.bias,
-                    }
-                )
+                tree_feed: dict[str, Array] = {
+                    "reader_ids": ids[None],
+                    "positions": np.asarray(reference[f"{call}.positions"])[None],
+                    "tree_bias": np.asarray(reference[f"{call}.tree_bias"])[None, None],
+                    "cross_keys": cross.keys,
+                    "cross_values": cross.values,
+                    "cross_bias": cross.bias,
+                }
+                if prelude is not None:
+                    tree_feed["prelude_keys"] = prelude.keys
+                    tree_feed["prelude_values"] = prelude.values
+                    tree_feed["prelude_bias"] = prelude.bias
+                [logits] = runner.outputs(tree_feed)
                 want = np.asarray(reference[f"{call}.logits"], dtype=np.float32)
                 checks.append(fp16_check(f"reference.{call}.logits", "logits", logits, want))
     return checks
@@ -253,8 +273,9 @@ def feed_of(
     feed: Mapping[str, Array],
     case_context: ContextFeed | None,
     cross: CrossFeed | None,
+    prelude: PreludeFeed | None = None,
 ) -> dict[str, Array]:
-    """*feed* with the function's remaining inputs (the context rows, the cross keys) added."""
+    """*feed* with the function's remaining inputs (context rows, cross and prelude KV) added."""
     full = dict(feed)
     if family == "keys":
         assert case_context is not None
@@ -266,6 +287,12 @@ def feed_of(
             cross.values,
             cross.bias,
         )
+        if prelude is not None:
+            full["prelude_keys"], full["prelude_values"], full["prelude_bias"] = (
+                prelude.keys,
+                prelude.values,
+                prelude.bias,
+            )
     return full
 
 
@@ -327,14 +354,19 @@ def verify_family(
             for edge in edges(bundle)
             if (edge.family, edge.length) == (family, function.length)
         ]
-        if family != "context" and Edge(family, function.length, common) not in wanted:
+        if (
+            family not in ("context", "prelude")
+            and Edge(family, function.length, common) not in wanted
+        ):
             wanted.append(Edge(family, function.length, common))
         for edge in wanted:
             case = make_case(bundle, edge)
             exact = build_module(bundle, family, case.exact_length)
             want = run_case(exact, family, case, case.exact)
             del exact
-            out = runner.outputs(feed_of(family, case.padded, case.context, case.cross))
+            out = runner.outputs(
+                feed_of(family, case.padded, case.context, case.cross, case.prelude)
+            )
             got = real_parts(family, edge.real, out)
             for part, rows in got.items():
                 checks.append(
@@ -345,7 +377,7 @@ def verify_family(
                         want[part],
                     )
                 )
-            if family != "context" and edge.real == common:
+            if family not in ("context", "prelude") and edge.real == common:
                 agreed[function.name] = got
         del runner
         gc.collect()
@@ -396,7 +428,7 @@ def verify(
         if not check.ok
     ]
     agreement: list[Check] = []
-    for family in spec.FAMILIES:
+    for family in spec.families_for(bundle.manifest.decoder_prelude):
         reports, joined = verify_family(
             bundle, converted[family], build_dir, reference, require_neural_engine
         )

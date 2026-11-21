@@ -19,7 +19,7 @@ import torch
 from torch import nn
 
 from mlime.logging import log
-from mlime.train.charlm_vocab import BOS
+from mlime.train.charlm_vocab import BOS, SEP
 from mlime.train.e2e_model import Decoder, E2EModel
 from mlime.train.shapes import bucket, capturing
 
@@ -221,6 +221,8 @@ class KeySearchInputs:
     lane_lengths: torch.Tensor
     width: int
     beta: float
+    prelude_chars: torch.Tensor | None = None
+    prelude_lengths: torch.Tensor | None = None
 
 
 def padded_key_inputs(inputs: KeySearchInputs, *, bucketed: bool) -> KeySearchInputs:
@@ -246,6 +248,15 @@ def padded_key_inputs(inputs: KeySearchInputs, *, bucketed: bool) -> KeySearchIn
         (0, 0, 0, padded_positions - inputs.gains.shape[1], 0, padded_lanes - lanes),
         value=float("-inf"),
     )
+    prelude_chars = inputs.prelude_chars
+    prelude_lengths = inputs.prelude_lengths
+    if prelude_chars is not None and prelude_lengths is not None:
+        chars = prelude_chars.shape[1]
+        padded_chars = bucket(chars)
+        prelude_chars = nn.functional.pad(
+            prelude_chars, (0, padded_chars - chars, 0, padded_records - records)
+        )
+        prelude_lengths = nn.functional.pad(prelude_lengths, (0, padded_records - records))
     return KeySearchInputs(
         states=states,
         key_mask=key_mask,
@@ -254,6 +265,8 @@ def padded_key_inputs(inputs: KeySearchInputs, *, bucketed: bool) -> KeySearchIn
         lane_lengths=nn.functional.pad(inputs.lane_lengths, (0, padded_lanes - lanes), value=1),
         width=inputs.width,
         beta=inputs.beta,
+        prelude_chars=prelude_chars,
+        prelude_lengths=prelude_lengths,
     )
 
 
@@ -275,6 +288,7 @@ def run_key_search(decoder: Decoder, inputs: KeySearchInputs) -> tuple[torch.Ten
     gains = inputs.gains
     device = gains.device
     count, length, emittable = gains.shape
+    steps = length + int(decoder.score_eos)
     width = inputs.width
     rows = count * width
     lane_of_row = torch.arange(count, device=device).repeat_interleave(width)
@@ -284,6 +298,17 @@ def run_key_search(decoder: Decoder, inputs: KeySearchInputs) -> tuple[torch.Ten
         for keys, values in (cross.kv(inputs.states) for cross in decoder.gated_layers())
     ]
     encoder_mask = inputs.key_mask.index_select(0, owner)
+    prelude_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None
+    prelude_mask: torch.Tensor | None = None
+    prelude_lengths: torch.Tensor | None = None
+    if inputs.prelude_chars is not None and inputs.prelude_lengths is not None:
+        pre = decoder.prelude_eager(inputs.prelude_chars, inputs.prelude_lengths)
+        prelude_kv = [
+            (k.index_select(0, owner).contiguous(), v.index_select(0, owner).contiguous())
+            for k, v in zip(pre.keys, pre.values, strict=True)
+        ]
+        prelude_mask = pre.mask.index_select(0, owner)
+        prelude_lengths = pre.lengths.index_select(0, owner)
     carried = torch.full((emittable,), float("-inf"), device=device)
     carried[:1].fill_(0.0)
     layers, heads = decoder.reader.config.layers, decoder.reader.config.heads
@@ -293,13 +318,14 @@ def run_key_search(decoder: Decoder, inputs: KeySearchInputs) -> tuple[torch.Ten
         if torch.is_autocast_enabled(device.type)
         else decoder.reader.embed.weight.dtype
     )
-    keys = torch.zeros(layers, rows, heads, length, head_dim, dtype=cached, device=device)
+    keys = torch.zeros(layers, rows, heads, steps, head_dim, dtype=cached, device=device)
     values = torch.zeros_like(keys)
     scores = torch.full((count, width), float("-inf"), device=device)
     scores[:, :1].fill_(0.0)
-    tokens = torch.full((rows,), BOS, dtype=torch.long, device=device)
+    root_id = SEP if prelude_kv is not None else BOS
+    tokens = torch.full((rows,), root_id, dtype=torch.long, device=device)
     block = torch.arange(count, device=device).unsqueeze(1) * width
-    positions = torch.arange(length, device=device)
+    positions = torch.arange(steps, device=device)
     parents: list[torch.Tensor] = []
     choices: list[torch.Tensor] = []
     # Marked as in :func:`run_search`: a compiled advance's first graph is the
@@ -313,7 +339,13 @@ def run_key_search(decoder: Decoder, inputs: KeySearchInputs) -> tuple[torch.Ten
     for pair in encoder_kv:
         for part in pair:
             torch._dynamo.maybe_mark_dynamic(part, (0, 2))
-    for position in range(length):
+    if prelude_kv is not None and prelude_mask is not None and prelude_lengths is not None:
+        torch._dynamo.maybe_mark_dynamic(prelude_mask, (0, 1))
+        torch._dynamo.maybe_mark_dynamic(prelude_lengths, 0)
+        for pair in prelude_kv:
+            for part in pair:
+                torch._dynamo.maybe_mark_dynamic(part, (0, 2))
+    for position in range(steps):
         tokens, scores, (keys, values), parent, choice = decoder.advance_keys(
             positions[position],
             tokens,
@@ -327,10 +359,13 @@ def run_key_search(decoder: Decoder, inputs: KeySearchInputs) -> tuple[torch.Ten
             carried,
             block,
             inputs.beta,
+            prelude_kv,
+            prelude_mask,
+            prelude_lengths,
         )
         parents.append(parent)
         choices.append(choice)
-    return walk_back(torch.stack(parents), torch.stack(choices)), scores
+    return walk_back(torch.stack(parents), torch.stack(choices))[:, :, :length], scores
 
 
 def walk_back(parents: torch.Tensor, choices: torch.Tensor) -> torch.Tensor:
@@ -435,15 +470,28 @@ class SearchGraphs:
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """:func:`run_key_search` over *inputs*, from this shape's captured graph."""
         autocast = torch.get_autocast_dtype("cuda") if torch.is_autocast_enabled("cuda") else None
+        prelude_shape = None if inputs.prelude_chars is None else inputs.prelude_chars.shape
         key = (
             "keys",
             inputs.states.shape,
             inputs.gains.shape,
+            prelude_shape,
+            decoder.score_eos,
             inputs.states.dtype,
             inputs.width,
             inputs.beta,
             autocast,
         )
+        given: dict[str, torch.Tensor] = {
+            "key_states": inputs.states,
+            "key_mask": inputs.key_mask,
+            "lane_owner": inputs.lane_owner,
+            "key_gains": inputs.gains,
+            "key_lane_lengths": inputs.lane_lengths,
+        }
+        if inputs.prelude_chars is not None and inputs.prelude_lengths is not None:
+            given["prelude_chars"] = inputs.prelude_chars
+            given["prelude_lengths"] = inputs.prelude_lengths
 
         def build(views: dict[str, torch.Tensor]) -> KeySearchInputs:
             return KeySearchInputs(
@@ -454,17 +502,13 @@ class SearchGraphs:
                 lane_lengths=views["key_lane_lengths"],
                 width=inputs.width,
                 beta=inputs.beta,
+                prelude_chars=views.get("prelude_chars"),
+                prelude_lengths=views.get("prelude_lengths"),
             )
 
         return self._replay(
             key,
-            {
-                "key_states": inputs.states,
-                "key_mask": inputs.key_mask,
-                "lane_owner": inputs.lane_owner,
-                "key_gains": inputs.gains,
-                "key_lane_lengths": inputs.lane_lengths,
-            },
+            given,
             build,
             lambda static: run_key_search(decoder, static),
             autocast,
