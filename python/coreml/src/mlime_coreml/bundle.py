@@ -12,7 +12,7 @@ import json
 import types
 import typing
 from collections.abc import Callable
-from dataclasses import dataclass, fields, is_dataclass
+from dataclasses import MISSING, dataclass, fields, is_dataclass
 from pathlib import Path
 from typing import Any, Literal, cast
 
@@ -162,6 +162,11 @@ class Manifest:
     families: tuple[FamilySpec, ...]
     tensors: tuple[TensorEntry, ...]
     reference: tuple[ReferenceProbe, ...]
+    decoder_prelude: bool = False
+    score_eos: bool = False
+    reader_eos: int = 2
+    reader_sep: int = 3
+    reader_unk: int = 4
 
     def family(self, name: Family) -> FamilySpec:
         """The family called *name*."""
@@ -175,14 +180,21 @@ def _build(kind: Any, data: Any, where: str) -> Any:
         if not isinstance(data, dict):
             raise ValueError(f"{where}: expected an object, found {type(data).__name__}")
         hints = typing.get_type_hints(kind)
-        names = {field.name for field in fields(kind)}
-        if set(data) != names:
+        declared = fields(kind)
+        names = {field.name for field in declared}
+        required = {
+            field.name
+            for field in declared
+            if field.default is MISSING and field.default_factory is MISSING
+        }
+        problems = (set(data) - names) | (required - set(data))
+        if problems:
             raise ValueError(
-                f"{where}: fields {sorted(set(data) ^ names)} are missing or unknown to this code"
+                f"{where}: fields {sorted(problems)} are missing or unknown to this code"
             )
         construct = cast(Callable[..., Any], kind)
         return construct(
-            **{name: _build(hints[name], data[name], f"{where}.{name}") for name in names}
+            **{name: _build(hints[name], data[name], f"{where}.{name}") for name in data}
         )
     if origin is tuple:
         [item, *_] = typing.get_args(kind)
@@ -225,14 +237,20 @@ class Bundle:
             return {name: archive[name] for name in archive.files}
 
 
-def expected_families() -> tuple[FamilySpec, ...]:
+def expected_families(decoder_prelude: bool = False) -> tuple[FamilySpec, ...]:
     """The families and functions this code's buckets define."""
     sizes: dict[Family, tuple[int, ...]] = {
         "context": spec.CONTEXT_BUCKETS,
+        "prelude": spec.PRELUDE_BUCKETS,
         "keys": spec.KEYS_WIDTHS,
         "tree": spec.TREE_BUCKETS,
     }
-    sentinels = {"context": spec.KEY_SENTINELS, "keys": spec.KEY_SENTINELS, "tree": 0}
+    sentinels = {
+        "context": spec.KEY_SENTINELS,
+        "prelude": spec.KEY_SENTINELS,
+        "keys": spec.KEY_SENTINELS,
+        "tree": 0,
+    }
     return tuple(
         FamilySpec(
             family,
@@ -241,7 +259,7 @@ def expected_families() -> tuple[FamilySpec, ...]:
                 for size in sizes[family]
             ),
         )
-        for family in spec.FAMILIES
+        for family in spec.families_for(decoder_prelude)
     )
 
 
@@ -259,7 +277,7 @@ def read_bundle(directory: Path) -> Bundle:
             f"{path} was written for packing policy {manifest.policy_version}; this code "
             f"implements {spec.POLICY_VERSION}"
         )
-    if manifest.families != expected_families():
+    if manifest.families != expected_families(manifest.decoder_prelude):
         raise ValueError(f"{path} lists function families other than this code's buckets")
     if (manifest.n_max, manifest.neg) != (spec.N_MAX, spec.NEG):
         raise ValueError(

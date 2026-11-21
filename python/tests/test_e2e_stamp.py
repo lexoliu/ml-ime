@@ -642,3 +642,28 @@ def test_a_key_stage_stamps_the_arcs_lexicon_its_evaluation_reads(tmp_path: Path
             stage=E2EV2Stage(init_from="mlime-e2e-v2-g4"),
             key_arcs="knowledge.tsv",
         )
+
+
+def test_joint_stage_stamps_decoder_prelude_and_score_eos_and_refuses_warm_up(
+    tmp_path: Path,
+) -> None:
+    out = tmp_path / "prelude"
+    argv = ["e2e", "stamp", "mlime-e2e-keys-s2-prelude", "--out", str(out)]
+    stage = ["--init-from", "mlime-e2e-keys-s1-frame3-a100", "--keys"]
+    result = CliRunner().invoke(app, [*argv, *stage, "--decoder-prelude", "--score-eos"])
+    assert result.exit_code == 0, result.output
+    kernel = (out / "kernel.py").read_text()
+    assert literal(kernel, "KEYS") == {
+        "layers": 2,
+        "transition_weight": 1.0,
+        "decoder_prelude": True,
+        "score_eos": True,
+        "correct_syllables": True,
+    }
+    for flag in ("--decoder-prelude", "--score-eos"):
+        warm = CliRunner().invoke(
+            app, [*argv, *stage, "--key-warm-up", flag, "--out", str(tmp_path / "w")]
+        )
+        assert warm.exit_code == 2 and "trains no transition" in error(warm.output)
+        no_init = CliRunner().invoke(app, [*argv, "--keys", flag, "--out", str(tmp_path / "n")])
+        assert no_init.exit_code == 2 and "pass --init-from" in error(no_init.output)

@@ -53,7 +53,7 @@ import torch
 import torch.nn.functional as functional
 
 from mlime.legality import MAX_ARC_KEYS, Legality, LegalityOptions
-from mlime.train.charlm_vocab import BOS
+from mlime.train.charlm_vocab import BOS, SEP
 from mlime.train.ctc import alignment_scores, constrained_ctc
 from mlime.train.e2e_model import KeyRankingConfig
 from mlime.train.e2e_search import (
@@ -571,16 +571,31 @@ def sentence_scores(
     nll = constrained_ctc(blank, emit, priced(cost, gamma), keys.index_select(0, owner), lengths)
     decoder = model.decoder
     ids = decoder.emit_ids[sequences]
-    previous = torch.cat([torch.full_like(ids[:, :1], BOS), ids[:, :-1]], dim=1)
-    steps = torch.arange(sequences.shape[1], device=sequences.device) < lengths.unsqueeze(1)
+    root_id = SEP if states.prelude is not None else BOS
+    root = torch.full_like(ids[:, :1], root_id)
+    if decoder.score_eos:
+        emittable = int(decoder.emit_ids.numel())
+        previous = torch.cat([root, ids], dim=1)
+        said = torch.cat([sequences, torch.full_like(sequences[:, :1], emittable)], dim=1).scatter(
+            1, lengths.unsqueeze(1), emittable
+        )
+        steps = torch.arange(sequences.shape[1] + 1, device=sequences.device) <= lengths.unsqueeze(
+            1
+        )
+        step_bound = bound + int(sequences.shape[0])
+    else:
+        previous = torch.cat([root, ids[:, :-1]], dim=1)
+        said = sequences
+        steps = torch.arange(sequences.shape[1], device=sequences.device) < lengths.unsqueeze(1)
+        step_bound = bound
     for tensor in (previous, steps):
         torch._dynamo.maybe_mark_dynamic(tensor, (0, 1))
-    features = decoder.over_keys(previous, states.states, states.mask, owner)
+    features = decoder.over_keys(previous, states.states, states.mask, owner, states.prelude)
     reader = decoder.reader
     projected = reader.project(reader.dropout(features))
-    emitted = reader.embed.weight.index_select(0, decoder.emit_ids)
+    emitted = reader.embed.weight.index_select(0, decoder.output_ids())
     return SentenceScores(
-        nll=nll, transition=packed_path_scores(projected, emitted, sequences, steps, bound)
+        nll=nll, transition=packed_path_scores(projected, emitted, said, steps, step_bound)
     )
 
 
@@ -667,7 +682,10 @@ class KeyRankingModel(KeyE2EModel):
             encoded.reshape(-1, hidden).index_select(0, keyed.key_positions)
         )
         gold_nll, blank, emit = self.gold_alignment(keyed, log_probs)
-        states = self.states_at_keys(keyed.key_mask, encoded)
+        prelude = self._encode_prelude(
+            keyed.prelude_chars, keyed.prelude_lengths, keyed.spans.context_rows
+        )
+        states = self.states_at_keys(keyed.key_mask, encoded, prelude)
 
         table = dense_span_table(batch, self.decoder.emit_ids.numel())
         spans = span_rows_of(batch)
@@ -691,7 +709,8 @@ class KeyRankingModel(KeyE2EModel):
         scored = keyed.scored.numel()
         examples = keyed.size
         ctc = gold_nll.sum() / scored
-        transition = -parts.transition[:examples].sum() / scored
+        transition_tokens = scored + examples if self.decoder.score_eos else scored
+        transition = -parts.transition[:examples].sum() / transition_tokens
         term, extras = self.sequence_term(items, parts, ranking)
         loss = ctc + self.keys_config.transition_weight * transition + ranking.weight * term
         if ranking.teacher_weight > 0.0:
@@ -739,6 +758,7 @@ class KeyRankingModel(KeyE2EModel):
                 value, back, keyed.keys, keyed.span_end, keyed.lengths, ranking.other_lengths, cap
             )
             gains = lane_gains(log_probs, keyed.key_index, table, spans, lanes, ranking.gamma)
+            has_prelude = self.keys_config.decoder_prelude
             inputs = padded_key_inputs(
                 KeySearchInputs(
                     states=states.states.detach(),
@@ -748,6 +768,8 @@ class KeyRankingModel(KeyE2EModel):
                     lane_lengths=lanes.lengths,
                     width=ranking.beam,
                     beta=ranking.beta,
+                    prelude_chars=keyed.prelude_chars if has_prelude else None,
+                    prelude_lengths=keyed.prelude_lengths if has_prelude else None,
                 ),
                 bucketed=self.search_graphs is not None,
             )

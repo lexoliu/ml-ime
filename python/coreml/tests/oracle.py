@@ -64,7 +64,10 @@ GATED = 1
 LETTERS = 26
 SPECIALS = Specials(pad=0, cls=1, sep=2, mask=3)
 READER_BOS = 1
-READER_IDS = (4, 5, 6, 7, 8, 9, 10, 11, 12)
+READER_EOS = 2
+READER_SEP = 3
+READER_UNK = 4
+READER_IDS = (5, 6, 7, 8, 9, 10, 11, 12, 13)
 EPS = spec.DEFAULT_LAYER_NORM_EPS
 
 #: The probes the reference holds: a name, its keys (as letter ids) and its context's token ids.
@@ -224,12 +227,21 @@ def random_weights(seed: int = 5) -> Weights:
     return weights
 
 
-def _families(name: str) -> tuple[Family, ...]:
+def _families(name: str, decoder_prelude: bool = False) -> tuple[Family, ...]:
     """The families that read a tensor, as the training side's table names them."""
     if name.startswith("context."):
         return ("context",)
     if name.startswith("decoder.cross_attention.") and name.split(".")[-2] in ("key", "value"):
         return ("keys",)
+    if decoder_prelude and name.startswith(
+        (
+            "decoder.reader.embed.",
+            "decoder.reader.input.",
+            "decoder.reader.positions.",
+            "decoder.reader.blocks.",
+        )
+    ):
+        return ("prelude", "tree")
     if name.startswith("decoder."):
         return ("tree",)
     return ("keys",)
@@ -385,12 +397,58 @@ def oracle_keys(
     return logits, keys, values
 
 
-def oracle_row(
-    w: Weights, prefix: tuple[int, ...], keys: torch.Tensor, values: torch.Tensor, real: int
-) -> torch.Tensor:
-    """The decoder's next-character logits ``[E]`` after *prefix*, run causally over all of it."""
+def oracle_prelude(
+    w: Weights, prelude_ids: list[int], bucket: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Causal reader over *prelude_ids* (``<bos>`` first), padded to *bucket*."""
     d = DECODER
-    tokens = torch.tensor([[READER_BOS, *(READER_IDS[index] for index in prefix)]])
+    tokens = torch.tensor([prelude_ids], dtype=torch.long)
+    x = nn.functional.linear(
+        nn.functional.embedding(tokens, w["decoder.reader.embed.weight"]),
+        w["decoder.reader.input.weight"],
+        w["decoder.reader.input.bias"],
+    )
+    x = x + w["decoder.reader.positions.weight"][: tokens.shape[1]]
+    keys = torch.zeros(d.layers, d.heads, bucket, d.head_dim)
+    values = torch.zeros_like(keys)
+    for layer in range(d.layers):
+        base = f"decoder.reader.blocks.{layer}"
+        q, k, v = _linear(w, f"{base}.qkv", _norm(w, f"{base}.norm1", x, d.layer_norm_eps)).chunk(
+            3, -1
+        )
+        kh, vh = _heads(k, d.heads), _heads(v, d.heads)
+        keys[layer, :, : len(prelude_ids)] = kh[0]
+        values[layer, :, : len(prelude_ids)] = vh[0]
+        attended = nn.functional.scaled_dot_product_attention(
+            _heads(q, d.heads), kh, vh, is_causal=True
+        )
+        x = x + _linear(w, f"{base}.out", _merge(attended))
+        lifted = nn.functional.gelu(
+            _linear(w, f"{base}.ff.0", _norm(w, f"{base}.norm2", x, d.layer_norm_eps))
+        )
+        x = x + nn.functional.linear(lifted, w[f"{base}.ff.2.weight"], w[f"{base}.ff.2.bias"])
+    return keys, values
+
+
+def oracle_row(
+    w: Weights,
+    prefix: tuple[int, ...],
+    keys: torch.Tensor,
+    values: torch.Tensor,
+    real: int,
+    prelude_ids: list[int] | None = None,
+    score_eos: bool = False,
+) -> torch.Tensor:
+    """The decoder's next-character logits ``[E (+ 1)]`` after *prefix*, run causally."""
+    d = DECODER
+    if prelude_ids is None:
+        tokens = torch.tensor([[READER_BOS, *(READER_IDS[index] for index in prefix)]])
+        pre_len = 0
+    else:
+        tokens = torch.tensor(
+            [[*prelude_ids, READER_SEP, *(READER_IDS[index] for index in prefix)]]
+        )
+        pre_len = len(prelude_ids)
     x = nn.functional.linear(
         nn.functional.embedding(tokens, w["decoder.reader.embed.weight"]),
         w["decoder.reader.input.weight"],
@@ -410,15 +468,19 @@ def oracle_row(
             _linear(w, f"{base}.ff.0", _norm(w, f"{base}.norm2", x, d.layer_norm_eps))
         )
         x = x + nn.functional.linear(lifted, w[f"{base}.ff.2.weight"], w[f"{base}.ff.2.bias"])
+        # Only the sentence portion (from <sep> / <bos> onwards) cross-attends to key states!
+        sent = x[:, pre_len:]
         cross = f"decoder.cross_attention.{layer}"
-        query = _heads(_linear(w, f"{cross}.query", _norm(w, f"{cross}.norm", x, EPS)), d.heads)
-        attended = nn.functional.scaled_dot_product_attention(
+        query = _heads(_linear(w, f"{cross}.query", _norm(w, f"{cross}.norm", sent, EPS)), d.heads)
+        cross_att = nn.functional.scaled_dot_product_attention(
             query, keys[layer][None, :, :real], values[layer][None, :, :real]
         )
-        x = x + w[f"{cross}.gate"] * _linear(w, f"{cross}.out", _merge(attended))
+        sent = sent + w[f"{cross}.gate"] * _linear(w, f"{cross}.out", _merge(cross_att))
+        x = torch.cat([x[:, :pre_len], sent], dim=1)
     features = _norm(w, "decoder.reader.norm", x, d.layer_norm_eps)[0, -1]
     projected = _linear(w, "decoder.reader.project", features)
-    emitted = w["decoder.reader.embed.weight"][torch.tensor(READER_IDS)]
+    out_ids = (*READER_IDS, READER_EOS) if score_eos else READER_IDS
+    emitted = w["decoder.reader.embed.weight"][torch.tensor(out_ids)]
     return emitted @ projected
 
 
@@ -431,26 +493,30 @@ def _call(
     keys: torch.Tensor,
     values: torch.Tensor,
     real: int,
+    prelude_ids: list[int] | None = None,
+    score_eos: bool = False,
 ) -> dict[str, np.ndarray]:
     """One packed call over *requests*: the policy's single call, with the oracle's rows."""
     nodes = sorted({p[:i] for p in requests for i in range(len(p) + 1)}, key=lambda p: (len(p), p))
     bucket = next(size for size in spec.TREE_BUCKETS if size >= len(nodes))
     index = {node: row for row, node in enumerate(nodes)}
-    reader_ids = np.full(bucket, READER_BOS, dtype=np.int32)
-    positions = np.zeros(bucket, dtype=np.int32)
+    offset = 0 if prelude_ids is None else len(prelude_ids)
+    root_tok = READER_BOS if prelude_ids is None else READER_SEP
+    reader_ids = np.full(bucket, root_tok, dtype=np.int32)
+    positions = np.full(bucket, offset, dtype=np.int32)
     bias = np.full((bucket, bucket), spec.NEG, dtype=np.float32)
-    logits = np.zeros((bucket, EMITTED), dtype=np.float32)
-    root = oracle_row(w, (), keys, values, real).numpy()
+    logits = np.zeros((bucket, EMITTED + int(score_eos)), dtype=np.float32)
+    root = oracle_row(w, (), keys, values, real, prelude_ids, score_eos).numpy()
     for row in range(bucket):
         bias[row, row] = 0.0
         logits[row] = root
     for row, node in enumerate(nodes):
-        positions[row] = len(node)
+        positions[row] = offset + len(node)
         if node:
             reader_ids[row] = READER_IDS[node[-1]]
             for ancestor in (node[:i] for i in range(len(node))):
                 bias[row, index[ancestor]] = 0.0
-        logits[row] = oracle_row(w, node, keys, values, real).numpy()
+        logits[row] = oracle_row(w, node, keys, values, real, prelude_ids, score_eos).numpy()
     answers = np.array([(i, index[p]) for i, p in enumerate(requests)], dtype=np.int32).reshape(
         -1, 2
     )
@@ -475,17 +541,24 @@ def reference_sets(seed: int) -> tuple[tuple[tuple[int, ...], ...], ...]:
     return scripted, seeded
 
 
-def write_bundle(directory: Path, seed: int = 5) -> Manifest:
+def write_bundle(
+    directory: Path,
+    seed: int = 5,
+    *,
+    decoder_prelude: bool = False,
+    score_eos: bool = False,
+) -> Manifest:
     """Write the tiny bundle: weights, manifest, tokenizer stand-in and an oracle-made reference."""
     directory.mkdir(parents=True, exist_ok=True)
     w = random_weights(seed)
     arrays: dict[str, np.ndarray] = {}
     probes = []
+    ctx_bucket = spec.CONTEXT_BUCKETS[0]
     with torch.no_grad():
         for index, (name, letters, context_ids) in enumerate(PROBES):
-            ids = np.full(spec.CONTEXT_BUCKETS[0], SPECIALS.pad, dtype=np.int32)
-            mask = np.zeros(spec.CONTEXT_BUCKETS[0], dtype=np.float32)
-            rows = np.zeros((spec.CONTEXT_BUCKETS[0], TOWER.hidden), dtype=np.float32)
+            ids = np.full(ctx_bucket, SPECIALS.pad, dtype=np.int32)
+            mask = np.zeros(ctx_bucket, dtype=np.float32)
+            rows = np.zeros((ctx_bucket, TOWER.hidden), dtype=np.float32)
             context = None
             if context_ids is not None:
                 real = len(context_ids)
@@ -498,10 +571,29 @@ def write_bundle(directory: Path, seed: int = 5) -> Manifest:
                 f"{name}.context_mask": mask,
                 f"{name}.context": rows,
             }
+            prelude_ids: list[int] | None = None
+            if decoder_prelude:
+                prelude_ids = (
+                    [READER_BOS]
+                    if context_ids is None
+                    else [READER_BOS, READER_IDS[0], READER_UNK, READER_IDS[2]]
+                )
+                pre_tokens = np.zeros(ctx_bucket, dtype=np.int32)
+                pre_tokens[: len(prelude_ids)] = prelude_ids
+                pre_keys, pre_values = oracle_prelude(w, prelude_ids, ctx_bucket)
+                pre_bias = np.full((1, 1, 1, ctx_bucket), spec.NEG, dtype=np.float32)
+                pre_bias[..., : len(prelude_ids)] = 0.0
+                arrays |= {
+                    f"{name}.prelude_tokens": pre_tokens,
+                    f"{name}.prelude_length": np.array(len(prelude_ids), dtype=np.int32),
+                    f"{name}.prelude_keys": pre_keys.numpy(),
+                    f"{name}.prelude_values": pre_values.numpy(),
+                    f"{name}.prelude_bias": pre_bias,
+                }
             n = len(letters)
             row_ids = np.array([SPECIALS.cls, *([SPECIALS.mask] * n), SPECIALS.sep], dtype=np.int32)
-            arrays[f"{name}.input_ids"] = row_ids
             arrays[f"{name}.key_letters"] = np.array([LETTERS, *letters, LETTERS], dtype=np.int32)
+            arrays[f"{name}.input_ids"] = row_ids
             arrays[f"{name}.attention_mask"] = np.ones(n + 2, dtype=np.float32)
             logits, keys, values = oracle_keys(w, letters, context)
             arrays[f"{name}.ctc_logits"] = logits.numpy()
@@ -512,7 +604,7 @@ def write_bundle(directory: Path, seed: int = 5) -> Manifest:
             arrays[f"{name}.cross_bias"] = bias
             sets = reference_sets(index)
             for number, requests in enumerate(sets):
-                call = _call(w, list(requests), keys, values, n)
+                call = _call(w, list(requests), keys, values, n, prelude_ids, score_eos)
                 for key, value in call.items():
                     arrays[f"{name}.tree{number}.call0.{key}"] = value
             probes.append(ReferenceProbe(name, "".join(chr(97 + c) for c in letters), None, sets))
@@ -526,7 +618,7 @@ def write_bundle(directory: Path, seed: int = 5) -> Manifest:
         policy_version=spec.POLICY_VERSION,
         n_max=spec.N_MAX,
         neg=spec.NEG,
-        context_tokens=spec.CONTEXT_BUCKETS[0],
+        context_tokens=ctx_bucket,
         specials=SPECIALS,
         letter_pad=LETTERS,
         characters=tuple("abcdefghi"),
@@ -535,14 +627,22 @@ def write_bundle(directory: Path, seed: int = 5) -> Manifest:
         dims=dims(),
         correct_syllables=True,
         probes=(),
-        families=expected_families(),
+        families=expected_families(decoder_prelude),
         tensors=tuple(
             TensorEntry(
-                name, tuple(tensor.shape), str(tensor.dtype).removeprefix("torch."), _families(name)
+                name,
+                tuple(tensor.shape),
+                str(tensor.dtype).removeprefix("torch."),
+                _families(name, decoder_prelude),
             )
             for name, tensor in w.items()
         ),
         reference=tuple(probes),
+        decoder_prelude=decoder_prelude,
+        score_eos=score_eos,
+        reader_eos=READER_EOS,
+        reader_sep=READER_SEP,
+        reader_unk=READER_UNK,
     )
     (directory / MANIFEST).write_text(json.dumps(dataclasses.asdict(manifest), indent=2) + "\n")
     return manifest

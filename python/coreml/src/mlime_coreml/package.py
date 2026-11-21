@@ -125,7 +125,7 @@ def build_archive(
     Returns its path and sha256.
     """
     entries: list[tuple[str, bytes | Path | None]] = []
-    for family in spec.FAMILIES:
+    for family in spec.families_for(manifest.decoder_prelude):
         entries.extend(_tree(models_dir / spec.DIRECTORIES[family], models_dir))
     entries += [
         (MANIFEST, bundle_dir / MANIFEST),

@@ -62,7 +62,7 @@ def bench_feed(bundle: Bundle, family: Family, function: Function) -> dict[str, 
     """A full-bucket feed: the traced sample's structure, random context and cross activations."""
     feed = sample_feed(bundle, family, function)
     rng = np.random.default_rng(0)
-    for name in ("context", "cross_keys", "cross_values"):
+    for name in ("context", "cross_keys", "cross_values", "prelude_keys", "prelude_values"):
         if name in feed:
             feed[name] = rng.standard_normal(feed[name].shape).astype(np.float32)
     return feed
@@ -126,17 +126,18 @@ def bench_family(
 
 
 def bench(
-    bundle: Bundle, work_dir: Path, families: tuple[Family, ...] = spec.FAMILIES
+    bundle: Bundle, work_dir: Path, families: tuple[Family, ...] | None = None
 ) -> dict[str, dict[str, dict[str, object]]]:
     """Convert each family, measure it, delete its models, write ``work_dir/bench.json``.
 
     One family at a time, so the working set is one family's packages and the disk holds one.
     """
+    chosen = spec.families_for(bundle.manifest.decoder_prelude) if families is None else families
     build_dir = work_dir / "build"
     models_dir = work_dir / "models"
     build_dir.mkdir(parents=True, exist_ok=True)
     report: dict[str, dict[str, dict[str, object]]] = {}
-    for family in families:
+    for family in chosen:
         converted = convert_family(bundle, family, build_dir, models_dir)
         report[family] = bench_family(bundle, converted, build_dir)
         shutil.rmtree(converted.package)

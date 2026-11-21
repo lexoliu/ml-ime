@@ -64,3 +64,29 @@ def test_a_tensor_the_manifest_does_not_list_is_refused(bundle_dir: Path, tmp_pa
     (broken / MANIFEST).write_text(json.dumps(document))
     with pytest.raises(ValueError, match=f"{WEIGHTS} and the manifest disagree"):
         read_bundle(broken)
+
+
+def test_a_prelude_and_eos_oracle_bundle_passes_port_and_padding_and_legacy_loads(
+    bundle_dir: Path, tmp_path: Path
+) -> None:
+    from oracle import write_bundle
+
+    prelude_dir = tmp_path / "prelude-bundle"
+    write_bundle(prelude_dir, seed=11, decoder_prelude=True, score_eos=True)
+    prelude_bundle = read_bundle(prelude_dir)
+    assert prelude_bundle.manifest.decoder_prelude and prelude_bundle.manifest.score_eos
+    checks = check_port(prelude_bundle)
+    kinds = {check.name.split(".")[-1] for check in checks}
+    assert {"prelude_keys", "prelude_values", "logits", "log_probs"} <= kinds
+    assert not [(c.name, c.max_abs) for c in checks if not c.ok]
+    assert not [(c.name, c.max_abs) for c in check_padding(prelude_bundle) if not c.ok]
+
+    # Legacy manifest omitting #309 fields still loads cleanly.
+    legacy = tmp_path / "legacy"
+    shutil.copytree(bundle_dir, legacy)
+    document = json.loads((legacy / MANIFEST).read_text())
+    for key in ("decoder_prelude", "score_eos", "reader_eos", "reader_sep", "reader_unk"):
+        document.pop(key, None)
+    (legacy / MANIFEST).write_text(json.dumps(document))
+    loaded = read_bundle(legacy)
+    assert not loaded.manifest.decoder_prelude and not loaded.manifest.score_eos

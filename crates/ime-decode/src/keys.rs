@@ -199,6 +199,9 @@ pub struct KeySearchOptions {
     pub prior: Weight,
     /// The arcs landing per key offset: the best by optimistic gain.
     pub arc_width: NonZeroUsize,
+    /// Close complete hypotheses at the final key with `log T(<eos> | output)`,
+    /// read from column `E` of each transition row.
+    pub score_eos: bool,
 }
 
 /// The arcs landing per offset the product's search uses: its shape, as the
@@ -695,6 +698,9 @@ struct Search {
     combine: Combine,
     beam_width: Option<NonZeroUsize>,
     top_k: Option<NonZeroUsize>,
+    score_eos: bool,
+    eos_keep: Option<NonZeroUsize>,
+    closing: Vec<PrefixState>,
     prior: f64,
     /// The extra mass a landed arc adds in the sum: `log(e^pi - 1)`.
     bonus: f64,
@@ -725,6 +731,8 @@ impl Search {
                 arcs: 0,
             }],
         };
+        let top_k = options.top_k.or(options.beam);
+        let eos_keep = options.beam.map(|beam| top_k.map_or(beam, |k| beam.max(k)));
         let prior = options.prior.get();
         let mut search = Self {
             tables: Tables::new(lattice, log_probs, options.gamma.get()),
@@ -735,7 +743,10 @@ impl Search {
             beta: options.beta.get(),
             combine: options.combine,
             beam_width: options.beam,
-            top_k: options.top_k.or(options.beam),
+            top_k,
+            score_eos: options.score_eos,
+            eos_keep,
+            closing: Vec::new(),
             prior,
             bonus: if prior > 0.0 {
                 prior + (-(-prior).exp()).ln_1p()
@@ -1100,7 +1111,11 @@ impl Search {
         let mut survivors = self.carry_over(end, &groups, &by_parent, &mut taken);
         let final_key = end == self.tables.keys;
         let limit = if final_key {
-            self.top_k
+            if self.score_eos {
+                self.eos_keep
+            } else {
+                self.top_k
+            }
         } else {
             self.beam_width
         };
@@ -1117,7 +1132,32 @@ impl Search {
         }
         self.land_arcs(&mut survivors, end);
         if final_key {
-            return Some(self.finish(&survivors));
+            if !self.score_eos || survivors.is_empty() {
+                return Some(self.finish(&survivors));
+            }
+            if let Some(keep) = self.eos_keep.filter(|keep| survivors.len() > keep.get()) {
+                let n = self.tables.keys;
+                let scores: Vec<f64> = survivors
+                    .iter()
+                    .map(|prefix| {
+                        let state =
+                            prefix.cuts.iter().find(|state| state.cut == n).expect(
+                                "every output at the last key has the cut at the key count",
+                            );
+                        state.mass + self.beta * prefix.transition
+                    })
+                    .collect();
+                let mut order: Vec<usize> = (0..survivors.len()).collect();
+                order.sort_by(|&a, &b| descending(scores[a], scores[b]));
+                order.truncate(keep.get());
+                let mut slots: Vec<Option<PrefixState>> = survivors.into_iter().map(Some).collect();
+                survivors = order
+                    .into_iter()
+                    .filter_map(|index| slots[index].take())
+                    .collect();
+            }
+            self.closing = survivors;
+            return None;
         }
         self.beam = self.prune(survivors, end);
         self.evict();
@@ -1253,6 +1293,45 @@ impl Search {
         results
     }
 
+    /// Close the surviving outputs at the last key with `log T(<eos> | output)`.
+    fn finish_eos(&self, emittable: usize) -> Vec<KeyHypothesis> {
+        let n = self.tables.keys;
+        let mut results: Vec<KeyHypothesis> = self
+            .closing
+            .iter()
+            .map(|prefix| {
+                let state = prefix
+                    .cuts
+                    .iter()
+                    .find(|state| state.cut == n)
+                    .expect("every output at the last key has the cut at the key count");
+                let mut ids = Vec::new();
+                self.trie.ids_into(prefix.id, &mut ids);
+                let (cuts, mut steps) = self.covers.walk(state.cover);
+                let eos = f64::from(self.rows[&prefix.id][emittable]);
+                let transition = prefix.transition + eos;
+                if let Some(last) = steps.last_mut() {
+                    *last += self.beta * eos;
+                }
+                KeyHypothesis {
+                    ids,
+                    cuts,
+                    steps,
+                    score: state.mass + self.beta * transition + self.tables.blank_total,
+                    ctc: state.ctc + self.tables.blank_total,
+                    transition,
+                    correction: state.correction,
+                    arcs: state.arcs,
+                }
+            })
+            .collect();
+        results.sort_by(|a, b| descending(a.score, b.score));
+        if let Some(top_k) = self.top_k {
+            results.truncate(top_k.get());
+        }
+        results
+    }
+
     /// Drop the rows of prefixes no beam prefix can extend into again: a row
     /// stays while its prefix, or one of its ancestors, is in the beam.
     fn evict(&mut self) {
@@ -1320,7 +1399,8 @@ pub fn key_search<T: KeyTransition>(
     if lattice.is_empty() || !inputs_agree(lattice, log_probs) {
         return Ok(Vec::new());
     }
-    let width = log_probs.emittable();
+    let emittable = log_probs.emittable();
+    let row_width = emittable + usize::from(options.score_eos);
     let mut search = Search::new(lattice, log_probs, words, options, stats);
     for end in 1..=lattice.keys() {
         if search.beam.is_empty() {
@@ -1332,17 +1412,35 @@ pub fn key_search<T: KeyTransition>(
             if queries.is_empty() {
                 continue;
             }
-            let mut rows = vec![0.0_f32; queries.len() * width];
+            let mut rows = vec![0.0_f32; queries.len() * row_width];
             transition.rows(&search.trie, &queries, &mut rows)?;
             stats.calls += 1;
             stats.rows += queries.len();
             stats.landing_rows += landings;
-            for (&id, row) in queries.iter().zip(rows.chunks_exact(width)) {
+            for (&id, row) in queries.iter().zip(rows.chunks_exact(row_width)) {
                 search.rows.insert(id, row.into());
             }
         }
         if let Some(results) = search.step(end) {
             return Ok(results);
+        }
+        if !search.closing.is_empty() {
+            let queries: Vec<PrefixId> = search
+                .closing
+                .iter()
+                .map(|prefix| prefix.id)
+                .filter(|id| !search.rows.contains_key(id))
+                .collect();
+            if !queries.is_empty() {
+                let mut rows = vec![0.0_f32; queries.len() * row_width];
+                transition.rows(&search.trie, &queries, &mut rows)?;
+                stats.calls += 1;
+                stats.rows += queries.len();
+                for (&id, row) in queries.iter().zip(rows.chunks_exact(row_width)) {
+                    search.rows.insert(id, row.into());
+                }
+            }
+            return Ok(search.finish_eos(emittable));
         }
     }
     Ok(Vec::new())

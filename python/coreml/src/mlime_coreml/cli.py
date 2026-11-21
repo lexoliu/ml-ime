@@ -39,11 +39,12 @@ def _convert(args: argparse.Namespace) -> None:
     build_dir, models_dir = work_dir / "build", work_dir / "models"
     build_dir.mkdir(parents=True, exist_ok=True)
     bundle = read_bundle(args.bundle)
+    families = spec.families_for(bundle.manifest.decoder_prelude)
     converted = {
-        family: convert_family(bundle, family, build_dir, models_dir) for family in spec.FAMILIES
+        family: convert_family(bundle, family, build_dir, models_dir) for family in families
     }
     verify(bundle, converted, build_dir, work_dir, require_neural_engine=not args.no_neural_engine)
-    for family in spec.FAMILIES:
+    for family in families:
         shutil.rmtree(converted[family].package)
     if build_dir.exists():
         shutil.rmtree(build_dir)
@@ -72,8 +73,11 @@ def _package(args: argparse.Namespace) -> None:
 def _bench(args: argparse.Namespace) -> None:
     from mlime_coreml.measure import bench
 
-    families: tuple[Family, ...] = tuple(args.family) if args.family else spec.FAMILIES
-    bench(read_bundle(args.bundle), args.work_dir.resolve(), families)
+    bundle = read_bundle(args.bundle)
+    families: tuple[Family, ...] = (
+        tuple(args.family) if args.family else spec.families_for(bundle.manifest.decoder_prelude)
+    )
+    bench(bundle, args.work_dir.resolve(), families)
 
 
 def main() -> None:
@@ -105,7 +109,7 @@ def main() -> None:
 
     bench = with_bundle("bench", "convert each family and measure every function")
     bench.add_argument("--work-dir", required=True, type=Path)
-    bench.add_argument("--family", action="append", choices=spec.FAMILIES)
+    bench.add_argument("--family", action="append", choices=spec.ALL_FAMILIES)
     bench.set_defaults(run=_bench)
 
     args = parser.parse_args()

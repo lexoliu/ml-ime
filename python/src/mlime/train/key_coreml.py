@@ -67,7 +67,7 @@ from mlime.train.key_eval import (
     check_automaton,
     search_points,
 )
-from mlime.train.key_manifest import KeyManifest
+from mlime.train.key_manifest import Family, KeyManifest
 from mlime.train.key_search import Hypothesis, Prefix
 from mlime.train.key_tree import TreeCall, closure_size, plan
 from mlime.train.keys import KeyCollator, KeyInputs
@@ -80,7 +80,12 @@ Ints = npt.NDArray[np.int32]
 Array = npt.NDArray[np.generic]
 
 #: The directory each family converts into, and the model it holds (``mlime_coreml.spec``).
-DIRECTORIES = {"context": "context", "keys": "keys", "tree": "decoder"}
+DIRECTORIES = {
+    "context": "context",
+    "prelude": "prelude",
+    "keys": "keys",
+    "tree": "decoder",
+}
 
 #: The directory manifest every converted model directory carries.
 DIRECTORY_MANIFEST = "manifest.json"
@@ -109,7 +114,7 @@ class _TensorSpec:
 class _DirectoryManifest:
     """What of a model directory's ``manifest.json`` a loader reads; other fields are ignored."""
 
-    family: Literal["context", "keys", "tree"]
+    family: Literal["context", "prelude", "keys", "tree"]
     step: int
     policy_version: int
     functions: dict[str, int]
@@ -196,6 +201,16 @@ class Context:
     mask: Half  # [1, tokens]
 
 
+@dataclass(frozen=True)
+class Prelude:
+    """The prelude function's cached reader keys and values ``<bos> c_1 .. c_k`` (#309)."""
+
+    keys: Half  # [layers, heads, P, head_dim]
+    values: Half  # [layers, heads, P, head_dim]
+    bias: Half  # [1, 1, 1, P]
+    length: int
+
+
 def key_row(manifest: KeyManifest, letters: Sequence[int], width: int) -> dict[str, Array]:
     """The keys function's row inputs: ``[CLS] [MASK]*n [SEP] [PAD]*`` at *width*."""
     count = len(letters)
@@ -216,20 +231,25 @@ def key_row(manifest: KeyManifest, letters: Sequence[int], width: int) -> dict[s
     }
 
 
-def tree_row(manifest: KeyManifest, call: TreeCall) -> dict[str, Array]:
+def tree_row(
+    manifest: KeyManifest, call: TreeCall, prelude_length: int | None = None
+) -> dict[str, Array]:
     """The tree function's node inputs for *call*: the reader ids, depths and additive bias.
 
     A node's token is its prefix's last character as the reader's id, ``<bos>`` for the root and
-    for padding; a node sees its ancestors and itself, a padding row only itself.
+    for padding (or ``<sep>`` at *prelude_length* when a prelude precedes the sentence); a node
+    sees its ancestors and itself, a padding row only itself.
     """
     size = call.bucket
-    reader_ids = np.full(size, manifest.reader_bos, dtype=np.int32)
-    positions = np.zeros(size, dtype=np.int32)
+    root = manifest.reader_bos if prelude_length is None else manifest.reader_sep
+    offset = 0 if prelude_length is None else prelude_length
+    reader_ids = np.full(size, root, dtype=np.int32)
+    positions = np.full(size, offset, dtype=np.int32)
     visible = np.eye(size, dtype=np.bool_)
     for row, node in enumerate(call.nodes):
         if node:
             reader_ids[row] = manifest.reader_ids[node[-1]]
-        positions[row] = len(node)
+        positions[row] = offset + len(node)
         if call.parents[row] >= 0:
             visible[row] |= visible[call.parents[row]]
     bias = np.where(visible, 0.0, manifest.neg).astype(np.float16)
@@ -273,7 +293,12 @@ class CoreMlKeyModel:
         """Characters the head and the decoder emit."""
         return len(self.manifest.characters)
 
-    def function(self, family: Literal["context", "keys", "tree"], name: str) -> _Function:
+    def _family(self, name: Literal["context", "prelude", "keys", "tree"]) -> Family:
+        return next(family for family in self.manifest.families if family.name == name)
+
+    def function(
+        self, family: Literal["context", "prelude", "keys", "tree"], name: str
+    ) -> _Function:
         """*family*'s function *name*, loaded on first use."""
         if name not in self._loaded:
             held = self._manifests[family]
@@ -284,7 +309,7 @@ class CoreMlKeyModel:
     def context(self, inputs: KeyInputs) -> Context:
         """The context function over a one-row collate's context, padded to its length."""
         tokens = self.manifest.context_tokens
-        [function] = self.manifest.families[0].functions
+        [function] = self._family("context").functions
         hidden = self.manifest.dims.fill.hidden
         real = int(inputs.context_ids.shape[1])
         if inputs.size != 1 or real > tokens:
@@ -303,10 +328,39 @@ class CoreMlKeyModel:
         out = self.function("context", function.name)({"context_ids": ids, "context_mask": mask})
         return Context(out["context"].astype(np.float16), mask)
 
+    def prelude(self, inputs: KeyInputs) -> Prelude | None:
+        """The prelude function over a one-row collate's context characters, when enabled."""
+        manifest = self.manifest
+        if not manifest.decoder_prelude:
+            return None
+        [function] = self._family("prelude").functions
+        length = function.length
+        real_chars = int(inputs.prelude_lengths[0])
+        prelude_len = 1 + real_chars
+        if inputs.size != 1 or prelude_len > length:
+            raise ValueError(
+                f"the prelude function takes one row of at most {length} tokens, got "
+                f"{inputs.size} of {prelude_len}"
+            )
+        tokens = np.zeros((1, length), dtype=np.int32)
+        tokens[0, 0] = manifest.reader_bos
+        if real_chars > 0:
+            table = np.array([*manifest.reader_ids, manifest.reader_unk], dtype=np.int32)
+            tokens[0, 1:prelude_len] = table[inputs.prelude_chars[0, :real_chars].numpy()]
+        out = self.function("prelude", function.name)({"prelude_tokens": tokens})
+        bias = np.full((1, 1, 1, length), manifest.neg, dtype=np.float16)
+        bias[..., :prelude_len] = 0.0
+        return Prelude(
+            keys=out["prelude_keys"].astype(np.float16),
+            values=out["prelude_values"].astype(np.float16),
+            bias=bias,
+            length=prelude_len,
+        )
+
     def encode(self, letters: Sequence[int], context: Context) -> Encoding:
         """The keys function, at the smallest width that holds *letters*, over the context."""
         manifest = self.manifest
-        keys = manifest.families[1]
+        keys = self._family("keys")
         fits = [function for function in keys.functions if function.capacity >= len(letters)]
         if not fits:
             largest = keys.functions[-1].capacity
@@ -329,17 +383,20 @@ class CoreMlKeyModel:
             cross_bias=bias,
         )
 
-    def tree(self, call: TreeCall, encoding: Encoding) -> Half:
-        """One tree call: every node's next-character logits, ``[bucket, E]`` float16."""
+    def tree(self, call: TreeCall, encoding: Encoding, prelude: Prelude | None = None) -> Half:
+        """One tree call: every node's next-token logits, ``[bucket, E (+ 1)]`` float16."""
         function = self.function("tree", f"tree_{call.bucket}")
-        out = function(
-            {
-                **tree_row(self.manifest, call),
-                "cross_keys": encoding.cross_keys,
-                "cross_values": encoding.cross_values,
-                "cross_bias": encoding.cross_bias,
-            }
-        )
+        feeds: dict[str, Array] = {
+            **tree_row(self.manifest, call, None if prelude is None else prelude.length),
+            "cross_keys": encoding.cross_keys,
+            "cross_values": encoding.cross_values,
+            "cross_bias": encoding.cross_bias,
+        }
+        if prelude is not None:
+            feeds["prelude_keys"] = prelude.keys
+            feeds["prelude_values"] = prelude.values
+            feeds["prelude_bias"] = prelude.bias
+        out = function(feeds)
         logits: Half = out["logits"][0]
         return logits
 
@@ -394,9 +451,11 @@ class CoreMlTransition:
         encoding: Encoding,
         times: DecodeTimes,
         speculate: Sequence[Prefix] = (),
+        prelude: Prelude | None = None,
     ) -> None:
         self.model = model
         self.encoding = encoding
+        self.prelude = prelude
         self.times = times
         self.statistics = KeystrokeStatistics(keys=encoding.keys)
         #: ``prefix -> (the call's logits, the node's row)``.
@@ -416,7 +475,7 @@ class CoreMlTransition:
         """Plan and run *requests*; cache every node. The number of calls made."""
         calls = plan(requests)
         for call in calls:
-            logits = self.model.tree(call, self.encoding)
+            logits = self.model.tree(call, self.encoding, self.prelude)
             self.statistics.calls[call.bucket] += 1
             for row, node in enumerate(call.nodes):
                 self._rows.setdefault(node, (logits, row))
@@ -530,7 +589,9 @@ class CoreMlKeyDecoder:
         every point searches it; a point's speculation is its own last keystroke's queries.
         """
         started = time.perf_counter()
-        context = self.model.context(self.collator.inputs([record.keys], [record.context]))
+        collated = self.collator.inputs([record.keys], [record.context])
+        context = self.model.context(collated)
+        prelude = self.model.prelude(collated)
         self.times.encode += time.perf_counter() - started
         letters = [letter_id(key) for key in record.keys]
         counts = range(1, len(letters) + 1) if self.replay else [len(letters)]
@@ -548,7 +609,9 @@ class CoreMlKeyDecoder:
             log_probs = log_softmax(encoding.ctc_logits)
             self.times.lattice += time.perf_counter() - started
             for point, weights in enumerate(grid):
-                transition = CoreMlTransition(self.model, encoding, self.times, asked[point])
+                transition = CoreMlTransition(
+                    self.model, encoding, self.times, asked[point], prelude
+                )
                 [[results[point]]] = search_points(
                     [lattice],
                     torch.from_numpy(log_probs).unsqueeze(0),
@@ -557,6 +620,7 @@ class CoreMlKeyDecoder:
                     beam=self.beam,
                     top_k=self.top_k,
                     times=self.times,
+                    score_eos=self.model.manifest.score_eos,
                 )
                 self.statistics.keystrokes.append(transition.finish())
                 asked[point] = transition.queried

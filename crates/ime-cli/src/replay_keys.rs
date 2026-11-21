@@ -449,7 +449,12 @@ impl ConfigEcho {
 
 impl ReplayKeysArgs {
     /// The key engine's options: the legality and search the flags name.
-    fn engine_options(&self, weights: Weights, correct_syllables: bool) -> KeyEngineOptions {
+    fn engine_options(
+        &self,
+        weights: Weights,
+        correct_syllables: bool,
+        score_eos: bool,
+    ) -> KeyEngineOptions {
         KeyEngineOptions {
             legality: LegalityOptions {
                 unfinished_tail: self.unfinished_tail,
@@ -463,6 +468,7 @@ impl ReplayKeysArgs {
                 combine: weights.combine.combine(),
                 prior: Weight::ZERO,
                 arc_width: DEFAULT_ARC_WIDTH,
+                score_eos,
             },
         }
     }
@@ -549,13 +555,14 @@ fn replay(args: &ReplayKeysArgs) -> Result<Report> {
     let legality =
         Legality::over(model.characters()).context("the model's characters have no readings")?;
     let correct_syllables = args.correct_syllables.unwrap_or(model.correct_syllables());
+    let score_eos = model.score_eos();
     let max_keys = model.max_keys();
     let step = model.step();
     let mut session = Session::new(
         KeyEngine::new(
             model,
             &legality,
-            args.engine_options(weights, correct_syllables),
+            args.engine_options(weights, correct_syllables, score_eos),
         ),
         SessionOptions { sentences: 3 },
     );

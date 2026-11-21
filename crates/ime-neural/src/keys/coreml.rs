@@ -25,9 +25,10 @@
 //! keyed by process name, so the model is opened off the typing path.
 
 use std::cell::OnceCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Instant;
 
 use ime_pinyin::{EmitId, Keys};
@@ -141,6 +142,7 @@ pub enum CoreMlKeyError {
 #[serde(rename_all = "lowercase")]
 enum Family {
     Context,
+    Prelude,
     Keys,
     Tree,
 }
@@ -150,24 +152,37 @@ impl Family {
     const fn directory(self) -> &'static str {
         match self {
             Self::Context => "context",
+            Self::Prelude => "prelude",
             Self::Keys => "keys",
             Self::Tree => "decoder",
         }
     }
 
     /// The inputs a function of the family is fed, with their element types.
-    const fn inputs(self) -> &'static [(&'static str, Dtype)] {
+    const fn inputs(self, decoder_prelude: bool) -> &'static [(&'static str, Dtype)] {
         match self {
             Self::Context => &[
                 ("context_ids", Dtype::Int32),
                 ("context_mask", Dtype::Float16),
             ],
+            Self::Prelude => &[("prelude_tokens", Dtype::Int32)],
             Self::Keys => &[
                 ("input_ids", Dtype::Int32),
                 ("key_letters", Dtype::Int32),
                 ("attention_mask", Dtype::Float16),
                 ("context", Dtype::Float16),
                 ("context_mask", Dtype::Float16),
+            ],
+            Self::Tree if decoder_prelude => &[
+                ("reader_ids", Dtype::Int32),
+                ("positions", Dtype::Int32),
+                ("tree_bias", Dtype::Float16),
+                ("cross_keys", Dtype::Float16),
+                ("cross_values", Dtype::Float16),
+                ("cross_bias", Dtype::Float16),
+                ("prelude_keys", Dtype::Float16),
+                ("prelude_values", Dtype::Float16),
+                ("prelude_bias", Dtype::Float16),
             ],
             Self::Tree => &[
                 ("reader_ids", Dtype::Int32),
@@ -184,6 +199,10 @@ impl Family {
     const fn outputs(self) -> &'static [(&'static str, Dtype)] {
         match self {
             Self::Context => &[("context", Dtype::Float16)],
+            Self::Prelude => &[
+                ("prelude_keys", Dtype::Float16),
+                ("prelude_values", Dtype::Float16),
+            ],
             Self::Keys => &[
                 ("ctc_logits", Dtype::Float16),
                 ("cross_keys", Dtype::Float16),
@@ -260,6 +279,14 @@ struct Dims {
     emitted: usize,
 }
 
+const fn default_reader_sep() -> i32 {
+    3
+}
+
+const fn default_reader_unk() -> i32 {
+    4
+}
+
 /// What of `key-model.json` a runner reads; other fields are ignored.
 #[derive(Deserialize)]
 struct KeyManifest {
@@ -276,6 +303,14 @@ struct KeyManifest {
     reader_bos: i32,
     dims: Dims,
     families: Vec<FamilySpec>,
+    #[serde(default)]
+    decoder_prelude: bool,
+    #[serde(default)]
+    score_eos: bool,
+    #[serde(default = "default_reader_sep")]
+    reader_sep: i32,
+    #[serde(default = "default_reader_unk")]
+    reader_unk: i32,
 }
 
 fn read(path: &Path) -> Result<Vec<u8>, CoreMlKeyError> {
@@ -345,6 +380,28 @@ impl KeyManifest {
                 "the context family is not one function of the context length",
             ));
         }
+        if self.decoder_prelude {
+            let prelude = self.family(path, Family::Prelude)?;
+            if prelude.len() != 1
+                || prelude[0].length != self.context_tokens
+                || prelude[0].name != format!("prelude_{}", self.context_tokens)
+                || self.context_tokens.checked_sub(KEY_SENTINELS) != Some(prelude[0].capacity)
+            {
+                return Err(refuse(
+                    path,
+                    "the prelude family is not one function of the context length",
+                ));
+            }
+        } else if self
+            .families
+            .iter()
+            .any(|held| held.name == Family::Prelude)
+        {
+            return Err(refuse(
+                path,
+                "lists a prelude family while decoder_prelude is off",
+            ));
+        }
         let keys = self.family(path, Family::Keys)?;
         let widths_ascend = keys.windows(2).all(|pair| pair[0].length < pair[1].length);
         if keys.is_empty()
@@ -410,7 +467,11 @@ fn check_directory(
         ));
     }
     for (what, declared, expected) in [
-        ("inputs", &held.inputs, family.inputs()),
+        (
+            "inputs",
+            &held.inputs,
+            family.inputs(manifest.decoder_prelude),
+        ),
         ("outputs", &held.outputs, family.outputs()),
     ] {
         let found: Vec<(&str, Dtype)> = declared
@@ -538,6 +599,82 @@ impl ContextEncoder {
     }
 }
 
+/// Cached reader keys and values of `<bos> c_1 .. c_k` for the tree functions.
+struct Prelude {
+    keys: Tensor<f16>,
+    values: Tensor<f16>,
+    bias: Tensor<f16>,
+    length: usize,
+}
+
+/// The decoder's causal context prelude encoder (`prelude_P`), cached per context text.
+struct PreludeEncoder {
+    function: Function,
+    tokens: usize,
+    reader_bos: i32,
+    reader_unk: i32,
+    neg: f32,
+    char_to_reader: HashMap<char, i32>,
+    none: Option<Rc<Prelude>>,
+    last: Option<(Box<str>, Rc<Prelude>)>,
+}
+
+impl PreludeEncoder {
+    /// The prelude KV of *text*, reusing `none` for absent/empty text and `last` on repeat.
+    fn encode(&mut self, text: Option<&str>) -> Result<Rc<Prelude>, CoreMlKeyError> {
+        let Some(text) = text.filter(|text| !text.is_empty()) else {
+            if let Some(none) = &self.none {
+                return Ok(Rc::clone(none));
+            }
+            let empty = Rc::new(self.run("")?);
+            self.none = Some(Rc::clone(&empty));
+            return Ok(empty);
+        };
+        let pair = match self.last.take() {
+            Some((held, prelude)) if &*held == text => (held, prelude),
+            _ => (text.into(), Rc::new(self.run(text)?)),
+        };
+        Ok(Rc::clone(&self.last.insert(pair).1))
+    }
+
+    /// Run `prelude_P` over `<bos>` plus the last `tokens - 2` characters of *text*.
+    fn run(&mut self, text: &str) -> Result<Prelude, CoreMlKeyError> {
+        let tail: Vec<char> = text
+            .chars()
+            .rev()
+            .take(self.tokens - KEY_SENTINELS)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        let prelude_len = 1 + tail.len();
+        let mut ids = vec![0_i32; self.tokens];
+        ids[0] = self.reader_bos;
+        for (slot, ch) in ids[1..prelude_len].iter_mut().zip(tail) {
+            *slot = self
+                .char_to_reader
+                .get(&ch)
+                .copied()
+                .unwrap_or(self.reader_unk);
+        }
+        let mut inputs = Inputs::new();
+        inputs.insert(
+            "prelude_tokens",
+            &Tensor::from_slice(&[1, self.tokens], &ids)?,
+        )?;
+        let out = self.function.predict(&inputs)?;
+        let mut bias = vec![f16::from_f32(self.neg); self.tokens];
+        bias[..prelude_len].fill(f16::ZERO);
+        debug!(tokens = prelude_len, "encoded a decoder prelude");
+        Ok(Prelude {
+            keys: out.tensor("prelude_keys")?,
+            values: out.tensor("prelude_values")?,
+            bias: Tensor::from_slice(&[1, 1, 1, self.tokens], &bias)?,
+            length: prelude_len,
+        })
+    }
+}
+
 /// One keys function: the keys it holds, its width, and the function.
 struct KeysFunction {
     capacity: usize,
@@ -558,6 +695,7 @@ pub struct CoreMlEncoding {
     keys: Tensor<f16>,
     values: Tensor<f16>,
     bias: Tensor<f16>,
+    prelude: Option<Rc<Prelude>>,
 }
 
 /// The tree function's node inputs: per node its reader id and depth, and the
@@ -568,25 +706,28 @@ struct TreeRow {
     bias: Vec<f16>,
 }
 
-/// One tree call's logits: float16 `[1, bucket, emittable]`, in Core ML
+/// One tree call's logits: float16 `[1, bucket, emittable (+ 1)]`, in Core ML
 /// storage until a row is read, and then on the host.
 pub struct CoreMlLogits {
     tensor: Tensor<f16>,
     host: OnceCell<Vec<f16>>,
 }
 
-/// The converted key model: three function families, each function loaded.
+/// The converted key model: function families loaded for a compute-unit set.
 pub struct CoreMlKeyModel {
     step: u64,
     correct_syllables: bool,
+    score_eos: bool,
     characters: Vec<char>,
     specials: Specials,
     letter_pad: i32,
     reader_ids: Vec<i32>,
     reader_bos: i32,
+    reader_sep: i32,
     neg: f32,
     n_max: usize,
     context: ContextEncoder,
+    prelude: Option<PreludeEncoder>,
     keys: Vec<KeysFunction>,
     tree: Vec<TreeFunction>,
 }
@@ -629,6 +770,29 @@ impl CoreMlKeyModel {
             rows: Tensor::from_slice(&[1, tokens, hidden], &vec![f16::ZERO; tokens * hidden])?,
             mask: Tensor::from_slice(&[1, tokens], &vec![f16::ZERO; tokens])?,
         };
+        let prelude = if manifest.decoder_prelude {
+            let [(_, function)] =
+                <[_; 1]>::try_from(load_family(directory, Family::Prelude, &manifest, units)?)
+                    .map_err(|_| refuse(&path, "the prelude family is not one function"))?;
+            let char_to_reader = manifest
+                .characters
+                .iter()
+                .copied()
+                .zip(manifest.reader_ids.iter().copied())
+                .collect();
+            Some(PreludeEncoder {
+                function,
+                tokens,
+                reader_bos: manifest.reader_bos,
+                reader_unk: manifest.reader_unk,
+                neg: manifest.neg,
+                char_to_reader,
+                none: None,
+                last: None,
+            })
+        } else {
+            None
+        };
         let keys = load_family(directory, Family::Keys, &manifest, units)?
             .into_iter()
             .map(|(capacity, function)| KeysFunction { capacity, function })
@@ -646,11 +810,13 @@ impl CoreMlKeyModel {
         Ok(Self {
             step: manifest.step,
             correct_syllables: manifest.correct_syllables,
+            score_eos: manifest.score_eos,
             characters: manifest.characters,
             specials: manifest.specials,
             letter_pad: manifest.letter_pad,
             reader_ids: manifest.reader_ids,
             reader_bos: manifest.reader_bos,
+            reader_sep: manifest.reader_sep,
             neg: manifest.neg,
             n_max: manifest.n_max,
             context: ContextEncoder {
@@ -661,6 +827,7 @@ impl CoreMlKeyModel {
                 none,
                 last: None,
             },
+            prelude,
             keys,
             tree,
         })
@@ -710,12 +877,23 @@ impl CoreMlKeyModel {
     /// additive bias.
     ///
     /// A node's token is its prefix's last character as the reader's id,
-    /// `<bos>` for the root and for padding; a node sees its ancestors and
+    /// `<bos>` for the root and for padding (or `<sep>` at *`prelude_length`*
+    /// when a prelude precedes the sentence); a node sees its ancestors and
     /// itself, a padding row only itself.
-    fn tree_row(&self, call: &TreeCall<'_, EmitId>) -> Result<TreeRow, CoreMlKeyError> {
+    fn tree_row(
+        &self,
+        call: &TreeCall<'_, EmitId>,
+        prelude_length: Option<usize>,
+    ) -> Result<TreeRow, CoreMlKeyError> {
         let size = call.bucket();
-        let mut reader_ids = vec![self.reader_bos; size];
-        let mut positions = vec![0_i32; size];
+        let (root, offset) = match prelude_length {
+            Some(length) => (self.reader_sep, length),
+            None => (self.reader_bos, 0),
+        };
+        let offset_i32 =
+            i32::try_from(offset).map_err(|_| CoreMlKeyError::Int32("a prelude's length"))?;
+        let mut reader_ids = vec![root; size];
+        let mut positions = vec![offset_i32; size];
         let mut visible = vec![false; size * size];
         for row in 0..size {
             visible[row * size + row] = true;
@@ -724,8 +902,8 @@ impl CoreMlKeyModel {
             if let Some(last) = node.last() {
                 reader_ids[row] = self.reader_ids[last.index()];
             }
-            positions[row] =
-                i32::try_from(node.len()).map_err(|_| CoreMlKeyError::Int32("a prefix's depth"))?;
+            positions[row] = i32::try_from(offset + node.len())
+                .map_err(|_| CoreMlKeyError::Int32("a prefix's depth"))?;
             if let Some(parent) = call.parents()[row] {
                 // A parent's row precedes its child's, so it is in `before`.
                 let (before, rest) = visible.split_at_mut(row * size);
@@ -794,6 +972,10 @@ impl KeyModel for CoreMlKeyModel {
         self.keys.last().map_or(0, |held| held.capacity)
     }
 
+    fn score_eos(&self) -> bool {
+        self.score_eos
+    }
+
     fn encode(
         &mut self,
         keys: &Keys,
@@ -812,7 +994,12 @@ impl KeyModel for CoreMlKeyModel {
             })?;
         let width = self.keys[position].capacity + KEY_SENTINELS;
         let (ids, letters, attention) = self.key_row(keys, width);
-        let context = self.context.encode(context)?;
+        let encoded_context = self.context.encode(context)?;
+        let prelude = self
+            .prelude
+            .as_mut()
+            .map(|encoder| encoder.encode(context))
+            .transpose()?;
         let mut inputs = Inputs::new();
         inputs.insert("input_ids", &Tensor::from_slice(&[1, width], &ids)?)?;
         inputs.insert("key_letters", &Tensor::from_slice(&[1, width], &letters)?)?;
@@ -820,8 +1007,8 @@ impl KeyModel for CoreMlKeyModel {
             "attention_mask",
             &Tensor::from_slice(&[1, width], &attention)?,
         )?;
-        inputs.insert("context", &context.rows)?;
-        inputs.insert("context_mask", &context.mask)?;
+        inputs.insert("context", &encoded_context.rows)?;
+        inputs.insert("context_mask", &encoded_context.mask)?;
         let name = format!("keys_{width}");
         let out = self.keys[position].function.predict(&inputs)?;
 
@@ -845,6 +1032,7 @@ impl KeyModel for CoreMlKeyModel {
             keys: out.tensor("cross_keys")?,
             values: out.tensor("cross_values")?,
             bias: Tensor::from_slice(&[1, 1, 1, self.n_max], &bias)?,
+            prelude,
         })
     }
 
@@ -853,7 +1041,8 @@ impl KeyModel for CoreMlKeyModel {
         encoding: &CoreMlEncoding,
         call: &TreeCall<'_, EmitId>,
     ) -> Result<CoreMlLogits, CoreMlKeyError> {
-        let row = self.tree_row(call)?;
+        let prelude_len = encoding.prelude.as_ref().map(|pre| pre.length);
+        let row = self.tree_row(call, prelude_len)?;
         self.run_tree(encoding, call.bucket(), &row, call.nodes().len())
     }
 
@@ -891,12 +1080,18 @@ impl CoreMlKeyModel {
         inputs.insert("cross_keys", &encoding.keys)?;
         inputs.insert("cross_values", &encoding.values)?;
         inputs.insert("cross_bias", &encoding.bias)?;
+        if let Some(prelude) = &encoding.prelude {
+            inputs.insert("prelude_keys", &prelude.keys)?;
+            inputs.insert("prelude_values", &prelude.values)?;
+            inputs.insert("prelude_bias", &prelude.bias)?;
+        }
         let tensor = held.function.predict(&inputs)?.tensor::<f16>("logits")?;
+        let columns = self.characters.len() + usize::from(self.score_eos);
         check_shape(
             &format!("tree_{size}"),
             "logits",
             &tensor,
-            &[1, size, self.characters.len()],
+            &[1, size, columns],
         )?;
         debug!(bucket = size, nodes, "ran a tree function");
         Ok(CoreMlLogits {
@@ -932,6 +1127,15 @@ impl CoreMlKeyModel {
             seconds = tick.elapsed().as_secs_f64(),
             "warmed a function"
         );
+        if let Some(prelude) = &mut self.prelude {
+            let tick = Instant::now();
+            prelude.run(WARM_CONTEXT)?;
+            info!(
+                function = "prelude",
+                seconds = tick.elapsed().as_secs_f64(),
+                "warmed a function"
+            );
+        }
         let mut log_probs = Vec::new();
         let mut encoding = None;
         for position in 0..self.keys.len() {
@@ -952,11 +1156,12 @@ impl CoreMlKeyModel {
         let Some(encoding) = encoding else {
             return Ok(());
         };
-        let mut row = vec![0.0; self.characters.len()];
+        let mut row = vec![0.0; self.characters.len() + usize::from(self.score_eos)];
+        let prelude_len = encoding.prelude.as_ref().map(|pre| pre.length);
         let buckets: Vec<usize> = self.tree.iter().map(|held| held.bucket).collect();
         for size in buckets {
             let tick = Instant::now();
-            let padding = self.padding_row(size);
+            let padding = self.padding_row(size, prelude_len)?;
             let logits = self.run_tree(&encoding, size, &padding, 0)?;
             self.log_softmax(&logits, 0, &mut row);
             info!(
@@ -974,16 +1179,26 @@ impl CoreMlKeyModel {
 
     /// A tree call's inputs with no node: every row is padding, which sees
     /// only itself.
-    fn padding_row(&self, size: usize) -> TreeRow {
+    fn padding_row(
+        &self,
+        size: usize,
+        prelude_length: Option<usize>,
+    ) -> Result<TreeRow, CoreMlKeyError> {
+        let (root, offset) = match prelude_length {
+            Some(length) => (self.reader_sep, length),
+            None => (self.reader_bos, 0),
+        };
+        let offset_i32 =
+            i32::try_from(offset).map_err(|_| CoreMlKeyError::Int32("a prelude's length"))?;
         let hidden = f16::from_f32(self.neg);
         let mut bias = vec![hidden; size * size];
         for row in 0..size {
             bias[row * size + row] = f16::ZERO;
         }
-        TreeRow {
-            reader_ids: vec![self.reader_bos; size],
-            positions: vec![0; size],
+        Ok(TreeRow {
+            reader_ids: vec![root; size],
+            positions: vec![offset_i32; size],
             bias,
-        }
+        })
     }
 }

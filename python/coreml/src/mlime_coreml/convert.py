@@ -29,8 +29,10 @@ from mlime_coreml.feeds import (
     Array,
     context_row,
     key_row,
+    prelude_row,
     random_context_ids,
     random_letters,
+    random_prelude_ids,
     random_tree,
     tree_row,
 )
@@ -77,6 +79,9 @@ def sample_feed(bundle: Bundle, family: Family, function: Function) -> dict[str,
     if family == "context":
         ids = random_context_ids(manifest, min(8, function.length), rng)
         return context_row(manifest, ids, function.length)
+    if family == "prelude":
+        ids = random_prelude_ids(manifest, min(8, function.length), rng)
+        return prelude_row(manifest, ids, function.length)
     if family == "keys":
         feed = key_row(
             manifest, random_letters(manifest, min(5, function.capacity), rng), function.length
@@ -84,11 +89,22 @@ def sample_feed(bundle: Bundle, family: Family, function: Function) -> dict[str,
         feed["context"] = np.zeros(sig.inputs[3].resolve(function.length), dtype=np.float32)
         feed["context_mask"] = np.ones(sig.inputs[4].resolve(function.length), dtype=np.float32)
         return feed
-    feed = tree_row(manifest, random_tree(manifest, min(8, function.length), rng), function.length)
+    prelude_len = 4 if manifest.decoder_prelude else None
+    feed = tree_row(
+        manifest,
+        random_tree(manifest, min(8, function.length), rng),
+        function.length,
+        prelude_len,
+    )
     cross = sig.inputs[3].resolve(function.length)
     feed["cross_keys"] = np.zeros(cross, dtype=np.float32)
     feed["cross_values"] = np.zeros(cross, dtype=np.float32)
     feed["cross_bias"] = np.zeros(sig.inputs[5].resolve(function.length), dtype=np.float32)
+    if manifest.decoder_prelude:
+        pre = sig.inputs[6].resolve(function.length)
+        feed["prelude_keys"] = np.zeros(pre, dtype=np.float32)
+        feed["prelude_values"] = np.zeros(pre, dtype=np.float32)
+        feed["prelude_bias"] = np.zeros(sig.inputs[8].resolve(function.length), dtype=np.float32)
     return feed
 
 

@@ -91,6 +91,7 @@ CONTEXT_TOWER_FIELDS = frozenset({"tower", "revision", "lora_rank", "lora_alpha"
 KEYS_FIELDS = frozenset({"layers", "correct_syllables"})
 WARM_UP_WEIGHTS = frozenset({"distill_weight", "frame_weight"})
 JOINT_WEIGHTS = frozenset({"transition_weight"})
+JOINT_FLAGS = frozenset({"decoder_prelude", "score_eos"})
 
 #: What a stamped ``TRAIN_FILL_TOWER`` holds: what S1 trains of the fill path
 #: beside the tower itself (#241).
@@ -239,12 +240,17 @@ class E2EV2Stage:
             if not self.key_warm_up:
                 raise ValueError("the fill tower trains in the key warm-up; stamp KEY_WARM_UP")
         if self.keys is not None:
-            fields = KEYS_FIELDS | (WARM_UP_WEIGHTS if self.key_warm_up else JOINT_WEIGHTS)
-            if set(self.keys) != fields:
+            required = KEYS_FIELDS | (WARM_UP_WEIGHTS if self.key_warm_up else JOINT_WEIGHTS)
+            allowed = required if self.key_warm_up else required | JOINT_FLAGS
+            if not (required <= set(self.keys) <= allowed):
                 stage = "warm-up (S1)" if self.key_warm_up else "joint stage (S2)"
                 raise ValueError(
-                    f"a key front of the {stage} names {sorted(fields)}, got {sorted(self.keys)}"
+                    f"a key front of the {stage} names {sorted(required)} "
+                    f"(and optional {sorted(allowed - required)}), got {sorted(self.keys)}"
                 )
+            for flag in set(self.keys) & JOINT_FLAGS:
+                if not isinstance(self.keys[flag], bool):
+                    raise ValueError(f"{flag} is a boolean switch, got {self.keys[flag]!r}")
             if self.ranking is not None or self.context_warm_up:
                 raise ValueError(
                     "a key-level stage ranks no lattice readings and warms up only its key front"

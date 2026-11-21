@@ -34,6 +34,7 @@ from mlime.legality import MAX_ARC_KEYS, GoldArcs, Legality, LegalityOptions
 from mlime.train.arbitration import ReadingArbitration
 from mlime.train.lexicon import Lexicon
 from mlime.train.samples import (
+    DEFAULT_CONTEXT_TOKENS,
     LETTER_PAD,
     Augmentation,
     Batch,
@@ -84,7 +85,10 @@ class KeyFrontConfig:
     ``correct_syllables`` is the legality automaton's: whether a span that is
     itself a syllable may be read through a correction. ``max_keys`` is the
     longest key string an example may have; the fill tower's positions are
-    the bound, two of them taken by the sentinels.
+    the bound, two of them taken by the sentinels. ``decoder_prelude`` feeds
+    the joint stage's decoder ``<bos> context <sep>`` before the sentence
+    (dropped alongside the encoder's context dropout), and ``score_eos``
+    includes ``<eos>`` in the decoder's vocabulary and sentence score (#309).
     """
 
     layers: int = 2
@@ -93,6 +97,8 @@ class KeyFrontConfig:
     transition_weight: float = 1.0
     correct_syllables: bool = True
     max_keys: int = 510
+    decoder_prelude: bool = False
+    score_eos: bool = False
 
     def __post_init__(self) -> None:
         if self.layers < 1:
@@ -349,6 +355,8 @@ class KeyInputs:
     context_mask: torch.Tensor
     has_context: torch.Tensor
     context_rows: torch.Tensor
+    prelude_chars: torch.Tensor
+    prelude_lengths: torch.Tensor
 
     @property
     def size(self) -> int:
@@ -404,6 +412,8 @@ class KeyBatch:
     corrupted: torch.Tensor
     position_mask: torch.Tensor
     key_mask: torch.Tensor
+    prelude_chars: torch.Tensor
+    prelude_lengths: torch.Tensor
 
     @property
     def inputs(self) -> KeyInputs:
@@ -418,6 +428,8 @@ class KeyBatch:
             context_mask=spans.context_mask,
             has_context=spans.has_context,
             context_rows=spans.context_rows,
+            prelude_chars=self.prelude_chars,
+            prelude_lengths=self.prelude_lengths,
         )
 
     @property
@@ -477,11 +489,13 @@ class KeyCollator:
 
     The span half is the span model's own :class:`~mlime.train.samples.Collator`
     over the spans the typist meant, which also throws each example's context
-    dropout coin; the keys share it.
+    dropout coin; the keys and the decoder's character prelude share it.
     """
 
-    def __init__(self, spans: Collator):
+    def __init__(self, spans: Collator, lexicon: Lexicon):
         self.spans = spans
+        self._char_index = {character: index for index, character in enumerate(lexicon.characters)}
+        self._unk_index = lexicon.size
 
     @property
     def rng(self) -> random.Random:
@@ -535,6 +549,9 @@ class KeyCollator:
             raise ValueError("the keys' span ends and the span batch's scored positions disagree")
         if span_batch.targets.shape[1] != positions + 2:
             raise ValueError("the span batch's columns are not the gold's and two sentinels")
+        prelude_chars, prelude_lengths = self._prelude_rows(
+            [example.context for example in keyed], span_batch.has_context
+        )
         return KeyBatch(
             spans=span_batch,
             key_input_ids=rows.key_input_ids,
@@ -552,6 +569,8 @@ class KeyCollator:
             corrupted=corrupted,
             position_mask=position_mask,
             key_mask=key_mask,
+            prelude_chars=prelude_chars,
+            prelude_lengths=prelude_lengths,
         )
 
     def inputs(self, keys: Sequence[str], contexts: Sequence[str | None]) -> KeyInputs:
@@ -569,6 +588,7 @@ class KeyCollator:
             raise ValueError(f"{len(keys)} key strings but {len(contexts)} contexts")
         rows = self._key_rows(keys)
         context_ids, context_mask, has_context = self.spans.encode_contexts(contexts)
+        prelude_chars, prelude_lengths = self._prelude_rows(contexts, has_context)
         return KeyInputs(
             key_input_ids=rows.key_input_ids,
             key_attention=rows.key_attention,
@@ -578,7 +598,31 @@ class KeyCollator:
             context_mask=context_mask,
             has_context=has_context,
             context_rows=torch.arange(len(keys)),
+            prelude_chars=prelude_chars,
+            prelude_lengths=prelude_lengths,
         )
+
+    def _prelude_rows(
+        self, contexts: Sequence[str | None], has_context: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Context tails as lexicon indices (``lexicon.size`` for ``<unk>``), sharing dropout."""
+        limit = max(0, min(self.max_context_tokens, DEFAULT_CONTEXT_TOKENS) - 2)
+        encoded: list[list[int]] = []
+        for context, keep in zip(contexts, has_context.tolist(), strict=True):
+            if keep > 0.0 and context and limit > 0:
+                tail = context[-limit:]
+                encoded.append([self._char_index.get(ch, self._unk_index) for ch in tail])
+            else:
+                encoded.append([])
+        # Width >= 2 keeps ``prelude_chars`` off PyTorch Dynamo's 0/1
+        # specialisation under dynamic torch.compile even when a batch has no contexts.
+        width = max(2, max((len(ids) for ids in encoded), default=0))
+        chars = torch.zeros((len(contexts), width), dtype=torch.long)
+        lengths = torch.tensor([len(ids) for ids in encoded], dtype=torch.long)
+        for row, ids in enumerate(encoded):
+            if ids:
+                chars[row, : len(ids)] = torch.tensor(ids, dtype=torch.long)
+        return chars, lengths
 
     def _key_rows(self, keys: Sequence[str]) -> _KeyRows:
         """The keys' fill rows ``[CLS] k1 .. kn [SEP]``, padded to the longest."""

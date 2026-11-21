@@ -140,8 +140,8 @@ DEFINITIONS: dict[str, str] = {
     ),
     "transition": (
         "A prefix of emission ids i_1..i_k hashes as h_0 = 0, h_j = splitmix64(h_(j-1) ^ i_j); "
-        "its row is row[c] = draw(transition_seed, h_k ^ c) for c < E. Under transition 'flat' "
-        "every row is 0.0."
+        "its row is row[c] = draw(transition_seed, h_k ^ c) for c < E (and c = E for <eos> "
+        "when score_eos is true). Under transition 'flat' every row is 0.0."
     ),
     "settings": (
         "beta is 1 throughout; beam is 8, or null (no pruning) for records of at most "
@@ -253,8 +253,8 @@ def emissions(keys: int, width: int, seed: int, flat: bool) -> npt.NDArray[np.fl
 class HashedTransition:
     """The fixture's transition: rows are SplitMix64 draws over a prefix's rolling hash."""
 
-    def __init__(self, width: int, seed: int, flat: bool) -> None:
-        self.width = width
+    def __init__(self, width: int, seed: int, flat: bool, score_eos: bool = False) -> None:
+        self.width = width + int(score_eos)
         self.seed = seed
         self.flat = flat
         self.hashes: dict[Prefix, int] = {(): 0}
@@ -346,6 +346,7 @@ def _search(
     words: Sequence[WordArc] | None = None,
     prior: float = 0.0,
     arc_width: int = DEFAULT_ARC_WIDTH,
+    score_eos: bool = False,
 ) -> tuple[list[Hypothesis], HashedTransition, ArcCounts]:
     """The Python search over one record: hypotheses, the transition's calls, the arc counts."""
     width = len(lattice_legality.characters)
@@ -353,7 +354,9 @@ def _search(
     log_probs = torch.from_numpy(
         emissions(len(record.keys), width, record.seed, record.emission == "flat")
     )[None]
-    transition = HashedTransition(width, record.seed ^ _TRANSITION_XOR, record.transition == "flat")
+    transition = HashedTransition(
+        width, record.seed ^ _TRANSITION_XOR, record.transition == "flat", score_eos=score_eos
+    )
     counts = ArcCounts()
     [found] = search(
         [lattice],
@@ -367,6 +370,7 @@ def _search(
         prior=prior,
         arc_width=arc_width,
         counts=counts,
+        score_eos=score_eos,
     )
     return found, transition, counts
 
@@ -378,18 +382,22 @@ def run_setting(
     viterbi: bool,
     beam: int | None,
     gamma: float,
+    score_eos: bool = False,
 ) -> dict[str, Any]:
     """One record under one setting: the search's hypotheses and its transition calls."""
     found, transition, _ = _search(
-        lattice_legality, record, viterbi=viterbi, beam=beam, gamma=gamma
+        lattice_legality, record, viterbi=viterbi, beam=beam, gamma=gamma, score_eos=score_eos
     )
-    return {
+    out: dict[str, Any] = {
         "combine": "viterbi" if viterbi else "sum",
         "beam": beam,
         "gamma": gamma,
         "hypotheses": [_hypothesis(hypothesis, arcs=False) for hypothesis in found],
         "calls": transition.calls,
     }
+    if score_eos:
+        out["score_eos"] = True
+    return out
 
 
 def run_arc_setting(
@@ -401,6 +409,7 @@ def run_arc_setting(
     beam: int | None,
     prior: float,
     arc_width: int,
+    score_eos: bool = False,
 ) -> dict[str, Any]:
     """One arc record under one setting: :func:`run_setting` with the arcs, their counts too."""
     found, transition, counts = _search(
@@ -412,8 +421,9 @@ def run_arc_setting(
         words=words,
         prior=prior,
         arc_width=arc_width,
+        score_eos=score_eos,
     )
-    return {
+    out: dict[str, Any] = {
         "combine": "viterbi" if viterbi else "sum",
         "beam": beam,
         "gamma": ARC_GAMMA,
@@ -423,6 +433,9 @@ def run_arc_setting(
         "calls": transition.calls,
         "counts": {"offered": counts.offered, "landed": counts.landed, "rows": counts.rows},
     }
+    if score_eos:
+        out["score_eos"] = True
+    return out
 
 
 #: The transition seed is the emission seed xor this.
@@ -473,12 +486,21 @@ def _record(record: FixtureRecord, automaton: Legality, rows: Path) -> dict[str,
         "transition_seed": f"{record.seed ^ _TRANSITION_XOR:016x}",
     }
     if not record.lexicon:
-        document["settings"] = [
+        settings = [
             run_setting(automaton, record, viterbi=viterbi, beam=beam, gamma=gamma)
             for viterbi in (False, True)
             for beam in beams
             for gamma in GAMMAS
         ]
+        if record.name in ("xian", "shuijiap", "tie-homophones", "train-0", "train-3"):
+            settings.extend(
+                run_setting(
+                    automaton, record, viterbi=viterbi, beam=beam, gamma=0.5, score_eos=True
+                )
+                for viterbi in (False, True)
+                for beam in beams
+            )
+        document["settings"] = settings
         return document
     lexicon = ArcLexicon.load(rows, LEXICON_CATEGORIES, automaton.characters)
     words = lexicon.arcs(automaton.lattice(record.keys, OFFLINE), record.keys)
@@ -490,7 +512,7 @@ def _record(record: FixtureRecord, automaton: Legality, rows: Path) -> dict[str,
     document["words"] = [
         _word(word) for word in sorted(words, key=lambda arc: (arc.start, arc.entry, arc.end))
     ]
-    document["settings"] = [
+    arc_settings = [
         run_arc_setting(
             automaton,
             record,
@@ -505,6 +527,22 @@ def _record(record: FixtureRecord, automaton: Legality, rows: Path) -> dict[str,
         for prior in ARC_PRIORS
         for arc_width in ARC_WIDTHS
     ]
+    if record.name in ("arc-small", "arc-train-0"):
+        arc_settings.extend(
+            run_arc_setting(
+                automaton,
+                record,
+                words,
+                viterbi=viterbi,
+                beam=beam,
+                prior=1.5,
+                arc_width=DEFAULT_ARC_WIDTH,
+                score_eos=True,
+            )
+            for viterbi in (False, True)
+            for beam in beams
+        )
+    document["settings"] = arc_settings
     return document
 
 

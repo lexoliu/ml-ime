@@ -466,3 +466,79 @@ def test_a_run_names_one_source_and_replay_needs_core_ml(tmp_path: Path) -> None
     assert neither.exit_code != 0 and "name exactly one of" in neither.output
     replay = CliRunner().invoke(app, [*base, "--checkpoint", str(tmp_path / "c"), "--replay"])
     assert replay.exit_code != 0 and "replays keystrokes" in replay.output
+
+
+@darwin
+def test_a_prelude_and_eos_model_converts_and_agrees_with_pytorch(
+    stack: Stack, tmp_path: Path
+) -> None:
+    from mlime.train.key_coreml import CoreMlKeyDecoder, CoreMlKeyModel, CoreMlTransition
+
+    vocab = CharVocab(chars=SPECIALS + tuple(stack.lexicon.characters))
+    tower = copy.deepcopy(TINY)
+    tower.max_position_embeddings = 128
+    torch.manual_seed(4)
+    model = KeyE2EModel.compose(
+        tower,
+        stack.lexicon,
+        joint_config(replace(JOINT_KEYS, max_keys=126, decoder_prelude=True, score_eos=True)),
+        len(vocab),
+        emittable_ids(stack.lexicon, vocab),
+    )
+    open_gates(model)
+    read_the_encoder(model)
+    model.eval()
+
+    bundle = tmp_path / "bundle"
+    write_key_bundle(model, 21, stack.lexicon, stack.legality, KeyTokenizer(), bundle)
+    done = subprocess.run(
+        [
+            "uv",
+            "run",
+            "--no-sync",
+            "--project",
+            str(ROOT / "python/coreml"),
+            "mlime-coreml",
+            "convert",
+            "--bundle",
+            str(bundle),
+            "--work-dir",
+            str(tmp_path),
+            "--no-neural-engine",
+            "--no-package",
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=1200,
+        check=False,
+    )
+    assert done.returncode == 0, done.stderr[-4000:]
+    engine = CoreMlKeyModel(tmp_path / "models")
+    assert engine.manifest.decoder_prelude and engine.manifest.score_eos
+
+    collator = key_collator(stack.spans, stack.lexicon)
+    for keys, context in (("woaibeijing", "我爱北京今日は김치"), ("zhonghe", None)):
+        inputs = collator.inputs([keys], [context])
+        with torch.no_grad():
+            states = model.key_states(inputs)
+            want = ModelTransition(model, states, DecodeTimes())([0, 0], [(), (0, 1)])
+        encoding = engine.encode([letter_id(k) for k in keys], engine.context(inputs))
+        prelude = engine.prelude(inputs)
+        assert prelude is not None
+        got = CoreMlTransition(engine, encoding, DecodeTimes(), (), prelude)([0, 0], [(), (0, 1)])
+        assert got.shape == (2, stack.lexicon.size + 1)
+        assert np.abs(got - want.numpy()).max() <= LOG_PROB_ATOL
+
+    pt = decoder(model, stack.lexicon, stack.spans, stack.legality).decode(records()[:6], [GRID[0]])
+    for replay in (False, True):
+        cm = CoreMlKeyDecoder(
+            model=engine,
+            lexicon=stack.lexicon,
+            collator=collator,
+            legality=stack.legality,
+            options=model.e2e_config.keys.options,  # type: ignore[union-attr]
+            replay=replay,
+        ).decode(records()[:6], [GRID[0]])
+        agreed = sum(a[0].ids == b[0].ids for a, b in zip(pt[0], cm[0], strict=True))
+        assert agreed >= 5

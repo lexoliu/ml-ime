@@ -46,3 +46,33 @@ def test_a_tiny_bundle_converts_verifies_and_packages_deterministically(
         bundle.manifest, bundle_dir, models, tmp_path / "verification.json", again
     )
     assert digest == repeat and first.read_bytes() == second.read_bytes()
+
+
+def test_a_prelude_and_eos_bundle_converts_verifies_and_packages(tmp_path: Path) -> None:
+    from oracle import write_bundle
+
+    from mlime_coreml.bundle import read_bundle
+    from mlime_coreml.convert import ConvertedFamily, convert_family
+    from mlime_coreml.package import build_archive
+    from mlime_coreml.verify import verify
+
+    bundle_dir = tmp_path / "bundle"
+    write_bundle(bundle_dir, seed=9, decoder_prelude=True, score_eos=True)
+    bundle = read_bundle(bundle_dir)
+    families = spec.families_for(bundle.manifest.decoder_prelude)
+    assert families == ("context", "prelude", "keys", "tree")
+    build, models = tmp_path / "build", tmp_path / "models"
+    build.mkdir()
+    converted: dict[spec.Family, ConvertedFamily] = {
+        family: convert_family(bundle, family, build, models) for family in families
+    }
+    report = verify(bundle, converted, build, tmp_path, require_neural_engine=False)
+    assert report["passed"]
+    for family in families:
+        directory = models / spec.DIRECTORIES[family]
+        assert (directory / f"{spec.DIRECTORIES[family]}.mlmodelc").is_dir()
+        assert (directory / "manifest.json").is_file()
+    archive, _ = build_archive(
+        bundle.manifest, bundle_dir, models, tmp_path / "verification.json", tmp_path
+    )
+    assert archive.is_file()

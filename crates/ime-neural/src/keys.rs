@@ -227,6 +227,11 @@ pub trait KeyModel {
     /// largest keys function. Input of more keys is outside the model.
     fn max_keys(&self) -> usize;
 
+    /// Whether a tree row appends `<eos>` after the emittable characters.
+    fn score_eos(&self) -> bool {
+        false
+    }
+
     /// Encode *keys* under *context*: write the head's CTC log-probs into
     /// *`log_probs`* (cleared first), `keys.len()` rows of the emittable
     /// characters and the blank, the blank last, and return what the tree

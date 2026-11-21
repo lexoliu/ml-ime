@@ -356,12 +356,22 @@ def build_from(
     )
     vocabularies = Vocabularies.load(char_table, recorded.base_model, context)
     model = from_checkpoint(state, vocabularies.lexicon, wanted)
-    if recorded.keys is not None and (keys is None or recorded.keys.weighed_as(keys) != keys):
-        raise ValueError(
-            f"{source} has the key front {recorded.keys}; a stage keeps it and changes only "
-            "its loss weights"
-        )
     joint = keys is not None and not key_warm_up
+    if recorded.keys is not None:
+        carried = (
+            replace(
+                recorded.keys,
+                decoder_prelude=keys.decoder_prelude,
+                score_eos=keys.score_eos,
+            )
+            if with_weights and joint and recorded.key_warm_up and keys is not None
+            else recorded.keys
+        )
+        if keys is None or carried.weighed_as(keys) != keys:
+            raise ValueError(
+                f"{source} has the key front {recorded.keys}; a stage keeps it and changes only "
+                "its loss weights (and S2's transition switches when starting from S1)"
+            )
     if recorded.keys is not None and not recorded.key_warm_up and key_warm_up:
         raise ValueError(
             f"{source} is a joint key run (S2); the warm-up (S1) comes before it, never after"
@@ -512,6 +522,10 @@ def compile_modules(model: E2EModel, mode: str) -> None:
         model.decoder.over_keys = torch.compile(  # type: ignore[method-assign]
             model.decoder.over_keys, dynamic=True, options=options
         )
+        if model.keys_config.decoder_prelude:
+            model.decoder.prelude = torch.compile(  # type: ignore[method-assign]
+                model.decoder.prelude, dynamic=True, options=options
+            )
         if isinstance(model, KeyRankingModel):
             # The candidate search's position, whole as the span model's is.
             model.decoder.advance_keys = whole_compile(  # type: ignore[method-assign]

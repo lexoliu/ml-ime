@@ -83,9 +83,9 @@ from transformers import BertConfig, BertForMaskedLM, BertModel
 
 from mlime.logging import log
 from mlime.train.charlm_model import Block, TransformerCharLm
-from mlime.train.charlm_vocab import BOS
+from mlime.train.charlm_vocab import BOS, SEP
 from mlime.train.ctc import alignment_components, alignment_scores, constrained_ctc
-from mlime.train.e2e_model import E2EConfig, E2EModel, EncoderAttention, context_tower
+from mlime.train.e2e_model import E2EConfig, E2EModel, EncoderAttention, PreludeKV, context_tower
 from mlime.train.key_manifest import N_MAX, NEG
 from mlime.train.key_tree import TreeCall
 from mlime.train.keys import (
@@ -99,7 +99,7 @@ from mlime.train.keys import (
 from mlime.train.lexicon import Lexicon
 from mlime.train.loop import Accuracy
 from mlime.train.model import ContextTower, RouteAOutput, count_correct, mark_dynamic
-from mlime.train.samples import LETTER_PAD, token_budget_batches
+from mlime.train.samples import DEFAULT_CONTEXT_TOKENS, LETTER_PAD, token_budget_batches
 
 #: Parameter prefixes of the parts the key model adds: they train at the new rate.
 KEY_PARAMETER_PREFIXES = ("key_front.", "blank.")
@@ -138,11 +138,29 @@ class KeyStates:
     ``states [B, Wk, H]`` holds row ``b``'s key ``t`` at ``[b, t]`` -- the
     sentinels' columns are cut away -- and ``mask [B, Wk]`` (bool) marks the
     real keys; a padded key's state is whatever the tower computed there and
-    is read by nothing the mask excludes.
+    is read by nothing the mask excludes. With ``decoder_prelude`` on,
+    ``prelude`` caches each row's ``<bos> c_1 .. c_k`` reader keys and values.
     """
 
     states: torch.Tensor
     mask: torch.Tensor
+    prelude: PreludeKV | None = None
+
+
+@dataclass(frozen=True)
+class PreludeMemory:
+    """One record's causal reader prelude ``<bos> c_1 .. c_k`` at a fixed static length (#309).
+
+    ``keys`` and ``values`` are ``[layers, heads, P, head_dim]``, ``bias`` is
+    additive ``[1, 1, 1, P]`` (0 on the ``length`` real tokens, ``NEG`` after),
+    and ``tokens [1, P]`` are the reader token ids fed to the prelude function.
+    """
+
+    keys: torch.Tensor
+    values: torch.Tensor
+    bias: torch.Tensor
+    tokens: torch.Tensor
+    length: int
 
 
 @dataclass(frozen=True)
@@ -212,10 +230,10 @@ class _JointTerms:
     """One joint pass: the constrained CTC's per-row terms and the transition's logits.
 
     ``nll [B]`` is each row's constrained-CTC loss, ``blank`` and ``emit``
-    the alignment scores it was summed from, ``transition [P, E]`` the
-    decoder's teacher-forced logits at each gold character over the whole
-    emittable set, and ``targets [P]`` those characters, in the span batch's
-    ``scored`` order.
+    the alignment scores it was summed from, ``transition [P (+ B), E (+ 1)]``
+    the decoder's teacher-forced logits at each gold character (and ``<eos>``
+    when ``score_eos`` is on), ``targets [P (+ B)]`` those indices, and
+    ``scored_chars`` the gold character count ``P``.
     """
 
     nll: torch.Tensor
@@ -223,6 +241,7 @@ class _JointTerms:
     emit: torch.Tensor
     transition: torch.Tensor
     targets: torch.Tensor
+    scored_chars: int
 
 
 class KeyBlock(nn.Module):
@@ -689,21 +708,33 @@ class KeyE2EModel(E2EModel):
     def joint_loss(self, batch: KeyBatch) -> RouteAOutput:
         """S2's loss: the constrained CTC plus ``transition_weight`` times the transition's term.
 
-        Both are normalised per gold character, the CTC exactly as S1's. The
-        transition's term is the cross-entropy of each gold character under
-        the decoder's log-softmax over the whole emittable set, teacher-forced
+        The CTC is normalised per gold character, exactly as S1's. The
+        transition's term is the mean cross-entropy of the predicted tokens
+        (each gold character, plus ``<eos>`` when ``score_eos`` is on) under
+        the decoder's log-softmax over the output alphabet, teacher-forced
         over the gold prefix and reading every key (:meth:`joint_terms`).
         """
         terms = self.joint_terms(batch)
-        scored = terms.targets.numel()
-        ctc = terms.nll.sum() / scored
+        ctc = terms.nll.sum() / terms.scored_chars
         log_probs = terms.transition.float().log_softmax(dim=-1)
-        transition = -log_probs.gather(1, terms.targets.unsqueeze(1)).sum() / scored
+        transition = -log_probs.gather(1, terms.targets.unsqueeze(1)).sum() / terms.targets.numel()
         loss = ctc + self.keys_config.transition_weight * transition
         extras = {"ctc_loss": ctc.detach(), "transition_loss": transition.detach()}
         return RouteAOutput(
             loss=loss, extras={**extras, **self.components(batch, terms.blank, terms.emit)}
         )
+
+    def _encode_prelude(
+        self, prelude_chars: torch.Tensor, prelude_lengths: torch.Tensor, context_rows: torch.Tensor
+    ) -> PreludeKV | None:
+        """The reader's prelude KV per fill row when ``decoder_prelude`` is on; else ``None``."""
+        if not self.keys_config.decoder_prelude:
+            return None
+        torch._dynamo.maybe_mark_dynamic(prelude_chars, (0, 1))
+        torch._dynamo.maybe_mark_dynamic(prelude_lengths, 0)
+        torch._dynamo.maybe_mark_dynamic(context_rows, 0)
+        kv = self.decoder.prelude(prelude_chars, prelude_lengths)
+        return kv.select(context_rows)
 
     def joint_terms(self, batch: KeyBatch) -> _JointTerms:
         """One pass of the joint stage over *batch*: the CTC's terms and the transition's logits.
@@ -716,23 +747,40 @@ class KeyE2EModel(E2EModel):
         mark_dynamic(spans)
         encoded = self.encode_keys(batch, self.encode_context(spans))
         nll, blank, emit = self.ctc_alignment(batch, encoded.reshape(-1, encoded.shape[-1]))
+        prelude = self._encode_prelude(
+            batch.prelude_chars, batch.prelude_lengths, spans.context_rows
+        )
+        states = self.states_at_keys(batch.key_mask, encoded, prelude)
         at = batch.gold_positions
+        gold_chars = batch.gold.reshape(-1).index_select(0, at)
+        scored_chars = int(at.numel())
+        if self.decoder.score_eos:
+            eos = torch.full(
+                (batch.size,),
+                int(self.decoder.emit_ids.numel()),
+                dtype=torch.long,
+                device=gold_chars.device,
+            )
+            targets = torch.cat([gold_chars, eos])
+        else:
+            targets = gold_chars
         return _JointTerms(
             nll=nll,
             blank=blank,
             emit=emit,
-            transition=self.transition_logits(
-                self.states_at_keys(batch.key_mask, encoded), batch.gold, at
-            ),
-            targets=batch.gold.reshape(-1).index_select(0, at),
+            transition=self.transition_logits(states, batch.gold, at, batch.lengths),
+            targets=targets,
+            scored_chars=scored_chars,
         )
 
-    def states_at_keys(self, mask: torch.Tensor, encoded: torch.Tensor) -> KeyStates:
+    def states_at_keys(
+        self, mask: torch.Tensor, encoded: torch.Tensor, prelude: PreludeKV | None = None
+    ) -> KeyStates:
         """*encoded* ``[B, Wk + 2, H]``, the fill tower over the keys, without its sentinels.
 
         *mask* ``[B, Wk]`` marks each row's real keys.
         """
-        return KeyStates(states=encoded[:, 1 : mask.shape[1] + 1], mask=mask)
+        return KeyStates(states=encoded[:, 1 : mask.shape[1] + 1], mask=mask, prelude=prelude)
 
     def key_states(self, keys: KeyInputs) -> KeyStates:
         """Encode the keys once: the search's encoder pass (6a of #257).
@@ -750,29 +798,47 @@ class KeyE2EModel(E2EModel):
         for tensor in (keys.context_ids, keys.context_mask):
             torch._dynamo.maybe_mark_dynamic(tensor, (0, 1))
         memory = self.context_memory(keys.context_ids, keys.context_mask)
-        return self.states_at_keys(keys.key_mask, self.encode_inputs(keys, memory))
+        prelude = self._encode_prelude(keys.prelude_chars, keys.prelude_lengths, keys.context_rows)
+        return self.states_at_keys(keys.key_mask, self.encode_inputs(keys, memory), prelude)
 
     def transition_logits(
-        self, keys: KeyStates, gold: torch.Tensor, at: torch.Tensor
+        self,
+        keys: KeyStates,
+        gold: torch.Tensor,
+        at: torch.Tensor,
+        lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """The decoder's teacher-forced logits at the gold characters, ``[P, E]``.
+        """Teacher-forced logits at gold characters (and ``<eos>``), ``[P (+ B), E (+ 1)]``.
 
         *gold* ``[B, M]`` holds each row's sentence as emission indices, any
-        valid index past its end; step ``j`` reads ``<bos>`` and the gold's
-        first ``j`` characters, and every block cross-attends to *keys*. *at*
-        ``[P]`` picks the real steps as flat indices into ``[B, M]``
-        (:attr:`KeyBatch.gold_positions`), so only those rows meet the head.
+        valid index past its end; step ``j`` reads the sentence root (``<sep>``
+        with a prelude, ``<bos>`` without) and the gold's first ``j``
+        characters, and every block cross-attends to *keys*. *at* ``[P]``
+        picks the real character steps as flat indices into ``[B, M]``
+        (:attr:`KeyBatch.gold_positions`), and when ``score_eos`` is on,
+        *lengths* ``[B]`` picks each row's closing ``<eos>`` step after them.
         """
         decoder = self.decoder
         ids = decoder.emit_ids[gold]
-        previous = torch.cat(
-            [torch.full((ids.shape[0], 1), BOS, dtype=torch.long, device=ids.device), ids[:, :-1]],
-            dim=1,
-        )
+        root_id = SEP if keys.prelude is not None else BOS
+        root = torch.full((ids.shape[0], 1), root_id, dtype=torch.long, device=ids.device)
+        if decoder.score_eos:
+            if lengths is None:
+                raise ValueError("transition_logits with score_eos needs each row's length")
+            width = ids.shape[1]
+            previous = torch.cat([root, ids], dim=1)
+            char_at = (at // width) * (width + 1) + (at % width)
+            eos_at = torch.arange(ids.shape[0], device=ids.device) * (width + 1) + lengths
+            gather_at = torch.cat([char_at, eos_at])
+        else:
+            previous = torch.cat([root, ids[:, :-1]], dim=1)
+            gather_at = at
         for tensor in (previous, keys.states, keys.mask):
             torch._dynamo.maybe_mark_dynamic(tensor, (0, 1))
-        features = decoder.over_keys(previous, keys.states, keys.mask)
-        return decoder.emission_logits(features.reshape(-1, features.shape[-1]).index_select(0, at))
+        features = decoder.over_keys(previous, keys.states, keys.mask, prelude=keys.prelude)
+        return decoder.emission_logits(
+            features.reshape(-1, features.shape[-1]).index_select(0, gather_at)
+        )
 
     def transition_log_probs(
         self,
@@ -781,7 +847,7 @@ class KeyE2EModel(E2EModel):
         prefixes: torch.Tensor,
         lengths: torch.Tensor,
     ) -> torch.Tensor:
-        """The next character's log-probabilities after each hypothesis, ``[N, E]`` float32.
+        """The next token's log-probabilities after each hypothesis, ``[N, E (+ 1)]`` float32.
 
         The search's batched transition query (6c of #257). *keys* are
         :meth:`key_states`' output for a set of records; hypothesis ``n``
@@ -789,23 +855,22 @@ class KeyE2EModel(E2EModel):
         ``keys.states``' first dim) and has emitted ``prefixes[n, :lengths[n]]``
         (``prefixes [N, L]`` long emission indices, any valid emission index
         past ``lengths[n]``; ``lengths [N]`` long, each at most ``L``; ``L``
-        may be 0). Row ``n`` is the log-softmax over the whole emittable set,
-        emission order, of the character that follows the prefix: the
-        distribution the training term reads at that step, which the search
-        masks without renormalising. Each query re-runs the decoder over
-        ``<bos>`` and the whole prefix, batched over the hypotheses; the
-        decoder is causal, so what follows a prefix's end does not reach it.
-        Call under ``eval()`` and ``torch.no_grad()``.
+        may be 0). Row ``n`` is the log-softmax over the output alphabet,
+        emission order (with ``<eos>`` last when ``score_eos`` is on), of the
+        token that follows the prefix. Call under ``eval()`` and ``torch.no_grad()``.
         """
         decoder = self.decoder
+        root_id = SEP if keys.prelude is not None else BOS
         tokens = torch.cat(
             [
-                torch.full((prefixes.shape[0], 1), BOS, dtype=torch.long, device=prefixes.device),
+                torch.full(
+                    (prefixes.shape[0], 1), root_id, dtype=torch.long, device=prefixes.device
+                ),
                 decoder.emit_ids[prefixes],
             ],
             dim=1,
         )
-        features = decoder.over_keys(tokens, keys.states, keys.mask, rows)
+        features = decoder.over_keys(tokens, keys.states, keys.mask, rows, keys.prelude)
         steps = tokens.shape[1]
         at = torch.arange(tokens.shape[0], device=tokens.device) * steps + lengths
         last = features.reshape(-1, features.shape[-1]).index_select(0, at)
@@ -836,21 +901,58 @@ class KeyE2EModel(E2EModel):
         bias[..., :real] = 0.0
         return CrossMemory(keys=key_slots, values=value_slots, bias=bias)
 
-    def tree_feeds(self, call: TreeCall) -> TreeFeeds:
+    def prelude_memory(
+        self, keys: KeyInputs, row: int = 0, length: int = DEFAULT_CONTEXT_TOKENS
+    ) -> PreludeMemory:
+        """Record *row*'s reader prelude ``<bos> c_1 .. c_k`` padded to *length* (#309)."""
+        real_chars = int(keys.prelude_lengths[row])
+        prelude_len = 1 + real_chars
+        if prelude_len > length:
+            raise ValueError(f"{prelude_len} prelude tokens do not fit a length of {length}")
+        device = self.decoder.emit_ids.device
+        tokens = torch.zeros((1, length), dtype=torch.long, device=device)
+        tokens[0, 0] = BOS
+        if real_chars > 0:
+            chars = keys.prelude_chars[row, :real_chars].to(device)
+            tokens[0, 1:prelude_len] = self.decoder.prelude_table()[chars]
+        x = self.decoder.embed(tokens, None, 0)
+        causal = torch.triu(torch.full((length, length), NEG, device=device), diagonal=1)
+        layer_keys: list[torch.Tensor] = []
+        layer_values: list[torch.Tensor] = []
+        for block in self.decoder.reader.layers():
+            q, k, v = block.split(x)
+            scores = (q @ k.transpose(-1, -2)) / math.sqrt(block.head_dim) + causal
+            x = block.merge(x, scores.softmax(dim=-1) @ v)
+            layer_keys.append(k[0])
+            layer_values.append(v[0])
+        bias = x.new_full((1, 1, 1, length), NEG)
+        bias[..., :prelude_len] = 0.0
+        return PreludeMemory(
+            keys=torch.stack(layer_keys),
+            values=torch.stack(layer_values),
+            bias=bias,
+            tokens=tokens,
+            length=prelude_len,
+        )
+
+    def tree_feeds(self, call: TreeCall, prelude_length: int | None = None) -> TreeFeeds:
         """A packed call's inputs: reader ids, depths and the additive tree bias.
 
         A node's token is its prefix's last character mapped to the reader's
-        id, ``<bos>`` for the root; a padding row is ``<bos>`` at depth 0 and
-        sees only itself.
+        id, ``<bos>`` for the root (or ``<sep>`` at *prelude_length* when a
+        prelude precedes the sentence); a padding row takes the root token and
+        depth and sees only itself (and the prelude when present).
         """
         size = call.bucket
         device = self.decoder.emit_ids.device
-        reader_ids = torch.full((1, size), BOS, dtype=torch.long, device=device)
-        positions = torch.zeros((1, size), dtype=torch.long, device=device)
+        root = BOS if prelude_length is None else SEP
+        offset = 0 if prelude_length is None else prelude_length
+        reader_ids = torch.full((1, size), root, dtype=torch.long, device=device)
+        positions = torch.full((1, size), offset, dtype=torch.long, device=device)
         for row, node in enumerate(call.nodes):
             if node:
                 reader_ids[0, row] = self.decoder.emit_ids[node[-1]]
-            positions[0, row] = len(node)
+            positions[0, row] = offset + len(node)
         bias = torch.full((1, 1, size, size), NEG, device=device)
         for row in range(size):
             bias[0, 0, row, list(call.visible(row))] = 0.0
@@ -862,20 +964,16 @@ class KeyE2EModel(E2EModel):
         positions: torch.Tensor,
         tree_bias: torch.Tensor,
         cross: CrossMemory,
+        prelude: PreludeMemory | None = None,
     ) -> torch.Tensor:
-        """Every node's next-character logits over a packed prefix tree, ``[1, S, E]``.
+        """Every node's next-token logits over a packed prefix tree, ``[1, S, E (+ 1)]``.
 
         ``reader_ids [1, S]`` is each node's last token as a reader id and
         ``positions [1, S]`` its depth; ``tree_bias [1, 1, S, S]`` is additive,
         0 where the column is an ancestor of the row or the row itself and
         :data:`~mlime.train.key_manifest.NEG` elsewhere; *cross* is the
-        record's key states. Row ``i`` is what :meth:`transition_logits` gives
-        after the prefix ending at node ``i``: a node attending to exactly its
-        ancestors at their depths is causal attention over its prefix. A
-        padding row that sees only itself changes no other row. Attention is
-        a matrix product, an additive mask, a softmax and a matrix product,
-        and no row is fully masked, so the module converts for the Neural
-        Engine as written. Call under ``eval()`` and ``torch.no_grad()``.
+        record's key states, and *prelude* (when present) its cached ``<bos>
+        c_1 .. c_k`` reader KV. Call under ``eval()`` and ``torch.no_grad()``.
         """
         decoder = self.decoder
         reader = decoder.reader
@@ -883,7 +981,17 @@ class KeyE2EModel(E2EModel):
         for layer, (block, gate) in enumerate(
             zip(reader.layers(), decoder.gated_layers(), strict=True)
         ):
-            x = _tree_attention(block, x, tree_bias)
+            if prelude is None:
+                x = _tree_attention(block, x, tree_bias)
+            else:
+                q, k, v = block.split(x)
+                k_all = torch.cat([prelude.keys[layer].unsqueeze(0), k], dim=2)
+                v_all = torch.cat([prelude.values[layer].unsqueeze(0), v], dim=2)
+                bias_all = torch.cat(
+                    [prelude.bias.expand(-1, -1, x.shape[1], -1), tree_bias], dim=-1
+                )
+                scores = (q @ k_all.transpose(-1, -2)) / math.sqrt(block.head_dim) + bias_all
+                x = block.merge(x, scores.softmax(dim=-1) @ v_all)
             x = _cross_attention(
                 gate,
                 x,
@@ -899,9 +1007,14 @@ class KeyE2EModel(E2EModel):
         positions: torch.Tensor,
         tree_bias: torch.Tensor,
         cross: CrossMemory,
+        prelude: PreludeMemory | None = None,
     ) -> torch.Tensor:
-        """:meth:`tree_logits` log-softmaxed over the emittable set in float32, ``[1, S, E]``."""
-        return self.tree_logits(reader_ids, positions, tree_bias, cross).float().log_softmax(-1)
+        """:meth:`tree_logits` log-softmaxed in float32, ``[1, S, E (+ 1)]``."""
+        return (
+            self.tree_logits(reader_ids, positions, tree_bias, cross, prelude)
+            .float()
+            .log_softmax(-1)
+        )
 
     def student_frame(self, batch: KeyBatch) -> torch.Tensor:
         """The parent's decoder frame fed the key front's states at the span ends.
@@ -1017,13 +1130,17 @@ def joint_evaluate(
     nll = torch.zeros((), dtype=torch.float64, device=device)
     was_training = model.training
     model.eval()
+    emittable = int(model.decoder.emit_ids.numel())
     with torch.no_grad():
         for group in token_budget_batches(
             iter(examples), token_budget, collator.max_context_tokens
         ):
             terms = model.joint_terms(collator(group).to(device))
-            correct += (terms.transition.argmax(dim=-1) == terms.targets).sum()
-            scored += terms.targets.numel()
+            chars = terms.scored_chars
+            correct += (
+                terms.transition[:chars, :emittable].argmax(dim=-1) == terms.targets[:chars]
+            ).sum()
+            scored += chars
             nll += terms.nll.double().sum()
     if was_training:
         model.train()

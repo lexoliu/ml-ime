@@ -62,6 +62,15 @@ def signature(manifest: Manifest, family: Family) -> Signature:
             ),
             outputs=(Tensor("context", "float16", (1, "length", dims.context.hidden)),),
         )
+    if family == "prelude":
+        pre: tuple[Dim, ...] = (decoder.layers, decoder.heads, "length", decoder.head_dim)
+        return Signature(
+            inputs=(Tensor("prelude_tokens", "int32", (1, "length")),),
+            outputs=(
+                Tensor("prelude_keys", "float16", pre, batched=False),
+                Tensor("prelude_values", "float16", pre, batched=False),
+            ),
+        )
     if family == "keys":
         tokens = manifest.context_tokens
         return Signature(
@@ -78,16 +87,29 @@ def signature(manifest: Manifest, family: Family) -> Signature:
                 Tensor("cross_values", "float16", cross, batched=False),
             ),
         )
+    tree_inputs: list[Tensor] = [
+        Tensor("reader_ids", "int32", (1, "length")),
+        Tensor("positions", "int32", (1, "length")),
+        Tensor("tree_bias", "float16", (1, 1, "length", "length")),
+        Tensor("cross_keys", "float16", cross, batched=False),
+        Tensor("cross_values", "float16", cross, batched=False),
+        Tensor("cross_bias", "float16", (1, 1, 1, spec.N_MAX)),
+    ]
+    if manifest.decoder_prelude:
+        tokens = manifest.context_tokens
+        prelude = (decoder.layers, decoder.heads, tokens, decoder.head_dim)
+        tree_inputs.extend(
+            (
+                Tensor("prelude_keys", "float16", prelude, batched=False),
+                Tensor("prelude_values", "float16", prelude, batched=False),
+                Tensor("prelude_bias", "float16", (1, 1, 1, tokens)),
+            )
+        )
     return Signature(
-        inputs=(
-            Tensor("reader_ids", "int32", (1, "length")),
-            Tensor("positions", "int32", (1, "length")),
-            Tensor("tree_bias", "float16", (1, 1, "length", "length")),
-            Tensor("cross_keys", "float16", cross, batched=False),
-            Tensor("cross_values", "float16", cross, batched=False),
-            Tensor("cross_bias", "float16", (1, 1, 1, spec.N_MAX)),
+        inputs=tuple(tree_inputs),
+        outputs=(
+            Tensor("logits", "float16", (1, "length", dims.emitted + int(manifest.score_eos))),
         ),
-        outputs=(Tensor("logits", "float16", (1, "length", dims.emitted)),),
     )
 
 

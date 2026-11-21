@@ -109,6 +109,7 @@ enum Event {
 struct Synthetic {
     emittable: usize,
     vary: bool,
+    score_eos: bool,
     /// What [`KeyModel::max_keys`] reports.
     limit: usize,
     calls: usize,
@@ -120,10 +121,17 @@ impl Synthetic {
         Self {
             emittable,
             vary,
+            score_eos: false,
             limit: usize::MAX,
             calls: 0,
             events: RefCell::new(Vec::new()),
         }
+    }
+
+    /// The same model closing hypotheses with an `<eos>` column.
+    fn with_eos(mut self) -> Self {
+        self.score_eos = true;
+        self
     }
 
     /// The same model holding at most *limit* keys.
@@ -152,6 +160,10 @@ impl KeyModel for Synthetic {
         self.limit
     }
 
+    fn score_eos(&self) -> bool {
+        self.score_eos
+    }
+
     fn encode(
         &mut self,
         keys: &Keys,
@@ -178,10 +190,11 @@ impl KeyModel for Synthetic {
     fn tree(&mut self, encoding: &u64, call: &TreeCall<'_, EmitId>) -> Result<Logits, Infallible> {
         let number = self.calls;
         self.calls += 1;
+        let width = self.emittable + usize::from(self.score_eos);
         let rows = call
             .nodes()
             .iter()
-            .flat_map(|node| node_row(self.emittable, *encoding, node, self.vary.then_some(number)))
+            .flat_map(|node| node_row(width, *encoding, node, self.vary.then_some(number)))
             .collect();
         self.events.borrow_mut().push(Event::Tree {
             call: number,
@@ -196,7 +209,7 @@ impl KeyModel for Synthetic {
             call: logits.call,
             node,
         });
-        let width = self.emittable;
+        let width = self.emittable + usize::from(self.score_eos);
         log_softmax(&logits.rows[node * width..(node + 1) * width], out);
     }
 }
@@ -204,6 +217,7 @@ impl KeyModel for Synthetic {
 /// The direct search's transition: every row from the prefix alone.
 struct Reference {
     emittable: usize,
+    score_eos: bool,
     encoding: u64,
 }
 
@@ -217,9 +231,10 @@ impl KeyTransition for Reference {
         out: &mut [f32],
     ) -> Result<(), Infallible> {
         let mut ids = Vec::new();
-        for (&query, row) in queries.iter().zip(out.chunks_exact_mut(self.emittable)) {
+        let width = self.emittable + usize::from(self.score_eos);
+        for (&query, row) in queries.iter().zip(out.chunks_exact_mut(width)) {
             trie.ids_into(query, &mut ids);
-            log_softmax(&node_row(self.emittable, self.encoding, &ids, None), row);
+            log_softmax(&node_row(width, self.encoding, &ids, None), row);
         }
         Ok(())
     }
@@ -240,6 +255,7 @@ fn options(legality: LegalityOptions) -> KeyEngineOptions {
             combine: Combine::Sum,
             prior: Weight::ZERO,
             arc_width: DEFAULT_ARC_WIDTH,
+            score_eos: false,
         },
     }
 }
@@ -309,6 +325,7 @@ fn direct(legality: &Legality, typed: &str) -> Vec<Sentence> {
         KeyLogProbs::new(pending.letters().len(), emittable + 1, &data).expect("a table");
     let mut reference = Reference {
         emittable,
+        score_eos: false,
         encoding,
     };
     let Ok(found) = key_search(
@@ -746,4 +763,55 @@ fn a_session_typed_across_the_limit_answers_what_each_engine_answers_directly() 
         session.sentences(),
         sentences(&mut bounded(&legality, limit), &typed[..limit])
     );
+}
+
+#[test]
+fn an_eos_scoring_model_closes_sentences_and_matches_direct_search() {
+    let legality = legality();
+    let emittable = legality.emittable().len();
+    let typed = "woaibj";
+    let mut session = Session::new(
+        KeyEngine::new(
+            Synthetic::new(emittable, false).with_eos(),
+            &legality,
+            options(LegalityOptions::LIVE),
+        ),
+        SessionOptions { sentences: 3 },
+    );
+    for ch in typed.chars() {
+        session.key(ch).expect("a keystroke decodes");
+    }
+    let pending = pending(typed);
+    let lattice = legality.lattice(
+        pending.letters(),
+        LegalityOptions {
+            unfinished_tail: true,
+            ..LegalityOptions::LIVE
+        },
+    );
+    let mut model = Synthetic::new(emittable, false).with_eos();
+    let mut data = Vec::new();
+    let Ok(encoding) = model.encode(pending.letters(), None, &mut data);
+    let log_probs =
+        KeyLogProbs::new(pending.letters().len(), emittable + 1, &data).expect("a table");
+    let mut search_options = options(LegalityOptions::LIVE).search;
+    search_options.score_eos = true;
+    let mut reference = Reference {
+        emittable,
+        score_eos: true,
+        encoding,
+    };
+    let Ok(found) = key_search(
+        &lattice,
+        &log_probs,
+        &[],
+        &mut reference,
+        &search_options,
+        &mut KeySearchStats::default(),
+    );
+    let wanted: Vec<Sentence> = found
+        .iter()
+        .map(|hypothesis| as_sentence(&legality, hypothesis))
+        .collect();
+    assert_eq!(session.sentences(), wanted);
 }

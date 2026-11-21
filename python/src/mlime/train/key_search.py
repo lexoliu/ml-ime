@@ -377,6 +377,7 @@ class _Record:
         if words and prior > 0 and self.chars.size:
             self._keep(lattice, words, arc_width)
         self.rows: dict[Prefix, npt.NDArray[np.float32]] = {}
+        self.closing: dict[Prefix, _Prefix] = {}
         self.results: list[Hypothesis] = []
 
     def _keep(self, lattice: KeyLattice, words: Sequence[WordArc], width: int) -> None:
@@ -544,7 +545,14 @@ class _Record:
         return out
 
     def step(
-        self, end: int, beta: float, beam: int | None, top_k: int | None, viterbi: bool
+        self,
+        end: int,
+        beta: float,
+        beam: int | None,
+        top_k: int | None,
+        viterbi: bool,
+        *,
+        score_eos: bool = False,
     ) -> None:
         """Consume key ``end - 1``: emit, drop dead cuts, merge, prune to the beam."""
         groups = self.extensions(end, beta, viterbi)
@@ -579,7 +587,8 @@ class _Record:
             if cuts:
                 survivors[key] = _Prefix(prefix.transition, cuts)
         final = end == self.n
-        limit = top_k if final else beam
+        eos_keep = None if beam is None else max(beam, top_k if top_k is not None else beam)
+        limit = (eos_keep if score_eos else top_k) if final else beam
         # New prefixes: every new one has the one cut ``end``, so the bound
         # they are ranked by is common and the best ``limit`` by score are all
         # that can make the beam.
@@ -610,7 +619,19 @@ class _Record:
             else:
                 held.cuts[end] = self.merged(held.cuts.get(end), arrival)
         if final:
-            self._finish(survivors, beta, top_k)
+            if not score_eos or not survivors:
+                self._finish(survivors, beta, top_k)
+                return
+            if eos_keep is not None and len(survivors) > eos_keep:
+                kept = sorted(
+                    survivors,
+                    key=lambda key: (
+                        -(survivors[key].cuts[self.n].mass + beta * survivors[key].transition)
+                    ),
+                )[:eos_keep]
+                survivors = {key: survivors[key] for key in kept}
+            self.closing = survivors
+            self.beam = {}
             return
         if beam is not None and len(survivors) > beam:
             ranks = {
@@ -668,6 +689,28 @@ class _Record:
         self.beam = {}
         self.rows = {}
 
+    def finish_eos(self, beta: float, top_k: int | None, emittable: int) -> None:
+        """Close the surviving outputs at ``self.n`` with ``log T(<eos> | output)`` (#309)."""
+        results = []
+        for key, prefix in self.closing.items():
+            state = prefix.cuts[self.n]
+            transition = prefix.transition + float(self.rows[key][emittable])
+            results.append(
+                Hypothesis(
+                    ids=key,
+                    score=state.mass + beta * transition + self.blank_total,
+                    ctc=state.ctc + self.blank_total,
+                    transition=transition,
+                    correction=state.correction,
+                    cuts=state.cover,
+                    arcs=state.arcs,
+                )
+            )
+        results.sort(key=lambda hypothesis: -hypothesis.score)
+        self.results = results if top_k is None else results[:top_k]
+        self.closing = {}
+        self.rows = {}
+
     def evict(self) -> None:
         """Drop the rows of prefixes no beam prefix can extend into again."""
         beam = self.beam
@@ -703,6 +746,7 @@ def search(
     prior: float = 0.0,
     arc_width: int = DEFAULT_ARC_WIDTH,
     counts: ArcCounts | None = None,
+    score_eos: bool = False,
 ) -> list[list[Hypothesis]]:
     """Each record's best legal outputs over its keys' lattice, best first.
 
@@ -738,6 +782,7 @@ def search(
     if top_k is None:
         top_k = beam
     emittable = columns - 1
+    row_width = emittable + int(score_eos)
     for lattice in lattices:
         if lattice.keys > width:
             raise ValueError(f"a record has {lattice.keys} keys against {width} log-prob rows")
@@ -770,11 +815,32 @@ def search(
                 owners.extend([index] * len(asked))
                 prefixes.extend(asked)
             if prefixes:
-                fetched = _host_rows(transition(owners, prefixes), len(prefixes), emittable)
+                fetched = _host_rows(transition(owners, prefixes), len(prefixes), row_width)
                 for index, key, row in zip(owners, prefixes, fetched, strict=True):
                     records[index].rows[key] = row
         for index in live:
-            records[index].step(end, beta, beam, top_k, viterbi)
+            records[index].step(end, beta, beam, top_k, viterbi, score_eos=score_eos)
+        if score_eos:
+            closing = [
+                index for index in live if records[index].n == end and records[index].closing
+            ]
+            if closing:
+                eos_owners: list[int] = []
+                eos_prefixes: list[Prefix] = []
+                for index in closing:
+                    asked = [
+                        key for key in records[index].closing if key not in records[index].rows
+                    ]
+                    eos_owners.extend([index] * len(asked))
+                    eos_prefixes.extend(asked)
+                if eos_prefixes:
+                    fetched = _host_rows(
+                        transition(eos_owners, eos_prefixes), len(eos_prefixes), row_width
+                    )
+                    for index, key, row in zip(eos_owners, eos_prefixes, fetched, strict=True):
+                        records[index].rows[key] = row
+                for index in closing:
+                    records[index].finish_eos(beta, top_k, emittable)
     return [record.results for record in records]
 
 
@@ -835,6 +901,7 @@ def search_keys(
     prior: float = 0.0,
     arc_width: int = DEFAULT_ARC_WIDTH,
     counts: ArcCounts | None = None,
+    score_eos: bool = False,
 ) -> list[list[Hypothesis]]:
     """:func:`search` over the keys' lattices under *options*, offline by default.
 
@@ -858,6 +925,7 @@ def search_keys(
         prior=prior,
         arc_width=arc_width,
         counts=counts,
+        score_eos=score_eos,
     )
 
 

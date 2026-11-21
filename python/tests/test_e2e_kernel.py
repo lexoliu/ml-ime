@@ -1148,3 +1148,44 @@ def test_training_budget_rates_the_leg_on_stepping_seconds_alone(
     assert kernel.training_budget(1_000, 40_000, legacy, processes=2) == 12_000
     zero_stepping = {"summary": {**legacy["summary"], "stepping_seconds": 0.0}}
     assert kernel.training_budget(1_000, 40_000, zero_stepping, processes=2) == 12_000
+
+
+def test_joint_stage_passes_decoder_prelude_and_score_eos_to_trainer_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import typer
+    from typer.core import TyperGroup
+
+    import mlime.__main__ as cli
+
+    kernel = load_kernel(monkeypatch, tmp_path, segment=0)
+    monkeypatch.setattr(kernel, "INIT_FROM", "mlime-e2e-keys-s1-frame3-a100")
+    monkeypatch.setattr(
+        kernel,
+        "KEYS",
+        {
+            "layers": 2,
+            "transition_weight": 1.0,
+            "decoder_prelude": True,
+            "score_eos": True,
+            "correct_syllables": True,
+        },
+    )
+    train_argv = kernel.train_argv(
+        tmp_path / "char_pinyin.tsv",
+        tmp_path / "run",
+        max_steps=100,
+        wall_budget=3600,
+        start=kernel.start_argv(None, tmp_path / "checkpoint-final.pt"),
+        resume=None,
+        token_budget=12288,
+    )
+    count_argv = kernel.count_argv(tmp_path / "char_pinyin.tsv", tmp_path / "counts.json", None)
+    tail = [str(arg) for arg in train_argv[train_argv.index("mlime") + 3 :]]
+    assert "--decoder-prelude" in tail and "--score-eos" in tail
+    assert "--decoder-prelude" not in count_argv and "--score-eos" not in count_argv
+    group = typer.main.get_command(cli.app)
+    assert isinstance(group, TyperGroup)
+    train = group.commands["train"]
+    assert isinstance(train, TyperGroup)
+    train.commands["e2e"].make_context("e2e", tail)

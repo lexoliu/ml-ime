@@ -227,7 +227,8 @@ def key_collator(spans: SpanVocab, lexicon: Lexicon, dropout: float = 0.0) -> Ke
             tokenizer,
             CandidateSpace(spans, lexicon.candidate_mask),
             context_dropout=dropout,
-        )
+        ),
+        lexicon,
     )
 
 
@@ -1241,10 +1242,12 @@ def joint_config(keys: KeyFrontConfig = JOINT_KEYS) -> E2EConfig:
     return E2EConfig(cross_attention_layers=1, decoder=READER_TINY, keys=keys)
 
 
-def tiny_joint_model(lexicon: Lexicon, vocab: CharVocab) -> KeyE2EModel:
+def tiny_joint_model(
+    lexicon: Lexicon, vocab: CharVocab, keys: KeyFrontConfig = JOINT_KEYS
+) -> KeyE2EModel:
     torch.manual_seed(0)
     model = KeyE2EModel.compose(
-        TINY, lexicon, joint_config(), len(vocab), emittable_ids(lexicon, vocab)
+        TINY, lexicon, joint_config(keys), len(vocab), emittable_ids(lexicon, vocab)
     )
     # A trained run's gates are open; at zero the decoder would not read the
     # keys at all and the context path would get an exactly zero gradient.
@@ -1677,3 +1680,202 @@ def test_a_compiled_s2_step_issues_no_host_syncs(
         step()
     finally:
         torch.cuda.set_sync_debug_mode("default")
+
+
+# --- decoder context prelude and <eos> (#309) -----------------------------------
+
+
+PRELUDE_EOS_KEYS = replace(JOINT_KEYS, decoder_prelude=True, score_eos=True)
+
+
+def test_at_zero_gates_prelude_and_eos_equal_the_plain_char_lm(
+    lexicon: Lexicon, reader_vocab: CharVocab, spans: SpanVocab
+) -> None:
+    """With cross-attention gates at zero, Decoder over prelude + <sep> is TransformerCharLm."""
+    from mlime.train.charlm_vocab import BOS, EOS, SEP, UNK
+    from mlime.train.key_tree import plan
+
+    torch.manual_seed(17)
+    model = KeyE2EModel.compose(
+        TINY,
+        lexicon,
+        joint_config(PRELUDE_EOS_KEYS),
+        len(reader_vocab),
+        emittable_ids(lexicon, reader_vocab),
+    ).eval()
+    # Keep decoder cross-attention gates at exact zero so the reader stands alone.
+    collator = key_collator(spans, lexicon, dropout=0.0)
+    emit_ids = model.decoder.emit_ids
+    out_ids = torch.cat([emit_ids, torch.tensor([EOS], dtype=torch.long)])
+    char_to_emit = {ch: idx for idx, ch in enumerate(lexicon.characters)}
+    prefix = (0, 1, 2)
+
+    # Include Chinese, Japanese and Korean characters in context to cover CJK + <unk>.
+    for keys, context in (
+        ("woaibj", "我爱北京"),
+        ("zhongguo", "今日は水饺김치"),
+        ("xian", None),
+    ):
+        inputs = collator.inputs([keys], [context])
+        with torch.no_grad():
+            states = model.key_states(inputs)
+            assert states.prelude is not None
+            # 1) Plain TransformerCharLm over [<bos>, c_1..c_k, <sep>, y_1..y_m].
+            ctx_ids = (
+                [
+                    int(emit_ids[char_to_emit[ch]]) if ch in char_to_emit else UNK
+                    for ch in context[-62:]
+                ]
+                if context
+                else []
+            )
+            full_tokens = torch.tensor(
+                [[BOS, *ctx_ids, SEP, *(int(emit_ids[i]) for i in prefix)]], dtype=torch.long
+            )
+            reader_features = model.decoder.reader.features(full_tokens)
+            reader_scores = (
+                model.decoder.reader.project(reader_features)
+                @ model.decoder.reader.embed.weight.index_select(0, out_ids).T
+            )
+            want_steps = reader_scores[0, len(ctx_ids) + 1 :].log_softmax(dim=-1)
+
+            # 2) Decoder.over_keys teacher-forced over [<sep>, y_1..y_m].
+            sent_tokens = torch.tensor(
+                [[SEP, *(int(emit_ids[i]) for i in prefix)]], dtype=torch.long
+            )
+            over_scores = model.decoder.emission_logits(
+                model.decoder.over_keys(
+                    sent_tokens, states.states, states.mask, prelude=states.prelude
+                )
+            )[0].log_softmax(dim=-1)
+            torch.testing.assert_close(over_scores, want_steps, atol=1e-5, rtol=0.0)
+
+            # 3) transition_log_probs (which runs incremental step_keys / advance_keys).
+            prefixes = [prefix[:d] for d in range(len(prefix) + 1)]
+            stepped = model.transition_log_probs(
+                states,
+                torch.zeros(len(prefixes), dtype=torch.long),
+                torch.tensor(
+                    [(*p, *((0,) * (len(prefix) - len(p)))) for p in prefixes], dtype=torch.long
+                ),
+                torch.tensor([len(p) for p in prefixes], dtype=torch.long),
+            )
+            torch.testing.assert_close(stepped, want_steps, atol=1e-5, rtol=0.0)
+
+            # 4) Packed tree recompute (tree_log_probs) with open gates too.
+            open_gates(model)
+            states_open = model.key_states(inputs)
+            cross = model.cross_memory(states_open)
+            prelude_mem = model.prelude_memory(inputs)
+            [call] = plan(prefixes)
+            feeds = model.tree_feeds(call, prelude_mem.length)
+            tree_lp = model.tree_log_probs(
+                feeds.reader_ids, feeds.positions, feeds.tree_bias, cross, prelude_mem
+            )[0]
+            ref_open = model.transition_log_probs(
+                states_open,
+                torch.zeros(len(prefixes), dtype=torch.long),
+                torch.tensor(
+                    [(*p, *((0,) * (len(prefix) - len(p)))) for p in prefixes], dtype=torch.long
+                ),
+                torch.tensor([len(p) for p in prefixes], dtype=torch.long),
+            )
+            for req_idx, row in call.answers:
+                torch.testing.assert_close(tree_lp[row], ref_open[req_idx], atol=1e-5, rtol=0.0)
+            for gate in model.decoder.gated_layers():
+                gate.gate.data.zero_()
+
+
+def test_context_dropout_drops_encoder_context_and_decoder_prelude_together(
+    vocabularies: Vocabularies, spans: SpanVocab, lexicon: Lexicon
+) -> None:
+    examples = [ex for ex in build_examples(vocabularies) if ex.context][:12]
+    assert len(examples) >= 6
+    collator = key_collator(spans, lexicon, dropout=0.5)
+    collator.rng.seed(42)
+    batch = collator(examples)
+    kept = batch.spans.has_context > 0.0
+    assert bool(kept.any()) and bool((~kept).any())
+    assert torch.equal(batch.prelude_lengths > 0, kept)
+    assert batch.prelude_chars.shape[1] >= 1
+
+
+def test_an_s2_prelude_eos_stage_starts_from_s1_compiles_and_locks_its_flags(
+    corpus: tuple[Path, Path],
+    vocabularies: Vocabularies,
+    spans: SpanVocab,
+    lexicon: Lexicon,
+    reader_vocab: CharVocab,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from torch._dynamo.utils import counters
+
+    monkeypatch.setattr(Vocabularies, "load", classmethod(lambda cls, *_: vocabularies))
+    monkeypatch.setattr(BertConfig, "from_pretrained", classmethod(lambda cls, *_: TINY))
+    parent = parent_checkpoint(lexicon, reader_vocab, tmp_path / "parent.pt")
+    samples_dir, labels_dir = corpus
+    slices = Slices(
+        train=("test-00000.parquet",), held_out=("test-00001.parquet",), max_held_out_examples=8
+    )
+    training = TrainingConfig(
+        max_steps=4, token_budget=96, log_every=1, checkpoint_every=2, fp16=False, seed=3
+    )
+
+    def paths(name: str) -> RunPaths:
+        return RunPaths(
+            samples=samples_dir,
+            labels=labels_dir,
+            char_table=tmp_path / "unread",
+            out=tmp_path / name,
+        )
+
+    e2e(paths("s1"), slices, training, init_e2e=parent, keys=FRAMED, key_warm_up=True)
+    warmed = tmp_path / "s1" / "checkpoint-000004.pt"
+    run_s2 = e2e(paths("s2"), slices, training, init_e2e=warmed, keys=PRELUDE_EOS_KEYS)
+    steps = [r for r in run_records(run_s2.metrics) if r.get("event") == "step"]
+    assert len(steps) == 4 and all(math.isfinite(r["transition_loss"]) for r in steps)
+
+    # Resuming keeps the same flags and refuses flipping them.
+    resumed = e2e(
+        paths("s2-resumed"),
+        slices,
+        training,
+        resume=tmp_path / "s2" / "checkpoint-000002.pt",
+        keys=PRELUDE_EOS_KEYS,
+    )
+    again = [r["loss"] for r in run_records(resumed.metrics) if r.get("event") == "step"]
+    assert again == [r["loss"] for r in steps[2:]]
+    with pytest.raises(ValueError, match="changes only its loss weights"):
+        e2e(
+            paths("s2-flipped"),
+            slices,
+            training,
+            resume=tmp_path / "s2" / "checkpoint-000002.pt",
+            keys=JOINT_KEYS,
+        )
+
+    # Dynamic compile over prelude + over_keys introduces zero extra graphs across shapes.
+    model = tiny_joint_model(lexicon, reader_vocab, keys=PRELUDE_EOS_KEYS)
+    model.freeze_for_joint()
+    model.decoder.prelude = torch.compile(  # type: ignore[method-assign]
+        model.decoder.prelude, dynamic=True, backend="eager"
+    )
+    model.decoder.over_keys = torch.compile(  # type: ignore[method-assign]
+        model.decoder.over_keys, dynamic=True, backend="eager"
+    )
+    coll = key_collator(spans, lexicon, dropout=0.3)
+    examples = sorted(build_examples(vocabularies), key=lambda ex: len(ex.keys))
+    groups = [examples[:2], examples[-3:], examples[4:9], examples[::3]]
+    model.train()
+    breaks = sum(counters["graph_breaks"].values())
+    first = model(coll(groups[0])).loss
+    assert first is not None
+    first.backward()
+    graphs = int(counters["stats"].get("unique_graphs") or 0)
+    for group in groups[1:]:
+        loss = model(coll(group)).loss
+        assert loss is not None
+        loss.backward()
+    assert int(counters["stats"].get("unique_graphs") or 0) == graphs
+    assert int(sum(counters["graph_breaks"].values())) == breaks
