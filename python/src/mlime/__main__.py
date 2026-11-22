@@ -2696,6 +2696,262 @@ def eval_gui(
         write_report(report, out)
 
 
+@train_app.command("teacher")
+def train_teacher(
+    data_dir: Path = DATA_DIR,
+    labels: Path = LABELS,
+    char_table: Path = CHAR_TABLE,
+    out: Path = typer.Option(..., "--out", help="Directory for teacher checkpoints and metrics"),
+    model: str = typer.Option("Qwen/Qwen3.8-27B", "--model", help="Base Qwen3.5 model name"),
+    revision: str = typer.Option(
+        "37561816e66b5b9153b1b64c10968c18c1e6f4a0",
+        "--revision",
+        help="Pinned model revision (empty for latest)",
+    ),
+    lora_rank: int = typer.Option(64, "--lora-rank"),
+    lora_alpha: float = typer.Option(128.0, "--lora-alpha"),
+    lr: float = typer.Option(1e-4, "--lr"),
+    batch_size: int = typer.Option(16, "--batch-size"),
+    accumulate: int = typer.Option(4, "--accumulate"),
+    max_steps: int = typer.Option(3125, "--max-steps"),
+    checkpoint_every: int = typer.Option(250, "--checkpoint-every"),
+    log_every: int = typer.Option(10, "--log-every"),
+    typos: bool = typer.Option(True, "--typos/--no-typos"),
+    typo_table: Path = typer.Option(None, "--typo-table"),
+    unit_initials: float = UNIT_INITIALS,
+    unit_lexicon: Path = UNIT_LEXICON,
+    context_dropout: float = typer.Option(0.30, "--context-dropout"),
+    train_shard: list[str] = TRAIN_SHARD,
+    resume: Path = typer.Option(None, "--resume", help="Checkpoint to resume from"),
+    seed: int = SEED,
+    verbose: bool = VERBOSE,
+) -> None:
+    """Fine-tune the Phase 2 Qwen3.8-27B LoRA teacher (#191, #326)."""
+    configure(verbose)
+    import torch
+
+    from mlime.data.corpus import default_char_table
+    from mlime.train.teacher import (
+        TeacherTrainConfig,
+        corpus_teacher_stream,
+        load_student_lexicon,
+        load_teacher,
+        train_teacher_loop,
+    )
+
+    table = char_table or default_char_table()
+    if table is None:
+        raise typer.BadParameter("no char_pinyin.tsv found; pass --char-table")
+    lexicon = load_student_lexicon(table)
+    layout = DataLayout(data_dir)
+    rev = revision or None
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    teacher, tokenizer = load_teacher(
+        lexicon.characters,
+        model_name=model,
+        revision=rev,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        dtype=dtype,
+        device=device,
+        gradient_checkpointing=device.type == "cuda",
+    )
+    skip = 0
+    if resume is not None and resume.is_file():
+        ckpt = torch.load(resume, map_location="cpu", weights_only=False)
+        skip = int(ckpt.get("step", 0)) * batch_size * accumulate
+    stream = corpus_teacher_stream(
+        layout.samples,
+        labels or data_dir / "labels",
+        table,
+        shards=train_shard or None,
+        typos=typos,
+        typo_table=typo_table,
+        unit_initials=unit_initials,
+        unit_lexicon=unit_lexicon,
+        context_dropout=context_dropout,
+        seed=seed,
+        skip_examples=skip,
+    )
+    cfg = TeacherTrainConfig(
+        model=model,
+        revision=rev,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        lr=lr,
+        batch_size=batch_size,
+        accumulate=accumulate,
+        max_steps=max_steps,
+        seed=seed,
+        log_every=log_every,
+        checkpoint_every=checkpoint_every,
+        gradient_checkpointing=device.type == "cuda",
+    )
+    summary = train_teacher_loop(teacher, tokenizer, stream, out, cfg, resume_path=resume)
+    typer.echo(json.dumps(summary, indent=2))
+
+
+@eval_app.command("teacher")
+def eval_teacher(
+    adapter: Path = typer.Option(..., "--adapter", help="Saved teacher checkpoint or adapter"),
+    eval_set: Path = typer.Option(..., "--eval-set", help="Evaluation JSONL file"),
+    model: str = typer.Option("Qwen/Qwen3.8-27B", "--model"),
+    revision: str = typer.Option("37561816e66b5b9153b1b64c10968c18c1e6f4a0", "--revision"),
+    lora_rank: int = typer.Option(64, "--lora-rank"),
+    lora_alpha: float = typer.Option(128.0, "--lora-alpha"),
+    char_table: Path = CHAR_TABLE,
+    typo_table: Path = typer.Option(None, "--typo-table"),
+    syllables: Path = typer.Option(None, "--syllables"),
+    slice_: str = typer.Option("dev", "--slice", help="dev, test or all"),
+    dev_share: float = typer.Option(0.0905, "--dev-share"),
+    context: bool = typer.Option(True, "--context/--no-context"),
+    beam: int = typer.Option(8, "--beam"),
+    gamma: float = typer.Option(1.0, "--gamma"),
+    dump: Path = typer.Option(None, "--dump", help="Resumable per-record JSONL dump"),
+    out: Path = typer.Option(None, "--out", help="Where to write the rendered metrics table"),
+    limit: int = typer.Option(None, "--limit"),
+    verbose: bool = VERBOSE,
+) -> None:
+    """Evaluate the Phase 2 Qwen teacher with lattice-constrained beam search (#191, #326)."""
+    configure(verbose)
+    import torch
+
+    from mlime.data.corpus import default_char_table
+    from mlime.legality import Legality
+    from mlime.locate import find_upwards
+    from mlime.train.teacher import evaluate_teacher, load_student_lexicon, load_teacher
+    from mlime.typo import SYLLABLES_RELATIVE, default_typo_table
+
+    table = char_table or default_char_table()
+    if table is None:
+        raise typer.BadParameter("no char_pinyin.tsv found; pass --char-table")
+    typo = typo_table or default_typo_table()
+    if typo is None:
+        raise typer.BadParameter("no typo.json found; pass --typo-table")
+    inventory = syllables or find_upwards(SYLLABLES_RELATIVE)
+    if inventory is None:
+        raise typer.BadParameter("no syllables.txt found; pass --syllables")
+    lexicon = load_student_lexicon(table)
+    legality = Legality.load(
+        lexicon.characters, char_table=table, typo_table=typo, syllables=inventory
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    teacher, tokenizer = load_teacher(
+        lexicon.characters,
+        model_name=model,
+        revision=revision or None,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        dtype=dtype,
+        device=device,
+        gradient_checkpointing=False,
+        adapter_path=adapter,
+    )
+    report, _ = evaluate_teacher(
+        teacher,
+        tokenizer,
+        eval_set,
+        legality,
+        slice_=slice_,
+        dev_share=dev_share,
+        with_context=context,
+        beam=beam,
+        gamma=gamma,
+        dump_path=dump,
+        limit=limit,
+    )
+    rendered = report.render()
+    typer.echo(rendered)
+    if out is not None:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(rendered + "\n", encoding="utf-8")
+
+
+@train_app.command("label-teacher")
+def train_label_teacher(
+    adapter: Path = typer.Option(..., "--adapter", help="Saved teacher checkpoint or adapter"),
+    data_dir: Path = DATA_DIR,
+    labels: Path = LABELS,
+    out: Path = typer.Option(..., "--out", help="Output directory for Parquet T1/T2/T3 shards"),
+    model: str = typer.Option("Qwen/Qwen3.8-27B", "--model"),
+    revision: str = typer.Option("37561816e66b5b9153b1b64c10968c18c1e6f4a0", "--revision"),
+    lora_rank: int = typer.Option(64, "--lora-rank"),
+    lora_alpha: float = typer.Option(128.0, "--lora-alpha"),
+    char_table: Path = CHAR_TABLE,
+    typo_table: Path = typer.Option(None, "--typo-table"),
+    syllables: Path = typer.Option(None, "--syllables"),
+    typos: bool = typer.Option(True, "--typos/--no-typos"),
+    unit_initials: float = UNIT_INITIALS,
+    unit_lexicon: Path = UNIT_LEXICON,
+    train_shard: list[str] = TRAIN_SHARD,
+    beam: int = typer.Option(8, "--beam"),
+    gamma: float = typer.Option(1.0, "--gamma"),
+    top_k_t1: int = typer.Option(32, "--top-k-t1"),
+    max_per_shard: int = typer.Option(None, "--max-per-shard"),
+    seed: int = SEED,
+    verbose: bool = VERBOSE,
+) -> None:
+    """Write offline resumable T1/T2/T3 Parquet teacher labels shard by shard (S5, #191)."""
+    configure(verbose)
+    import torch
+
+    from mlime.data.corpus import default_char_table
+    from mlime.legality import Legality
+    from mlime.locate import find_upwards
+    from mlime.train.teacher import label_corpus_shards, load_student_lexicon, load_teacher
+    from mlime.typo import SYLLABLES_RELATIVE, default_typo_table
+
+    table = char_table or default_char_table()
+    if table is None:
+        raise typer.BadParameter("no char_pinyin.tsv found; pass --char-table")
+    typo = typo_table or default_typo_table()
+    if typo is None:
+        raise typer.BadParameter("no typo.json found; pass --typo-table")
+    inventory = syllables or find_upwards(SYLLABLES_RELATIVE)
+    if inventory is None:
+        raise typer.BadParameter("no syllables.txt found; pass --syllables")
+    lexicon = load_student_lexicon(table)
+    legality = Legality.load(
+        lexicon.characters, char_table=table, typo_table=typo, syllables=inventory
+    )
+    layout = DataLayout(data_dir)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    teacher, tokenizer = load_teacher(
+        lexicon.characters,
+        model_name=model,
+        revision=revision or None,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
+        dtype=dtype,
+        device=device,
+        gradient_checkpointing=False,
+        adapter_path=adapter,
+    )
+    summary = label_corpus_shards(
+        teacher,
+        tokenizer,
+        layout.samples,
+        labels or data_dir / "labels",
+        table,
+        legality,
+        out,
+        shards=train_shard or None,
+        typos=typos,
+        typo_table=typo,
+        unit_initials=unit_initials,
+        unit_lexicon=unit_lexicon,
+        seed=seed,
+        beam=beam,
+        gamma=gamma,
+        top_k_t1=top_k_t1,
+        max_per_shard=max_per_shard,
+    )
+    typer.echo(json.dumps(summary, indent=2))
+
+
 def run() -> None:
     """The `mlime` entry point.
 
