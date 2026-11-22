@@ -70,10 +70,9 @@ table does not load, so an export and the decoder always move together.
 
 ## Compute
 
-- Before any step that would burn more than 30 minutes of compute, stop and make it faster
-  first: Rust instead of Python, parallelism across records, SIMD, a GPU, a batched shape. The
-  slow version does not get run "just this once" so that the optimisation can come next time;
-  most runs have no next time.
+- Any long-running program or workload that occupies expensive compute resources must be written
+  in Rust and thoroughly optimised to maximise hardware utilisation. Never run a slow version
+  "just this once", and stop to optimise before any step that would burn more than 30 minutes.
 - Estimate the cost first — model calls × cost per call ÷ the throughput the target machine
   reaches at that batch size — and write the estimate in the issue.
 - Anything that will run for more than an hour must be resumable: it checkpoints its progress
