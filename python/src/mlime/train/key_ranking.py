@@ -772,6 +772,7 @@ class KeyRankingModel(KeyE2EModel):
                     prelude_lengths=keyed.prelude_lengths if has_prelude else None,
                 ),
                 bucketed=self.search_graphs is not None,
+                prelude_width=decoder.reader.config.context_chars if has_prelude else None,
             )
             sequences, scores = search_cover_lanes(decoder, inputs, self.search_graphs)
             count = lanes.owner.numel()

@@ -225,13 +225,21 @@ class KeySearchInputs:
     prelude_lengths: torch.Tensor | None = None
 
 
-def padded_key_inputs(inputs: KeySearchInputs, *, bucketed: bool) -> KeySearchInputs:
+def padded_key_inputs(
+    inputs: KeySearchInputs,
+    *,
+    bucketed: bool,
+    prelude_width: int | None = None,
+) -> KeySearchInputs:
     """*inputs* padded to :func:`bucket` sizes when *bucketed*, as :func:`padded_inputs` pads lanes.
 
     The records, keys, lanes and positions are each rounded up. A padded lane
     reads the first record and admits nothing, so every row of it stays at
     minus infinity; a padded record has only its first key unmasked; a padded
-    position is a step every lane has ended at.
+    position is a step every lane has ended at. When *prelude_width* is given,
+    the prelude is padded to ``bucket(max(chars, prelude_width))`` so every
+    micro-batch shares one prelude width instead of multiplying the captured
+    graph shapes by the prelude's bucket count (#322).
     """
     if not bucketed:
         return inputs
@@ -252,7 +260,7 @@ def padded_key_inputs(inputs: KeySearchInputs, *, bucketed: bool) -> KeySearchIn
     prelude_lengths = inputs.prelude_lengths
     if prelude_chars is not None and prelude_lengths is not None:
         chars = prelude_chars.shape[1]
-        padded_chars = bucket(chars)
+        padded_chars = bucket(chars if prelude_width is None else max(chars, prelude_width))
         prelude_chars = nn.functional.pad(
             prelude_chars, (0, padded_chars - chars, 0, padded_records - records)
         )
@@ -431,6 +439,9 @@ class SearchGraphs:
                 log.info(
                     "search buffers grown, graphs dropped", buffer=name, graphs=len(self.captured)
                 )
+                # Wait for any asynchronous replay on the current stream before
+                # destroying graph handles and releasing their shared pool (#322).
+                torch.cuda.synchronize()
                 self.captured.clear()
                 # PyTorch refuses a capture into a pool no live graph holds,
                 # and the dropped graphs' pool lives on until the memory it
@@ -538,6 +549,9 @@ class SearchGraphs:
             views[name].copy_(tensor)
         if captured is None:
             if len(self.captured) == self.limit:
+                # Synchronise before destroying the evicted graph so no
+                # asynchronous replay on the stream races with its pool (#322).
+                torch.cuda.synchronize()
                 # Released before the capture, so the driver hands its
                 # memory to the new graph instead of growing.
                 self.captured.popitem(last=False)
