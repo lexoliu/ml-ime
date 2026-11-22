@@ -69,6 +69,37 @@ colab/e2e.sh DIR wait && colab/e2e.sh DIR fetch && colab/e2e.sh DIR stop
 
 The logs, selections, and each section's dev and test dumps are in the `lexoliu/mlime-resume` bucket under `final/mlime-e2e-keys-s4-prelude/`.
 
+## Word arcs (#282) and M1 latency (#151)
+
+**Word arcs (`prior = 4`, 5,119 idioms `≥ 20` occurrences, L4 `1.44 CU`).** Adding the #282 word-arc lexicon at `prior = 4` produces zero regressions across all six clean test sections while lifting initial-typed idiom entity exactness by `+27.89` points on abbreviated and `+14.55` on mixed:
+
+| section | no arcs | arcs (π=4) | records | vs fused |
+|---|---|---|---|---|
+| full, context on / off | 77.12 / 69.54 | **77.12 / 69.60** | 0 / +3 | −1.61 / −2.25 |
+| abbreviated, on / off | 31.45 / 19.11 | **31.54 / 19.21** | +5 / +5 | **+3.12 / +1.94** |
+| mixed, on / off | 41.88 / 29.82 | **42.00 / 29.84** | +6 / +1 | **+3.77 / +0.70** |
+
+Knowledge slice (test, with context):
+
+| | no arcs | arcs (π=4) | S4 + arcs | fused |
+|---|---|---|---|---|
+| abbreviated, all entities, slice top-1 | 30.08% | **31.64%** (`z = 2.31`) | 28.71% | 25.59% |
+| abbreviated, idiom entity exact | 50.96% | **78.85%** (`30` gained, `1` lost, `z = 5.21`) | 69.23% | 52.88% |
+| mixed, all entities, slice top-1 | 40.23% | **41.95%** (`9` gained, `0` lost, `z = 3.00`) | 38.89% | 37.36% |
+| mixed, idiom entity exact | 57.27% | **71.82%** (`17` gained, `1` lost, `z = 3.77`) | 67.27% | 58.18% |
+
+On the idiom selection set (`306` sentences, context off), idiom entity exact across `π ∈ {0, 4, 8, 12, 16}` is `44.44% / 70.79% / 77.46% / 81.59% / 82.54%`.
+
+**M1 Core ML latency (`d961379`, `step 4,058`, Mac mini M1 8 GB).** Exported via `mlime export keys` and `mlime-coreml convert`: all 10 Core ML functions (`ctx_64`, `prelude_64`, `keys_{16,32,64,128}`, `tree_{32,64,128,256}`) verified with `0` failing checks on the Neural Engine. Replaying `eval3` dev (`498` records, `14,625` keystrokes, `β = 1, γ = 1, sum`, `0` records too long):
+
+| engine | median | p95 | max | phys footprint | peak RSS |
+|---|---|---|---|---|---|
+| S4/S5-prelude (Core ML ANE) | **28.71 ms** | **61.54 ms** | 152.01 ms | **146 MB** | 376 MB |
+| #216 §8 target | ≤ 109 ms | ≤ 236 ms | — | — | — |
+| fused (M1 product) | 130.6 ms | 270.8 ms | 3,450 ms | 1.32 GB | 2.89 GB |
+
+By typed length (median / p95): `1–4` `16.2 / 29.6 ms`, `5–8` `20.6 / 27.2 ms`, `9–16` `26.1 / 35.0 ms`, `17–24` `32.8 / 45.2 ms`, `25–32` `40.6 / 56.0 ms`, `33–48` `48.2 / 71.8 ms`, `49–64` `62.6 / 95.0 ms`, `65+` `75.7 / 121.6 ms`. Warmup `0.153 s`, speculated row share `79.2%`.
+
 ## Next
 
 - Phase 1 is complete: `S2-prelude` (#313) → `S3-prelude` (#315) → `S4/S5-prelude` (#320) beats S5 on all 8 sections and clears fused on abbreviated and mixed in both context settings.
