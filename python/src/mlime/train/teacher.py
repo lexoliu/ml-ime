@@ -901,7 +901,7 @@ def corpus_teacher_stream(
             raise FileNotFoundError("no syllables.txt found; pass --syllables")
         noise = NoiseModel.load(table_path)
         table = CorrectionTable(noise, load_syllables(syl_path))
-        candidates = CandidateSpace(spans, lexicon.candidate_mask, table)
+        candidates = CandidateSpace(spans, lexicon.candidate_mask, table, lexicon.homophones)
     units: UnitMatcher | None = None
     if unit_initials > 0.0:
         if unit_lexicon is None:
@@ -1073,7 +1073,7 @@ def label_corpus_shards(
             raise FileNotFoundError("no syllables.txt found; pass --syllables")
         noise = NoiseModel.load(table_path)
         table = CorrectionTable(noise, load_syllables(syl_path))
-        candidates = CandidateSpace(spans, lexicon.candidate_mask, table)
+        candidates = CandidateSpace(spans, lexicon.candidate_mask, table, lexicon.homophones)
     units: UnitMatcher | None = None
     if unit_initials > 0.0:
         if unit_lexicon is None:
