@@ -1241,6 +1241,8 @@ def key_eval_argv(
         *(item for gamma in gammas for item in ("--gamma", str(gamma))),
         # The sum only: the max never differed from it in S2's or S3's sweeps.
         "--sum",
+        "--token-budget",
+        "32768",
         "--context" if context else "--no-context",
         "--dump-dir",
         str(dump_dir),

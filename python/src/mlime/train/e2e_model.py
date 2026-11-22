@@ -587,6 +587,10 @@ class Decoder(nn.Module):
         normed: torch.Tensor = self.reader.norm(x)
         return normed
 
+    def cross_kv(self, states: torch.Tensor) -> tuple[tuple[torch.Tensor, torch.Tensor], ...]:
+        """Project each gated block's encoder keys and values once for a group of records."""
+        return tuple(cross.kv(states) for cross in self.gated_layers())
+
     def over_keys(
         self,
         tokens: torch.Tensor,
@@ -594,6 +598,7 @@ class Decoder(nn.Module):
         mask: torch.Tensor,
         rows: torch.Tensor | None = None,
         prelude: PreludeKV | None = None,
+        cross_kv: Sequence[tuple[torch.Tensor, torch.Tensor]] | None = None,
     ) -> torch.Tensor:
         """Teacher-forced features of a decoder reading keys: ``[N, T] -> [N, T, hidden]``.
 
@@ -602,15 +607,17 @@ class Decoder(nn.Module):
         gated block cross-attends to, real where ``mask [R, S]`` (bool) is.
         Token row ``n`` reads state row ``rows[n]``, or row ``n`` itself when
         *rows* is None. Each block's keys and values are projected once per
-        state row and gathered per token row, so a beam's hypotheses share
-        their record's projection. No step gets a span input: the decoder must
-        have none.
+        state row (or reused from *cross_kv*) and gathered per token row, so a
+        beam's hypotheses share their record's projection. No step gets a span
+        input: the decoder must have none.
         """
         kept = mask if rows is None else mask.index_select(0, rows)
         if prelude is None:
             x = self.embed(tokens, None, 0)
-            for block, cross in zip(self.reader.layers(), self.gated_layers(), strict=True):
-                keys, values = cross.kv(states)
+            for layer, (block, cross) in enumerate(
+                zip(self.reader.layers(), self.gated_layers(), strict=True)
+            ):
+                keys, values = cross.kv(states) if cross_kv is None else cross_kv[layer]
                 if rows is not None:
                     keys, values = keys.index_select(0, rows), values.index_select(0, rows)
                 x = cross.attend(block(x), keys, values, kept)
@@ -638,12 +645,61 @@ class Decoder(nn.Module):
                 dropout_p=block.dropout.p if block.training else 0.0,
             )
             x = block.merge(x, attended)
-            keys, values = cross.kv(states)
+            keys, values = cross.kv(states) if cross_kv is None else cross_kv[layer]
             if rows is not None:
                 keys, values = keys.index_select(0, rows), values.index_select(0, rows)
             x = cross.attend(x, keys, values, kept)
         normed = self.reader.norm(x)
         return normed
+
+    def step_over_keys(
+        self,
+        tokens: torch.Tensor,
+        positions: torch.Tensor,
+        past_keys: torch.Tensor,
+        past_values: torch.Tensor,
+        past_mask: torch.Tensor,
+        cross_kv: Sequence[tuple[torch.Tensor, torch.Tensor]],
+        key_mask: torch.Tensor,
+        rows: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Advance one token over keys using cached self-attention and encoder KV (#316).
+
+        ``tokens [N]`` are the new reader ids at absolute ``positions [N]``;
+        ``past_keys`` and ``past_values`` are ``[layers, N, heads, P, head_dim]``
+        real where ``past_mask [N, P]`` is True; ``cross_kv`` holds each layer's
+        precomputed ``([R, heads, S, head_dim], [R, heads, S, head_dim])`` for
+        the group's records. Returns ``(features [N, H], new_keys, new_values)``
+        with ``new_keys`` / ``new_values`` shaped ``[layers, N, heads, head_dim]``.
+        """
+        x = self.embed(tokens.unsqueeze(1), None, positions)
+        kept = key_mask.index_select(0, rows)
+        attn_mask = torch.cat(
+            [past_mask, torch.ones((tokens.shape[0], 1), dtype=torch.bool, device=tokens.device)],
+            dim=1,
+        )[:, None, None, :]
+        new_keys: list[torch.Tensor] = []
+        new_values: list[torch.Tensor] = []
+        for layer, (block, cross) in enumerate(
+            zip(self.reader.layers(), self.gated_layers(), strict=True)
+        ):
+            q, k, v = block.split(x)
+            k_all = torch.cat([past_keys[layer], k], dim=2)
+            v_all = torch.cat([past_values[layer], v], dim=2)
+            attended = nn.functional.scaled_dot_product_attention(
+                q,
+                k_all,
+                v_all,
+                attn_mask=attn_mask,
+                dropout_p=block.dropout.p if block.training else 0.0,
+            )
+            x = block.merge(x, attended)
+            ck, cv = cross_kv[layer]
+            x = cross.attend(x, ck.index_select(0, rows), cv.index_select(0, rows), kept)
+            new_keys.append(k.squeeze(2))
+            new_values.append(v.squeeze(2))
+        features: torch.Tensor = self.reader.norm(x).squeeze(1)
+        return features, torch.stack(new_keys), torch.stack(new_values)
 
     def emission_logits(self, features: torch.Tensor) -> torch.Tensor:
         """``[..., hidden]`` features to logits over the output alphabet, ``[..., E (+ 1)]``.

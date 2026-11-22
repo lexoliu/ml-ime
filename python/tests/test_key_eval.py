@@ -615,3 +615,82 @@ def test_the_keys_command_sweeps_the_prior_and_refuses_it_without_a_lexicon(
     # Prior 0 needs no lexicon to parse; the missing checkpoint is what stops it.
     parsed = CliRunner().invoke(app, [*base, "--arc-prior", "0"])
     assert "--arc-prior" not in error(parsed.output) and "--arcs" not in error(parsed.output)
+
+
+@pytest.mark.parametrize(("decoder_prelude", "score_eos"), [(False, False), (True, True)])
+def test_kv_cached_model_transition_matches_eager_and_caches_across_grid(
+    lexicon: Lexicon,
+    spans: SpanVocab,
+    reader_vocab: CharVocab,
+    decoder_prelude: bool,
+    score_eos: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """KV-cached ModelTransition matches eager scoring and reuses rows across grids (#316)."""
+    from mlime.train.key_eval import DecodeTimes, ModelTransition
+    from mlime.train.keys import KeyFrontConfig
+
+    torch.manual_seed(0)
+    model = tiny_joint_model(
+        lexicon,
+        reader_vocab,
+        keys=KeyFrontConfig(max_keys=62, decoder_prelude=decoder_prelude, score_eos=score_eos),
+    ).eval()
+    with torch.no_grad():
+        for layer in model.decoder.gated_layers():
+            layer.gate.fill_(0.5)
+    collator = key_collator(spans, lexicon)
+    inputs = collator.inputs(
+        ["woaibeijing", "zhongchongwolv"],
+        ["北京", None],
+    )
+    with torch.no_grad():
+        states = model.key_states(inputs)
+        transition = ModelTransition(model, states, DecodeTimes())
+
+        def eager(records: list[int], prefixes: list[tuple[int, ...]]) -> torch.Tensor:
+            lengths = torch.tensor([len(p) for p in prefixes], dtype=torch.long)
+            width = max((len(p) for p in prefixes), default=0)
+            padded = torch.zeros((len(prefixes), width), dtype=torch.long)
+            for row, prefix in enumerate(prefixes):
+                for col, ch in enumerate(prefix):
+                    padded[row, col] = ch
+            return model.transition_log_probs(
+                states,
+                torch.tensor(records, dtype=torch.long),
+                padded,
+                lengths,
+            )
+
+        # Incremental root -> len 1 -> len 2 -> len 3 + direct fallback jump without cached parent.
+        batches: list[tuple[list[int], list[tuple[int, ...]]]] = [
+            ([0, 1], [(), ()]),
+            ([0, 0, 1], [(0,), (1,), (2,)]),
+            ([0, 1], [(0, 2), (2, 1)]),
+            ([0, 1], [(0, 2, 1), (3, 1, 0)]),
+        ]
+        for recs, prefs in batches:
+            got = transition(recs, prefs)
+            want = eager(recs, prefs)
+            assert torch.allclose(got, want, atol=1e-5), float((got - want).abs().max())
+
+        # Re-querying any cached (record, prefix) across a second grid point hits the cache.
+        calls = 0
+        orig_step = model.decoder.step_over_keys
+        orig_over = model.decoder.over_keys
+
+        def fail_step(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            return orig_step(*args, **kwargs)
+
+        def fail_over(*args: Any, **kwargs: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            return orig_over(*args, **kwargs)
+
+        monkeypatch.setattr(model.decoder, "step_over_keys", fail_step)
+        monkeypatch.setattr(model.decoder, "over_keys", fail_over)
+        cached = transition([0, 1, 0], [(0, 2), (3, 1, 0), ()])
+        assert calls == 0
+        assert torch.allclose(cached, eager([0, 1, 0], [(0, 2), (3, 1, 0), ()]), atol=1e-5)

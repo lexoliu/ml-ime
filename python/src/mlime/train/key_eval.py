@@ -52,6 +52,7 @@ import json
 import math
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, nullcontext
 from dataclasses import asdict, dataclass, field
 from itertools import batched
 from pathlib import Path
@@ -62,6 +63,7 @@ import torch
 
 from mlime.legality import KeyLattice, Legality, LegalityOptions
 from mlime.logging import log
+from mlime.train.charlm_vocab import BOS, SEP
 from mlime.train.e2e_eval import EvalRow, Report, SliceReports, read_eval_records
 from mlime.train.key_arcs import ArcLexicon, WordArc
 from mlime.train.key_model import KeyE2EModel, KeyStates
@@ -246,34 +248,176 @@ class DecodeTimes:
         return once + grid_points * each
 
 
-class ModelTransition:
-    """The search's transition over one group's key states: the decoder's batched query.
+def _eval_autocast(device: torch.device) -> AbstractContextManager[Any]:
+    """Mixed-precision inference on CUDA (bf16 where supported, else fp16); no-op on CPU."""
+    if device.type != "cuda":
+        return nullcontext()
+    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    return torch.amp.autocast("cuda", dtype=dtype)
 
-    The search hands every prefix about to extend at a key offset, across the
-    group's records, in one call; they go to
-    :meth:`~mlime.train.key_model.KeyE2EModel.transition_log_probs` as one
-    padded batch, and the rows come back to the host, where the search reads
-    them.
+
+class ModelTransition:
+    """The search's transition over one group's key states: KV-cached batched queries (#316).
+
+    Projects each gated block's encoder K/V once per group, advances beam
+    extensions one token at a time using cached self-attention KV states, and
+    reuses computed ``(record, prefix)`` log-probability rows across all weight
+    points of a grid sweep.
     """
 
     def __init__(self, model: KeyE2EModel, states: KeyStates, times: DecodeTimes) -> None:
         self.model = model
         self.states = states
         self.times = times
+        self._device = states.states.device
+        self._direct_override = (
+            getattr(model.transition_log_probs, "__func__", None)
+            is not KeyE2EModel.transition_log_probs
+        )
+        with _eval_autocast(self._device):
+            self._cross_kv = model.decoder.cross_kv(states.states)
+        self._kv_dtype = self._cross_kv[0][0].dtype
+        self._rows: dict[tuple[int, Prefix], torch.Tensor] = {}
+        self._kv: dict[tuple[int, Prefix], tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _run_stepped(self, pairs: Sequence[tuple[int, Prefix]]) -> None:
+        decoder = self.model.decoder
+        prelude = self.states.prelude
+        device = self._device
+        count = len(pairs)
+        root_id = SEP if prelude is not None else BOS
+        rec_ids = torch.tensor([rec for rec, _ in pairs], dtype=torch.long, device=device)
+        emit_ids = decoder.emit_ids
+        token_list = [root_id if not prefix else int(emit_ids[prefix[-1]]) for _, prefix in pairs]
+        tokens = torch.tensor(token_list, dtype=torch.long, device=device)
+        parent_lens = [len(prefix) for _, prefix in pairs]
+        max_parent = max(parent_lens)
+        layers = len(decoder.reader.layers())
+        heads = decoder.reader.config.heads
+        head_dim = decoder.reader.config.hidden // heads
+        sent_k = torch.zeros(
+            (layers, count, heads, max_parent, head_dim), dtype=self._kv_dtype, device=device
+        )
+        sent_v = torch.zeros_like(sent_k)
+        sent_mask = torch.zeros((count, max_parent), dtype=torch.bool, device=device)
+        for index, (rec, prefix) in enumerate(pairs):
+            if prefix:
+                pk, pv = self._kv[(rec, prefix[:-1])]
+                plen = pk.shape[2]
+                sent_k[:, index, :, :plen, :] = pk
+                sent_v[:, index, :, :plen, :] = pv
+                sent_mask[index, :plen] = True
+        parent_lens_t = torch.tensor(parent_lens, dtype=torch.long, device=device)
+        if prelude is not None:
+            own = prelude.select(rec_ids)
+            pre_k = torch.stack(own.keys).to(dtype=self._kv_dtype)
+            pre_v = torch.stack(own.values).to(dtype=self._kv_dtype)
+            past_keys = torch.cat([pre_k, sent_k], dim=3)
+            past_values = torch.cat([pre_v, sent_v], dim=3)
+            past_mask = torch.cat([own.mask, sent_mask], dim=1)
+            positions = own.lengths + parent_lens_t
+        else:
+            past_keys, past_values, past_mask = sent_k, sent_v, sent_mask
+            positions = parent_lens_t
+        with _eval_autocast(device):
+            features, new_k, new_v = decoder.step_over_keys(
+                tokens,
+                positions,
+                past_keys,
+                past_values,
+                past_mask,
+                self._cross_kv,
+                self.states.mask,
+                rec_ids,
+            )
+            logits = decoder.emission_logits(features)
+        rows_cpu = logits.float().log_softmax(dim=-1).cpu()
+        new_k = new_k.to(dtype=self._kv_dtype)
+        new_v = new_v.to(dtype=self._kv_dtype)
+        for index, (rec, prefix) in enumerate(pairs):
+            self._rows[(rec, prefix)] = rows_cpu[index]
+            step_k = new_k[:, index].unsqueeze(2)
+            step_v = new_v[:, index].unsqueeze(2)
+            if not prefix:
+                self._kv[(rec, prefix)] = (step_k, step_v)
+            else:
+                pk, pv = self._kv[(rec, prefix[:-1])]
+                self._kv[(rec, prefix)] = (
+                    torch.cat([pk, step_k], dim=2),
+                    torch.cat([pv, step_v], dim=2),
+                )
+
+    def _run_fallback(self, pairs: Sequence[tuple[int, Prefix]]) -> None:
+        decoder = self.model.decoder
+        device = self._device
+        rec_ids = torch.tensor([rec for rec, _ in pairs], dtype=torch.long, device=device)
+        lengths = np.fromiter((len(prefix) for _, prefix in pairs), dtype=np.int64)
+        padded = np.zeros((len(pairs), int(lengths.max(initial=0))), dtype=np.int64)
+        for row, (_, prefix) in enumerate(pairs):
+            padded[row, : len(prefix)] = prefix
+        root_id = SEP if self.states.prelude is not None else BOS
+        prefixes_t = torch.from_numpy(padded).to(device)
+        lengths_t = torch.from_numpy(lengths).to(device)
+        tokens = torch.cat(
+            [
+                torch.full((len(pairs), 1), root_id, dtype=torch.long, device=device),
+                decoder.emit_ids[prefixes_t],
+            ],
+            dim=1,
+        )
+        with _eval_autocast(device):
+            features = decoder.over_keys(
+                tokens,
+                self.states.states,
+                self.states.mask,
+                rec_ids,
+                self.states.prelude,
+                cross_kv=self._cross_kv,
+            )
+            at = torch.arange(len(pairs), device=device) * tokens.shape[1] + lengths_t
+            last = features.reshape(-1, features.shape[-1]).index_select(0, at)
+            logits = decoder.emission_logits(last)
+        rows_cpu = logits.float().log_softmax(dim=-1).cpu()
+        for index, pair in enumerate(pairs):
+            self._rows[pair] = rows_cpu[index]
 
     def __call__(self, records: Sequence[int], prefixes: Sequence[Prefix]) -> torch.Tensor:
         started = time.perf_counter()
-        device = self.states.states.device
-        lengths = np.fromiter((len(prefix) for prefix in prefixes), dtype=np.int64)
-        padded = np.zeros((len(prefixes), int(lengths.max(initial=0))), dtype=np.int64)
-        for row, prefix in enumerate(prefixes):
-            padded[row, : len(prefix)] = prefix
-        rows = self.model.transition_log_probs(
-            self.states,
-            torch.tensor(list(records), dtype=torch.long, device=device),
-            torch.from_numpy(padded).to(device),
-            torch.from_numpy(lengths).to(device),
-        ).cpu()
+        requested = list(zip(records, prefixes, strict=True))
+        missing: list[tuple[int, Prefix]] = []
+        seen: set[tuple[int, Prefix]] = set()
+        for pair in requested:
+            if pair not in self._rows and pair not in seen:
+                seen.add(pair)
+                missing.append(pair)
+        if missing:
+            if self._direct_override:
+                lengths = np.fromiter((len(prefix) for _, prefix in missing), dtype=np.int64)
+                padded = np.zeros((len(missing), int(lengths.max(initial=0))), dtype=np.int64)
+                for row, (_, prefix) in enumerate(missing):
+                    padded[row, : len(prefix)] = prefix
+                rows_cpu = self.model.transition_log_probs(
+                    self.states,
+                    torch.tensor(
+                        [rec for rec, _ in missing], dtype=torch.long, device=self._device
+                    ),
+                    torch.from_numpy(padded).to(self._device),
+                    torch.from_numpy(lengths).to(self._device),
+                ).cpu()
+                for index, pair in enumerate(missing):
+                    self._rows[pair] = rows_cpu[index]
+            else:
+                stepped = [
+                    pair for pair in missing if not pair[1] or (pair[0], pair[1][:-1]) in self._kv
+                ]
+                fallback = [
+                    pair for pair in missing if pair[1] and (pair[0], pair[1][:-1]) not in self._kv
+                ]
+                if stepped:
+                    self._run_stepped(stepped)
+                if fallback:
+                    self._run_fallback(fallback)
+        rows = torch.stack([self._rows[pair] for pair in requested])
         self.times.transition += time.perf_counter() - started
         return rows
 
@@ -460,8 +604,9 @@ class KeyDecoder:
             inputs = self.collator.inputs(
                 [record.keys for record in group], [record.context for record in group]
             ).to(self.device)
-            states = self.model.key_states(inputs)
-            log_probs = self.model.ctc_log_probs(states.states)
+            with _eval_autocast(self.device):
+                states = self.model.key_states(inputs)
+                log_probs = self.model.ctc_log_probs(states.states)
             if log_probs.shape[-1] != width + 1:
                 raise ValueError(
                     f"the head emits {log_probs.shape[-1] - 1} characters against the "
