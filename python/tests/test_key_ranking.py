@@ -970,3 +970,26 @@ def test_ranking_with_decoder_prelude_and_score_eos_matches_joint_and_brute_forc
             assert got.keys() == {ids for ids, _ in top}
             for ids, score in top:
                 assert got[ids] == pytest.approx(score, abs=1e-3)
+
+
+def test_padded_key_inputs_pins_prelude_width_to_one_bucket() -> None:
+    """Fixing *prelude_width* collapses every batch's prelude to one bucketed width (#322)."""
+    width = 62
+    records, keys, lanes, positions, hidden, emittable = 3, 12, 6, 5, 16, 32
+    for chars in (2, 10, 35, width):
+        raw = KeySearchInputs(
+            states=torch.zeros(records, keys, hidden),
+            key_mask=torch.ones(records, keys, dtype=torch.bool),
+            lane_owner=torch.arange(lanes) % records,
+            gains=torch.zeros(lanes, positions, emittable),
+            lane_lengths=torch.full((lanes,), positions, dtype=torch.long),
+            width=4,
+            beta=2.0,
+            prelude_chars=torch.ones(records, chars, dtype=torch.long),
+            prelude_lengths=torch.full((records,), min(chars, 2), dtype=torch.long),
+        )
+        padded = padded_key_inputs(raw, bucketed=True, prelude_width=width)
+        assert padded.prelude_chars is not None
+        assert padded.prelude_chars.shape[1] == 64
+        assert padded.prelude_lengths is not None
+        assert padded.prelude_lengths.shape[0] == padded.states.shape[0]
