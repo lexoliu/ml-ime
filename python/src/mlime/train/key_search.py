@@ -718,13 +718,10 @@ class _Record:
     def evict(self) -> None:
         """Drop the rows of prefixes no beam prefix can extend into again."""
         beam = self.beam
-        if not self.landing:
-            self.rows = {key: row for key, row in self.rows.items() if key in beam}
-            return
         self.rows = {
             key: row
             for key, row in self.rows.items()
-            if key in beam or any(key[:length] in beam for length in range(len(key)))
+            if any(key[:length] in beam for length in range(len(key) + 1))
         }
 
 
