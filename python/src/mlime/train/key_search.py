@@ -604,7 +604,11 @@ class _Record:
             if limit is not None and scores.size > limit:
                 # Exact ties at the boundary go to the earlier extension, so the
                 # selection is fully determined.
-                keep = np.sort(np.argsort(-scores, kind="stable")[:limit])
+                neg = -scores
+                cutoff = float(np.partition(neg, limit - 1)[limit - 1])
+                better = np.flatnonzero(neg < cutoff)
+                tied = np.flatnonzero(neg == cutoff)[: limit - better.size]
+                keep = np.sort(np.concatenate([better, tied]))
                 owner, position = owner[keep], position[keep]
             fresh = list(zip(owner.tolist(), position.tolist(), strict=True))
         for index, at in fresh:
@@ -714,10 +718,13 @@ class _Record:
     def evict(self) -> None:
         """Drop the rows of prefixes no beam prefix can extend into again."""
         beam = self.beam
+        if not self.landing:
+            self.rows = {key: row for key, row in self.rows.items() if key in beam}
+            return
         self.rows = {
             key: row
             for key, row in self.rows.items()
-            if any(key[:length] in beam for length in range(len(key) + 1))
+            if key in beam or any(key[:length] in beam for length in range(len(key)))
         }
 
 
