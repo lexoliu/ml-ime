@@ -16,6 +16,7 @@ from mlime.train.teacher import (
     EmittableVocab,
     QwenTeacher,
     TeacherTrainConfig,
+    bucketed_microbatches,
     build_training_batch,
     constrained_beam_decode,
     encode_prompt,
@@ -223,3 +224,20 @@ def test_encode_prompt_keeps_one_keystroke_per_token() -> None:
     expected_keys = [tok.encode(ch, add_special_tokens=False)[0] for ch in "fakeidea"]
     sep = tok.encode("\t", add_special_tokens=False)
     assert ids[-(len(expected_keys) + len(sep)) : -len(sep)] == expected_keys
+
+
+def test_bucketed_microbatches_reduces_padding_and_keeps_all_examples() -> None:
+    tok = _FakeTokenizer()
+    chars = ("我", "爱", "北", "京")
+    vocab = EmittableVocab.build(chars, tok)
+    c2e = vocab.char_to_emit()
+    short = [(None, "woai", "我爱")] * 8
+    long = [("我爱北京" * 8, "woaibeijing" * 4, "我爱北京")] * 8
+    mixed = [x for pair in zip(short, long, strict=True) for x in pair]
+    batches = list(bucketed_microbatches(mixed, tok, c2e, batch_size=4, pool_batches=4, seed=0))
+    assert len(batches) == 4
+    assert sum(len(b) for b in batches) == 16
+    # Every bucketed batch is homogeneous (either all short or all long -> 100% pad efficiency).
+    for b in batches:
+        lengths = {len(encode_prompt(tok, ctx, k)) + len(t) for ctx, k, t in b}
+        assert len(lengths) == 1

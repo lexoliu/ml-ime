@@ -744,6 +744,45 @@ def save_teacher_checkpoint(
     return path
 
 
+def bucketed_microbatches(
+    stream: Iterable[tuple[str | None, str, str]],
+    tokenizer: Any,
+    char_to_emit: Mapping[str, int],
+    *,
+    batch_size: int,
+    pool_batches: int = 16,
+    seed: int = 0,
+) -> Iterable[list[tuple[str | None, str, str]]]:
+    """Group *stream* into length-bucketed microbatches to eliminate padding waste (#336).
+
+    Collects ``pool_batches * batch_size`` valid examples, sorts them by exact
+    encoded length ``len(prompt) + len(text)``, slices into tight microbatches
+    of *batch_size*, and yields those microbatches in shuffled order so gradient
+    accumulation mixes short and long sentences unbiasedly.
+    """
+    pool_size = max(1, pool_batches) * batch_size
+    rng = random.Random(seed + 3_000_003)
+    iterator = iter(stream)
+    while True:
+        pool: list[tuple[int, tuple[str | None, str, str]]] = []
+        while len(pool) < pool_size:
+            try:
+                ctx, keys, text = next(iterator)
+            except StopIteration:
+                break
+            if all(ch in char_to_emit for ch in text):
+                seq_len = len(encode_prompt(tokenizer, ctx, keys)) + len(text)
+                pool.append((seq_len, (ctx, keys, text)))
+        if not pool:
+            break
+        pool.sort(key=lambda pair: pair[0])
+        batches = [
+            [item for _, item in pool[i : i + batch_size]] for i in range(0, len(pool), batch_size)
+        ]
+        rng.shuffle(batches)
+        yield from batches
+
+
 def train_teacher_loop(
     teacher: QwenTeacher,
     tokenizer: Any,
@@ -793,7 +832,15 @@ def train_teacher_loop(
     out_dir.mkdir(parents=True, exist_ok=True)
     metrics_path = out_dir / "metrics.jsonl"
     teacher.train()
-    iterator = iter(stream)
+    micro_iter = iter(
+        bucketed_microbatches(
+            stream,
+            tokenizer,
+            char_to_emit,
+            batch_size=config.batch_size,
+            seed=config.seed,
+        )
+    )
     t0 = time.monotonic()
     last_loss = 0.0
     step = start_step
@@ -808,16 +855,12 @@ def train_teacher_loop(
         step_loss = 0.0
         step_tokens = 0
         step_examples = 0
+        step_real_in = 0
+        step_padded_in = 0
         for _micro in range(config.accumulate):
-            batch_items: list[tuple[str | None, str, str]] = []
-            while len(batch_items) < config.batch_size:
-                try:
-                    ctx, keys, text = next(iterator)
-                except StopIteration:
-                    break
-                if all(ch in char_to_emit for ch in text):
-                    batch_items.append((ctx, keys, text))
-            if not batch_items:
+            try:
+                batch_items = next(micro_iter)
+            except StopIteration:
                 break
             input_ids, attn_mask, labels = build_training_batch(
                 tokenizer,
@@ -827,6 +870,8 @@ def train_teacher_loop(
                 pad_token_id=pad_id,
                 device=device,
             )
+            step_real_in += int(attn_mask.sum().item())
+            step_padded_in += int(attn_mask.numel())
             loss, scored = teacher(input_ids, attn_mask, labels)
             if scored > 0:
                 (loss / config.accumulate).backward()
@@ -844,6 +889,7 @@ def train_teacher_loop(
 
         if step == start_step + 1 or step % config.log_every == 0 or step == config.max_steps:
             elapsed = time.monotonic() - t0
+            pad_eff = round(step_real_in / max(1, step_padded_in), 3)
             record = {
                 "event": "step",
                 "step": step,
@@ -851,6 +897,7 @@ def train_teacher_loop(
                 "lr": cur_lr,
                 "examples": step_examples,
                 "tokens": step_tokens,
+                "pad_eff": pad_eff,
                 "seconds": round(elapsed, 2),
             }
             with metrics_path.open("a", encoding="utf-8") as mf:
@@ -862,6 +909,7 @@ def train_teacher_loop(
                 lr=cur_lr,
                 examples=step_examples,
                 tokens=step_tokens,
+                pad_eff=pad_eff,
                 seconds=round(elapsed, 2),
             )
 
