@@ -18,6 +18,7 @@ from mlime.train.teacher import (
     TeacherTrainConfig,
     build_training_batch,
     constrained_beam_decode,
+    encode_prompt,
     score_candidates_and_t1,
     train_teacher_loop,
     write_labels_parquet,
@@ -204,3 +205,21 @@ def test_constrained_beam_decode_and_offline_t1_t2_labels(tmp_path: Path) -> Non
     table = pq.read_table(out_pq)
     assert table.num_rows == 1
     assert table.column("text")[0].as_py() == "我爱北京"
+
+
+def test_encode_prompt_keeps_one_keystroke_per_token() -> None:
+    class _MergingTokenizer(_FakeTokenizer):
+        def encode(self, text: str, add_special_tokens: bool = False) -> list[int]:
+            if text == "fake":
+                return [250]
+            if "fake" in text:
+                return [250]
+            return super().encode(text, add_special_tokens=add_special_tokens)
+
+    tok = _MergingTokenizer()
+    ids = encode_prompt(tok, "今天", "fakeidea")
+    # Every letter in "fakeidea" is encoded individually, never merged to token 250.
+    assert 250 not in ids
+    expected_keys = [tok.encode(ch, add_special_tokens=False)[0] for ch in "fakeidea"]
+    sep = tok.encode("\t", add_special_tokens=False)
+    assert ids[-(len(expected_keys) + len(sep)) : -len(sep)] == expected_keys

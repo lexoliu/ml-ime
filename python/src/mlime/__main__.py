@@ -2722,7 +2722,11 @@ def train_teacher(
     unit_lexicon: Path = UNIT_LEXICON,
     context_dropout: float = typer.Option(0.30, "--context-dropout"),
     train_shard: list[str] = TRAIN_SHARD,
-    resume: Path = typer.Option(None, "--resume", help="Checkpoint to resume from"),
+    resume: Path = typer.Option(None, "--resume", help="Checkpoint to resume mid-schedule from"),
+    init_from: Path = typer.Option(
+        None, "--init-from", help="Parent stage checkpoint to initialise adapter weights from"
+    ),
+    shuffle_buffer: int = typer.Option(4096, "--shuffle-buffer"),
     seed: int = SEED,
     verbose: bool = VERBOSE,
 ) -> None:
@@ -2773,6 +2777,7 @@ def train_teacher(
         context_dropout=context_dropout,
         seed=seed,
         skip_examples=skip,
+        shuffle_buffer=shuffle_buffer,
     )
     cfg = TeacherTrainConfig(
         model=model,
@@ -2788,7 +2793,9 @@ def train_teacher(
         checkpoint_every=checkpoint_every,
         gradient_checkpointing=device.type == "cuda",
     )
-    summary = train_teacher_loop(teacher, tokenizer, stream, out, cfg, resume_path=resume)
+    summary = train_teacher_loop(
+        teacher, tokenizer, stream, out, cfg, resume_path=resume, init_from=init_from
+    )
     typer.echo(json.dumps(summary, indent=2))
 
 
