@@ -121,10 +121,11 @@ table does not load, so an export and the decoder always move together.
 - No Devin, local or cloud, works on this repository: its code runs straight on expensive GPUs,
   so it is written by a coordinating session or an Opus subagent and reviewed before any GPU
   runs it.
-- Training runs only on an A100 or a G4, never an H100. A T4 or L4 checks GPU training code for
-  correctness and trains nothing: its legs publish nothing and their weights are discarded. Code
-  that is not GPU training code is covered by unit tests, not GPU checks.
-- No A100 or G4 training starts without the owner's explicit permission, asked with the
+- Training runs on an A100, G4, or H100, chosen by measured throughput for the workload. A T4 or
+  L4 checks GPU training code for correctness and trains nothing: its legs publish nothing and
+  their weights are discarded. Code that is not GPU training code is covered by unit tests, not
+  GPU checks.
+- No A100, G4, or H100 training starts without the owner's explicit permission, asked with the
   correctness and performance checks complete and the expected training time.
 - Every Colab runtime carries the watchdog; nothing outlives its controller. Cost is stated in
   compute units, together with time.
