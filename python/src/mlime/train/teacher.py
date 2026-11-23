@@ -135,24 +135,60 @@ class EmittableVocab:
 
 
 def format_prompt(context: str | None, keys: str, max_context_chars: int = 62) -> str:
-    """Format the canonical-BPE prompt read before the one-hanzi-per-token output."""
+    """Format the readable prompt prefix before the one-hanzi-per-token output."""
     ctx = "" if not context else context[max(0, len(context) - max_context_chars) :]
     return f"{CONSTANT_HEAD}{ctx}{FIELD_SEP}{keys}{FIELD_SEP}"
 
 
-def encode_prompt(tokenizer: Any, context: str | None, keys: str) -> list[int]:
-    """Encode the prompt prefix with Qwen's canonical BPE (no added special tokens)."""
-    ids: list[int] = tokenizer.encode(format_prompt(context, keys), add_special_tokens=False)
-    return ids
+def encode_prompt(
+    tokenizer: Any, context: str | None, keys: str, max_context_chars: int = 62
+) -> list[int]:
+    """Encode *context* with canonical BPE and *keys* one ASCII letter per token.
+
+    Encoding raw pinyin through BPE splits long keystrokes into arbitrary
+    English/multilingual subwords (e.g. ``mageqiujiganfakeyidea`` ->
+    ``['mage', 'qi', 'uj', 'igan', 'fake', 'y', 'idea']``), collapsing accuracy
+    on long full-pinyin sentences (#328). Every ``a..z`` keystroke is a single
+    token in Qwen's vocabulary, so encoding keys one character at a time keeps
+    every letter aligned cleanly while preserving canonical BPE for Chinese
+    context.
+    """
+    ctx = "" if not context else context[max(0, len(context) - max_context_chars) :]
+    prefix_ids: list[int] = tokenizer.encode(
+        f"{CONSTANT_HEAD}{ctx}{FIELD_SEP}", add_special_tokens=False
+    )
+    key_ids: list[int] = []
+    for ch in keys:
+        ch_ids: list[int] = tokenizer.encode(ch, add_special_tokens=False)
+        key_ids.extend(ch_ids)
+    sep_ids: list[int] = tokenizer.encode(FIELD_SEP, add_special_tokens=False)
+    return [*prefix_ids, *key_ids, *sep_ids]
+
+
+class TeacherLoraLinear(LoraLinear):
+    """BF16 Tensor Core LoRA matmul with fp32 master weights for AdamW (#328).
+
+    Casts the small ``[rank, in]`` / ``[out, rank]`` factors to ``x.dtype``
+    instead of casting the full ``[B, T, H]`` activation tensor to fp32 across
+    400 adapted projections (forward and gradient-checkpointed recompute).
+    """
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        base: torch.Tensor = nn.Linear.forward(self, x)
+        a = self.lora_a.to(x.dtype)
+        b = self.lora_b.to(x.dtype)
+        update = (x @ a.T) @ b.T
+        result: torch.Tensor = base + self.scale * update
+        return result
 
 
 def _apply_lora(module: nn.Module, config: LoraConfig) -> int:
-    """Replace every target ``nn.Linear`` in *module* with :class:`LoraLinear`."""
+    """Replace every target ``nn.Linear`` in *module* with :class:`TeacherLoraLinear`."""
     replaced = 0
     for child_name, child in list(module.named_children()):
         if isinstance(child, nn.Linear) and not isinstance(child, LoraLinear):
             if child_name in config.targets:
-                setattr(module, child_name, LoraLinear(child, config.rank, config.alpha))
+                setattr(module, child_name, TeacherLoraLinear(child, config.rank, config.alpha))
                 replaced += 1
         else:
             replaced += _apply_lora(child, config)
@@ -716,8 +752,15 @@ def train_teacher_loop(
     config: TeacherTrainConfig,
     *,
     resume_path: Path | None = None,
+    init_from: Path | None = None,
 ) -> dict[str, Any]:
-    """Resumable LoRA training loop over ``(context, keys, target_text)`` triples."""
+    """Resumable LoRA training loop over ``(context, keys, target_text)`` triples.
+
+    *resume_path* restores adapter weights, AdamW state, and step counter to
+    continue an interrupted run. *init_from* loads only adapter weights from a
+    finished parent stage (such as S3 -> S4) and starts a fresh LR schedule at
+    step 0.
+    """
     device = teacher.emit_head.weight.device
     char_to_emit = teacher.vocab.char_to_emit()
     pad_id = int(
@@ -734,6 +777,10 @@ def train_teacher_loop(
         optimiser.load_state_dict(ckpt["optimiser"])
         start_step = int(ckpt["step"])
         log.info("teacher resumed", path=str(resume_path), step=start_step)
+    elif init_from is not None and init_from.is_file():
+        ckpt = torch.load(init_from, map_location="cpu", weights_only=False)
+        teacher.load_adapter_state_dict(ckpt.get("adapter", ckpt))
+        log.info("teacher initialised from parent", path=str(init_from))
 
     warmup = max(1, int(config.max_steps * config.warmup_fraction))
 
@@ -864,6 +911,7 @@ def corpus_teacher_stream(
     context_dropout: float = 0.30,
     seed: int = 0,
     skip_examples: int = 0,
+    shuffle_buffer: int = 4096,
 ) -> Iterable[tuple[str | None, str, str]]:
     """Stream ``(context, raw_keys, target_text)`` triples from corpus shards.
 
@@ -920,19 +968,31 @@ def corpus_teacher_stream(
     )
     stream = CorpusStream(samples_dir, labels_dir, builder, shards=shards, epoch=0)
     rng = random.Random(seed + 1_000_003)
+    shuf_rng = random.Random(seed + 2_000_003)
+    buf: list[tuple[str | None, str, str]] = []
     seen = 0
     epoch = 0
     while True:
         stream.set_epoch(epoch)
         for ex in stream:
             drop_ctx = ex.context is None or rng.random() < context_dropout
-            seen += 1
-            if seen <= skip_examples:
-                continue
             ctx = None if drop_ctx else ex.context
             keys = "".join(ex.spans)
             text = "".join(lexicon.characters[t] for t in ex.targets)
-            yield ctx, keys, text
+            item = (ctx, keys, text)
+            if shuffle_buffer <= 1:
+                seen += 1
+                if seen > skip_examples:
+                    yield item
+            elif len(buf) < shuffle_buffer:
+                buf.append(item)
+            else:
+                pick = shuf_rng.randrange(len(buf))
+                out_item = buf[pick]
+                buf[pick] = item
+                seen += 1
+                if seen > skip_examples:
+                    yield out_item
         epoch += 1
 
 
