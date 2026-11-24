@@ -391,19 +391,68 @@ class BeamHypothesis:
     score: float
 
 
-def _lattice_adjacency(
-    legality: Legality, keys: str, options: LegalityOptions
-) -> tuple[int, dict[int, list[tuple[int, int, float]]]]:
-    """Build ``start_offset -> [(end_offset, emit_id, cost), ...]`` from the pruned lattice."""
-    lattice = legality.lattice(keys, options)
-    adj: dict[int, list[tuple[int, int, float]]] = {}
-    starts = lattice.start.tolist()
-    ends = lattice.end.tolist()
-    chars = lattice.character.tolist()
-    costs = lattice.cost.tolist()
-    for s, e, c, cost in zip(starts, ends, chars, costs, strict=True):
-        adj.setdefault(int(s), []).append((int(e), int(c), float(cost)))
-    return len(keys), adj
+@dataclass(frozen=True)
+class _SpanLattice:
+    """Pruned legality spans indexed by start keystroke offset.
+
+    Stores the memoised NumPy ``(ids, costs)`` arrays from
+    :meth:`~mlime.legality.Legality.span_matches` directly and pre-merges
+    per-start-offset ``(uniq_ids, min_gamma_costs)`` in float32 so beam
+    expansion runs one vectorized score op per live offset instead of looping
+    over thousands of flattened character arcs.
+    """
+
+    key_len: int
+    by_start: dict[int, list[tuple[int, np.ndarray, np.ndarray]]]
+    merged_by_start: dict[int, tuple[np.ndarray, np.ndarray]]
+
+
+def _span_lattice(
+    legality: Legality, keys: str, options: LegalityOptions, *, gamma: float = 1.0
+) -> _SpanLattice:
+    """Build a pruned :class:`_SpanLattice` for *keys* with pre-merged per-offset costs."""
+    from mlime.legality import MAX_ARC_KEYS
+
+    if not keys or not keys.isascii() or not keys.isalpha() or not keys.islower():
+        raise ValueError(f"keys must be a non-empty [a-z] string, got {keys!r}")
+    width = len(keys)
+    edges: dict[tuple[int, int], tuple[np.ndarray, np.ndarray]] = {}
+    for start in range(width):
+        for end in range(start + 1, min(start + MAX_ARC_KEYS, width) + 1):
+            matches = legality.span_matches(keys[start:end], end == width, options)
+            if matches.ids.size:
+                edges[(start, end)] = (matches.ids, matches.costs)
+    reachable = [False] * (width + 1)
+    reachable[0] = True
+    for start, end in sorted(edges):
+        if reachable[start]:
+            reachable[end] = True
+    productive = [False] * (width + 1)
+    productive[width] = True
+    for start, end in sorted(edges, reverse=True):
+        if productive[end]:
+            productive[start] = True
+    by_start: dict[int, list[tuple[int, np.ndarray, np.ndarray]]] = {}
+    for (start, end), (ids, costs) in sorted(edges.items()):
+        if reachable[start] and productive[end]:
+            by_start.setdefault(start, []).append((end, ids, costs))
+
+    gamma_f32 = np.float32(gamma)
+    merged_by_start: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+    for start, spans in by_start.items():
+        if len(spans) == 1:
+            _, ids, costs = spans[0]
+            merged_by_start[start] = (ids, (costs * gamma).astype(np.float32))
+            continue
+        all_ids = np.concatenate([ids for _, ids, _ in spans])
+        all_costs = np.concatenate([costs for _, _, costs in spans])
+        order = np.lexsort((all_costs, all_ids))
+        s_ids = all_ids[order]
+        s_costs = all_costs[order]
+        first = np.ones(s_ids.shape, dtype=bool)
+        first[1:] = s_ids[1:] != s_ids[:-1]
+        merged_by_start[start] = (s_ids[first], s_costs[first].astype(np.float32) * gamma_f32)
+    return _SpanLattice(width, by_start, merged_by_start)
 
 
 def _select_cache_rows(cache: Any, indices: Sequence[int]) -> Any:
@@ -433,6 +482,289 @@ def _select_cache_rows(cache: Any, indices: Sequence[int]) -> Any:
     return new
 
 
+@dataclass
+class _PrefillBatch:
+    """Left-padded prompt prefill shared across batched beam search and T1/T2 scoring."""
+
+    prompt_lens: list[int]
+    max_prompt_len: int
+    attn_mask: torch.Tensor
+    first_log_probs: torch.Tensor
+    prefix_cache: Any
+
+
+@torch.no_grad()
+def _prefill_prompts(
+    teacher: QwenTeacher,
+    tokenizer: Any,
+    records: Sequence[tuple[str | None, str]],
+) -> _PrefillBatch:
+    """Prefill a batch of ``(context, keys)`` prompts with left-padding and exact RoPE positions.
+
+    Left-padding keeps ``Qwen3_5GatedDeltaNet`` conv/recurrent states and full-attention KV
+    outputs numerically identical to unpadded single-record prefills while saturating the GPU.
+    """
+    device = teacher.emit_head.weight.device
+    pad_id = int(
+        tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    )
+    prompts = [encode_prompt(tokenizer, ctx, keys) for ctx, keys in records]
+    prompt_lens = [len(p) for p in prompts]
+    max_prompt_len = max(prompt_lens)
+    batch = len(prompts)
+
+    input_ids = torch.full((batch, max_prompt_len), pad_id, dtype=torch.long)
+    attn_mask = torch.zeros((batch, max_prompt_len), dtype=torch.long)
+    for i, prompt in enumerate(prompts):
+        n = len(prompt)
+        input_ids[i, max_prompt_len - n :] = torch.tensor(prompt, dtype=torch.long)
+        attn_mask[i, max_prompt_len - n :] = 1
+    input_ids = input_ids.to(device)
+    attn_mask = attn_mask.to(device)
+    position_ids = (attn_mask.cumsum(dim=-1) - 1).clamp_min(0)
+    cache_position = torch.arange(max_prompt_len, dtype=torch.long, device=device)
+
+    out = teacher.backbone(
+        inputs_embeds=teacher.embed_ids(input_ids),
+        attention_mask=attn_mask,
+        position_ids=position_ids,
+        cache_position=cache_position,
+        use_cache=True,
+    )
+    first_logits = teacher.project_logits(out.last_hidden_state[:, -1])
+    first_log_probs = functional.log_softmax(first_logits, dim=-1)
+    return _PrefillBatch(
+        prompt_lens=prompt_lens,
+        max_prompt_len=max_prompt_len,
+        attn_mask=attn_mask,
+        first_log_probs=first_log_probs,
+        prefix_cache=out.past_key_values,
+    )
+
+
+def _expand_record_beams(
+    lattice: _SpanLattice,
+    active: list[tuple[float, tuple[int, ...], dict[int, float], np.ndarray, int]],
+    finished: list[BeamHypothesis],
+    *,
+    beam: int,
+    gamma: float,
+    eos_emit: int,
+    characters: tuple[str, ...],
+) -> list[tuple[float, tuple[int, ...], dict[int, float], int]]:
+    """Expand one record's active beams using span-vectorized NumPy top-K selection.
+
+    Returns the surviving ``(score, new_emitted, next_offsets, parent_cache_row)``
+    specs (up to *beam*), or an empty list when the record has finished decoding.
+    """
+    per_offset_k = beam + 4
+    candidates: list[tuple[float, bool, tuple[int, ...], int, int]] = []
+
+    for parent_idx, (score, emitted, offsets, lp, _cache_row) in enumerate(active):
+        if lattice.key_len in offsets:
+            end_score = score + float(lp[eos_emit])
+            candidates.append((end_score, True, emitted, -1, parent_idx))
+
+        cur_min_cost = min(offsets.values())
+        best_by_eid: dict[int, float] = {}
+        for off, cur_cost in offsets.items():
+            merged = lattice.merged_by_start.get(off)
+            if merged is None:
+                continue
+            uniq_ids, min_g_costs = merged
+            shift = np.float32(gamma * (cur_cost - cur_min_cost))
+            scores_arr = (
+                lp[uniq_ids] - min_g_costs if shift == 0.0 else lp[uniq_ids] - (min_g_costs + shift)
+            )
+            n = uniq_ids.size
+            if n > per_offset_k:
+                top_idx = np.argpartition(scores_arr, n - per_offset_k)[n - per_offset_k :]
+                top_ids = uniq_ids[top_idx].tolist()
+                top_sc = scores_arr[top_idx].tolist()
+            else:
+                top_ids = uniq_ids.tolist()
+                top_sc = scores_arr.tolist()
+            for eid, rel_s in zip(top_ids, top_sc, strict=True):
+                cand_s = score + rel_s
+                prev_s = best_by_eid.get(eid)
+                if prev_s is None or cand_s > prev_s:
+                    best_by_eid[eid] = cand_s
+
+        for eid, cand_s in best_by_eid.items():
+            candidates.append((cand_s, False, (*emitted, eid), eid, parent_idx))
+
+    if not candidates:
+        return []
+    candidates.sort(key=lambda item: -item[0])
+
+    next_specs: list[tuple[float, tuple[int, ...], dict[int, float], int]] = []
+    seen_emitted: set[tuple[int, ...]] = set()
+    for cand_score, is_eos, emitted, eid, parent_idx in candidates:
+        if is_eos:
+            text = "".join(characters[e] for e in emitted)
+            finished.append(BeamHypothesis(text=text, emit_ids=emitted, score=cand_score))
+            continue
+        if emitted in seen_emitted:
+            continue
+        seen_emitted.add(emitted)
+        next_offs: dict[int, float] = {}
+        parent_offsets = active[parent_idx][2]
+        for off, cur_cost in parent_offsets.items():
+            for end_off, ids, arc_costs in lattice.by_start.get(off, ()):
+                pos = int(np.searchsorted(ids, eid))
+                if pos < ids.size and int(ids[pos]) == eid:
+                    cost = cur_cost + float(arc_costs[pos])
+                    prev_cost = next_offs.get(end_off)
+                    if prev_cost is None or cost < prev_cost:
+                        next_offs[end_off] = cost
+        next_specs.append((cand_score, emitted, next_offs, active[parent_idx][4]))
+        if len(next_specs) >= beam:
+            break
+
+    if not next_specs:
+        return []
+    finished.sort(key=lambda h: -h.score)
+    if len(finished) >= beam and finished[beam - 1].score >= next_specs[0][0]:
+        return []
+    return next_specs
+
+
+def _finalise_hypotheses(finished: Sequence[BeamHypothesis], beam: int) -> list[BeamHypothesis]:
+    """Deduplicate finished hypotheses by text, keeping the highest score per text."""
+    best_by_text: dict[str, BeamHypothesis] = {}
+    for hyp in finished:
+        prev_hyp = best_by_text.get(hyp.text)
+        if prev_hyp is None or hyp.score > prev_hyp.score:
+            best_by_text[hyp.text] = hyp
+    ranked = sorted(best_by_text.values(), key=lambda h: -h.score)
+    return ranked[:beam]
+
+
+@torch.no_grad()
+def _decode_from_prefill(
+    teacher: QwenTeacher,
+    prefill: _PrefillBatch,
+    keys_list: Sequence[str],
+    legality: Legality,
+    options: LegalityOptions = OFFLINE,
+    *,
+    beam: int = 8,
+    gamma: float = 1.0,
+) -> list[list[BeamHypothesis]]:
+    """Run batched multi-record lattice-constrained beam search from a shared *prefill*.
+
+    Does not mutate ``prefill.prefix_cache`` (``_select_cache_rows`` always allocates fresh
+    tensors before the backbone updates conv/recurrent states), so callers can immediately reuse
+    *prefill* for T1/T2 scoring.
+    """
+    n_records = len(keys_list)
+    if n_records == 0:
+        return []
+    device = teacher.emit_head.weight.device
+    vocab = teacher.vocab
+    eos_emit = vocab.eos_emit_id
+
+    lattices = [_span_lattice(legality, k, options, gamma=gamma) for k in keys_list]
+    first_lps_np = prefill.first_log_probs.cpu().numpy()
+
+    # Per-record active beams: (score, emitted, offsets, row_lp, cache_row_idx)
+    per_rec_active: list[list[tuple[float, tuple[int, ...], dict[int, float], np.ndarray, int]]] = [
+        [] for _ in range(n_records)
+    ]
+    per_rec_finished: list[list[BeamHypothesis]] = [[] for _ in range(n_records)]
+    for r, lat in enumerate(lattices):
+        if lat.by_start and 0 in lat.by_start:
+            per_rec_active[r] = [(0.0, (), {0: 0.0}, first_lps_np[r], r)]
+
+    batch_cache = prefill.prefix_cache
+    cur_attn_mask = prefill.attn_mask
+    max_steps = max((lat.key_len for lat in lattices), default=0)
+
+    for step_t in range(max_steps + 1):
+        parent_cache_rows: list[int] = []
+        step_toks: list[list[int]] = []
+        step_pos_ids: list[list[int]] = []
+        flat_meta: list[tuple[int, float, tuple[int, ...], dict[int, float]]] = []
+
+        for r in range(n_records):
+            if not per_rec_active[r]:
+                continue
+            next_specs = _expand_record_beams(
+                lattices[r],
+                per_rec_active[r],
+                per_rec_finished[r],
+                beam=beam,
+                gamma=gamma,
+                eos_emit=eos_emit,
+                characters=vocab.characters,
+            )
+            per_rec_active[r] = []
+            for cand_score, emitted, next_offs, parent_cache_row in next_specs:
+                parent_cache_rows.append(parent_cache_row)
+                step_toks.append([vocab.emit_to_token[emitted[-1]]])
+                step_pos_ids.append([prefill.prompt_lens[r] + step_t])
+                flat_meta.append((r, cand_score, emitted, next_offs))
+
+        if not flat_meta:
+            break
+
+        parent_idx_t = torch.tensor(parent_cache_rows, dtype=torch.long, device=device)
+        child_cache = _select_cache_rows(batch_cache, parent_cache_rows)
+        step_mask = torch.cat(
+            [
+                cur_attn_mask.index_select(0, parent_idx_t),
+                torch.ones((len(flat_meta), 1), dtype=torch.long, device=device),
+            ],
+            dim=1,
+        )
+        step_tensor = torch.tensor(step_toks, dtype=torch.long, device=device)
+        pos_tensor = torch.tensor(step_pos_ids, dtype=torch.long, device=device)
+        cache_pos = torch.tensor([prefill.max_prompt_len + step_t], dtype=torch.long, device=device)
+        step_out = teacher.backbone(
+            inputs_embeds=teacher.embed_ids(step_tensor),
+            attention_mask=step_mask,
+            position_ids=pos_tensor,
+            cache_position=cache_pos,
+            past_key_values=child_cache,
+            use_cache=True,
+        )
+        step_logits = teacher.project_logits(step_out.last_hidden_state[:, -1])
+        step_lps = functional.log_softmax(step_logits, dim=-1).cpu().numpy()
+        batch_cache = step_out.past_key_values
+        cur_attn_mask = step_mask
+
+        for i, (r, cand_score, emitted, next_offs) in enumerate(flat_meta):
+            per_rec_active[r].append((cand_score, emitted, next_offs, step_lps[i], i))
+
+    return [_finalise_hypotheses(fin, beam) for fin in per_rec_finished]
+
+
+@torch.no_grad()
+def constrained_beam_decode_batch(
+    teacher: QwenTeacher,
+    tokenizer: Any,
+    records: Sequence[tuple[str | None, str]],
+    legality: Legality,
+    options: LegalityOptions = OFFLINE,
+    *,
+    beam: int = 8,
+    gamma: float = 1.0,
+) -> list[list[BeamHypothesis]]:
+    """Batched lattice-constrained beam search across multiple ``(context, keys)`` records."""
+    if not records:
+        return []
+    prefill = _prefill_prompts(teacher, tokenizer, records)
+    return _decode_from_prefill(
+        teacher,
+        prefill,
+        [keys for _, keys in records],
+        legality,
+        options,
+        beam=beam,
+        gamma=gamma,
+    )
+
+
 @torch.no_grad()
 def constrained_beam_decode(
     teacher: QwenTeacher,
@@ -445,114 +777,177 @@ def constrained_beam_decode(
     beam: int = 8,
     gamma: float = 1.0,
 ) -> list[BeamHypothesis]:
-    """Batched lattice-constrained beam search over one record, sharing the prefix cache.
+    """Batched lattice-constrained beam search over one record, sharing the prefix cache."""
+    return constrained_beam_decode_batch(
+        teacher,
+        tokenizer,
+        [(context, keys)],
+        legality,
+        options,
+        beam=beam,
+        gamma=gamma,
+    )[0]
 
-    Every output sentence is guaranteed legal under *legality* and *options*.
-    Each beam state tracks ``offsets: dict[int, float]`` mapping reachable
-    keystroke offsets to their minimum accumulated correction cost. Active beams
-    are advanced in a single batched ``[K, 1]`` forward pass per step.
+
+@torch.no_grad()
+def _score_candidates_and_t1_from_prefill(
+    teacher: QwenTeacher,
+    tokenizer: Any,
+    prefill: _PrefillBatch,
+    gold_emit_ids_list: Sequence[Sequence[int]],
+    candidate_emit_ids_list: Sequence[Sequence[Sequence[int]]],
+    *,
+    top_k_t1: int = 32,
+    score_batch_size: int = 64,
+) -> list[tuple[list[list[int]], list[list[float]], list[float]]]:
+    """Compute T1 and T2 across a batch of records reusing *prefill* without re-encoding prompts.
+
+    Deduplicates identical ``(record, candidate)`` sequences (so gold appearing inside the candidate
+    list is scored once) and groups unique continuations by length into chunks of
+    *score_batch_size* with vectorized score extraction.
     """
-    key_len, adj = _lattice_adjacency(legality, keys, options)
-    if not adj or 0 not in adj:
+    n_records = len(gold_emit_ids_list)
+    if n_records == 0:
         return []
-
     device = teacher.emit_head.weight.device
     vocab = teacher.vocab
     eos_emit = vocab.eos_emit_id
-
-    prompt_ids = encode_prompt(tokenizer, context, keys)
-    prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-    out = teacher.backbone(
-        inputs_embeds=teacher.embed_ids(prompt_tensor),
-        use_cache=True,
+    k_t1 = min(top_k_t1, vocab.num_classes)
+    pad_tok = int(
+        tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     )
-    first_logits = teacher.project_logits(out.last_hidden_state[0, -1])
-    first_log_probs = functional.log_softmax(first_logits, dim=-1).cpu().numpy()
-    batch_cache = out.past_key_values
 
-    # Active beam entries: (score, emit_ids, offsets_costs, row_lp)
-    active: list[tuple[float, tuple[int, ...], dict[int, float], np.ndarray]] = [
-        (0.0, (), {0: 0.0}, first_log_probs)
+    # Position 0 top-k T1 for every record directly from the shared prefill.
+    vals0, idxs0 = prefill.first_log_probs.topk(k_t1, dim=-1)
+    vals0_list = vals0.cpu().tolist()
+    idxs0_list = idxs0.cpu().tolist()
+    first_lps_cpu = prefill.first_log_probs.cpu()
+
+    t1_ids_out: list[list[list[int]]] = [
+        [[int(x) for x in idxs0_list[r]]] for r in range(n_records)
     ]
-    finished: list[BeamHypothesis] = []
-    max_steps = key_len
+    t1_lps_out: list[list[list[float]]] = [
+        [[float(x) for x in vals0_list[r]]] for r in range(n_records)
+    ]
 
-    for _step in range(max_steps + 1):
-        if not active:
-            break
-        candidates: list[tuple[float, bool, tuple[int, ...], dict[int, float], int]] = []
-        for parent_idx, (score, emitted, offsets, lp) in enumerate(active):
-            # 1. Can we close the sentence here?
-            if key_len in offsets:
-                end_score = score + float(lp[eos_emit])
-                candidates.append((end_score, True, emitted, offsets, parent_idx))
-            # 2. Group reachable (emit_id -> next_offsets_costs) from current live offsets.
-            next_by_char: dict[int, dict[int, float]] = {}
-            for off, cur_cost in offsets.items():
-                for end_off, eid, arc_cost in adj.get(off, ()):
-                    total_cost = cur_cost + arc_cost
-                    bucket = next_by_char.setdefault(eid, {})
-                    prev = bucket.get(end_off)
-                    if prev is None or total_cost < prev:
-                        bucket[end_off] = total_cost
-            cur_min_cost = min(offsets.values())
-            for eid, next_offs in next_by_char.items():
-                next_min_cost = min(next_offs.values())
-                delta_cost = next_min_cost - cur_min_cost
-                cand_score = score + float(lp[eid]) - gamma * delta_cost
-                candidates.append((cand_score, False, (*emitted, eid), next_offs, parent_idx))
+    # Deduplicate (rec_idx, seq_tuple) across gold + candidates while flagging which entry is gold.
+    unique_entries: dict[tuple[int, tuple[int, ...]], bool] = {}
+    empty_scores: dict[int, float] = {
+        r: float(first_lps_cpu[r, eos_emit].item()) for r in range(n_records)
+    }
+    for r in range(n_records):
+        gold_t = tuple(int(e) for e in gold_emit_ids_list[r])
+        if gold_t:
+            unique_entries[(r, gold_t)] = True
+        for cand in candidate_emit_ids_list[r]:
+            cand_t = tuple(int(e) for e in cand)
+            if cand_t and (r, cand_t) not in unique_entries:
+                unique_entries[(r, cand_t)] = False
 
-        if not candidates:
-            break
-        candidates.sort(key=lambda item: -item[0])
+    # Sort unique continuations by length so right-padding inside each chunk is minimal.
+    work = sorted(unique_entries.items(), key=lambda item: len(item[0][1]))
+    seq_scores: dict[tuple[int, tuple[int, ...]], float] = {}
+    gold_t1_rest: dict[int, tuple[list[list[int]], list[list[float]]]] = {}
 
-        next_active_specs: list[tuple[float, tuple[int, ...], dict[int, float], int]] = []
-        seen_emitted: set[tuple[int, ...]] = set()
-        for cand_score, is_eos, emitted, next_offs, parent_idx in candidates:
-            if is_eos:
-                text = "".join(vocab.characters[e] for e in emitted)
-                finished.append(BeamHypothesis(text=text, emit_ids=emitted, score=cand_score))
-                continue
-            if emitted in seen_emitted:
-                continue
-            seen_emitted.add(emitted)
-            next_active_specs.append((cand_score, emitted, next_offs, parent_idx))
-            if len(next_active_specs) >= beam:
-                break
+    chunk_size = max(1, score_batch_size)
+    for start in range(0, len(work), chunk_size):
+        chunk = work[start : start + chunk_size]
+        batch_n = len(chunk)
+        max_len = max(len(seq) for (_, seq), _ in chunk)
+        owners = [rec_idx for (rec_idx, _), _ in chunk]
+        owner_t = torch.tensor(owners, dtype=torch.long, device=device)
 
-        if not next_active_specs:
-            break
-        # Stop expanding if we already have `beam` finished hypotheses better than the best active.
-        finished.sort(key=lambda h: -h.score)
-        if len(finished) >= beam and finished[beam - 1].score >= next_active_specs[0][0]:
-            break
+        seq_tensor = torch.full((batch_n, max_len), pad_tok, dtype=torch.long)
+        cand_mask = torch.zeros((batch_n, max_len), dtype=torch.long)
+        pos_ids = torch.zeros((batch_n, max_len), dtype=torch.long)
+        for row_i, ((rec_idx, seq), _) in enumerate(chunk):
+            ln = len(seq)
+            seq_tensor[row_i, :ln] = torch.tensor(
+                [vocab.emit_to_token[e] for e in seq], dtype=torch.long
+            )
+            cand_mask[row_i, :ln] = 1
+            base_pos = prefill.prompt_lens[rec_idx]
+            pos_ids[row_i] = torch.arange(base_pos, base_pos + max_len, dtype=torch.long)
 
-        # Advance all active beams together in one batched [K, 1] forward pass.
-        parent_indices = [spec[3] for spec in next_active_specs]
-        step_toks = [[vocab.emit_to_token[spec[1][-1]]] for spec in next_active_specs]
-        step_tensor = torch.tensor(step_toks, dtype=torch.long, device=device)
-        child_cache = _select_cache_rows(batch_cache, parent_indices)
-        step_out = teacher.backbone(
-            inputs_embeds=teacher.embed_ids(step_tensor),
-            past_key_values=child_cache,
-            use_cache=True,
+        seq_tensor = seq_tensor.to(device)
+        cand_mask = cand_mask.to(device)
+        pos_ids = pos_ids.to(device)
+        attn_mask = torch.cat([prefill.attn_mask.index_select(0, owner_t), cand_mask], dim=1)
+        cache_pos = torch.arange(
+            prefill.max_prompt_len,
+            prefill.max_prompt_len + max_len,
+            dtype=torch.long,
+            device=device,
         )
-        step_logits = teacher.project_logits(step_out.last_hidden_state[:, -1])
-        step_lps = functional.log_softmax(step_logits, dim=-1).cpu().numpy()
-        batch_cache = step_out.past_key_values
-        active = [
-            (cand_score, emitted, next_offs, step_lps[i])
-            for i, (cand_score, emitted, next_offs, _) in enumerate(next_active_specs)
-        ]
+        expanded_cache = _select_cache_rows(prefill.prefix_cache, owners)
+        out = teacher.backbone(
+            inputs_embeds=teacher.embed_ids(seq_tensor),
+            attention_mask=attn_mask,
+            position_ids=pos_ids,
+            cache_position=cache_pos,
+            past_key_values=expanded_cache,
+            use_cache=False,
+        )
+        logits = teacher.project_logits(out.last_hidden_state)
+        lps = functional.log_softmax(logits, dim=-1)
 
-    # Deduplicate finished hypotheses by text, keeping highest score.
-    best_by_text: dict[str, BeamHypothesis] = {}
-    for hyp in finished:
-        prev_hyp = best_by_text.get(hyp.text)
-        if prev_hyp is None or hyp.score > prev_hyp.score:
-            best_by_text[hyp.text] = hyp
-    ranked = sorted(best_by_text.values(), key=lambda h: -h.score)
-    return ranked[:beam]
+        # Gather all target token log-probs in one vectorized op instead of per-token GPU syncs.
+        row_indices: list[int] = []
+        pos_indices: list[int] = []
+        tgt_indices: list[int] = []
+        lengths: list[int] = []
+        gold_rows: list[tuple[int, int, int]] = []
+        for row_i, ((rec_idx, seq), is_gold) in enumerate(chunk):
+            targets = [*seq[1:], eos_emit]
+            ln = len(targets)
+            lengths.append(ln)
+            for pos, tgt in enumerate(targets):
+                row_indices.append(row_i)
+                pos_indices.append(pos)
+                tgt_indices.append(tgt)
+            if is_gold:
+                gold_rows.append((row_i, rec_idx, ln))
+
+        gathered = (
+            lps[
+                torch.tensor(row_indices, dtype=torch.long, device=device),
+                torch.tensor(pos_indices, dtype=torch.long, device=device),
+                torch.tensor(tgt_indices, dtype=torch.long, device=device),
+            ]
+            .cpu()
+            .tolist()
+        )
+        cursor = 0
+        for ((rec_idx, seq), _), ln in zip(chunk, lengths, strict=True):
+            total = float(first_lps_cpu[rec_idx, seq[0]].item()) + sum(
+                gathered[cursor : cursor + ln]
+            )
+            cursor += ln
+            seq_scores[(rec_idx, seq)] = total
+
+        if gold_rows:
+            g_row_t = torch.tensor([r for r, _, _ in gold_rows], dtype=torch.long, device=device)
+            g_vals, g_idxs = lps.index_select(0, g_row_t).topk(k_t1, dim=-1)
+            g_vals_list = g_vals.cpu().tolist()
+            g_idxs_list = g_idxs.cpu().tolist()
+            for idx_in_g, (_row_i, rec_idx, ln) in enumerate(gold_rows):
+                gold_t1_rest[rec_idx] = (
+                    [[int(x) for x in g_idxs_list[idx_in_g][p]] for p in range(ln)],
+                    [[float(x) for x in g_vals_list[idx_in_g][p]] for p in range(ln)],
+                )
+
+    results: list[tuple[list[list[int]], list[list[float]], list[float]]] = []
+    for r in range(n_records):
+        if r in gold_t1_rest:
+            rest_ids, rest_lps = gold_t1_rest[r]
+            t1_ids_out[r].extend(rest_ids)
+            t1_lps_out[r].extend(rest_lps)
+        scores = [
+            empty_scores[r] if len(cand) == 0 else seq_scores[(r, tuple(int(e) for e in cand))]
+            for cand in candidate_emit_ids_list[r]
+        ]
+        results.append((t1_ids_out[r], t1_lps_out[r], scores))
+    return results
 
 
 @torch.no_grad()
@@ -575,75 +970,85 @@ def score_candidates_and_t1(
       log-probabilities at gold position ``j`` (including ``<eos>`` at ``len(gold)``).
     - ``candidate_scores[c]`` is ``log P_T(candidate_c + <eos> | context, keys)``.
     """
-    device = teacher.emit_head.weight.device
-    vocab = teacher.vocab
-    eos_emit = vocab.eos_emit_id
-    k_t1 = min(top_k_t1, vocab.num_classes)
+    prefill = _prefill_prompts(teacher, tokenizer, [(context, keys)])
+    return _score_candidates_and_t1_from_prefill(
+        teacher,
+        tokenizer,
+        prefill,
+        [gold_emit_ids],
+        [candidate_emit_ids],
+        top_k_t1=top_k_t1,
+        score_batch_size=max(1, len(candidate_emit_ids) + 1),
+    )[0]
 
-    prompt_ids = encode_prompt(tokenizer, context, keys)
-    prompt_len = len(prompt_ids)
-    prompt_tensor = torch.tensor([prompt_ids], dtype=torch.long, device=device)
-    prefix_out = teacher.backbone(
-        inputs_embeds=teacher.embed_ids(prompt_tensor),
-        use_cache=True,
+
+@torch.no_grad()
+def label_records_batch(
+    teacher: QwenTeacher,
+    tokenizer: Any,
+    records: Sequence[tuple[str, str | None, str, str, list[int]]],
+    legality: Legality,
+    options: LegalityOptions = OFFLINE,
+    *,
+    beam: int = 8,
+    gamma: float = 1.0,
+    top_k_t1: int = 32,
+    score_batch_size: int = 64,
+) -> list[dict[str, Any]]:
+    """Prefill once, beam-decode, and compute T1/T2/T3 labels for a batch of records.
+
+    Each item of *records* is ``(record_id, context, keys, gold_text, gold_emit_ids)``.
+    """
+    if not records:
+        return []
+    prefill = _prefill_prompts(teacher, tokenizer, [(ctx, keys) for _, ctx, keys, _, _ in records])
+    hyps_batch = _decode_from_prefill(
+        teacher,
+        prefill,
+        [keys for _, _, keys, _, _ in records],
+        legality,
+        options,
+        beam=beam,
+        gamma=gamma,
     )
-    first_lp = functional.log_softmax(
-        teacher.project_logits(prefix_out.last_hidden_state[0, -1]), dim=-1
+    cand_texts_batch: list[list[str]] = []
+    cand_ids_batch: list[list[list[int]]] = []
+    for (_rec_id, _ctx, _keys, text, gold_ids), hyps in zip(records, hyps_batch, strict=True):
+        cand_texts: list[str] = [text]
+        cand_ids: list[list[int]] = [gold_ids]
+        for h in hyps:
+            if h.text != text:
+                cand_texts.append(h.text)
+                cand_ids.append(list(h.emit_ids))
+        cand_texts_batch.append(cand_texts)
+        cand_ids_batch.append(cand_ids)
+
+    scored_batch = _score_candidates_and_t1_from_prefill(
+        teacher,
+        tokenizer,
+        prefill,
+        [gold_ids for _, _, _, _, gold_ids in records],
+        cand_ids_batch,
+        top_k_t1=top_k_t1,
+        score_batch_size=score_batch_size,
     )
-    prefix_cache = prefix_out.past_key_values
-
-    t1_ids: list[list[int]] = []
-    t1_log_probs: list[list[float]] = []
-    vals0, idxs0 = first_lp.topk(k_t1)
-    t1_ids.append([int(x) for x in idxs0.tolist()])
-    t1_log_probs.append([float(x) for x in vals0.tolist()])
-
-    # Row 0 is gold (if non-empty); subsequent rows are non-empty candidates.
-    all_seqs: list[Sequence[int]] = [gold_emit_ids, *candidate_emit_ids]
-    non_empty_indices = [i for i, seq in enumerate(all_seqs) if len(seq) > 0]
-    row_scores: dict[int, float] = {
-        i: float(first_lp[eos_emit].item()) for i, seq in enumerate(all_seqs) if len(seq) == 0
-    }
-
-    if non_empty_indices:
-        max_len = max(len(all_seqs[i]) for i in non_empty_indices)
-        batch_n = len(non_empty_indices)
-        pad_tok = int(
-            tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    rows_out: list[dict[str, Any]] = []
+    for (rec_id, ctx, keys, text, _gold_ids), cand_texts, (t1_ids, t1_lps, cand_scores) in zip(
+        records, cand_texts_batch, scored_batch, strict=True
+    ):
+        rows_out.append(
+            {
+                "id": rec_id,
+                "context": ctx,
+                "keys": keys,
+                "text": text,
+                "t1_ids": t1_ids,
+                "t1_log_probs": t1_lps,
+                "candidates": cand_texts,
+                "candidate_scores": cand_scores,
+            }
         )
-        seq_tensor = torch.full((batch_n, max_len), pad_tok, dtype=torch.long, device=device)
-        attn_mask = torch.ones((batch_n, prompt_len + max_len), dtype=torch.long, device=device)
-        for row_i, seq_idx in enumerate(non_empty_indices):
-            seq = all_seqs[seq_idx]
-            toks = [vocab.emit_to_token[e] for e in seq]
-            seq_tensor[row_i, : len(toks)] = torch.tensor(toks, dtype=torch.long, device=device)
-            if len(toks) < max_len:
-                attn_mask[row_i, prompt_len + len(toks) :] = 0
-
-        expanded_cache = _select_cache_rows(prefix_cache, [0] * batch_n)
-        out = teacher.backbone(
-            inputs_embeds=teacher.embed_ids(seq_tensor),
-            attention_mask=attn_mask,
-            past_key_values=expanded_cache,
-            use_cache=False,
-        )
-        logits = teacher.project_logits(out.last_hidden_state)
-        lps = functional.log_softmax(logits, dim=-1)
-
-        for row_i, seq_idx in enumerate(non_empty_indices):
-            seq = all_seqs[seq_idx]
-            total = float(first_lp[seq[0]].item())
-            targets = [*seq[1:], eos_emit]
-            for pos, tgt in enumerate(targets):
-                total += float(lps[row_i, pos, tgt].item())
-                if seq_idx == 0:
-                    vals, idxs = lps[row_i, pos].topk(k_t1)
-                    t1_ids.append([int(x) for x in idxs.tolist()])
-                    t1_log_probs.append([float(x) for x in vals.tolist()])
-            row_scores[seq_idx] = total
-
-    scores = [row_scores[i + 1] for i in range(len(candidate_emit_ids))]
-    return t1_ids, t1_log_probs, scores
+    return rows_out
 
 
 @dataclass(frozen=True)
@@ -667,13 +1072,11 @@ class TeacherTrainConfig:
     gradient_checkpointing: bool = True
 
 
-def write_labels_parquet(rows: Sequence[Mapping[str, Any]], out_path: Path) -> None:
-    """Write offline T1/T2/T3 teacher labels for one shard atomically to Parquet."""
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = out_path.with_suffix(".parquet.tmp")
-    schema = pa.schema(
+def _labels_parquet_schema() -> pa.Schema:
+    return pa.schema(
         [
             ("id", pa.string()),
+            ("context", pa.string()),
             ("keys", pa.string()),
             ("text", pa.string()),
             ("t1_ids", pa.list_(pa.list_(pa.int32()))),
@@ -682,7 +1085,14 @@ def write_labels_parquet(rows: Sequence[Mapping[str, Any]], out_path: Path) -> N
             ("candidate_scores", pa.list_(pa.float32())),
         ]
     )
-    table = pa.Table.from_pylist(list(rows), schema=schema)
+
+
+def write_labels_parquet(rows: Sequence[Mapping[str, Any]], out_path: Path) -> None:
+    """Write offline T1/T2/T3 teacher labels for one shard atomically to Parquet."""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(".parquet.tmp")
+    normalised = [{**row, "context": row.get("context")} for row in rows]
+    table = pa.Table.from_pylist(normalised, schema=_labels_parquet_schema())
     pq.write_table(table, tmp, compression="zstd")
     tmp.replace(out_path)
 
@@ -1058,11 +1468,13 @@ def evaluate_teacher(
     options: LegalityOptions = OFFLINE,
     dump_path: Path | None = None,
     limit: int | None = None,
+    batch_records: int = 16,
 ) -> tuple[Any, list[dict[str, Any]]]:
-    """Evaluate *teacher* with lattice-constrained beam search on *eval_set*.
+    """Evaluate *teacher* with batched lattice-constrained beam search on *eval_set*.
 
-    Resumable when *dump_path* is given: previously written rows are reloaded
-    and skipped so an interrupted evaluation continues where it left off.
+    Pending records are length-bucketed into batches of *batch_records* so left-padding
+    and decode step stragglers stay minimal. Resumable when *dump_path* is given:
+    previously written rows are reloaded and skipped.
     """
     from mlime.gui import read_eval_set, slice_indices
     from mlime.train.e2e_eval import Report, read_eval_records
@@ -1083,29 +1495,42 @@ def evaluate_teacher(
             log.info("teacher eval resumed", path=str(dump_path), done=len(existing))
 
     teacher.eval()
-    report = Report(top_k=beam)
-    results: list[dict[str, Any]] = []
     t0 = time.monotonic()
 
     if dump_path is not None:
         dump_path.parent.mkdir(parents=True, exist_ok=True)
 
-    for pos, idx in enumerate(indices):
-        row = rows[idx]
-        if idx in existing:
-            rec = existing[idx]
-        else:
-            ctx = row.context if with_context else None
-            hyps = constrained_beam_decode(
-                teacher,
-                tokenizer,
-                ctx,
-                row.pinyin,
-                legality,
-                options,
-                beam=beam,
-                gamma=gamma,
+    pending = [idx for idx in indices if idx not in existing]
+    pending.sort(
+        key=lambda idx: (
+            len(
+                encode_prompt(
+                    tokenizer, rows[idx].context if with_context else None, rows[idx].pinyin
+                )
             )
+            + len(rows[idx].pinyin)
+        )
+    )
+
+    step_size = max(1, batch_records)
+    decoded_new = 0
+    for start in range(0, len(pending), step_size):
+        batch_indices = pending[start : start + step_size]
+        batch_inputs = [
+            (rows[idx].context if with_context else None, rows[idx].pinyin) for idx in batch_indices
+        ]
+        hyps_batch = constrained_beam_decode_batch(
+            teacher,
+            tokenizer,
+            batch_inputs,
+            legality,
+            options,
+            beam=beam,
+            gamma=gamma,
+        )
+        lines_to_append: list[str] = []
+        for idx, hyps in zip(batch_indices, hyps_batch, strict=True):
+            row = rows[idx]
             rec = {
                 "index": idx,
                 "pinyin": row.pinyin,
@@ -1113,21 +1538,62 @@ def evaluate_teacher(
                 "hypotheses": [h.text for h in hyps],
                 "scores": [h.score for h in hyps],
             }
+            existing[idx] = rec
             if dump_path is not None:
-                with dump_path.open("a", encoding="utf-8") as df:
-                    df.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        report.observe(row.text, rec["hypotheses"])
-        results.append(rec)
-        if (pos + 1) % 50 == 0 or (pos + 1) == len(indices):
+                lines_to_append.append(json.dumps(rec, ensure_ascii=False) + "\n")
+        if dump_path is not None and lines_to_append:
+            with dump_path.open("a", encoding="utf-8") as df:
+                df.writelines(lines_to_append)
+        decoded_new += len(batch_indices)
+        done_total = len(indices) - (len(pending) - decoded_new)
+        if decoded_new == len(pending) or (start // step_size + 1) % max(1, 50 // step_size) == 0:
             elapsed = time.monotonic() - t0
+            hits = sum(
+                1
+                for i in indices
+                if i in existing
+                and existing[i]["hypotheses"]
+                and existing[i]["hypotheses"][0] == rows[i].text
+            )
             log.info(
                 "teacher eval progress",
-                done=pos + 1,
+                done=done_total,
                 total=len(indices),
-                top1=round(report.top1_hits / max(1, report.records), 4),
+                top1=round(hits / max(1, done_total), 4),
+                sec_per_rec=round(elapsed / max(1, decoded_new), 3),
                 seconds=round(elapsed, 1),
             )
+
+    report = Report(top_k=beam)
+    results: list[dict[str, Any]] = []
+    for idx in indices:
+        rec = existing[idx]
+        report.observe(rows[idx].text, rec["hypotheses"])
+        results.append(rec)
     return report, results
+
+
+def _merge_label_parts(
+    part_paths: Sequence[Path],
+    tail_rows: Sequence[Mapping[str, Any]],
+    out_path: Path,
+) -> None:
+    """Atomically combine partial shard Parquet files and *tail_rows* into *out_path*."""
+    tables = [pq.read_table(p) for p in part_paths]
+    if tail_rows:
+        normalised = [{**row, "context": row.get("context")} for row in tail_rows]
+        tables.append(pa.Table.from_pylist(normalised, schema=_labels_parquet_schema()))
+    merged = (
+        pa.concat_tables(tables)
+        if tables
+        else pa.Table.from_pylist([], schema=_labels_parquet_schema())
+    )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_path.with_suffix(".parquet.tmp")
+    pq.write_table(merged, tmp, compression="zstd")
+    tmp.replace(out_path)
+    for part in part_paths:
+        part.unlink(missing_ok=True)
 
 
 def label_corpus_shards(
@@ -1145,13 +1611,21 @@ def label_corpus_shards(
     syllables: Path | None = None,
     unit_initials: float = 0.0,
     unit_lexicon: Path | None = None,
+    context_dropout: float = 0.25,
     seed: int = 0,
     beam: int = 8,
     gamma: float = 1.0,
     top_k_t1: int = 32,
     max_per_shard: int | None = None,
+    batch_records: int = 16,
+    score_batch_size: int = 64,
+    checkpoint_every_rows: int = 1000,
 ) -> dict[str, Any]:
-    """Generate resumable offline T1/T2/T3 Parquet labels shard by shard (S5)."""
+    """Generate resumable offline T1/T2/T3 Parquet labels shard by shard (S5).
+
+    Supports both shard-level and mid-shard resumability via incremental
+    ``.part-*.parquet`` checkpoints flushed every *checkpoint_every_rows* rows.
+    """
     from mlime.data.shards import shard_paths
     from mlime.locate import find_upwards
     from mlime.train.arbitration import ReadingArbitration
@@ -1212,14 +1686,35 @@ def label_corpus_shards(
     written_shards = 0
     skipped_shards = 0
     total_rows = 0
+    step_size = max(1, batch_records)
+    flush_rows = max(1, checkpoint_every_rows)
 
-    for shard_path in selected:
+    for shard_idx, shard_path in enumerate(selected):
         out_pq = out_dir / shard_path.name
         if out_pq.is_file():
             skipped_shards += 1
             log.info("teacher label shard skipped (exists)", shard=shard_path.name)
             continue
-        rows_out: list[dict[str, Any]] = []
+
+        part_prefix = f".{shard_path.stem}.part-"
+        existing_parts = sorted(out_dir.glob(f"{part_prefix}*.parquet"))
+        done_ids: set[str] = set()
+        for part in existing_parts:
+            col = pq.read_table(part, columns=["id"]).column("id").to_pylist()
+            done_ids.update(str(x) for x in col)
+        if done_ids:
+            log.info(
+                "teacher label shard resumed",
+                shard=shard_path.name,
+                parts=len(existing_parts),
+                done=len(done_ids),
+            )
+
+        # Deterministic per-shard context dropout so mid-shard resume reproduces exact inputs.
+        ctx_rng = random.Random(seed + 4_000_003 + shard_idx * 9973)
+        work_items: list[tuple[int, str, str | None, str, str, list[int]]] = []
+        target_cap = max_per_shard
+        eligible_seen = 0
         for sample, syls in read_pair(shard_path, labels_dir):
             ex = builder.build(sample, syls, epoch=0)
             if ex is None:
@@ -1228,36 +1723,70 @@ def label_corpus_shards(
             text = "".join(lexicon.characters[t] for t in ex.targets)
             if not all(ch in char_to_emit for ch in text):
                 continue
-            gold_ids = [char_to_emit[ch] for ch in text]
-            hyps = constrained_beam_decode(
-                teacher, tokenizer, ex.context, keys, legality, OFFLINE, beam=beam, gamma=gamma
-            )
-            cand_texts: list[str] = [text]
-            cand_ids: list[list[int]] = [gold_ids]
-            for h in hyps:
-                if h.text != text:
-                    cand_texts.append(h.text)
-                    cand_ids.append(list(h.emit_ids))
-            t1_ids, t1_lps, cand_scores = score_candidates_and_t1(
-                teacher, tokenizer, ex.context, keys, gold_ids, cand_ids, top_k_t1=top_k_t1
-            )
-            rows_out.append(
-                {
-                    "id": ex.id,
-                    "keys": keys,
-                    "text": text,
-                    "t1_ids": t1_ids,
-                    "t1_log_probs": t1_lps,
-                    "candidates": cand_texts,
-                    "candidate_scores": cand_scores,
-                }
-            )
-            if max_per_shard is not None and len(rows_out) >= max_per_shard:
+            drop_ctx = ex.context is None or ctx_rng.random() < context_dropout
+            ctx = None if drop_ctx else ex.context
+            eligible_seen += 1
+            if ex.id not in done_ids:
+                gold_ids = [char_to_emit[ch] for ch in text]
+                sort_len = len(encode_prompt(tokenizer, ctx, keys)) + len(keys)
+                work_items.append((sort_len, ex.id, ctx, keys, text, gold_ids))
+            if target_cap is not None and eligible_seen >= target_cap:
                 break
-        write_labels_parquet(rows_out, out_pq)
+
+        work_items.sort(key=lambda item: item[0])
+        part_paths = list(existing_parts)
+        next_part_idx = len(part_paths)
+        part_rows: list[dict[str, Any]] = []
+        labelled_new = 0
+        t0 = time.monotonic()
+
+        for start in range(0, len(work_items), step_size):
+            batch = [
+                (rec_id, ctx, keys, text, gold_ids)
+                for _, rec_id, ctx, keys, text, gold_ids in work_items[start : start + step_size]
+            ]
+            rows = label_records_batch(
+                teacher,
+                tokenizer,
+                batch,
+                legality,
+                OFFLINE,
+                beam=beam,
+                gamma=gamma,
+                top_k_t1=top_k_t1,
+                score_batch_size=score_batch_size,
+            )
+            part_rows.extend(rows)
+            labelled_new += len(rows)
+            if len(part_rows) >= flush_rows:
+                part_path = out_dir / f"{part_prefix}{next_part_idx:05d}.parquet"
+                write_labels_parquet(part_rows, part_path)
+                part_paths.append(part_path)
+                next_part_idx += 1
+                part_rows.clear()
+                elapsed = time.monotonic() - t0
+                log.info(
+                    "teacher label shard checkpoint",
+                    shard=shard_path.name,
+                    done=len(done_ids) + labelled_new,
+                    total=len(done_ids) + len(work_items),
+                    sec_per_rec=round(elapsed / max(1, labelled_new), 3),
+                )
+
+        if part_paths:
+            _merge_label_parts(part_paths, part_rows, out_pq)
+        else:
+            write_labels_parquet(part_rows, out_pq)
+        shard_total = len(done_ids) + labelled_new
         written_shards += 1
-        total_rows += len(rows_out)
-        log.info("teacher label shard written", shard=shard_path.name, rows=len(rows_out))
+        total_rows += shard_total
+        elapsed = time.monotonic() - t0
+        log.info(
+            "teacher label shard written",
+            shard=shard_path.name,
+            rows=shard_total,
+            sec_per_rec=round(elapsed / max(1, labelled_new), 3),
+        )
 
     return {
         "written_shards": written_shards,
