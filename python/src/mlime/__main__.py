@@ -2959,6 +2959,110 @@ def train_label_teacher(
     typer.echo(json.dumps(summary, indent=2))
 
 
+@train_app.command("distill-keys")
+def train_distill_keys(
+    init_from: Path = typer.Option(
+        ..., "--init-from", help="Parent key-level student checkpoint (e.g. S4/S5-prelude)"
+    ),
+    labels_dir: Path = typer.Option(
+        ..., "--labels-dir", help="Directory of S5 offline teacher Parquet shards"
+    ),
+    out: Path = typer.Option(..., "--out", help="Output directory for checkpoints and metrics"),
+    char_table: Path = CHAR_TABLE,
+    typo_table: Path = typer.Option(None, "--typo-table"),
+    syllables: Path = typer.Option(None, "--syllables"),
+    base_lr: float = typer.Option(2e-5, "--base-lr"),
+    new_lr: float = typer.Option(2e-5, "--new-lr"),
+    weight_decay: float = typer.Option(0.01, "--weight-decay"),
+    warmup_fraction: float = typer.Option(0.04, "--warmup-fraction"),
+    batch_size: int = typer.Option(64, "--batch-size"),
+    accumulate: int = typer.Option(2, "--accumulate"),
+    max_steps: int = typer.Option(5000, "--max-steps"),
+    log_every: int = typer.Option(20, "--log-every"),
+    checkpoint_every: int = typer.Option(500, "--checkpoint-every"),
+    t1_weight: float = typer.Option(1.0, "--t1-weight"),
+    t1_temperature: float = typer.Option(1.0, "--t1-temperature"),
+    t2_weight: float = typer.Option(0.5, "--t2-weight"),
+    t2_temperature: float = typer.Option(1.0, "--t2-temperature"),
+    gold_weight: float = typer.Option(1.0, "--gold-weight"),
+    beta: float = typer.Option(2.0, "--beta"),
+    gamma: float = typer.Option(1.0, "--gamma"),
+    resume: Path = typer.Option(None, "--resume", help="Mid-schedule checkpoint to resume from"),
+    seed: int = SEED,
+    verbose: bool = VERBOSE,
+) -> None:
+    """Distil S5 offline teacher labels (T1/T2/T3) into the key-level student (S6, #191)."""
+    configure(verbose)
+    import torch
+
+    from mlime.data.corpus import default_char_table
+    from mlime.legality import Legality
+    from mlime.locate import find_upwards
+    from mlime.train.distill import (
+        DistillConfig,
+        DistillTrainConfig,
+        iter_teacher_label_shards,
+        train_distill_loop,
+    )
+    from mlime.train.e2e import load_key_model, recorded_config
+    from mlime.train.run import Vocabularies
+    from mlime.typo import SYLLABLES_RELATIVE, default_typo_table
+
+    table = char_table or default_char_table()
+    if table is None:
+        raise typer.BadParameter("no char_pinyin.tsv found; pass --char-table")
+    typo = typo_table or default_typo_table()
+    if typo is None:
+        raise typer.BadParameter("no typo.json found; pass --typo-table")
+    inventory = syllables or find_upwards(SYLLABLES_RELATIVE)
+    if inventory is None:
+        raise typer.BadParameter("no syllables.txt found; pass --syllables")
+
+    recorded = recorded_config(init_from)
+    vocabularies = Vocabularies.load(table, recorded.base_model, recorded.context)
+    legality = Legality.load(
+        vocabularies.lexicon.characters,
+        char_table=table,
+        typo_table=typo,
+        syllables=inventory,
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model, _ = load_key_model(init_from, vocabularies.lexicon, device)
+    collator = vocabularies.key_collator(context_dropout=0.0, seed=seed)
+    cfg = DistillTrainConfig(
+        distill=DistillConfig(
+            t1_weight=t1_weight,
+            t1_temperature=t1_temperature,
+            t2_weight=t2_weight,
+            t2_temperature=t2_temperature,
+            gold_weight=gold_weight,
+            beta=beta,
+            gamma=gamma,
+        ),
+        base_lr=base_lr,
+        new_lr=new_lr,
+        weight_decay=weight_decay,
+        warmup_fraction=warmup_fraction,
+        batch_size=batch_size,
+        accumulate=accumulate,
+        max_steps=max_steps,
+        seed=seed,
+        log_every=log_every,
+        checkpoint_every=checkpoint_every,
+    )
+    summary = train_distill_loop(
+        model,
+        collator,
+        legality,
+        iter_teacher_label_shards(labels_dir),
+        out,
+        cfg,
+        resume_path=resume,
+        options=model.keys_config.options,
+    )
+    typer.echo(json.dumps(summary, indent=2))
+
+
 def run() -> None:
     """The `mlime` entry point.
 
