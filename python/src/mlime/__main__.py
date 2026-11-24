@@ -2815,6 +2815,7 @@ def eval_teacher(
     context: bool = typer.Option(True, "--context/--no-context"),
     beam: int = typer.Option(8, "--beam"),
     gamma: float = typer.Option(1.0, "--gamma"),
+    batch_records: int = typer.Option(16, "--batch-records"),
     dump: Path = typer.Option(None, "--dump", help="Resumable per-record JSONL dump"),
     out: Path = typer.Option(None, "--out", help="Where to write the rendered metrics table"),
     limit: int = typer.Option(None, "--limit"),
@@ -2868,6 +2869,7 @@ def eval_teacher(
         gamma=gamma,
         dump_path=dump,
         limit=limit,
+        batch_records=batch_records,
     )
     rendered = report.render()
     typer.echo(rendered)
@@ -2892,10 +2894,14 @@ def train_label_teacher(
     typos: bool = typer.Option(True, "--typos/--no-typos"),
     unit_initials: float = UNIT_INITIALS,
     unit_lexicon: Path = UNIT_LEXICON,
+    context_dropout: float = typer.Option(0.25, "--context-dropout"),
     train_shard: list[str] = TRAIN_SHARD,
     beam: int = typer.Option(8, "--beam"),
     gamma: float = typer.Option(1.0, "--gamma"),
     top_k_t1: int = typer.Option(32, "--top-k-t1"),
+    batch_records: int = typer.Option(16, "--batch-records"),
+    score_batch_size: int = typer.Option(64, "--score-batch-size"),
+    checkpoint_every_rows: int = typer.Option(1000, "--checkpoint-every-rows"),
     max_per_shard: int = typer.Option(None, "--max-per-shard"),
     seed: int = SEED,
     verbose: bool = VERBOSE,
@@ -2950,11 +2956,15 @@ def train_label_teacher(
         typo_table=typo,
         unit_initials=unit_initials,
         unit_lexicon=unit_lexicon,
+        context_dropout=context_dropout,
         seed=seed,
         beam=beam,
         gamma=gamma,
         top_k_t1=top_k_t1,
         max_per_shard=max_per_shard,
+        batch_records=batch_records,
+        score_batch_size=score_batch_size,
+        checkpoint_every_rows=checkpoint_every_rows,
     )
     typer.echo(json.dumps(summary, indent=2))
 

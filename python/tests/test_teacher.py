@@ -16,10 +16,13 @@ from mlime.train.teacher import (
     EmittableVocab,
     QwenTeacher,
     TeacherTrainConfig,
+    _merge_label_parts,
     bucketed_microbatches,
     build_training_batch,
     constrained_beam_decode,
+    constrained_beam_decode_batch,
     encode_prompt,
+    label_records_batch,
     score_candidates_and_t1,
     train_teacher_loop,
     write_labels_parquet,
@@ -241,3 +244,86 @@ def test_bucketed_microbatches_reduces_padding_and_keeps_all_examples() -> None:
     for b in batches:
         lengths = {len(encode_prompt(tok, ctx, k)) + len(t) for ctx, k, t in b}
         assert len(lengths) == 1
+
+
+def test_batched_decode_and_prefix_reusing_labeller_match_single_record(tmp_path: Path) -> None:
+    tok = _FakeTokenizer()
+    chars = ("我", "爱", "北", "京", "中", "国", "天", "安", "门", "人", "弑", "玑")
+    vocab = EmittableVocab.build(chars, tok)
+    lora = LoraConfig(rank=4, alpha=8.0, targets=TEACHER_LORA_TARGETS)
+    teacher = QwenTeacher(_tiny_qwen35(), vocab, lora, gradient_checkpointing=False).eval()
+    legality = _tiny_legality(chars)
+    c2e = vocab.char_to_emit()
+
+    # Mix very different prompt and key lengths to stress left-padding and multi-step alignment.
+    cases = [
+        ("r0", None, "zg", "中国"),
+        ("r1", "我爱北京天安门" * 3, "woaibeijing", "我爱北京"),
+        ("r2", "历史", "shiji", "弑玑"),
+        ("r3", "今天去天安门", "tiananmen", "天安门"),
+    ]
+
+    batched_hyps = constrained_beam_decode_batch(
+        teacher,
+        tok,
+        [(ctx, keys) for _, ctx, keys, _ in cases],
+        legality,
+        OFFLINE,
+        beam=4,
+        gamma=1.0,
+    )
+    for (_rid, ctx, keys, _text), b_hyps in zip(cases, batched_hyps, strict=True):
+        s_hyps = constrained_beam_decode(
+            teacher, tok, ctx, keys, legality, OFFLINE, beam=4, gamma=1.0
+        )
+        assert [h.text for h in b_hyps] == [h.text for h in s_hyps]
+        for bh, sh in zip(b_hyps, s_hyps, strict=True):
+            assert bh.score == pytest.approx(sh.score, abs=1e-4)
+
+    batch_records = [
+        (rid, ctx, keys, text, [c2e[ch] for ch in text]) for rid, ctx, keys, text in cases
+    ]
+    labelled = label_records_batch(
+        teacher,
+        tok,
+        batch_records,
+        legality,
+        OFFLINE,
+        beam=4,
+        gamma=1.0,
+        top_k_t1=5,
+        score_batch_size=3,
+    )
+    assert len(labelled) == len(cases)
+    for (rid, ctx, keys, text, gold_ids), row, b_hyps in zip(
+        batch_records, labelled, batched_hyps, strict=True
+    ):
+        assert row["id"] == rid
+        assert row["context"] == ctx
+        assert row["keys"] == keys
+        assert row["text"] == text
+        cand_ids = [gold_ids, *[list(h.emit_ids) for h in b_hyps if h.text != text]]
+        ref_ids, ref_lps, ref_scores = score_candidates_and_t1(
+            teacher, tok, ctx, keys, gold_ids, cand_ids, top_k_t1=5
+        )
+        assert row["t1_ids"] == ref_ids
+        for got_p, ref_p in zip(row["t1_log_probs"], ref_lps, strict=True):
+            assert got_p == pytest.approx(ref_p, abs=1e-4)
+        assert row["candidate_scores"] == pytest.approx(ref_scores, abs=1e-4)
+
+    # Verify incremental part merge preserves schema including nullable context and cleans parts.
+    p0 = tmp_path / ".shard.part-00000.parquet"
+    p1 = tmp_path / ".shard.part-00001.parquet"
+    write_labels_parquet(labelled[:2], p0)
+    write_labels_parquet(labelled[2:3], p1)
+    merged_out = tmp_path / "shard.parquet"
+    _merge_label_parts([p0, p1], labelled[3:], merged_out)
+    assert not p0.exists() and not p1.exists()
+    table = pq.read_table(merged_out)
+    assert table.num_rows == 4
+    assert table.column("context").to_pylist() == [
+        None,
+        "我爱北京天安门" * 3,
+        "历史",
+        "今天去天安门",
+    ]
