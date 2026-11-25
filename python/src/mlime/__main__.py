@@ -3011,7 +3011,7 @@ def train_distill_keys(
     from mlime.train.distill import (
         DistillConfig,
         DistillTrainConfig,
-        iter_teacher_label_shards,
+        TeacherLabelShards,
         train_distill_loop,
     )
     from mlime.train.e2e import load_key_model, recorded_config
@@ -3064,7 +3064,7 @@ def train_distill_keys(
         model,
         collator,
         legality,
-        iter_teacher_label_shards(labels_dir),
+        TeacherLabelShards(labels_dir, seed=seed),
         out,
         cfg,
         resume_path=resume,

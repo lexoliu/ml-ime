@@ -126,6 +126,26 @@ def iter_teacher_label_shards(shards_dir: Path) -> Iterator[TeacherLabelRow]:
         yield from read_teacher_label_shard(path)
 
 
+class TeacherLabelShards:
+    """Re-iterable view over S5 Parquet shards for multi-epoch and resumed S6 runs (#342)."""
+
+    def __init__(self, shards_dir: Path, *, seed: int = 0) -> None:
+        self.shards_dir = shards_dir
+        self.seed = seed
+        self._paths = sorted(p for p in shards_dir.glob("*.parquet") if not p.name.startswith("."))
+        if not self._paths:
+            raise FileNotFoundError(f"no teacher label parquet shards found under {shards_dir}")
+        self._epoch = 0
+
+    def __iter__(self) -> Iterator[TeacherLabelRow]:
+        order = list(self._paths)
+        if len(order) > 1:
+            random.Random(self.seed + self._epoch).shuffle(order)
+        self._epoch += 1
+        for path in order:
+            yield from read_teacher_label_shard(path)
+
+
 def t1_kl_loss(
     student_log_probs: torch.Tensor,
     t1_ids: torch.Tensor,
@@ -643,6 +663,10 @@ def train_distill_loop(
     options: LegalityOptions = OFFLINE,
 ) -> dict[str, Any]:
     """Resumable offline T1/T2/T3 distillation loop for the key-level student (S6, #191)."""
+    if isinstance(stream, Iterator):
+        raise TypeError(
+            "train_distill_loop requires a re-iterable Iterable, not a single-use Iterator"
+        )
     device = next(model.parameters()).device
     model.freeze_for_joint()
     groups = model.parameter_groups(config.base_lr, config.new_lr)

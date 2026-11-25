@@ -24,6 +24,7 @@ from mlime.train.distill import (
     DistillConfig,
     DistillTrainConfig,
     TeacherLabelRow,
+    TeacherLabelShards,
     cosine_lr,
     iter_teacher_label_shards,
     read_teacher_label_shard,
@@ -266,6 +267,25 @@ def test_train_distill_loop_lowers_loss_resumes_and_reloads(
             )
         )
 
+    # Persist 2 rows so 3 + 3 steps must cycle epochs and resume past epoch 1.
+    shards_dir = tmp_path / "shards"
+    write_labels_parquet(
+        [
+            {
+                "id": r.id,
+                "context": r.context,
+                "keys": r.keys,
+                "text": r.text,
+                "t1_ids": [list(p) for p in r.t1_ids],
+                "t1_log_probs": [list(p) for p in r.t1_log_probs],
+                "candidates": list(r.candidates),
+                "candidate_scores": list(r.candidate_scores),
+            }
+            for r in label_rows
+        ],
+        shards_dir / "shard-00000.parquet",
+    )
+
     run_dir = tmp_path / "s6-run"
     cfg = DistillTrainConfig(
         distill=DistillConfig(t1_weight=1.0, t2_weight=0.5, gold_weight=1.0),
@@ -278,15 +298,29 @@ def test_train_distill_loop_lowers_loss_resumes_and_reloads(
         checkpoint_every=3,
         pool_batches=2,
     )
-    # Run first 3 steps, then resume to step 6.
+    # Single-use iterators must fail fast.
+    with pytest.raises(TypeError, match="re-iterable"):
+        train_distill_loop(
+            model, collator, legality, iter_teacher_label_shards(shards_dir), run_dir, cfg
+        )
+
+    # Run first 3 steps over TeacherLabelShards, then resume past epoch 1 to step 6.
     first_cfg = replace(cfg, max_steps=3)
-    s1 = train_distill_loop(model, collator, legality, label_rows * 8, run_dir, first_cfg)
+    s1 = train_distill_loop(
+        model, collator, legality, TeacherLabelShards(shards_dir), run_dir, first_cfg
+    )
     assert s1["steps"] == 3
     mid_ckpt = Path(s1["checkpoint"])
     assert mid_ckpt.is_file()
 
     s2 = train_distill_loop(
-        model, collator, legality, label_rows * 8, run_dir, cfg, resume_path=mid_ckpt
+        model,
+        collator,
+        legality,
+        TeacherLabelShards(shards_dir),
+        run_dir,
+        cfg,
+        resume_path=mid_ckpt,
     )
     assert s2["steps"] == 6
     final_ckpt = Path(s2["checkpoint"])
