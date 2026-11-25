@@ -364,7 +364,9 @@ def test_expand_record_beams_charges_eos_residual_cost() -> None:
     """Terminating on a costlier final offset must subtract its residual gamma cost (#346)."""
     lattice = _SpanLattice(key_len=5, by_start={}, merged_by_start={})
     lp = np.array([-2.0, -3.0, -0.4], dtype=np.float32)  # eos_emit = 2
-    active = [(-1.2, (0,), {3: 0.0, 5: 2.0}, lp, 0)]
+    active: list[tuple[float, tuple[int, ...], dict[int, float], np.ndarray, int]] = [
+        (-1.2, (0,), {3: 0.0, 5: 2.0}, lp, 0)
+    ]
     finished: list[BeamHypothesis] = []
     specs = _expand_record_beams(
         lattice,
@@ -380,4 +382,3 @@ def test_expand_record_beams_charges_eos_residual_cost() -> None:
     # score (-1.2) + lp[eos] (-0.4) - gamma (1.5) * (offsets[5] (2.0) - min_cost (0.0)) = -4.6
     assert finished[0].text == "我"
     assert finished[0].score == pytest.approx(-4.6, abs=1e-5)
-

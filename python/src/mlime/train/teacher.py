@@ -574,8 +574,8 @@ def _expand_record_beams(
     for parent_idx, (score, emitted, offsets, lp, _cache_row) in enumerate(active):
         cur_min_cost = min(offsets.values())
         if lattice.key_len in offsets:
-            end_score = score + float(lp[eos_emit]) - gamma * (
-                offsets[lattice.key_len] - cur_min_cost
+            end_score = (
+                score + float(lp[eos_emit]) - gamma * (offsets[lattice.key_len] - cur_min_cost)
             )
             candidates.append((end_score, True, emitted, -1, parent_idx))
 
