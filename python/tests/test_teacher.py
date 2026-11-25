@@ -16,7 +16,10 @@ from mlime.train.teacher import (
     EmittableVocab,
     QwenTeacher,
     TeacherTrainConfig,
+    _decode_from_prefill,
     _merge_label_parts,
+    _prefill_prompts,
+    _select_cache_rows,
     bucketed_microbatches,
     build_training_batch,
     constrained_beam_decode,
@@ -327,3 +330,27 @@ def test_batched_decode_and_prefix_reusing_labeller_match_single_record(tmp_path
         "历史",
         "今天去天安门",
     ]
+
+    # Verify consume=True frees source cache tensors while _decode_from_prefill preserves prefill.
+    prefill = _prefill_prompts(teacher, tok, [("今天", "woaibeijing"), (None, "zg")])
+    snap = [
+        layer.recurrent_states[0].clone()
+        for layer in prefill.prefix_cache.layers
+        if hasattr(layer, "recurrent_states")
+    ]
+    _ = _decode_from_prefill(teacher, prefill, ["woaibeijing", "zg"], legality, OFFLINE, beam=4)
+    after = [
+        layer.recurrent_states[0]
+        for layer in prefill.prefix_cache.layers
+        if hasattr(layer, "recurrent_states")
+    ]
+    for before_t, after_t in zip(snap, after, strict=True):
+        assert torch.equal(before_t, after_t)
+
+    consumed = _select_cache_rows(prefill.prefix_cache, [0, 1], consume=False)
+    _ = _select_cache_rows(consumed, [0], consume=True)
+    for layer in consumed.layers:
+        if hasattr(layer, "recurrent_states"):
+            assert layer.recurrent_states == {}
+        if hasattr(layer, "keys"):
+            assert layer.keys is None

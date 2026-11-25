@@ -455,8 +455,13 @@ def _span_lattice(
     return _SpanLattice(width, by_start, merged_by_start)
 
 
-def _select_cache_rows(cache: Any, indices: Sequence[int]) -> Any:
-    """Index batch rows of a Qwen3.5 hybrid ``DynamicCache`` (linear + full attention)."""
+def _select_cache_rows(cache: Any, indices: Sequence[int], *, consume: bool = False) -> Any:
+    """Index batch rows of a Qwen3.5 hybrid ``DynamicCache`` (linear + full attention).
+
+    When *consume* is True, source layer tensors are dropped immediately after
+    indexing so peak decode cache VRAM stays at ``1x`` instead of ``2x`` across
+    the 48 linear-attention recurrent states (#344).
+    """
     new = copy.copy(cache)
     idx = torch.as_tensor(indices, dtype=torch.long)
     new_layers = []
@@ -466,6 +471,9 @@ def _select_cache_rows(cache: Any, indices: Sequence[int]) -> Any:
             dev_idx = idx.to(layer.keys.device)
             nl.keys = layer.keys.index_select(0, dev_idx)
             nl.values = layer.values.index_select(0, dev_idx)
+            if consume:
+                layer.keys = None
+                layer.values = None
         if hasattr(layer, "conv_states"):
             nl.conv_states = {
                 k: v.index_select(0, idx.to(v.device)) for k, v in layer.conv_states.items()
@@ -477,6 +485,9 @@ def _select_cache_rows(cache: Any, indices: Sequence[int]) -> Any:
             nl.is_recurrent_states_initialized = dict(layer.is_recurrent_states_initialized)
             nl.has_previous_state = dict(layer.has_previous_state)
             nl.conv_kernel_size = dict(layer.conv_kernel_size)
+            if consume:
+                layer.conv_states = {}
+                layer.recurrent_states = {}
         new_layers.append(nl)
     new.layers = new_layers
     return new
@@ -709,7 +720,8 @@ def _decode_from_prefill(
             break
 
         parent_idx_t = torch.tensor(parent_cache_rows, dtype=torch.long, device=device)
-        child_cache = _select_cache_rows(batch_cache, parent_cache_rows)
+        child_cache = _select_cache_rows(batch_cache, parent_cache_rows, consume=step_t > 0)
+        batch_cache = None
         step_mask = torch.cat(
             [
                 cur_attn_mask.index_select(0, parent_idx_t),
