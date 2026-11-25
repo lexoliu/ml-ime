@@ -572,11 +572,13 @@ def _expand_record_beams(
     candidates: list[tuple[float, bool, tuple[int, ...], int, int]] = []
 
     for parent_idx, (score, emitted, offsets, lp, _cache_row) in enumerate(active):
+        cur_min_cost = min(offsets.values())
         if lattice.key_len in offsets:
-            end_score = score + float(lp[eos_emit])
+            end_score = (
+                score + float(lp[eos_emit]) - gamma * (offsets[lattice.key_len] - cur_min_cost)
+            )
             candidates.append((end_score, True, emitted, -1, parent_idx))
 
-        cur_min_cost = min(offsets.values())
         best_by_eid: dict[int, float] = {}
         for off, cur_cost in offsets.items():
             merged = lattice.merged_by_start.get(off)

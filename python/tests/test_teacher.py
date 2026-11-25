@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pyarrow.parquet as pq
 import pytest
 import torch
@@ -13,13 +14,16 @@ from mlime.legality import OFFLINE, Legality
 from mlime.train.qwen_tower import LoraConfig
 from mlime.train.teacher import (
     TEACHER_LORA_TARGETS,
+    BeamHypothesis,
     EmittableVocab,
     QwenTeacher,
     TeacherTrainConfig,
     _decode_from_prefill,
+    _expand_record_beams,
     _merge_label_parts,
     _prefill_prompts,
     _select_cache_rows,
+    _SpanLattice,
     bucketed_microbatches,
     build_training_batch,
     constrained_beam_decode,
@@ -354,3 +358,27 @@ def test_batched_decode_and_prefix_reusing_labeller_match_single_record(tmp_path
             assert layer.recurrent_states == {}
         if hasattr(layer, "keys"):
             assert layer.keys is None
+
+
+def test_expand_record_beams_charges_eos_residual_cost() -> None:
+    """Terminating on a costlier final offset must subtract its residual gamma cost (#346)."""
+    lattice = _SpanLattice(key_len=5, by_start={}, merged_by_start={})
+    lp = np.array([-2.0, -3.0, -0.4], dtype=np.float32)  # eos_emit = 2
+    active: list[tuple[float, tuple[int, ...], dict[int, float], np.ndarray, int]] = [
+        (-1.2, (0,), {3: 0.0, 5: 2.0}, lp, 0)
+    ]
+    finished: list[BeamHypothesis] = []
+    specs = _expand_record_beams(
+        lattice,
+        active,
+        finished,
+        beam=4,
+        gamma=1.5,
+        eos_emit=2,
+        characters=("我", "爱"),
+    )
+    assert specs == []
+    assert len(finished) == 1
+    # score (-1.2) + lp[eos] (-0.4) - gamma (1.5) * (offsets[5] (2.0) - min_cost (0.0)) = -4.6
+    assert finished[0].text == "我"
+    assert finished[0].score == pytest.approx(-4.6, abs=1e-5)
