@@ -2954,6 +2954,7 @@ def train_label_teacher(
         shards=train_shard or None,
         typos=typos,
         typo_table=typo,
+        syllables=inventory,
         unit_initials=unit_initials,
         unit_lexicon=unit_lexicon,
         context_dropout=context_dropout,

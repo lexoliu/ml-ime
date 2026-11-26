@@ -29,7 +29,11 @@ import time
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from mlime.train.keys import KeySampleBuilder
+    from mlime.train.lexicon import Lexicon
 
 import numpy as np
 import pyarrow as pa  # type: ignore[import-untyped]
@@ -1369,6 +1373,67 @@ def load_student_lexicon(char_table: Path) -> Any:
     return build_lexicon_for(char_table, load_tokenizer(RouteAConfig().base_model), spans)
 
 
+def _key_sample_builder(
+    char_table: Path,
+    *,
+    legality: Legality | None = None,
+    typos: bool = True,
+    typo_table: Path | None = None,
+    syllables: Path | None = None,
+    unit_initials: float = 0.0,
+    unit_lexicon: Path | None = None,
+    seed: int = 0,
+) -> tuple[Lexicon, KeySampleBuilder]:
+    """Build a key-level :class:`~mlime.train.keys.KeySampleBuilder` matching student training."""
+    from mlime.locate import find_upwards
+    from mlime.train.arbitration import ReadingArbitration
+    from mlime.train.keys import KeyFrontConfig, KeySampleBuilder
+    from mlime.train.samples import Augmentation
+    from mlime.train.spans import SpanVocab
+    from mlime.train.units import UnitMatcher
+    from mlime.typo import SYLLABLES_RELATIVE, NoiseModel, default_typo_table
+
+    spans = SpanVocab.load()
+    lexicon = load_student_lexicon(char_table)
+    arbitration = ReadingArbitration.load(spans)
+    if legality is None:
+        table_path = typo_table or default_typo_table()
+        if table_path is None:
+            raise FileNotFoundError("no typo.json found; pass --typo-table")
+        syl_path = syllables or find_upwards(SYLLABLES_RELATIVE)
+        if syl_path is None:
+            raise FileNotFoundError("no syllables.txt found; pass --syllables")
+        legality = Legality.load(
+            lexicon.characters,
+            char_table=char_table,
+            typo_table=table_path,
+            syllables=syl_path,
+        )
+    noise: NoiseModel | None = None
+    if typos:
+        table_path = typo_table or default_typo_table()
+        if table_path is None:
+            raise FileNotFoundError("no typo.json found; pass --typo-table")
+        noise = NoiseModel.load(table_path)
+    units: UnitMatcher | None = None
+    if unit_initials > 0.0:
+        if unit_lexicon is None:
+            raise ValueError("unit_initials > 0 requires unit_lexicon")
+        units = UnitMatcher.load(unit_lexicon)
+    builder = KeySampleBuilder(
+        lexicon,
+        spans,
+        arbitration,
+        legality,
+        KeyFrontConfig(),
+        augmentation=Augmentation(typos=typos, unit_initials=unit_initials),
+        seed=seed,
+        noise=noise,
+        units=units,
+    )
+    return lexicon, builder
+
+
 def corpus_teacher_stream(
     samples_dir: Path,
     labels_dir: Path,
@@ -1388,55 +1453,22 @@ def corpus_teacher_stream(
     """Stream ``(context, raw_keys, target_text)`` triples from corpus shards.
 
     Reuses :class:`~mlime.train.samples.CorpusStream` and
-    :class:`~mlime.train.samples.SampleBuilder` so typing styles (55/25/20),
-    typos, unit-initials, and interleaved shard order match the student's
-    training distribution. *skip_examples* fast-forwards past examples already
-    consumed by a resumed run.
+    :class:`~mlime.train.keys.KeySampleBuilder` so typing styles (55/25/20),
+    key-level typos, unit-initials, and interleaved shard order match the
+    key-level student's training distribution. *skip_examples* fast-forwards
+    past examples already consumed by a resumed run.
     """
-    from mlime.locate import find_upwards
-    from mlime.train.arbitration import ReadingArbitration
-    from mlime.train.lexicon import CandidateSpace
-    from mlime.train.samples import Augmentation, CorpusStream, SampleBuilder
-    from mlime.train.spans import SpanVocab
-    from mlime.train.units import UnitMatcher
-    from mlime.typo import (
-        SYLLABLES_RELATIVE,
-        CorrectionTable,
-        NoiseModel,
-        default_typo_table,
-        load_syllables,
-    )
+    from mlime.train.keys import KeyExample
+    from mlime.train.samples import CorpusStream
 
-    spans = SpanVocab.load()
-    lexicon = load_student_lexicon(char_table)
-    arbitration = ReadingArbitration.load(spans)
-    noise: NoiseModel | None = None
-    candidates: CandidateSpace | None = None
-    if typos:
-        table_path = typo_table or default_typo_table()
-        if table_path is None:
-            raise FileNotFoundError("no typo.json found; pass --typo-table")
-        syl_path = syllables or find_upwards(SYLLABLES_RELATIVE)
-        if syl_path is None:
-            raise FileNotFoundError("no syllables.txt found; pass --syllables")
-        noise = NoiseModel.load(table_path)
-        table = CorrectionTable(noise, load_syllables(syl_path))
-        candidates = CandidateSpace(spans, lexicon.candidate_mask, table, lexicon.homophones)
-    units: UnitMatcher | None = None
-    if unit_initials > 0.0:
-        if unit_lexicon is None:
-            raise ValueError("unit_initials > 0 requires unit_lexicon")
-        units = UnitMatcher.load(unit_lexicon)
-    aug = Augmentation(typos=typos, unit_initials=unit_initials)
-    builder = SampleBuilder(
-        lexicon,
-        spans,
-        arbitration,
-        augmentation=aug,
+    lexicon, builder = _key_sample_builder(
+        char_table,
+        typos=typos,
+        typo_table=typo_table,
+        syllables=syllables,
+        unit_initials=unit_initials,
+        unit_lexicon=unit_lexicon,
         seed=seed,
-        noise=noise,
-        candidates=candidates,
-        units=units,
     )
     stream = CorpusStream(samples_dir, labels_dir, builder, shards=shards, epoch=0)
     rng = random.Random(seed + 1_000_003)
@@ -1447,9 +1479,11 @@ def corpus_teacher_stream(
     while True:
         stream.set_epoch(epoch)
         for ex in stream:
+            if not isinstance(ex, KeyExample):
+                raise TypeError(f"expected KeyExample from KeySampleBuilder, got {type(ex)}")
             drop_ctx = ex.context is None or rng.random() < context_dropout
             ctx = None if drop_ctx else ex.context
-            keys = "".join(ex.spans)
+            keys = ex.keys
             text = "".join(lexicon.characters[t] for t in ex.targets)
             item = (ctx, keys, text)
             if shuffle_buffer <= 1:
@@ -1641,50 +1675,17 @@ def label_corpus_shards(
     ``.part-*.parquet`` checkpoints flushed every *checkpoint_every_rows* rows.
     """
     from mlime.data.shards import shard_paths
-    from mlime.locate import find_upwards
-    from mlime.train.arbitration import ReadingArbitration
-    from mlime.train.lexicon import CandidateSpace
-    from mlime.train.samples import Augmentation, SampleBuilder, interleave, read_pair
-    from mlime.train.spans import SpanVocab
-    from mlime.train.units import UnitMatcher
-    from mlime.typo import (
-        SYLLABLES_RELATIVE,
-        CorrectionTable,
-        NoiseModel,
-        default_typo_table,
-        load_syllables,
-    )
+    from mlime.train.samples import interleave, read_pair
 
-    spans = SpanVocab.load()
-    lexicon = load_student_lexicon(char_table)
-    arbitration = ReadingArbitration.load(spans)
-    noise: NoiseModel | None = None
-    candidates: CandidateSpace | None = None
-    if typos:
-        table_path = typo_table or default_typo_table()
-        if table_path is None:
-            raise FileNotFoundError("no typo.json found; pass --typo-table")
-        syl_path = syllables or find_upwards(SYLLABLES_RELATIVE)
-        if syl_path is None:
-            raise FileNotFoundError("no syllables.txt found; pass --syllables")
-        noise = NoiseModel.load(table_path)
-        table = CorrectionTable(noise, load_syllables(syl_path))
-        candidates = CandidateSpace(spans, lexicon.candidate_mask, table, lexicon.homophones)
-    units: UnitMatcher | None = None
-    if unit_initials > 0.0:
-        if unit_lexicon is None:
-            raise ValueError("unit_initials > 0 requires unit_lexicon")
-        units = UnitMatcher.load(unit_lexicon)
-
-    builder = SampleBuilder(
-        lexicon,
-        spans,
-        arbitration,
-        augmentation=Augmentation(typos=typos, unit_initials=unit_initials),
+    lexicon, builder = _key_sample_builder(
+        char_table,
+        legality=legality,
+        typos=typos,
+        typo_table=typo_table,
+        syllables=syllables,
+        unit_initials=unit_initials,
+        unit_lexicon=unit_lexicon,
         seed=seed,
-        noise=noise,
-        candidates=candidates,
-        units=units,
     )
     available = shard_paths(samples_dir, "*")
     if shards is not None:
@@ -1733,7 +1734,7 @@ def label_corpus_shards(
             ex = builder.build(sample, syls, epoch=0)
             if ex is None:
                 continue
-            keys = "".join(ex.spans)
+            keys = ex.keys
             text = "".join(lexicon.characters[t] for t in ex.targets)
             if not all(ch in char_to_emit for ch in text):
                 continue
