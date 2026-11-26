@@ -3027,6 +3027,7 @@ def train_distill_keys(
     from mlime.train.distill import (
         DistillConfig,
         DistillTrainConfig,
+        ParquetDistillSource,
         TeacherLabelShards,
         train_distill_loop,
     )
@@ -3086,6 +3087,20 @@ def train_distill_keys(
         pool_batches=pool_batches,
         prefetch_batches=prefetch_batches,
     )
+    stream_source = (
+        ParquetDistillSource(
+            shards_dir=labels_dir,
+            char_table=table,
+            typo_table=typo,
+            syllables=inventory,
+            base_model=recorded.base_model,
+            context_model=recorded.context,
+            seed=seed,
+            charlm_path=charlm_teacher if lm_weight > 0.0 else None,
+        )
+        if prefetch_batches > 0
+        else None
+    )
     summary = train_distill_loop(
         model,
         collator,
@@ -3095,6 +3110,7 @@ def train_distill_keys(
         cfg,
         resume_path=resume,
         charlm_path=charlm_teacher,
+        stream_source=stream_source,
         options=model.keys_config.options,
     )
     typer.echo(json.dumps(summary, indent=2))
