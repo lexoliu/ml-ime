@@ -1,11 +1,12 @@
-"""Unit tests for Phase 2 S6 offline T1/T2/T3 distillation (#191, #330, #340)."""
+"""Unit tests for Phase 2 S6 unified distillation (#191, #330, #340, #350)."""
 
 from __future__ import annotations
 
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 import torch.nn.functional as functional
@@ -19,7 +20,8 @@ from test_keys import (
 )
 
 from mlime.legality import OFFLINE, Legality
-from mlime.train.charlm_vocab import CharVocab
+from mlime.train.charlm_model import CharLmConfig, build
+from mlime.train.charlm_vocab import SPECIALS, CharVocab
 from mlime.train.distill import (
     DistillConfig,
     DistillTrainConfig,
@@ -27,10 +29,11 @@ from mlime.train.distill import (
     TeacherLabelShards,
     cosine_lr,
     iter_teacher_label_shards,
+    min_cost_span_ends,
     read_teacher_label_shard,
     score_candidate_sentences,
     t1_kl_loss,
-    t2_listwise_kl_loss,
+    t2_residual_kl_loss,
     train_distill_loop,
 )
 from mlime.train.e2e import load_key_model
@@ -57,6 +60,33 @@ def _tiny_prelude_key_model(lexicon: Lexicon, reader_vocab: CharVocab) -> KeyE2E
     )
 
 
+def _save_tiny_charlm(path: Path, characters: tuple[str, ...]) -> Path:
+    vocab = SPECIALS + tuple(characters)
+    cfg = CharLmConfig(
+        arch="transformer",
+        embedding=16,
+        hidden=32,
+        layers=2,
+        heads=2,
+        feedforward=64,
+        max_positions=64,
+        dropout=0.0,
+        context_chars=8,
+    )
+    torch.manual_seed(7)
+    lm = build(len(vocab), cfg).eval()
+    torch.save(
+        {
+            "step": 10,
+            "vocab": list(vocab),
+            "config": asdict(cfg),
+            "model": lm.state_dict(),
+        },
+        path,
+    )
+    return path
+
+
 def test_t1_kl_loss_zero_when_matching_and_decreases_under_grad() -> None:
     torch.manual_seed(0)
     vocab = 16
@@ -74,13 +104,11 @@ def test_t1_kl_loss_zero_when_matching_and_decreases_under_grad() -> None:
     )
     t1_lps = functional.log_softmax(torch.randn(n_pos, k), dim=-1)
 
-    # Exact match over top-k support with zero probability outside yields 0 KL.
     student_logits = torch.full((n_pos, vocab), -1e9, dtype=torch.float32)
     student_logits.scatter_(1, t1_ids, t1_lps)
     student_lp = functional.log_softmax(student_logits, dim=-1)
     assert float(t1_kl_loss(student_lp, t1_ids, t1_lps)) == pytest.approx(0.0, abs=1e-5)
 
-    # Gradient step lowers KL.
     trainable = torch.randn(n_pos, vocab, requires_grad=True)
     loss0 = t1_kl_loss(functional.log_softmax(trainable, dim=-1), t1_ids, t1_lps)
     loss0.backward()
@@ -90,7 +118,6 @@ def test_t1_kl_loss_zero_when_matching_and_decreases_under_grad() -> None:
     loss1 = t1_kl_loss(functional.log_softmax(updated, dim=-1), t1_ids, t1_lps)
     assert float(loss1.detach()) < float(loss0.detach())
 
-    # Masking ignores masked rows.
     mask = torch.tensor([True, True, False, False, False])
     masked_loss = t1_kl_loss(
         functional.log_softmax(trainable.detach(), dim=-1), t1_ids, t1_lps, mask=mask
@@ -101,12 +128,21 @@ def test_t1_kl_loss_zero_when_matching_and_decreases_under_grad() -> None:
     assert float(masked_loss) == pytest.approx(float(subset_loss), abs=1e-6)
 
 
-def test_t2_listwise_kl_loss_handles_variable_candidates_and_singleton_rows() -> None:
+def test_t2_residual_kl_loss_preserves_scale_and_masks_padding() -> None:
+    student_scores = torch.tensor(
+        [
+            [-10.0, -25.0, -40.0, 99.0],
+            [-3.0, -2.5, 50.0, 50.0],
+            [-0.3, 0.0, 0.0, 0.0],  # singleton row -> ignored
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
     teacher_scores = torch.tensor(
         [
             [-1.0, -2.5, -4.0, 0.0],
-            [-0.5, -1.2, 0.0, 0.0],
-            [-0.3, 0.0, 0.0, 0.0],  # only 1 valid candidate -> ignored
+            [-0.5, -3.0, 0.0, 0.0],
+            [-0.3, 0.0, 0.0, 0.0],
         ],
         dtype=torch.float32,
     )
@@ -118,23 +154,36 @@ def test_t2_listwise_kl_loss_handles_variable_candidates_and_singleton_rows() ->
         ],
         dtype=torch.bool,
     )
-    # Identical scores give 0 KL.
-    assert float(t2_listwise_kl_loss(teacher_scores, teacher_scores, valid)) == pytest.approx(
-        0.0, abs=1e-6
-    )
+    # Zero scale yields exact 0 KL regardless of score magnitude difference.
+    zero_kl, zero_flip = t2_residual_kl_loss(student_scores, teacher_scores, valid, scale=0.0)
+    assert float(zero_kl.detach()) == pytest.approx(0.0, abs=1e-6)
+    assert float(zero_flip) == pytest.approx(0.0, abs=1e-6)
 
-    # Perturbed student scores produce positive KL and valid gradients; padded entries have 0 grad.
-    student = (
-        teacher_scores
-        + torch.tensor([[0.0, 1.0, -0.5, 99.0], [1.0, -1.0, 50.0, 50.0], [0.0, 0.0, 0.0, 0.0]])
-    ).requires_grad_(True)
-    loss = t2_listwise_kl_loss(student, teacher_scores, valid)
-    assert float(loss.detach()) > 0.0
-    loss.backward()
-    assert student.grad is not None
-    assert float(student.grad[0, 3]) == 0.0
-    assert float(student.grad[1, 2]) == 0.0
-    assert float(student.grad[2].abs().sum()) == 0.0
+    # Positive scale produces positive KL, flips row 1 toward gold,
+    # and leaves padded/singleton grad 0.
+    kl, flip = t2_residual_kl_loss(student_scores, teacher_scores, valid, scale=0.6)
+    assert float(kl.detach()) > 0.0
+    assert float(flip) == pytest.approx(0.5, abs=1e-6)
+    kl.backward()
+    assert student_scores.grad is not None
+    assert float(student_scores.grad[0, 3]) == 0.0
+    assert float(student_scores.grad[1, 2]) == 0.0
+    assert float(student_scores.grad[2].abs().sum()) == 0.0
+    # Gradient on row 1 pushes gold score up (negative grad) and negative score down.
+    assert float(student_scores.grad[1, 0]) < 0.0
+    assert float(student_scores.grad[1, 1]) > 0.0
+
+
+def test_min_cost_span_ends_selects_lowest_cost_cover(legality: Legality) -> None:
+    ids = legality.ids("我爱北京")
+    assert ids is not None
+    arcs = legality.gold_ids("woaibeijing", ids, OFFLINE)
+    assert arcs is not None
+    assert min_cost_span_ends(arcs.dense()) == [1, 3, 6, 10]
+
+    impossible = np.full((2, 4, 6), np.inf, dtype=np.float64)
+    with pytest.raises(ValueError, match="no complete legal cover"):
+        min_cost_span_ends(impossible)
 
 
 def test_read_and_iter_teacher_label_shards(tmp_path: Path) -> None:
@@ -167,7 +216,8 @@ def test_read_and_iter_teacher_label_shards(tmp_path: Path) -> None:
     assert list(iter_teacher_label_shards(tmp_path)) == rows
 
     cfg = DistillConfig()
-    assert cfg.t1_weight == 1.0
+    assert cfg.uses_online_beam
+    assert cfg.uses_t3_candidates
     assert cosine_lr(1, 100, 1e-4) > 0.0
     assert cosine_lr(100, 100, 1e-4) == pytest.approx(0.0, abs=1e-9)
 
@@ -209,7 +259,7 @@ def test_score_candidate_sentences_matches_unbounded_search(
             assert float(scores[row_i, cand_i]) == pytest.approx(hyp.score, abs=1e-4)
 
 
-def test_train_distill_loop_lowers_loss_resumes_and_reloads(
+def test_train_distill_loop_unified_lowers_loss_resumes_and_reloads(
     tmp_path: Path,
     vocabularies: Vocabularies,
     lexicon: Lexicon,
@@ -219,8 +269,8 @@ def test_train_distill_loop_lowers_loss_resumes_and_reloads(
     model = _tiny_prelude_key_model(lexicon, reader_vocab)
     collator = vocabularies.key_collator(context_dropout=0.0)
     eos_id = lexicon.size
+    charlm_path = _save_tiny_charlm(tmp_path / "charlm.pt", lexicon.characters)
 
-    # Build synthetic TeacherLabelRows over legal sentences from the test lexicon.
     pairs = [
         ("r0", "我和北京", "woaibeijing", "我爱北京"),
         ("r1", None, "beijing", "北京"),
@@ -267,7 +317,6 @@ def test_train_distill_loop_lowers_loss_resumes_and_reloads(
             )
         )
 
-    # Persist 2 rows so 3 + 3 steps must cycle epochs and resume past epoch 1.
     shards_dir = tmp_path / "shards"
     write_labels_parquet(
         [
@@ -288,7 +337,20 @@ def test_train_distill_loop_lowers_loss_resumes_and_reloads(
 
     run_dir = tmp_path / "s6-run"
     cfg = DistillTrainConfig(
-        distill=DistillConfig(t1_weight=1.0, t2_weight=0.5, gold_weight=1.0),
+        distill=DistillConfig(
+            ce_weight=0.5,
+            t1_weight=0.5,
+            t1_temperature=1.5,
+            t2_weight=1.0,
+            t2_scale=0.6,
+            rank_t3_weight=0.025,
+            rank_online_weight=0.05,
+            lm_weight=1.0,
+            lm_scale=0.6,
+            beam=4,
+            negatives=4,
+            other_lengths=1,
+        ),
         base_lr=5e-3,
         new_lr=5e-3,
         batch_size=2,
@@ -297,17 +359,32 @@ def test_train_distill_loop_lowers_loss_resumes_and_reloads(
         log_every=1,
         checkpoint_every=3,
         pool_batches=2,
+        prefetch_batches=2,
     )
-    # Single-use iterators must fail fast.
+    # Single-use iterators and missing Char-LM teacher must fail fast.
     with pytest.raises(TypeError, match="re-iterable"):
         train_distill_loop(
-            model, collator, legality, iter_teacher_label_shards(shards_dir), run_dir, cfg
+            model,
+            collator,
+            legality,
+            iter_teacher_label_shards(shards_dir),
+            run_dir,
+            cfg,
+            charlm_path=charlm_path,
         )
+    with pytest.raises(ValueError, match="charlm_path"):
+        train_distill_loop(model, collator, legality, TeacherLabelShards(shards_dir), run_dir, cfg)
 
-    # Run first 3 steps over TeacherLabelShards, then resume past epoch 1 to step 6.
+    # Run 3 steps with prefetching + online beam + Char-LM + residual T2, then resume to step 6.
     first_cfg = replace(cfg, max_steps=3)
     s1 = train_distill_loop(
-        model, collator, legality, TeacherLabelShards(shards_dir), run_dir, first_cfg
+        model,
+        collator,
+        legality,
+        TeacherLabelShards(shards_dir),
+        run_dir,
+        first_cfg,
+        charlm_path=charlm_path,
     )
     assert s1["steps"] == 3
     mid_ckpt = Path(s1["checkpoint"])
@@ -321,16 +398,20 @@ def test_train_distill_loop_lowers_loss_resumes_and_reloads(
         run_dir,
         cfg,
         resume_path=mid_ckpt,
+        charlm_path=charlm_path,
     )
     assert s2["steps"] == 6
     final_ckpt = Path(s2["checkpoint"])
     assert final_ckpt.is_file()
 
-    lines = (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
-    losses = [json.loads(line)["loss"] for line in lines]
-    assert losses[-1] < losses[0]
+    records = [
+        json.loads(line)
+        for line in (run_dir / "metrics.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(records) == 6
+    assert records[-1]["loss"] < records[0]["loss"]
+    assert all("lm_loss" in rec and "rank_online_loss" in rec for rec in records)
 
-    # Checkpoint reloads cleanly through load_key_model (used by eval keys & Core ML export).
     reloaded, step = load_key_model(final_ckpt, lexicon, CPU, bert_config=TINY)
     assert step == 6
     model.eval()

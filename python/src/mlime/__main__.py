@@ -2982,27 +2982,42 @@ def train_distill_keys(
     char_table: Path = CHAR_TABLE,
     typo_table: Path = typer.Option(None, "--typo-table"),
     syllables: Path = typer.Option(None, "--syllables"),
-    base_lr: float = typer.Option(2e-5, "--base-lr"),
-    new_lr: float = typer.Option(2e-5, "--new-lr"),
+    charlm_teacher: Path = typer.Option(
+        None,
+        "--charlm-teacher",
+        help="Frozen Char-LM checkpoint calibrating the student's on-policy beam",
+    ),
+    base_lr: float = typer.Option(1e-5, "--base-lr"),
+    new_lr: float = typer.Option(1e-5, "--new-lr"),
     weight_decay: float = typer.Option(0.01, "--weight-decay"),
     warmup_fraction: float = typer.Option(0.04, "--warmup-fraction"),
-    batch_size: int = typer.Option(64, "--batch-size"),
-    accumulate: int = typer.Option(2, "--accumulate"),
-    max_steps: int = typer.Option(5000, "--max-steps"),
+    batch_size: int = typer.Option(32, "--batch-size"),
+    accumulate: int = typer.Option(4, "--accumulate"),
+    max_steps: int = typer.Option(1562, "--max-steps"),
     log_every: int = typer.Option(20, "--log-every"),
     checkpoint_every: int = typer.Option(500, "--checkpoint-every"),
-    t1_weight: float = typer.Option(1.0, "--t1-weight"),
-    t1_temperature: float = typer.Option(1.0, "--t1-temperature"),
-    t2_weight: float = typer.Option(0.5, "--t2-weight"),
-    t2_temperature: float = typer.Option(1.0, "--t2-temperature"),
-    gold_weight: float = typer.Option(1.0, "--gold-weight"),
+    ctc_weight: float = typer.Option(1.0, "--ctc-weight"),
+    ce_weight: float = typer.Option(0.5, "--ce-weight"),
+    t1_weight: float = typer.Option(0.5, "--t1-weight"),
+    t1_temperature: float = typer.Option(1.9, "--t1-temperature"),
+    t2_weight: float = typer.Option(1.0, "--t2-weight"),
+    t2_scale: float = typer.Option(0.6, "--t2-scale"),
+    rank_t3_weight: float = typer.Option(0.0, "--rank-t3-weight"),
+    rank_online_weight: float = typer.Option(0.05, "--rank-online-weight"),
+    lm_weight: float = typer.Option(1.0, "--lm-weight"),
+    lm_scale: float = typer.Option(0.6, "--lm-scale"),
+    beam: int = typer.Option(8, "--beam"),
+    negatives: int = typer.Option(8, "--negatives"),
+    other_lengths: int = typer.Option(1, "--other-lengths"),
     beta: float = typer.Option(2.0, "--beta"),
     gamma: float = typer.Option(1.0, "--gamma"),
+    pool_batches: int = typer.Option(32, "--pool-batches"),
+    prefetch_batches: int = typer.Option(8, "--prefetch-batches"),
     resume: Path = typer.Option(None, "--resume", help="Mid-schedule checkpoint to resume from"),
     seed: int = SEED,
     verbose: bool = VERBOSE,
 ) -> None:
-    """Distil S5 offline teacher labels (T1/T2/T3) into the key-level student (S6, #191)."""
+    """Distil S5 offline teacher labels with on-policy beam calibration (S6, #191, #350)."""
     configure(verbose)
     import torch
 
@@ -3042,11 +3057,19 @@ def train_distill_keys(
     collator = vocabularies.key_collator(context_dropout=0.0, seed=seed)
     cfg = DistillTrainConfig(
         distill=DistillConfig(
+            ctc_weight=ctc_weight,
+            ce_weight=ce_weight,
             t1_weight=t1_weight,
             t1_temperature=t1_temperature,
             t2_weight=t2_weight,
-            t2_temperature=t2_temperature,
-            gold_weight=gold_weight,
+            t2_scale=t2_scale,
+            rank_t3_weight=rank_t3_weight,
+            rank_online_weight=rank_online_weight,
+            lm_weight=lm_weight,
+            lm_scale=lm_scale,
+            beam=beam,
+            negatives=negatives,
+            other_lengths=other_lengths,
             beta=beta,
             gamma=gamma,
         ),
@@ -3060,6 +3083,8 @@ def train_distill_keys(
         seed=seed,
         log_every=log_every,
         checkpoint_every=checkpoint_every,
+        pool_batches=pool_batches,
+        prefetch_batches=prefetch_batches,
     )
     summary = train_distill_loop(
         model,
@@ -3069,6 +3094,7 @@ def train_distill_keys(
         out,
         cfg,
         resume_path=resume,
+        charlm_path=charlm_teacher,
         options=model.keys_config.options,
     )
     typer.echo(json.dumps(summary, indent=2))
