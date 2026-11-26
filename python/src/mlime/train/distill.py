@@ -31,15 +31,17 @@ import queue
 import random
 import threading
 import time
+import traceback
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import numpy as np
 import numpy.typing as npt
 import pyarrow.parquet as pq  # type: ignore[import-untyped]
 import torch
+import torch.multiprocessing as mp
 import torch.nn.functional as functional
 
 from mlime.legality import MAX_ARC_KEYS, OFFLINE, Legality, LegalityOptions
@@ -71,6 +73,7 @@ from mlime.train.key_teacher import (
     teacher_context,
 )
 from mlime.train.keys import KeyCollator, KeyInputs
+from mlime.train.qwen_tower import QwenContextConfig
 
 
 @dataclass(frozen=True)
@@ -226,26 +229,18 @@ class TeacherLabelShards:
 def min_cost_span_ends(dense_cost: npt.NDArray[np.floating[Any]]) -> list[int]:
     """Minimum-cost legal key-span end indices for a gold sentence from ``GoldArcs.dense()``."""
     m, k, max_w = dense_cost.shape
-    dp = np.full((m + 1, k + 1), math.inf, dtype=np.float64)
+    padded_prev = np.full(k + max_w, math.inf, dtype=np.float64)
+    padded_prev[max_w - 1] = 0.0
     bp = np.zeros((m + 1, k + 1), dtype=np.int64)
-    dp[0, 0] = 0.0
+    offsets = np.arange(k)[:, None] - np.arange(max_w)[None, :] + (max_w - 1)
+    rows_idx = np.arange(k)
     for j in range(1, m + 1):
-        row = dense_cost[j - 1]
-        for e in range(1, k + 1):
-            lim = min(e, max_w)
-            best_v = math.inf
-            best_w = 1
-            for w in range(1, lim + 1):
-                c = float(row[e - 1, w - 1])
-                if not math.isfinite(c):
-                    continue
-                v = dp[j - 1, e - w] + c
-                if v < best_v:
-                    best_v = v
-                    best_w = w
-            dp[j, e] = best_v
-            bp[j, e] = best_w
-    if not math.isfinite(dp[m, k]):
+        cand = padded_prev[offsets] + dense_cost[j - 1]
+        best_idx = np.argmin(cand, axis=1)
+        bp[j, 1:] = best_idx + 1
+        padded_prev[max_w - 1] = math.inf
+        padded_prev[max_w:] = cand[rows_idx, best_idx]
+    if not math.isfinite(float(padded_prev[max_w + k - 1])):
         raise ValueError("gold arc table has no complete legal cover over keys")
     ends = [0] * m
     cur = k
@@ -977,6 +972,192 @@ def save_distill_checkpoint(
     return path
 
 
+class DistillStreamSource(Protocol):
+    """Picklable factory opening a worker's stream, collator, and legality off-GIL (#353)."""
+
+    def open(
+        self,
+    ) -> tuple[Iterable[TeacherLabelRow], KeyCollator, Legality, TeacherVocab | None]:
+        """Build the worker-local stream, key collator, legality, and optional LM vocab."""
+        ...
+
+
+@dataclass(frozen=True)
+class ParquetDistillSource:
+    """Picklable S5 Parquet source opened inside a spawned prefetch worker (#353)."""
+
+    shards_dir: Path
+    char_table: Path
+    typo_table: Path
+    syllables: Path
+    base_model: str
+    context_model: QwenContextConfig | None = None
+    seed: int = 0
+    charlm_path: Path | None = None
+
+    def open(
+        self,
+    ) -> tuple[Iterable[TeacherLabelRow], KeyCollator, Legality, TeacherVocab | None]:
+        """Open shards, vocabularies, legality, and optional Char-LM vocab in the worker."""
+        from mlime.train.run import Vocabularies
+
+        vocabularies = Vocabularies.load(self.char_table, self.base_model, self.context_model)
+        legality = Legality.load(
+            vocabularies.lexicon.characters,
+            char_table=self.char_table,
+            typo_table=self.typo_table,
+            syllables=self.syllables,
+        )
+        collator = vocabularies.key_collator(context_dropout=0.0, seed=self.seed)
+        charlm_vocab = None if self.charlm_path is None else TeacherVocab.read(self.charlm_path)
+        return TeacherLabelShards(self.shards_dir, seed=self.seed), collator, legality, charlm_vocab
+
+
+def _cyclic_label_rows(
+    stream: Iterable[TeacherLabelRow],
+    skip_target: int,
+) -> Iterator[TeacherLabelRow]:
+    skipped = 0
+    while True:
+        yielded_any = False
+        for row in stream:
+            yielded_any = True
+            if skipped < skip_target:
+                skipped += 1
+                continue
+            yield row
+        if not yielded_any:
+            break
+
+
+def _distill_process_worker(
+    source: DistillStreamSource,
+    skip_target: int,
+    batch_size: int,
+    pool_batches: int,
+    seed: int,
+    score_eos: bool,
+    options: LegalityOptions,
+    include_online: bool,
+    negatives: int,
+    out_q: Any,
+    stop_event: Any,
+) -> None:
+    torch.set_num_threads(1)
+
+    def _put(item: Any) -> None:
+        while not stop_event.is_set():
+            try:
+                out_q.put(item, timeout=0.1)
+                return
+            except queue.Full:
+                continue
+
+    try:
+        stream, collator, legality, charlm_vocab = source.open()
+        micro_iter = bucketed_label_batches(
+            _cyclic_label_rows(stream, skip_target),
+            batch_size=batch_size,
+            pool_batches=pool_batches,
+            seed=seed,
+        )
+        while not stop_event.is_set():
+            try:
+                raw_rows = next(micro_iter)
+            except StopIteration:
+                _put(("eof", None))
+                return
+            built = collate_distill_batch(
+                raw_rows,
+                collator,
+                legality,
+                score_eos=score_eos,
+                options=options,
+                include_online=include_online,
+                negatives=negatives,
+                teacher_vocab=charlm_vocab,
+            )
+            if built is not None:
+                _put(("batch", built))
+    except BaseException:
+        _put(("error", traceback.format_exc()))
+
+
+class _ProcessDistillPrefetcher:
+    """Spawned process prefetcher isolating S6 collation from the trainer's GIL (#353)."""
+
+    def __init__(
+        self,
+        source: DistillStreamSource,
+        *,
+        skip_target: int,
+        batch_size: int,
+        pool_batches: int,
+        seed: int,
+        score_eos: bool,
+        options: LegalityOptions,
+        include_online: bool,
+        negatives: int,
+        maxsize: int,
+    ) -> None:
+        ctx = mp.get_context("spawn")
+        self._q: Any = ctx.Queue(maxsize=maxsize)
+        self._stop: Any = ctx.Event()
+        self._proc: Any = ctx.Process(
+            target=_distill_process_worker,
+            args=(
+                source,
+                skip_target,
+                batch_size,
+                pool_batches,
+                seed,
+                score_eos,
+                options,
+                include_online,
+                negatives,
+                self._q,
+                self._stop,
+            ),
+            daemon=True,
+        )
+        self._proc.start()
+
+    def get(self) -> DistillBatch | None:
+        """Return the next collated :class:`DistillBatch`, or ``None`` on exhaustion."""
+        while True:
+            try:
+                tag, payload = self._q.get(timeout=0.5)
+            except queue.Empty:
+                if not self._proc.is_alive():
+                    raise RuntimeError(
+                        f"S6 prefetch worker exited unexpectedly (code={self._proc.exitcode})"
+                    ) from None
+                continue
+            if tag == "batch":
+                assert isinstance(payload, DistillBatch)
+                return payload
+            if tag == "eof":
+                return None
+            if tag == "error":
+                raise RuntimeError(f"S6 prefetch worker failed:\n{payload}")
+            raise RuntimeError(f"unexpected prefetch message tag: {tag!r}")
+
+    def close(self) -> None:
+        """Stop the worker cleanly without blocking on a full queue."""
+        self._stop.set()
+        while True:
+            try:
+                self._q.get_nowait()
+            except (queue.Empty, ValueError, OSError):
+                break
+        self._proc.join(timeout=10.0)
+        if self._proc.is_alive():
+            self._proc.terminate()
+            self._proc.join(timeout=5.0)
+        self._q.close()
+        self._q.join_thread()
+
+
 def train_distill_loop(
     model: KeyE2EModel,
     collator: KeyCollator,
@@ -987,9 +1168,10 @@ def train_distill_loop(
     *,
     resume_path: Path | None = None,
     charlm_path: Path | None = None,
+    stream_source: DistillStreamSource | None = None,
     options: LegalityOptions = OFFLINE,
 ) -> dict[str, Any]:
-    """Resumable unified S6 distillation loop for the key-level student (#191, #350)."""
+    """Resumable unified S6 distillation loop for the key-level student (#191, #350, #353)."""
     if isinstance(stream, Iterator):
         raise TypeError(
             "train_distill_loop requires a re-iterable Iterable, not a single-use Iterator"
@@ -1027,28 +1209,16 @@ def train_distill_loop(
     metrics_path = out_dir / "metrics.jsonl"
     model.train()
 
-    def _cyclic_stream() -> Iterator[TeacherLabelRow]:
-        skipped = 0
-        skip_target = start_step * config.batch_size * config.accumulate
-        while True:
-            yielded_any = False
-            for row in stream:
-                yielded_any = True
-                if skipped < skip_target:
-                    skipped += 1
-                    continue
-                yield row
-            if not yielded_any:
-                break
-
-    micro_iter = bucketed_label_batches(
-        _cyclic_stream(),
-        batch_size=config.batch_size,
-        pool_batches=config.pool_batches,
-        seed=config.seed,
-    )
+    skip_target = start_step * config.batch_size * config.accumulate
+    prefetch = config.prefetch_batches > 0
+    proc_prefetcher: _ProcessDistillPrefetcher | None = None
+    batch_q: queue.Queue[DistillBatch | BaseException | None] | None = None
+    stop_prefetch = threading.Event()
+    prod_thread: threading.Thread | None = None
+    micro_iter: Iterator[list[TeacherLabelRow]] | None = None
 
     def _next_collated() -> DistillBatch | None:
+        assert micro_iter is not None
         while True:
             try:
                 raw_rows = next(micro_iter)
@@ -1067,36 +1237,54 @@ def train_distill_loop(
             if built is not None:
                 return built
 
-    prefetch = config.prefetch_batches > 0
-    batch_q: queue.Queue[DistillBatch | BaseException | None] | None = None
-    stop_prefetch = threading.Event()
-    prod_thread: threading.Thread | None = None
-    if prefetch:
-        batch_q = queue.Queue(maxsize=config.prefetch_batches)
+    if prefetch and stream_source is not None:
+        proc_prefetcher = _ProcessDistillPrefetcher(
+            stream_source,
+            skip_target=skip_target,
+            batch_size=config.batch_size,
+            pool_batches=config.pool_batches,
+            seed=config.seed,
+            score_eos=model.decoder.score_eos,
+            options=options,
+            include_online=dcfg.uses_online_beam,
+            negatives=dcfg.negatives,
+            maxsize=config.prefetch_batches,
+        )
+    else:
+        micro_iter = bucketed_label_batches(
+            _cyclic_label_rows(stream, skip_target),
+            batch_size=config.batch_size,
+            pool_batches=config.pool_batches,
+            seed=config.seed,
+        )
+        if prefetch:
+            batch_q = queue.Queue(maxsize=config.prefetch_batches)
 
-        def _put(item: DistillBatch | BaseException | None) -> None:
-            assert batch_q is not None
-            while not stop_prefetch.is_set():
-                try:
-                    batch_q.put(item, timeout=0.1)
-                    return
-                except queue.Full:
-                    continue
-
-        def _producer() -> None:
-            try:
+            def _put(item: DistillBatch | BaseException | None) -> None:
+                assert batch_q is not None
                 while not stop_prefetch.is_set():
-                    built = _next_collated()
-                    _put(built)
-                    if built is None:
+                    try:
+                        batch_q.put(item, timeout=0.1)
                         return
-            except BaseException as exc:
-                _put(exc)
+                    except queue.Full:
+                        continue
 
-        prod_thread = threading.Thread(target=_producer, daemon=True)
-        prod_thread.start()
+            def _producer() -> None:
+                try:
+                    while not stop_prefetch.is_set():
+                        built = _next_collated()
+                        _put(built)
+                        if built is None:
+                            return
+                except BaseException as exc:
+                    _put(exc)
+
+            prod_thread = threading.Thread(target=_producer, daemon=True)
+            prod_thread.start()
 
     def _pull_batch() -> DistillBatch | None:
+        if proc_prefetcher is not None:
+            return proc_prefetcher.get()
         if batch_q is None:
             return _next_collated()
         item = batch_q.get()
@@ -1198,6 +1386,8 @@ def train_distill_loop(
         stop_prefetch.set()
         if prod_thread is not None:
             prod_thread.join(timeout=5.0)
+        if proc_prefetcher is not None:
+            proc_prefetcher.close()
 
     final_path = save_distill_checkpoint(
         out_dir, model, optimiser, step, config, filename="checkpoint-final.pt"

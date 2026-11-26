@@ -185,6 +185,39 @@ def test_min_cost_span_ends_selects_lowest_cost_cover(legality: Legality) -> Non
     with pytest.raises(ValueError, match="no complete legal cover"):
         min_cost_span_ends(impossible)
 
+    # Randomized check against scalar DP with ties and infinities.
+    rng = np.random.default_rng(42)
+    for _ in range(10):
+        m, k, max_w = 5, 14, 6
+        grid = np.full((m, k, max_w), np.inf, dtype=np.float64)
+        pos = 0
+        widths = [3, 3, 2, 3, 3]
+        for j, w in enumerate(widths):
+            pos += w
+            grid[j, pos - 1, w - 1] = float(rng.uniform(0.0, 2.0))
+        extra = rng.random((m, k, max_w)) < 0.25
+        grid[extra] = rng.uniform(0.0, 5.0, size=int(extra.sum()))
+        dp = np.full((m + 1, k + 1), np.inf, dtype=np.float64)
+        bp = np.zeros((m + 1, k + 1), dtype=np.int64)
+        dp[0, 0] = 0.0
+        for j in range(1, m + 1):
+            for e in range(1, k + 1):
+                best_v = np.inf
+                best_w = 1
+                for w in range(1, min(e, max_w) + 1):
+                    v = dp[j - 1, e - w] + grid[j - 1, e - 1, w - 1]
+                    if v < best_v:
+                        best_v = v
+                        best_w = w
+                dp[j, e] = best_v
+                bp[j, e] = best_w
+        ref = [0] * m
+        cur = k
+        for j in range(m, 0, -1):
+            ref[j - 1] = cur - 1
+            cur -= int(bp[j, cur])
+        assert min_cost_span_ends(grid) == ref
+
 
 def test_read_and_iter_teacher_label_shards(tmp_path: Path) -> None:
     write_labels_parquet(
@@ -420,3 +453,111 @@ def test_train_distill_loop_unified_lowers_loss_resumes_and_reloads(
         a = model.ctc_log_probs(model.key_states(probe).states)
         b = reloaded.ctc_log_probs(reloaded.key_states(probe).states)
     assert torch.allclose(a, b, atol=1e-5)
+
+
+class _StubDistillSource:
+    """Picklable test source exercising spawned multiprocessing prefetch (#353)."""
+
+    def __init__(self, shards_dir: Path, charlm_path: Path) -> None:
+        self.shards_dir = shards_dir
+        self.charlm_path = charlm_path
+
+    def open(self):  # type: ignore[no-untyped-def]
+        from conftest import READINGS
+        from test_keys import DATA, KeyTokenizer
+
+        from mlime.train.arbitration import ReadingArbitration
+        from mlime.train.key_teacher import TeacherVocab
+        from mlime.train.lexicon import build_lexicon
+        from mlime.train.spans import SpanVocab
+        from mlime.typo import load_syllables
+
+        spans = SpanVocab.load()
+        vocab = {ch: idx + 100 for idx, ch in enumerate(sorted(READINGS))}
+        lex = build_lexicon(READINGS, vocab, spans)
+        tok = KeyTokenizer()
+        vocs = Vocabularies(
+            spans=spans,
+            tokenizer=tok,
+            context_tokenizer=tok,
+            lexicon=lex,
+            arbitration=ReadingArbitration.load(spans),
+            syllables=frozenset(load_syllables(DATA / "syllables.txt")),
+        )
+        leg = vocs.legality()
+        return (
+            TeacherLabelShards(self.shards_dir),
+            vocs.key_collator(context_dropout=0.0),
+            leg,
+            TeacherVocab.read(self.charlm_path),
+        )
+
+
+def test_train_distill_loop_spawned_process_prefetch(
+    tmp_path: Path,
+    vocabularies: Vocabularies,
+    lexicon: Lexicon,
+    reader_vocab: CharVocab,
+    legality: Legality,
+) -> None:
+    model = _tiny_prelude_key_model(lexicon, reader_vocab)
+    collator = vocabularies.key_collator(context_dropout=0.0)
+    eos_id = lexicon.size
+    charlm_path = _save_tiny_charlm(tmp_path / "charlm.pt", lexicon.characters)
+    ids = legality.ids("我爱北京")
+    assert ids is not None
+    t1_ids = [
+        *([eid, (eid + 1) % eos_id, eos_id] for eid in ids),
+        [eos_id, ids[0], (ids[0] + 1) % eos_id],
+    ]
+    t1_lps = [[-0.05, -3.5, -4.5] for _ in range(len(ids) + 1)]
+    shards_dir = tmp_path / "shards"
+    write_labels_parquet(
+        [
+            {
+                "id": f"r{i}",
+                "context": "我和北京" if i % 2 == 0 else None,
+                "keys": "woaibeijing",
+                "text": "我爱北京",
+                "t1_ids": t1_ids,
+                "t1_log_probs": t1_lps,
+                "candidates": ["我爱北京"],
+                "candidate_scores": [-0.5],
+            }
+            for i in range(4)
+        ],
+        shards_dir / "shard-00000.parquet",
+    )
+    cfg = DistillTrainConfig(
+        distill=DistillConfig(
+            ce_weight=0.5,
+            t1_weight=0.5,
+            t2_weight=0.0,
+            rank_online_weight=0.05,
+            lm_weight=1.0,
+            beam=4,
+            negatives=2,
+            other_lengths=1,
+        ),
+        base_lr=2e-3,
+        new_lr=2e-3,
+        batch_size=2,
+        accumulate=1,
+        max_steps=3,
+        log_every=1,
+        checkpoint_every=10,
+        pool_batches=2,
+        prefetch_batches=2,
+    )
+    summary = train_distill_loop(
+        model,
+        collator,
+        legality,
+        TeacherLabelShards(shards_dir),
+        tmp_path / "mp-run",
+        cfg,
+        charlm_path=charlm_path,
+        stream_source=_StubDistillSource(shards_dir, charlm_path),
+    )
+    assert summary["steps"] == 3
+    assert Path(summary["checkpoint"]).is_file()
