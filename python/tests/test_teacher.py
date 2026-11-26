@@ -11,6 +11,7 @@ import torch
 from transformers import Qwen3_5ForCausalLM, Qwen3_5TextConfig
 
 from mlime.legality import OFFLINE, Legality
+from mlime.train.lexicon import Lexicon
 from mlime.train.qwen_tower import LoraConfig
 from mlime.train.teacher import (
     TEACHER_LORA_TARGETS,
@@ -28,7 +29,9 @@ from mlime.train.teacher import (
     build_training_batch,
     constrained_beam_decode,
     constrained_beam_decode_batch,
+    corpus_teacher_stream,
     encode_prompt,
+    label_corpus_shards,
     label_records_batch,
     score_candidates_and_t1,
     train_teacher_loop,
@@ -382,3 +385,104 @@ def test_expand_record_beams_charges_eos_residual_cost() -> None:
     # score (-1.2) + lp[eos] (-0.4) - gamma (1.5) * (offsets[5] (2.0) - min_cost (0.0)) = -4.6
     assert finished[0].text == "我"
     assert finished[0].score == pytest.approx(-4.6, abs=1e-5)
+
+
+def test_teacher_stream_and_label_shards_use_key_sample_builder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    corpus: tuple[Path, Path],
+    lexicon: Lexicon,
+) -> None:
+    """Teacher streams and S5 labelling emit key-legal KeyExample.keys with typos intact (#349)."""
+    repo = Path(__file__).resolve().parents[2]
+    data = repo / "crates/ime-pinyin/data"
+    char_table = data / "char_pinyin.tsv"
+    typo_table = data / "typo.json"
+    syllables = data / "syllables.txt"
+    samples_dir, labels_dir = corpus
+
+    monkeypatch.setattr("mlime.train.teacher.load_student_lexicon", lambda _p: lexicon)
+    legality = Legality.load(
+        lexicon.characters,
+        char_table=char_table,
+        typo_table=typo_table,
+        syllables=syllables,
+    )
+
+    clean_stream = iter(
+        corpus_teacher_stream(
+            samples_dir,
+            labels_dir,
+            char_table,
+            typos=False,
+            typo_table=typo_table,
+            syllables=syllables,
+            seed=0,
+            shuffle_buffer=1,
+        )
+    )
+    typo_stream = iter(
+        corpus_teacher_stream(
+            samples_dir,
+            labels_dir,
+            char_table,
+            typos=True,
+            typo_table=typo_table,
+            syllables=syllables,
+            seed=0,
+            shuffle_buffer=1,
+        )
+    )
+    clean_items = [next(clean_stream) for _ in range(80)]
+    typo_items = [next(typo_stream) for _ in range(80)]
+
+    positive_cost = 0
+    for (_, clean_keys, clean_text), (_, typo_keys, typo_text) in zip(
+        clean_items, typo_items, strict=True
+    ):
+        assert typo_text == clean_text
+        cost = legality.cost(typo_keys, typo_text, OFFLINE)
+        assert cost is not None
+        if cost > 0.0:
+            positive_cost += 1
+        # Pure initial-only strings (length == char count) must never be corrupted.
+        if len(clean_keys) == len(clean_text):
+            assert typo_keys == clean_keys
+    assert positive_cost > 0
+
+    tok = _FakeTokenizer()
+    vocab = EmittableVocab.build(lexicon.characters, tok)
+    lora = LoraConfig(rank=4, alpha=8.0, targets=TEACHER_LORA_TARGETS)
+    teacher = QwenTeacher(_tiny_qwen35(), vocab, lora, gradient_checkpointing=False).eval()
+    out_dir = tmp_path / "s5-out"
+    summary = label_corpus_shards(
+        teacher,
+        tok,
+        samples_dir,
+        labels_dir,
+        char_table,
+        legality,
+        out_dir,
+        shards=["test-00000.parquet"],
+        typos=True,
+        typo_table=typo_table,
+        syllables=syllables,
+        beam=4,
+        top_k_t1=4,
+        max_per_shard=24,
+        batch_records=8,
+        score_batch_size=16,
+        checkpoint_every_rows=12,
+        seed=0,
+    )
+    assert summary["written_shards"] == 1
+    assert summary["total_rows"] == 24
+    written = pq.read_table(out_dir / "test-00000.parquet").to_pylist()
+    assert len(written) == 24
+    shard_positive_cost = 0
+    for row in written:
+        cost = legality.cost(row["keys"], row["text"], OFFLINE)
+        assert cost is not None
+        if cost > 0.0:
+            shard_positive_cost += 1
+    assert shard_positive_cost > 0
