@@ -88,10 +88,16 @@ class DistillConfig:
     t1_weight: float = 0.5
     #: Softmax temperature applied to the teacher's T1 log-probs over top-k support.
     t1_temperature: float = 1.9
+    #: Mask T1 off on typo rows (``gold_min_cost > 0``) and restore full gold CE (#355).
+    t1_clean_only: bool = False
+    #: Mask T1 off at positions where teacher top-1 disagrees with gold (#355).
+    t1_gold_first: bool = False
     #: Weight on residual listwise KL (T2) over gold + 27B beam-8 negatives (T3).
     t2_weight: float = 1.0
     #: Residual scale ``w`` in ``q = softmax(sg(S) + w * s_T)`` for T2 KL.
     t2_scale: float = 0.6
+    #: Gate residual T2 to rows where the teacher ranks gold first (#355).
+    t2_gold_first: bool = True
     #: Weight on hard-negative MMI over ``{gold} U T3``.
     rank_t3_weight: float = 0.0
     #: Weight on on-policy student beam MMI over ``{gold} U student_beam``.
@@ -207,11 +213,20 @@ def iter_teacher_label_shards(shards_dir: Path) -> Iterator[TeacherLabelRow]:
 
 
 class TeacherLabelShards:
-    """Re-iterable view over S5 Parquet shards for multi-epoch and resumed S6 runs (#342)."""
+    """Re-iterable view over S5 Parquet shards with cross-shard mixing (#342, #355)."""
 
-    def __init__(self, shards_dir: Path, *, seed: int = 0) -> None:
+    def __init__(
+        self,
+        shards_dir: Path,
+        *,
+        seed: int = 0,
+        mix_shards: int = 16,
+    ) -> None:
+        if mix_shards < 1:
+            raise ValueError(f"mix_shards must be >= 1, got {mix_shards}")
         self.shards_dir = shards_dir
         self.seed = seed
+        self.mix_shards = mix_shards
         self._paths = sorted(p for p in shards_dir.glob("*.parquet") if not p.name.startswith("."))
         if not self._paths:
             raise FileNotFoundError(f"no teacher label parquet shards found under {shards_dir}")
@@ -219,15 +234,25 @@ class TeacherLabelShards:
 
     def __iter__(self) -> Iterator[TeacherLabelRow]:
         order = list(self._paths)
+        epoch = self._epoch
         if len(order) > 1:
-            random.Random(self.seed + self._epoch).shuffle(order)
+            random.Random(self.seed + epoch).shuffle(order)
         self._epoch += 1
-        for path in order:
-            yield from read_teacher_label_shard(path)
+        if self.mix_shards == 1 or len(order) == 1:
+            for path in order:
+                yield from read_teacher_label_shard(path)
+            return
+        for group_idx, start in enumerate(range(0, len(order), self.mix_shards)):
+            group_paths = order[start : start + self.mix_shards]
+            rows: list[TeacherLabelRow] = []
+            for path in group_paths:
+                rows.extend(read_teacher_label_shard(path))
+            random.Random(self.seed + epoch * 1_009 + group_idx * 9_973 + 7).shuffle(rows)
+            yield from rows
 
 
-def min_cost_span_ends(dense_cost: npt.NDArray[np.floating[Any]]) -> list[int]:
-    """Minimum-cost legal key-span end indices for a gold sentence from ``GoldArcs.dense()``."""
+def min_cost_cover(dense_cost: npt.NDArray[np.floating[Any]]) -> tuple[list[int], float]:
+    """Minimum-cost legal key-span end indices and total cost from ``GoldArcs.dense()``."""
     m, k, max_w = dense_cost.shape
     padded_prev = np.full(k + max_w, math.inf, dtype=np.float64)
     padded_prev[max_w - 1] = 0.0
@@ -240,14 +265,20 @@ def min_cost_span_ends(dense_cost: npt.NDArray[np.floating[Any]]) -> list[int]:
         bp[j, 1:] = best_idx + 1
         padded_prev[max_w - 1] = math.inf
         padded_prev[max_w:] = cand[rows_idx, best_idx]
-    if not math.isfinite(float(padded_prev[max_w + k - 1])):
+    total_cost = float(padded_prev[max_w + k - 1])
+    if not math.isfinite(total_cost):
         raise ValueError("gold arc table has no complete legal cover over keys")
     ends = [0] * m
     cur = k
     for j in range(m, 0, -1):
         ends[j - 1] = cur - 1
         cur -= int(bp[j, cur])
-    return ends
+    return ends, total_cost
+
+
+def min_cost_span_ends(dense_cost: npt.NDArray[np.floating[Any]]) -> list[int]:
+    """Minimum-cost legal key-span end indices for a gold sentence from ``GoldArcs.dense()``."""
+    return min_cost_cover(dense_cost)[0]
 
 
 def t1_kl_loss(
@@ -280,19 +311,34 @@ def t1_kl_loss(
     return per_pos.mean()
 
 
+def t2_gold_first_mask(
+    teacher_scores: torch.Tensor,
+    valid_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Rows where gold (slot 0) is valid and attains the teacher's highest valid score (#355)."""
+    mask = valid_mask.bool()
+    if mask.ndim != 2 or mask.shape[1] < 2:
+        return torch.zeros(mask.shape[0], dtype=torch.bool, device=mask.device)
+    masked_t = teacher_scores.float().masked_fill(~mask, float("-inf"))
+    return mask[:, 0] & (masked_t[:, 0] >= masked_t.amax(dim=-1))
+
+
 def t2_residual_kl_loss(
     student_scores: torch.Tensor,
     teacher_scores: torch.Tensor,
     valid_mask: torch.Tensor,
     *,
     scale: float = 0.6,
+    gold_first: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Residual listwise KL ``KL(softmax(sg(S) + scale * T) || softmax(S))`` (#350).
+    """Residual listwise KL ``KL(softmax(sg(S) + scale * T) || softmax(S))`` (#350, #355).
 
     Preserves the student's CTC and typo-cost dynamic range by shifting the
     detached student scores by ``scale * teacher_scores`` via
-    :func:`~mlime.train.key_teacher.distillation`. Rows with fewer than 2 valid
-    candidates contribute zero loss. Returns ``(kl_mean, teacher_flip)``.
+    :func:`~mlime.train.key_teacher.distillation`. When *gold_first* is true,
+    rows where the teacher ranks a non-gold negative above slot 0 contribute
+    zero loss so teacher errors never flip gold predictions wrong; loss and
+    flip rate remain normalised by all valid-pair rows.
     """
     if student_scores.shape != teacher_scores.shape or student_scores.shape != valid_mask.shape:
         raise ValueError("student_scores, teacher_scores, and valid_mask must share shape [B, C]")
@@ -301,13 +347,16 @@ def t2_residual_kl_loss(
 
     mask = valid_mask.bool()
     has_pair = mask.sum(dim=-1) >= 2
-    if not bool(has_pair.any()):
+    active = has_pair & t2_gold_first_mask(teacher_scores, mask) if gold_first else has_pair
+    if not bool(active.any()):
         zero = student_scores.sum() * 0.0
         return zero, zero.detach()
 
-    slots = student_scores[has_pair].float().masked_fill(~mask[has_pair], float("-inf"))
-    kl, extras = distillation(slots, mask[has_pair], teacher_scores[has_pair].float(), scale)
-    return kl.mean(), extras["teacher_flip"]
+    denom = has_pair.sum().clamp_min(1).to(torch.float32)
+    slots = student_scores[active].float().masked_fill(~mask[active], float("-inf"))
+    kl, extras = distillation(slots, mask[active], teacher_scores[active].float(), scale)
+    kept_ratio = active.sum().to(torch.float32) / denom
+    return kl.sum() / denom, extras["teacher_flip"] * kept_ratio
 
 
 def _flat_ctc_layout(
@@ -453,6 +502,7 @@ class DistillBatch:
     t1_ids: torch.Tensor
     t1_log_probs: torch.Tensor
     t1_mask: torch.Tensor | None
+    t1_clean: torch.Tensor
     cand_owner: torch.Tensor
     cand_slot_b: torch.Tensor
     cand_slot_c: torch.Tensor
@@ -483,6 +533,7 @@ class DistillBatch:
             t1_ids=self.t1_ids.to(device, non_blocking=True),
             t1_log_probs=self.t1_log_probs.to(device, non_blocking=True),
             t1_mask=None if self.t1_mask is None else self.t1_mask.to(device, non_blocking=True),
+            t1_clean=self.t1_clean.to(device, non_blocking=True),
             cand_owner=self.cand_owner.to(device, non_blocking=True),
             cand_slot_b=self.cand_slot_b.to(device, non_blocking=True),
             cand_slot_c=self.cand_slot_c.to(device, non_blocking=True),
@@ -548,12 +599,18 @@ def collate_distill_batch(
     gold_char_targets: list[int] = []
     t1_char_ids: list[list[int]] = []
     t1_char_lps: list[list[float]] = []
+    t1_char_clean: list[bool] = []
     t1_eos_ids: list[list[int]] = []
     t1_eos_lps: list[list[float]] = []
+    t1_eos_clean: list[bool] = []
+    row_span_ends: list[list[int]] = []
 
     k_t1 = min(len(pos) for r, g, _ in valid_rows for pos in r.t1_ids[: len(g) + int(score_eos)])
     for b, (row, gold_ids, dense_np) in enumerate(valid_rows):
         ln = len(gold_ids)
+        ends, min_cost = min_cost_cover(dense_np)
+        row_span_ends.append(ends)
+        is_clean = min_cost <= 0.0
         gold[b, :ln] = torch.tensor(gold_ids, dtype=torch.long)
         gold_cost[b, :ln, : dense_np.shape[1]] = torch.from_numpy(dense_np).to(torch.float32)
         for j in range(ln):
@@ -561,9 +618,11 @@ def collate_distill_batch(
             gold_char_targets.append(gold_ids[j])
             t1_char_ids.append(list(row.t1_ids[j][:k_t1]))
             t1_char_lps.append(list(row.t1_log_probs[j][:k_t1]))
+            t1_char_clean.append(is_clean)
         if score_eos:
             t1_eos_ids.append(list(row.t1_ids[ln][:k_t1]))
             t1_eos_lps.append(list(row.t1_log_probs[ln][:k_t1]))
+            t1_eos_clean.append(is_clean)
 
     scored_chars = len(gold_at_list)
     if score_eos:
@@ -572,6 +631,7 @@ def collate_distill_batch(
         )
         t1_ids_t = torch.tensor([*t1_char_ids, *t1_eos_ids], dtype=torch.long)
         t1_lps_t = torch.tensor([*t1_char_lps, *t1_eos_lps], dtype=torch.float32)
+        t1_clean_t = torch.tensor([*t1_char_clean, *t1_eos_clean], dtype=torch.bool)
         t1_mask: torch.Tensor | None = None
     else:
         gold_targets = torch.tensor(gold_char_targets, dtype=torch.long)
@@ -580,6 +640,7 @@ def collate_distill_batch(
         in_vocab = raw_ids < emittable
         t1_ids_t = raw_ids.clamp(max=emittable - 1)
         t1_lps_t = torch.where(in_vocab, raw_lps, torch.full_like(raw_lps, -1e9))
+        t1_clean_t = torch.tensor(t1_char_clean, dtype=torch.bool)
         t1_mask = in_vocab.any(dim=-1)
 
     max_c = max((len(r.candidates) for r, _, _ in valid_rows), default=0)
@@ -632,8 +693,7 @@ def collate_distill_batch(
     if include_online:
         span_end = torch.zeros((batch_size, max_m), dtype=torch.long)
         lengths: list[int] = []
-        for b, (_, gold_ids, dense_np) in enumerate(valid_rows):
-            ends = min_cost_span_ends(dense_np)
+        for b, ((_, gold_ids, _), ends) in enumerate(zip(valid_rows, row_span_ends, strict=True)):
             span_end[b, : len(ends)] = torch.tensor(ends, dtype=torch.long)
             lengths.append(len(gold_ids))
 
@@ -690,6 +750,7 @@ def collate_distill_batch(
         t1_ids=t1_ids_t,
         t1_log_probs=t1_lps_t,
         t1_mask=t1_mask,
+        t1_clean=t1_clean_t,
         cand_owner=torch.tensor(cand_owners, dtype=torch.long),
         cand_slot_b=torch.tensor(cand_slot_b, dtype=torch.long),
         cand_slot_c=torch.tensor(cand_slot_c, dtype=torch.long),
@@ -705,14 +766,16 @@ def collate_distill_batch(
 
 @dataclass(frozen=True)
 class DistillStepLosses:
-    """Loss terms and diagnostics from one unified S6 micro-batch forward pass (#350)."""
+    """Loss terms and diagnostics from one unified S6 micro-batch forward pass (#350, #355)."""
 
     total: torch.Tensor
     ctc: torch.Tensor
     ce: torch.Tensor
     t1: torch.Tensor
+    t1_kept: torch.Tensor
     t2: torch.Tensor
     t2_flip: torch.Tensor
+    t2_kept: torch.Tensor
     rank_t3: torch.Tensor
     rank_online: torch.Tensor
     rank_acc: torch.Tensor
@@ -728,7 +791,7 @@ def distill_batch_loss(
     charlm_teacher: Teacher | None = None,
     search_graphs: SearchGraphs | None = None,
 ) -> DistillStepLosses:
-    """Run one vectorized unified S6 distillation forward pass (#191, #350)."""
+    """Run one vectorized unified S6 distillation forward pass (#191, #350, #355)."""
     states = model.key_states(batch.inputs)
     ctc_lp = model.ctc_log_probs(states.states)
     flat_lp, key_index = _flat_ctc_layout(ctc_lp)
@@ -742,18 +805,53 @@ def distill_batch_loss(
 
     trans_logits = model.transition_logits(states, batch.gold, batch.gold_at, batch.gold_lengths)
     trans_lp = trans_logits.float().log_softmax(dim=-1)
-    gold_ce = -trans_lp.gather(1, batch.gold_targets.unsqueeze(1)).mean()
+    gold_ce_pos = -trans_lp.gather(1, batch.gold_targets.unsqueeze(1)).squeeze(1)
+    gold_ce = gold_ce_pos.mean()
 
+    t1_kept = zero.detach()
     if config.t1_weight > 0.0:
-        t1_loss = t1_kl_loss(
-            trans_lp,
-            batch.t1_ids,
-            batch.t1_log_probs,
-            temperature=config.t1_temperature,
-            mask=batch.t1_mask,
-        )
+        if config.t1_clean_only or config.t1_gold_first:
+            active = (
+                batch.t1_mask.bool()
+                if batch.t1_mask is not None
+                else torch.ones_like(gold_ce_pos, dtype=torch.bool)
+            )
+            if config.t1_clean_only:
+                active = active & batch.t1_clean
+            if config.t1_gold_first:
+                active = active & (batch.t1_ids[:, 0] == batch.gold_targets)
+            scaled = batch.t1_log_probs.float() / config.t1_temperature
+            teacher_log_p = functional.log_softmax(scaled, dim=-1)
+            teacher_p = teacher_log_p.exp()
+            student_at_k = trans_lp.gather(1, batch.t1_ids.long())
+            t1_pos = (teacher_p * (teacher_log_p - student_at_k)).sum(dim=-1)
+            t1_kept = active.float().mean().detach()
+            t1_loss = (
+                (t1_pos * active.float()).sum() / active.sum().clamp_min(1)
+                if bool(active.any())
+                else zero
+            )
+            trans_objective = (
+                config.ce_weight * gold_ce_pos
+                + config.t1_weight * torch.where(active, t1_pos, gold_ce_pos)
+            ).mean()
+        else:
+            t1_loss = t1_kl_loss(
+                trans_lp,
+                batch.t1_ids,
+                batch.t1_log_probs,
+                temperature=config.t1_temperature,
+                mask=batch.t1_mask,
+            )
+            t1_kept = (
+                batch.t1_mask.float().mean().detach()
+                if batch.t1_mask is not None
+                else gold_ctc.new_ones(()).detach()
+            )
+            trans_objective = config.ce_weight * gold_ce + config.t1_weight * t1_loss
     else:
         t1_loss = zero
+        trans_objective = config.ce_weight * gold_ce
 
     rank_online = zero
     rank_acc = zero.detach()
@@ -858,6 +956,7 @@ def distill_batch_loss(
 
     t2_loss = zero
     t2_flip = zero.detach()
+    t2_kept = zero.detach()
     rank_t3 = zero
     if config.uses_t3_candidates and batch.cand_owner.numel() > 0:
         parts = sentence_scores(
@@ -883,7 +982,16 @@ def distill_batch_loss(
                 batch.teacher_scores,
                 batch.cand_valid,
                 scale=config.t2_scale,
+                gold_first=config.t2_gold_first,
             )
+            has_pair = batch.cand_valid.sum(dim=-1) >= 2
+            if bool(has_pair.any()):
+                t2_active = (
+                    has_pair & t2_gold_first_mask(batch.teacher_scores, batch.cand_valid)
+                    if config.t2_gold_first
+                    else has_pair
+                )
+                t2_kept = (t2_active.sum().float() / has_pair.sum().float()).detach()
         if config.rank_t3_weight > 0.0:
             valid = batch.cand_valid
             has_gold_pair = valid[:, 0] & (valid.sum(dim=-1) >= 2)
@@ -897,8 +1005,7 @@ def distill_batch_loss(
 
     total = (
         config.ctc_weight * gold_ctc
-        + config.ce_weight * gold_ce
-        + config.t1_weight * t1_loss
+        + trans_objective
         + config.t2_weight * t2_loss
         + config.rank_t3_weight * rank_t3
         + config.rank_online_weight * rank_online
@@ -909,8 +1016,10 @@ def distill_batch_loss(
         ctc=gold_ctc,
         ce=gold_ce,
         t1=t1_loss,
+        t1_kept=t1_kept,
         t2=t2_loss,
         t2_flip=t2_flip,
+        t2_kept=t2_kept,
         rank_t3=rank_t3,
         rank_online=rank_online,
         rank_acc=rank_acc,
@@ -984,7 +1093,7 @@ class DistillStreamSource(Protocol):
 
 @dataclass(frozen=True)
 class ParquetDistillSource:
-    """Picklable S5 Parquet source opened inside a spawned prefetch worker (#353)."""
+    """Picklable S5 Parquet source opened inside a spawned prefetch worker (#353, #355)."""
 
     shards_dir: Path
     char_table: Path
@@ -994,6 +1103,7 @@ class ParquetDistillSource:
     context_model: QwenContextConfig | None = None
     seed: int = 0
     charlm_path: Path | None = None
+    mix_shards: int = 16
 
     def open(
         self,
@@ -1010,7 +1120,12 @@ class ParquetDistillSource:
         )
         collator = vocabularies.key_collator(context_dropout=0.0, seed=self.seed)
         charlm_vocab = None if self.charlm_path is None else TeacherVocab.read(self.charlm_path)
-        return TeacherLabelShards(self.shards_dir, seed=self.seed), collator, legality, charlm_vocab
+        return (
+            TeacherLabelShards(self.shards_dir, seed=self.seed, mix_shards=self.mix_shards),
+            collator,
+            legality,
+            charlm_vocab,
+        )
 
 
 def _cyclic_label_rows(
@@ -1314,8 +1429,10 @@ def train_distill_loop(
             acc_ctc = torch.zeros((), device=device)
             acc_ce = torch.zeros((), device=device)
             acc_t1 = torch.zeros((), device=device)
+            acc_t1_kept = torch.zeros((), device=device)
             acc_t2 = torch.zeros((), device=device)
             acc_t2_flip = torch.zeros((), device=device)
+            acc_t2_kept = torch.zeros((), device=device)
             acc_rank_t3 = torch.zeros((), device=device)
             acc_rank_online = torch.zeros((), device=device)
             acc_rank_acc = torch.zeros((), device=device)
@@ -1342,8 +1459,10 @@ def train_distill_loop(
                 acc_ctc = acc_ctc + losses.ctc.detach() * inv
                 acc_ce = acc_ce + losses.ce.detach() * inv
                 acc_t1 = acc_t1 + losses.t1.detach() * inv
+                acc_t1_kept = acc_t1_kept + losses.t1_kept.detach() * inv
                 acc_t2 = acc_t2 + losses.t2.detach() * inv
                 acc_t2_flip = acc_t2_flip + losses.t2_flip.detach() * inv
+                acc_t2_kept = acc_t2_kept + losses.t2_kept.detach() * inv
                 acc_rank_t3 = acc_rank_t3 + losses.rank_t3.detach() * inv
                 acc_rank_online = acc_rank_online + losses.rank_online.detach() * inv
                 acc_rank_acc = acc_rank_acc + losses.rank_acc.detach() * inv
@@ -1366,8 +1485,10 @@ def train_distill_loop(
                         ctc=acc_ctc,
                         ce=acc_ce,
                         t1=acc_t1,
+                        t1_kept=acc_t1_kept,
                         t2=acc_t2,
                         t2_flip=acc_t2_flip,
+                        t2_kept=acc_t2_kept,
                         rank_t3=acc_rank_t3,
                         rank_online=acc_rank_online,
                         rank_acc=acc_rank_acc,
@@ -1414,8 +1535,10 @@ def distill_step_metrics(
         "ctc_loss": round(float(losses.ctc.detach().item()), 5),
         "ce_loss": round(float(losses.ce.detach().item()), 5),
         "t1_loss": round(float(losses.t1.detach().item()), 5),
+        "t1_kept": round(float(losses.t1_kept.detach().item()), 4),
         "t2_loss": round(float(losses.t2.detach().item()), 5),
         "t2_flip": round(float(losses.t2_flip.detach().item()), 4),
+        "t2_kept": round(float(losses.t2_kept.detach().item()), 4),
         "rank_t3_loss": round(float(losses.rank_t3.detach().item()), 5),
         "rank_online_loss": round(float(losses.rank_online.detach().item()), 5),
         "rank_acc": round(float(losses.rank_acc.detach().item()), 4),

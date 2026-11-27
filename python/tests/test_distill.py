@@ -27,12 +27,16 @@ from mlime.train.distill import (
     DistillTrainConfig,
     TeacherLabelRow,
     TeacherLabelShards,
+    collate_distill_batch,
     cosine_lr,
+    distill_batch_loss,
     iter_teacher_label_shards,
+    min_cost_cover,
     min_cost_span_ends,
     read_teacher_label_shard,
     score_candidate_sentences,
     t1_kl_loss,
+    t2_gold_first_mask,
     t2_residual_kl_loss,
     train_distill_loop,
 )
@@ -561,3 +565,158 @@ def test_train_distill_loop_spawned_process_prefetch(
     )
     assert summary["steps"] == 3
     assert Path(summary["checkpoint"]).is_file()
+
+
+def test_t2_residual_kl_loss_gold_first_blocks_teacher_wrong_rows() -> None:
+    student_scores = torch.tensor(
+        [
+            [-3.0, -2.0],  # student wrong, teacher right -> kept & flipped to gold
+            [-1.0, -2.5],  # student right, teacher wrong -> blocked under gold_first
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    teacher_scores = torch.tensor(
+        [
+            [-0.5, -3.5],  # gold first
+            [-4.5, -0.5],  # negative first (teacher error)
+        ],
+        dtype=torch.float32,
+    )
+    valid = torch.ones((2, 2), dtype=torch.bool)
+    assert t2_gold_first_mask(teacher_scores, valid).tolist() == [True, False]
+
+    # Unfiltered T2 pushes row 1 away from gold (positive grad on slot 0).
+    raw_kl, _ = t2_residual_kl_loss(
+        student_scores, teacher_scores, valid, scale=0.8, gold_first=False
+    )
+    raw_kl.backward()
+    assert student_scores.grad is not None
+    assert float(student_scores.grad[1, 0]) > 0.0
+
+    # Gold-first T2 zeroes row 1 gradient while keeping row 0 push toward gold.
+    student_scores.grad.zero_()
+    gated_kl, gated_flip = t2_residual_kl_loss(
+        student_scores, teacher_scores, valid, scale=0.8, gold_first=True
+    )
+    assert float(gated_kl.detach()) > 0.0
+    assert float(gated_flip) == pytest.approx(0.5, abs=1e-6)
+    gated_kl.backward()
+    assert float(student_scores.grad[0, 0]) < 0.0
+    assert float(student_scores.grad[0, 1]) > 0.0
+    assert float(student_scores.grad[1].abs().sum()) == 0.0
+
+    # All teacher-wrong rows yield exact zero loss and zero flip.
+    all_wrong = torch.tensor([[-4.0, -0.5], [-4.5, -0.5]], dtype=torch.float32)
+    z_kl, z_flip = t2_residual_kl_loss(
+        student_scores.detach(), all_wrong, valid, scale=0.8, gold_first=True
+    )
+    assert float(z_kl) == 0.0
+    assert float(z_flip) == 0.0
+
+
+def test_t1_gating_compensates_gold_ce_on_typo_and_disagreement(
+    vocabularies: Vocabularies,
+    lexicon: Lexicon,
+    reader_vocab: CharVocab,
+    legality: Legality,
+) -> None:
+    model = _tiny_prelude_key_model(lexicon, reader_vocab).eval()
+    collator = vocabularies.key_collator(context_dropout=0.0)
+    eos_id = lexicon.size
+    ids = legality.ids("我爱北京")
+    assert ids is not None
+
+    clean_arcs = legality.gold_ids("woaibeijing", ids, OFFLINE)
+    typo_arcs = legality.gold_ids("woaibeijign", ids, OFFLINE)
+    assert clean_arcs is not None and typo_arcs is not None
+    assert min_cost_cover(clean_arcs.dense())[1] == 0.0
+    assert min_cost_cover(typo_arcs.dense())[1] > 0.0
+
+    # Position 0 disagrees with gold; remaining positions + <eos> agree.
+    wrong_first = (ids[0] + 1) % eos_id
+    t1_ids = (
+        (wrong_first, ids[0], eos_id),
+        *((eid, (eid + 1) % eos_id, eos_id) for eid in ids[1:]),
+        (eos_id, ids[0], (ids[0] + 1) % eos_id),
+    )
+    t1_lps = tuple((-0.1, -2.5, -4.0) for _ in range(len(ids) + 1))
+
+    clean_row = TeacherLabelRow(
+        id="clean",
+        context=None,
+        keys="woaibeijing",
+        text="我爱北京",
+        t1_ids=t1_ids,
+        t1_log_probs=t1_lps,
+        candidates=("我爱北京",),
+        candidate_scores=(-0.5,),
+    )
+    typo_row = TeacherLabelRow(
+        id="typo",
+        context=None,
+        keys="woaibeijign",
+        text="我爱北京",
+        t1_ids=t1_ids,
+        t1_log_probs=t1_lps,
+        candidates=("我爱北京",),
+        candidate_scores=(-0.5,),
+    )
+
+    # On a typo-only batch with t1_clean_only=True, T1 is fully replaced by gold CE.
+    typo_batch = collate_distill_batch(
+        [typo_row], collator, legality, score_eos=True, options=OFFLINE
+    )
+    assert typo_batch is not None
+    assert not bool(typo_batch.t1_clean.any())
+    cfg_clean = DistillConfig(
+        ctc_weight=1.0,
+        ce_weight=0.45,
+        t1_weight=0.55,
+        t1_clean_only=True,
+        t2_weight=0.0,
+        rank_online_weight=0.0,
+        lm_weight=0.0,
+    )
+    with torch.no_grad():
+        typo_losses = distill_batch_loss(model, typo_batch, cfg_clean)
+    assert float(typo_losses.t1_kept) == 0.0
+    assert float(typo_losses.t1) == 0.0
+    assert float(typo_losses.total) == pytest.approx(
+        float(typo_losses.ctc + typo_losses.ce), abs=1e-5
+    )
+
+    # Mixed clean + typo batch with both gates keeps 4/5 clean positions = 4/10 total.
+    mixed_batch = collate_distill_batch(
+        [clean_row, typo_row], collator, legality, score_eos=True, options=OFFLINE
+    )
+    assert mixed_batch is not None
+    cfg_both = replace(cfg_clean, t1_gold_first=True)
+    with torch.no_grad():
+        mixed_losses = distill_batch_loss(model, mixed_batch, cfg_both)
+    assert float(mixed_losses.t1_kept) == pytest.approx(0.4, abs=1e-6)
+    assert float(mixed_losses.t1) > 0.0
+
+
+def test_teacher_label_shards_mixes_across_shards_deterministically(tmp_path: Path) -> None:
+    for s in range(4):
+        write_labels_parquet(
+            [
+                {
+                    "id": f"s{s}_{i}",
+                    "keys": "beijing",
+                    "text": "北京",
+                    "t1_ids": [[1, 2], [3, 4], [5, 6]],
+                    "t1_log_probs": [[-0.1, -2.3], [-0.2, -1.7], [-0.05, -3.0]],
+                    "candidates": ["北京"],
+                    "candidate_scores": [-0.5],
+                }
+                for i in range(10)
+            ],
+            tmp_path / f"shard-{s:05d}.parquet",
+        )
+    a = [r.id for r in TeacherLabelShards(tmp_path, seed=0, mix_shards=4)]
+    b = [r.id for r in TeacherLabelShards(tmp_path, seed=0, mix_shards=4)]
+    assert a == b
+    assert len(a) == 40 and len(set(a)) == 40
+    assert len({rid.split("_")[0] for rid in a[:10]}) >= 3
